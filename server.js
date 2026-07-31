@@ -146,21 +146,72 @@ function searchTermVariants(name) {
   return variants;
 }
 
-async function resolvePlayerId(name, teamHint, season, birthHint) {
-  const cacheKey = `resolve:${name}|${teamHint}|${season}|${birthHint || ""}`;
+// Resolves an English club/team name (e.g. "Vissel Kobe") to API-Football's
+// numeric team ID via the /teams search endpoint. This lets us find a player
+// on ANY club worldwide without having to pre-register that club's league ID
+// in SEARCH_LEAGUES — we just ask API-Football "which team is this" directly.
+// Cached for 30 days since a team's ID never changes.
+async function resolveTeamId(teamNameEnglish) {
+  const name = (teamNameEnglish || "").trim();
+  if (!name) return null;
+  const cacheKey = `team-id:${name.toLowerCase()}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== null) return cached;
+  try {
+    const data = await callApiFootball("/teams", { search: name });
+    const list = data.response || [];
+    if (!list.length) { cacheSet(cacheKey, null, 24 * 60 * 60 * 1000); return null; }
+    const exact = list.find((r) => (r.team && r.team.name || "").toLowerCase() === name.toLowerCase());
+    const id = (exact || list[0]).team.id;
+    cacheSet(cacheKey, id, 30 * 24 * 60 * 60 * 1000);
+    return id;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function resolvePlayerId(name, teamHint, season, birthHint, teamEnglishHint) {
+  const cacheKey = `resolve:${name}|${teamHint}|${season}|${birthHint || ""}|${teamEnglishHint || ""}`;
   const cached = cacheGet(cacheKey);
   if (cached !== null) return cached;
 
   let results = [];
-  outer:
-  for (const term of searchTermVariants(name)) {
-    for (const leagueId of SEARCH_LEAGUES) {
-      try {
-        const data = await callApiFootball("/players", { search: term, league: leagueId, season });
-        results = data.response || [];
-        if (results.length) break outer;
-      } catch (e) {
-        // this league/season combo errored (e.g. league id not valid for this season) — try the next one
+
+  // Preferred path: if we know the club's English name (set when a player is
+  // registered), resolve it straight to a team ID and search within that team.
+  // This works for ANY club in ANY league/country — no need to maintain a list
+  // of known league IDs at all — so it's the most future-proof way to find a
+  // player, especially for leagues we haven't specifically added support for.
+  if (teamEnglishHint) {
+    const teamId = await resolveTeamId(teamEnglishHint);
+    if (teamId) {
+      outerTeam:
+      for (const term of searchTermVariants(name)) {
+        try {
+          const data = await callApiFootball("/players", { search: term, team: teamId, season });
+          results = data.response || [];
+          if (results.length) break outerTeam;
+        } catch (e) {
+          // try the next name variant
+        }
+      }
+    }
+  }
+
+  // Fallback path: loop across our known major-league IDs (also used when no
+  // English club name was supplied, e.g. for players registered before this
+  // feature existed).
+  if (!results.length) {
+    outer:
+    for (const term of searchTermVariants(name)) {
+      for (const leagueId of SEARCH_LEAGUES) {
+        try {
+          const data = await callApiFootball("/players", { search: term, league: leagueId, season });
+          results = data.response || [];
+          if (results.length) break outer;
+        } catch (e) {
+          // this league/season combo errored (e.g. league id not valid for this season) — try the next one
+        }
       }
     }
   }
@@ -193,11 +244,12 @@ async function resolvePlayerId(name, teamHint, season, birthHint) {
 async function handlePlayerSeasonStats(query) {
   const name = String(query.get("name") || "").trim();
   const team = String(query.get("team") || "").trim();
+  const teamEn = String(query.get("teamEn") || "").trim(); // English club name, e.g. "Vissel Kobe" — used to look the club up directly via /teams, so we don't need that club's league ID pre-registered
   const birth = String(query.get("birth") || "").trim(); // YYYY-MM-DD, used to disambiguate same-surname players
   const season = String(query.get("season") || guessSeason());
   if (!name) return { status: 400, body: { found: false, error: "name is required" } };
 
-  const cacheKey = `season-stats:${name}|${team}|${birth}|${season}`;
+  const cacheKey = `season-stats:${name}|${team}|${teamEn}|${birth}|${season}`;
   const cached = cacheGet(cacheKey);
   if (cached) return { status: 200, body: cached };
 
@@ -212,7 +264,7 @@ async function handlePlayerSeasonStats(query) {
   try {
     let player = null;
     for (const s of candidateSeasons) {
-      player = await resolvePlayerId(name, team, s, birth);
+      player = await resolvePlayerId(name, team, s, birth, teamEn);
       if (player) break;
     }
     if (!player) {
@@ -286,35 +338,67 @@ async function handlePlayerSeasonStats(query) {
   }
 }
 
-async function handleFixturesToday(query) {
-  const leaguesParam = String(query.get("leagues") || "").split(",").map((s) => s.trim()).filter(Boolean);
-  const targetLeagues = leaguesParam.length ? leaguesParam : DEFAULT_LEAGUES;
-  const today = new Date().toISOString().slice(0, 10);
-  const season = guessSeason();
+// Leagues/competitions to hide from "today's real fixtures" even though
+// API-Football includes them in an unrestricted /fixtures?date=... response —
+// youth, reserve, and women's competitions clutter a fan-facing app whose
+// registered players are all senior men's footballers.
+const FIXTURE_NAME_DENYLIST = /\b(u1[5-9]|u2[0-3]|women|female|femenina|feminine|reserve|reserves|ii|youth|academy|futsal|beach soccer)\b/i;
 
-  const cacheKey = `fixtures:${today}:${targetLeagues.join(",")}`;
+async function handleFixturesToday(query) {
+  // A previous version of this looped over a fixed list of 5 European top-flight
+  // leagues (DEFAULT_LEAGUES). That silently returns nothing for weeks at a time
+  // during Europe's summer off-season (roughly June-August), since none of those
+  // 5 leagues are playing then — even though real football is happening every day
+  // elsewhere (MLS, Brazil, J-League, pre-season friendlies, international
+  // tournaments, etc.). API-Football's /fixtures endpoint accepts `date` on its
+  // own with no league restriction required, and returns everything scheduled
+  // that day worldwide — so we query it unrestricted and only apply an optional
+  // narrowing filter if the caller explicitly asks for specific league IDs via
+  // ?leagues=.
+  const leaguesParam = String(query.get("leagues") || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const today = new Date().toISOString().slice(0, 10);
+
+  const cacheKey = `fixtures:${today}:${leaguesParam.join(",")}`;
   const cached = cacheGet(cacheKey);
   if (cached) return { status: 200, body: cached };
 
   try {
-    const results = await Promise.all(targetLeagues.map(async (leagueId) => {
-      try {
-        const data = await callApiFootball("/fixtures", { date: today, league: leagueId, season });
-        return data.response || [];
-      } catch (e) {
-        return [];
-      }
-    }));
-    const fixtures = results.flat().map((f) => ({
-      id: f.fixture.id,
-      date: f.fixture.date,
-      status: f.fixture.status ? f.fixture.status.short : null,
-      venue: f.fixture.venue ? f.fixture.venue.name : null,
-      league: f.league ? f.league.name : null,
-      home: { name: f.teams.home.name, logo: f.teams.home.logo, winner: f.teams.home.winner },
-      away: { name: f.teams.away.name, logo: f.teams.away.logo, winner: f.teams.away.winner },
-      score: f.goals ? { home: f.goals.home, away: f.goals.away } : null,
-    }));
+    let all = [];
+    if (leaguesParam.length) {
+      // Caller explicitly narrowed to specific league IDs — honor that (loop is
+      // only needed because /fixtures takes one league ID at a time).
+      const season = guessSeason();
+      const results = await Promise.all(leaguesParam.map(async (leagueId) => {
+        try {
+          const data = await callApiFootball("/fixtures", { date: today, league: leagueId, season });
+          return data.response || [];
+        } catch (e) {
+          return [];
+        }
+      }));
+      all = results.flat();
+    } else {
+      // Default: no league restriction at all — get everything scheduled today.
+      const data = await callApiFootball("/fixtures", { date: today });
+      all = data.response || [];
+    }
+
+    const fixtures = all
+      .filter((f) => !FIXTURE_NAME_DENYLIST.test((f.league && f.league.name) || ""))
+      .map((f) => ({
+        id: f.fixture.id,
+        date: f.fixture.date,
+        status: f.fixture.status ? f.fixture.status.short : null,
+        venue: f.fixture.venue ? f.fixture.venue.name : null,
+        league: f.league ? f.league.name : null,
+        country: f.league ? f.league.country : null,
+        home: { name: f.teams.home.name, logo: f.teams.home.logo, winner: f.teams.home.winner },
+        away: { name: f.teams.away.name, logo: f.teams.away.logo, winner: f.teams.away.winner },
+        score: f.goals ? { home: f.goals.home, away: f.goals.away } : null,
+      }))
+      .sort((a, b) => new Date(a.date) - new Date(b.date))
+      .slice(0, 80); // a fully unrestricted worldwide day can have hundreds of matches — cap to a sane amount
+
     const payload = { found: true, source: "API-Football", date: today, fetchedAt: new Date().toISOString(), fixtures };
     cacheSet(cacheKey, payload, 15 * 60 * 1000);
     return { status: 200, body: payload };
@@ -377,44 +461,6 @@ const server = http.createServer(async (req, res) => {
         const { status, body } = await handleFixturesToday(parsed.searchParams);
         res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
-        return;
-      }
-      if (pathname === "/api/debug/raw-search") {
-        // Temporary diagnostic endpoint: bypasses all of our own transformation/
-        // fallback logic and returns exactly what API-Football itself says for a
-        // given search+league+season combo, so we can see the ground truth while
-        // tracking down why resolvePlayerId isn't finding known real players.
-        const name = parsed.searchParams.get("name") || "";
-        const league = parsed.searchParams.get("league") || "39";
-        const season = parsed.searchParams.get("season") || String(guessSeason());
-        try {
-          const data = await callApiFootball("/players", { search: name, league, season });
-          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-          res.end(JSON.stringify({ queried: { name, league, season }, resultsCount: (data.response || []).length, raw: data }));
-        } catch (e) {
-          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-          res.end(JSON.stringify({ queried: { name, league, season }, error: e.message, code: e.code }));
-        }
-        return;
-      }
-      if (pathname === "/api/debug/raw-player") {
-        // Temporary diagnostic endpoint: returns exactly what API-Football says for
-        // /players?id=...&season=..., with NO club-vs-national-team filtering applied,
-        // so we can see the real shape of the "statistics" array (how many entries,
-        // what each entry's team/league name is, and whether "nationality" is present
-        // on the player object) instead of guessing at it.
-        const id = parsed.searchParams.get("id") || "";
-        const season = parsed.searchParams.get("season") || String(guessSeason());
-        try {
-          const data = await callApiFootball("/players", { id, season });
-          const responseCount = (data.response || []).length;
-          const statsCounts = (data.response || []).map((entry) => (entry.statistics || []).length);
-          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-          res.end(JSON.stringify({ queried: { id, season }, responseCount, statisticsCountPerResponseEntry: statsCounts, raw: data }));
-        } catch (e) {
-          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-          res.end(JSON.stringify({ queried: { id, season }, error: e.message, code: e.code }));
-        }
         return;
       }
       res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
