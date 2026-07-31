@@ -291,6 +291,14 @@
   .chat-input-row { display: flex; gap: 8px; }
   .chat-input-row input { flex: 1; padding: 9px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text-primary); font-size: 13.5px; }
 
+  /* AI対話パートナー: 回答の後に「一緒に考える」ための要素(振り返り質問・別の視点・深掘り質問) */
+  .dialogue-extra { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border); }
+  .dialogue-reflect { font-size: 12.5px; color: var(--text-primary); font-weight: 600; margin-bottom: 6px; }
+  .dialogue-perspective { font-size: 12px; color: var(--text-secondary); font-style: italic; margin-bottom: 8px; }
+  .followup-chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chat-followup-btn { border: 1px solid var(--series-home); background: transparent; color: var(--series-home); padding: 5px 11px; border-radius: 999px; font-size: 12px; cursor: pointer; }
+  .chat-followup-btn:hover { background: var(--series-home); color: #fff; }
+
   /* Match Analysis AI */
   .match-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 4px; border-bottom: 1px solid var(--gridline); }
   .match-row:last-child { border-bottom: none; }
@@ -3076,6 +3084,88 @@ function buildRecommendationLine(player, other, diff, tagA, tagB) {
   }
   return `🤖 AIのおすすめ: 総合評価はほぼ互角のため、どちらが「おすすめ」かはチームに何を求めるか次第です。${tagA.emoji}${tagA.label}タイプが欲しいなら${player.name}、${tagB.emoji}${tagB.label}タイプが欲しいなら${other.name}が合いやすいでしょう。`;
 }
+/* =========================================================
+   AI対話パートナー(dialogue partner enrichment)
+   ---------------------------------------------------------
+   AIは「質問に答えて終わり」ではなく、
+     1) なぜそう考えたのか、利用者自身にも問い返す
+     2) 別の視点・反対意見も示す
+     3) 会話が自然と続く「深掘り質問」を提示する
+   ことで、利用者と一緒に考えるパートナーになることを目指す。
+   既存のanswerPlayerQuestion/heroAskAIの「回答」はそのままに、
+   回答の後ろに付け足す追加ブロックとして実装する。
+   ========================================================= */
+
+// 質問文自体に戦術的な語彙が含まれる場合、そのターンだけ深い解説モードに底上げする
+// (「AIが利用者の知識レベルを推測する」の軽量な実装。手動のレベル切り替えは
+// そのまま維持しつつ、質問の内容からもその場で判断を補う)
+const ADVANCED_VOCAB_RE = /xg|ポゼッション|ハイプレス|ライン間|5バック|3バック|4バック|ビルドアップ|可変|偽9番|インサイドハーフ|ゲーゲンプレス|オフサイド|プレッシング|スペース管理|ブロック|保持率/i;
+function effectiveDialogueLevel(question, baseLevel) {
+  const lv = baseLevel || "standard";
+  if (!ADVANCED_VOCAB_RE.test(question || "")) return lv;
+  if (lv === "beginner") return "standard";
+  return "expert";
+}
+
+const DIALOGUE_REFLECT_BUILDERS = {
+  player: (p, level) => level === "beginner"
+    ? `あなたは${p.name}のどんなところが一番すごいと思いますか？`
+    : `この評価に納得しますか？もし違う見方があるとしたら、それはなぜだと思いますか？`,
+  club: (clubName) => `あなたなら、${clubName}の強さの一番の理由に何を挙げますか？`,
+  match: (m, level) => level === "beginner"
+    ? `あなたは${m.homeLabel}と${m.awayLabel}、どちらが勝つと思いますか？`
+    : `この予測について、あなた自身はどちらが勝つと予想しますか？理由も考えてみてください。`,
+  comparison: (ctx) => `あなたなら${ctx.a}と${ctx.b}、どちらを先発で使いたいですか？`,
+};
+const DIALOGUE_PERSPECTIVE_BUILDERS = {
+  player: () => `一方で、能力値だけでは測れないメンタル面やチームとの相性次第で、評価の見え方が変わることもあります。`,
+  club: (clubName) => `ただし、選手層の評価は移籍市場や怪我人の状況次第で変わるため、来シーズンには順位が入れ替わる可能性も十分あります。`,
+  match: () => `ただし、格下と見られるチームでも守備を固めて一発を狙う戦い方をすれば、番狂わせが起きることもあります。`,
+  comparison: () => `「総合力が高い方が良い」とは限らず、チームの戦術や求める役割次第で評価は変わります。`,
+};
+const DIALOGUE_FOLLOWUP_BUILDERS = {
+  player: (p) => {
+    const qs = [
+      `もし${p.name}が怪我で離脱したら、チームにどんな影響があると思いますか？`,
+      `${p.name}と同じポジションの他の選手と比べて、どこが違うと思いますか？`,
+    ];
+    if (p.weaknesses && p.weaknesses.length) qs.push(`${p.name}の「${p.weaknesses[0]}」という弱点は、どうすれば克服できると思いますか？`);
+    return qs;
+  },
+  club: (clubName) => [
+    `${clubName}の弱点はどこだと思いますか？`,
+    `もし${clubName}の主力選手が1人移籍したら、チームはどう変わると思いますか？`,
+    `${clubName}を戦術的に止めるなら、どんな守り方が有効だと思いますか？`,
+  ],
+  match: (m) => [
+    `もし${m.awayLabel}が5バックで守ったら、どうなると思いますか？`,
+    `この試合で一番重要な選手は誰だと思いますか？`,
+    `${m.homeLabel}のキープレーヤーが欠場したら、結果は変わると思いますか？`,
+  ],
+  comparison: (ctx) => [
+    `もし${ctx.a}と${ctx.b}が同じチームでプレーしたら、どんな相乗効果があると思いますか？`,
+    `監督ならどちらを先発で使いますか？その理由も考えてみてください。`,
+  ],
+};
+
+// トピック種別(player/club/match/comparison)ごとに「振り返り質問」「別の視点」
+// 「深掘り質問」を組み立てて、回答の下に付け足すHTMLを返す。
+// 初心者(beginner)には「別の視点」は省略し、まずは基本の理解を優先する。
+function buildDialogueExtras(topicType, ctx, level) {
+  if (!topicType || !DIALOGUE_REFLECT_BUILDERS[topicType]) return "";
+  const reflect = DIALOGUE_REFLECT_BUILDERS[topicType](ctx, level);
+  const perspective = level === "beginner" ? null : DIALOGUE_PERSPECTIVE_BUILDERS[topicType](ctx, level);
+  const followups = DIALOGUE_FOLLOWUP_BUILDERS[topicType] ? DIALOGUE_FOLLOWUP_BUILDERS[topicType](ctx, level) : [];
+  let html = `<div class="dialogue-extra">`;
+  if (reflect) html += `<div class="dialogue-reflect">🤔 ${escapeHtml(reflect)}</div>`;
+  if (perspective) html += `<div class="dialogue-perspective">🔄 ${escapeHtml(perspective)}</div>`;
+  if (followups && followups.length) {
+    html += `<div class="followup-chip-row">` + followups.map(q => `<button class="chat-followup-btn" data-q="${escapeHtml(q)}">・${escapeHtml(q)}</button>`).join("") + `</div>`;
+  }
+  html += `</div>`;
+  return html;
+}
+
 function answerPlayerQuestion(player, question, level) {
   const q = (question || "").trim();
   if (!q) return "質問を入力してください。";
@@ -3847,8 +3937,8 @@ function renderChatUI(player) {
   const el = document.getElementById("chatMessages");
   if (!el) return;
   el.innerHTML = chatHistories[key].length
-    ? chatHistories[key].map(m => `<div class="chat-msg ${m.role}"><div class="chat-bubble">${m.text}</div></div>`).join("")
-    : `<p class="value-note">上のボタンから質問を選ぶか、下の入力欄に自由に質問を入力してください。</p>`;
+    ? chatHistories[key].map(m => `<div class="chat-msg ${m.role}"><div class="chat-bubble">${m.text}${m.extras || ""}</div></div>`).join("")
+    : `<p class="value-note">上のボタンから質問を選ぶか、下の入力欄に自由に質問を入力してください。AIは答えるだけでなく、一緒に考える質問も返します。</p>`;
   el.scrollTop = el.scrollHeight;
 }
 function sendChatMessage(player, presetText) {
@@ -3858,8 +3948,14 @@ function sendChatMessage(player, presetText) {
   const key = photoCacheKey(player);
   if (!chatHistories[key]) chatHistories[key] = [];
   chatHistories[key].push({ role: "user", text: escapeHtml(text) });
+  const dLevel = effectiveDialogueLevel(text, state.level);
   const answer = beginnerize(answerPlayerQuestion(player, text, state.level));
-  chatHistories[key].push({ role: "ai", text: escapeHtml(answer) });
+  const other = detectMentionedPlayer(text, player.key);
+  const isComparison = !!(other && /違い|比較|どっちが|どちらが|vs|対/.test(text));
+  const topicType = isComparison ? "comparison" : "player";
+  const topicCtx = isComparison ? { a: player.name, b: other.name } : player;
+  const extras = buildDialogueExtras(topicType, topicCtx, dLevel);
+  chatHistories[key].push({ role: "ai", text: escapeHtml(answer), extras });
   if (input) input.value = "";
   renderChatUI(player);
 }
@@ -3948,6 +4044,15 @@ function wirePlayerExtras(player) {
   (cardWrapEl || document).querySelectorAll(".chat-suggest-btn").forEach(btn => {
     btn.addEventListener("click", () => sendChatMessage(player, btn.dataset.q));
   });
+  // AI対話パートナーの「深掘り質問」チップ — チャットは再描画のたびに中身が
+  // 入れ替わるため、チップ自体ではなく親の#chatMessagesにイベント委譲する
+  const chatMessagesEl = document.getElementById("chatMessages");
+  if (chatMessagesEl) {
+    chatMessagesEl.addEventListener("click", (e) => {
+      const btn = e.target.closest(".chat-followup-btn");
+      if (btn) sendChatMessage(player, btn.dataset.q);
+    });
+  }
 }
 
 /* =========================================================
@@ -4581,7 +4686,7 @@ function renderHeroChatUI() {
   const el = document.getElementById("heroChatMessages");
   if (!el) return;
   el.innerHTML = heroChatHistory.length
-    ? heroChatHistory.map(m => `<div class="chat-msg ${m.role}"><div class="chat-bubble">${m.text}</div></div>`).join("")
+    ? heroChatHistory.map(m => `<div class="chat-msg ${m.role}"><div class="chat-bubble">${m.text}${m.extras || ""}</div></div>`).join("")
     : "";
   el.scrollTop = el.scrollHeight;
 }
@@ -4656,10 +4761,12 @@ function heroAskAI(question) {
   heroChatHistory.push({ role: "user", text: escapeHtml(q) });
   renderHeroChatUI();
 
+  const dLevel = effectiveDialogueLevel(q, state.level);
   const matchIntent = /(今日|本日).*(試合|見るべき|おすすめ)|見るべき試合|おすすめの試合|どの試合を見る/.test(q);
   const comparisonKeyword = /(どっち|どちら|vs|VS|対|比較|違い)/.test(q);
   const mentioned = findAllMentionedPlayers(q, 2);
   let reply;
+  let topicType = null, topicCtx = null;
 
   if (mentioned.length >= 2 && comparisonKeyword) {
     switchToPlayerMode();
@@ -4674,27 +4781,32 @@ function heroAskAI(question) {
       if (sel) { sel.value = mentioned[1].key; renderComparison(mentioned[0], mentioned[1].key); scrollToEl("compareResultWrap"); }
     }, 60);
     reply = `${mentioned[0].nameJa}と${mentioned[1].nameJa}を比較しました。下の選手カードの「比較する」欄にAIの分析とおすすめを表示しています。`;
+    topicType = "comparison"; topicCtx = { a: mentioned[0].name, b: mentioned[1].name };
   } else if (mentioned.length === 1) {
     switchToPlayerMode();
     document.getElementById("playerSearchInput").value = mentioned[0].nameJa;
     renderPlayerCard(mentioned[0], state.level);
     scrollToEl("playerCardWrap");
     reply = `${mentioned[0].nameJa}について、下にAI分析カードを表示しました。${answerPlayerQuestion(mentioned[0], q, state.level)}`;
+    topicType = "player"; topicCtx = mentioned[0];
   } else {
     const clubName = detectClubMention(q);
     if (clubName) {
       reply = buildClubAnswer(clubName, state.level);
+      topicType = "club"; topicCtx = clubName;
     } else if (matchIntent) {
       switchToMatchMode();
       const m = getDailyFeaturedMatchup();
       renderMatchAnalysis(m.id);
       scrollToEl("matchAnalysisWrap");
       reply = `本日のAIおすすめカードは「${m.homeLabel} vs ${m.awayLabel}」です。下に分析を表示しました。📡「本日の実際の試合」に実データがある場合は、そちらも合わせてチェックしてみてください。`;
+      topicType = "match"; topicCtx = m;
     } else {
       reply = `うまく認識できませんでした。「(選手名)はどんな選手？」「(クラブ名)はなぜ強い？」「今日見るべき試合は？」「(選手A)と(選手B)どっち？」のような聞き方だと、登録データからAIが答えを組み立てられます。`;
     }
   }
-  heroChatHistory.push({ role: "ai", text: escapeHtml(reply) });
+  const extras = buildDialogueExtras(topicType, topicCtx, dLevel);
+  heroChatHistory.push({ role: "ai", text: escapeHtml(reply), extras });
   renderHeroChatUI();
 }
 // Categorized suggested-question chips (home-screen polish): 今話題 / 今日人気 are
@@ -4740,6 +4852,12 @@ document.getElementById("heroChatBtn").addEventListener("click", () => {
 });
 document.getElementById("heroChatInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { heroAskAI(e.target.value); e.target.value = ""; }
+});
+// AI対話パートナーの「深掘り質問」チップ(hero chat側) — #heroChatMessages自体は
+// 固定の要素なので、ここで一度だけイベント委譲すればよい。
+document.getElementById("heroChatMessages").addEventListener("click", (e) => {
+  const btn = e.target.closest(".chat-followup-btn");
+  if (btn) heroAskAI(btn.dataset.q);
 });
 
 /* ---- Position / nationality filters for the player chip list ---- */
