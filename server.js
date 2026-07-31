@@ -27,6 +27,13 @@ const fs = require("fs");
 const path = require("path");
 const { URL } = require("url");
 
+// Stage C: 対話エンジン(議論モード)関連。実体は server/rag/ ・ server/discuss/ ・
+// server/llm/ にあり、ここではモジュールとして読み込むだけ(利用箇所は下の方の
+// 「Stage C」セクションを参照)。
+const { createKnowledgeSource } = require("./rag/knowledgeSource");
+const { planInformationNeeds } = require("./discuss/planner");
+const { generateLLM, currentProviderName } = require("./llm");
+
 // ---- .env を自前で読み込む(dotenvパッケージ不使用) ----
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -839,6 +846,449 @@ async function handleAutoCollectPredictions() {
   return { status: 200, body: { ok: true, upstashConfigured: true, logged, resolved, notes } };
 }
 
+// ---- 試合分析AI: 予測ロジックAPI化(Stage B) ----
+// これまでフロントエンド(index.html)の中でその場で計算していた「試合分析AI」の
+// 予測ロジック(予想スコア・AI確信度・ボール支配率予想・勝因/弱点分析・試合の流れ・
+// ターニングポイント/MVP予想・攻撃方向予想・危険エリア・予想布陣/フォーメーション)を、
+// このサーバー側の関数として1対1で移植したもの。
+//
+// 設計方針:
+//   - 「何を予測するか(AIの判断)」はサーバーで計算する。
+//   - 「どう見せるか(SVGの描画・CSS変数を使った配色など)」はフロントエンドに残す。
+//   これにより、この先モデルを本物の機械学習に差し替える際も、フロントエンドの
+//   見た目やレンダリング処理には一切手を入れずに済む(判断ロジックの入れ替えだけで完結する)。
+//
+// データの持ち方について: 選手データ(PLAYERS)自体は今回まだフロントエンド側に
+// 残しており(Stage C「データ蓄積」で本格的に扱う範囲)、リクエストごとに必要な
+// 選手データをフロントエンドから送ってもらう形にしている。これにより、この
+// エンドポイントの入出力インターフェースを変えずに、将来「選手データもサーバー側
+// DBから取得する」という変更を裏側だけで行えるようにしてある。
+const ATTR_LABELS_SRV = { attack: "攻撃力", shooting: "シュート", dribbling: "ドリブル", passing: "パス", tactical: "戦術理解", speed: "スピード", physical: "フィジカル", defense: "守備" };
+const ATTR_KEYS_SRV = Object.keys(ATTR_LABELS_SRV);
+
+function positionGroupSrv(pos) {
+  if (!pos || pos === "-") return "不明";
+  const first = String(pos).split(/[\/\s]/)[0].toUpperCase();
+  if (first.indexOf("GK") !== -1) return "GK";
+  if (["CB", "RB", "LB", "SB", "WB", "DF"].some((t) => first.indexOf(t) !== -1)) return "DF";
+  if (["RW", "LW", "CF", "ST", "FW", "SS"].some((t) => first.indexOf(t) !== -1)) return "FW";
+  if (["DM", "CM", "AM", "MF"].some((t) => first.indexOf(t) !== -1)) return "MF";
+  return "その他";
+}
+
+function teamAvgSrv(players, attr) {
+  if (!players.length) return 62;
+  return players.reduce((s, p) => s + (attr === "overall" ? p.overall : (p.attrs ? p.attrs[attr] : 0)), 0) / players.length;
+}
+
+function computeAttrAveragesSrv(players) {
+  const out = {};
+  ATTR_KEYS_SRV.forEach((k) => { out[k] = teamAvgSrv(players, k); });
+  return out;
+}
+
+function pickLikelyXISrv(players) {
+  const buckets = { GK: [], DF: [], MF: [], FW: [] };
+  players.forEach((p) => { const g = positionGroupSrv(p.position); if (buckets[g]) buckets[g].push(p); });
+  Object.keys(buckets).forEach((g) => buckets[g].sort((a, b) => b.overall - a.overall));
+  const counts = { GK: 1, DF: 4, MF: 4, FW: 2 };
+  const xi = [];
+  Object.keys(counts).forEach((g) => xi.push(...buckets[g].slice(0, counts[g])));
+  return xi.length ? xi : players.slice().sort((a, b) => b.overall - a.overall).slice(0, Math.min(11, players.length));
+}
+
+function formationStringSrv(xi) {
+  return `${xi.filter((p) => positionGroupSrv(p.position) === "DF").length}-${xi.filter((p) => positionGroupSrv(p.position) === "MF").length}-${xi.filter((p) => positionGroupSrv(p.position) === "FW").length}`;
+}
+
+function pickStandoutPlayerSrv(players) {
+  if (!players || !players.length) return null;
+  return players.slice().sort((a, b) => b.overall - a.overall)[0];
+}
+
+function fmtSrv(n, digits) {
+  return Number(n).toFixed(digits != null ? digits : 1);
+}
+
+function buildWinLossFactorsSrv(homeLabel, awayLabel, homeAvg, awayAvg, homeOverall, awayOverall) {
+  const homeWins = homeOverall >= awayOverall;
+  const winner = homeWins ? homeLabel : awayLabel;
+  const loser = homeWins ? awayLabel : homeLabel;
+  const winnerAvg = homeWins ? homeAvg : awayAvg;
+  const loserAvg = homeWins ? awayAvg : homeAvg;
+  const winKey = ATTR_KEYS_SRV.slice().sort((a, b) => (winnerAvg[b] - loserAvg[b]) - (winnerAvg[a] - loserAvg[a]))[0];
+  const loseKey = ATTR_KEYS_SRV.slice().sort((a, b) => loserAvg[a] - loserAvg[b])[0];
+  const winFactor = `${winner}は${ATTR_LABELS_SRV[winKey]}で相手を上回っており(平均${fmtSrv(winnerAvg[winKey])} 対 ${fmtSrv(loserAvg[winKey])})、ここが試合を優位に進める鍵になるとAIは予想しています。`;
+  const loseFactor = `${loser}は${ATTR_LABELS_SRV[loseKey]}がチーム内で相対的に弱く(平均${fmtSrv(loserAvg[loseKey])})、ここを突かれると苦しい展開になり得ます。`;
+  return { winFactor, loseFactor, winner, loser };
+}
+
+function buildTurningPointAndMvpSrv(homeLabel, awayLabel, homeP, awayP, winnerLabel) {
+  const winnerPlayers = winnerLabel === homeLabel ? homeP : awayP;
+  const standout = pickStandoutPlayerSrv(winnerPlayers) || pickStandoutPlayerSrv(homeP.concat(awayP));
+  const minute = 8 + Math.floor(Math.random() * 82);
+  const half = minute <= 45 ? "前半" : "後半";
+  const turningPoint = standout
+    ? `${half}${minute}分前後、${standout.nameJa}が試合の流れを引き寄せる場面を作ると予想されます。`
+    : `試合中盤にどちらかのチームがギアを上げるタイミングが訪れると予想されます。`;
+  return { turningPoint, mvp: standout ? { key: standout.key, nameJa: standout.nameJa, emoji: standout.emoji, overall: standout.overall } : null };
+}
+
+function buildAttackDirectionDecisionSrv(homeAvg, awayAvg) {
+  const dirFor = (avg) => (avg.speed + avg.dribbling > avg.passing + avg.tactical) ? "サイドを起点にした攻撃" : "中央からの組み立て";
+  return { homeDir: dirFor(homeAvg), awayDir: dirFor(awayAvg) };
+}
+
+function buildMatchFlowDecisionSrv(diff) {
+  const phaseCount = 5;
+  const lean = Math.max(-1, Math.min(1, diff / 30));
+  const segments = [];
+  for (let i = 0; i < phaseCount; i++) segments.push(((lean + (Math.random() - 0.5) * 1.1) >= 0 ? "home" : "away"));
+  return segments;
+}
+
+function buildDangerZonesDecisionSrv(players) {
+  const attackers = players.slice().sort((a, b) => ((b.attrs ? b.attrs.shooting : 0) + (b.attrs ? b.attrs.dribbling : 0)) - ((a.attrs ? a.attrs.shooting : 0) + (a.attrs ? a.attrs.dribbling : 0))).slice(0, 3);
+  const agg = {};
+  attackers.forEach((p) => (p.zones || []).forEach(([zoneLabel, n]) => { agg[zoneLabel] = Math.max(agg[zoneLabel] || 0, n); }));
+  return Object.entries(agg).map(([zoneLabel, n]) => ({ zoneLabel, n }));
+}
+
+function poissonishSrv(lambda) {
+  let n = 0, p = Math.exp(-lambda), cum = p, r = Math.random();
+  while (cum < r && n < 8) { n++; p *= lambda / n; cum += p; }
+  return n;
+}
+
+// 選手データ(1人分)の最低限のバリデーション。number/string型が壊れていると
+// 以降の計算がNaN/例外になり得るため、ここで弾いておく。
+function isValidPredictPlayer(p) {
+  if (!p || typeof p !== "object") return false;
+  if (typeof p.overall !== "number" || !Number.isFinite(p.overall)) return false;
+  if (!p.attrs || typeof p.attrs !== "object") return false;
+  if (!ATTR_KEYS_SRV.every((k) => typeof p.attrs[k] === "number" && Number.isFinite(p.attrs[k]))) return false;
+  return true;
+}
+
+const MAX_PREDICT_PLAYERS_PER_SIDE = 60; // 悪用防止(登録選手数の実際の最大は40台なので十分な余裕を持たせた上限)
+
+async function handlePredictMatch(body) {
+  if (!body || typeof body !== "object") return { status: 400, body: { ok: false, error: "invalid JSON body" } };
+  const { homeLabel, awayLabel, homePlayers, awayPlayers } = body;
+  if (typeof homeLabel !== "string" || typeof awayLabel !== "string") {
+    return { status: 400, body: { ok: false, error: "homeLabel and awayLabel (string) are required" } };
+  }
+  if (!Array.isArray(homePlayers) || !Array.isArray(awayPlayers)) {
+    return { status: 400, body: { ok: false, error: "homePlayers and awayPlayers must be arrays" } };
+  }
+  if (homePlayers.length > MAX_PREDICT_PLAYERS_PER_SIDE || awayPlayers.length > MAX_PREDICT_PLAYERS_PER_SIDE) {
+    return { status: 400, body: { ok: false, error: `too many players per side (max ${MAX_PREDICT_PLAYERS_PER_SIDE})` } };
+  }
+  const homeP = homePlayers.filter(isValidPredictPlayer);
+  const awayP = awayPlayers.filter(isValidPredictPlayer);
+  if (homeP.length !== homePlayers.length || awayP.length !== awayPlayers.length) {
+    return { status: 400, body: { ok: false, error: "one or more player entries are malformed (missing/invalid overall or attrs)" } };
+  }
+
+  const homeOverall = teamAvgSrv(homeP, "overall"), awayOverall = teamAvgSrv(awayP, "overall");
+  const homeAvg = computeAttrAveragesSrv(homeP), awayAvg = computeAttrAveragesSrv(awayP);
+  const diff = homeOverall - awayOverall;
+
+  // 予想スコア(ポワソン分布ベース、毎回ランダム再生成 = 「分析する」を押すたびに新しいAI予測)
+  const homeLambda = Math.max(0.4, 1.35 + diff / 28);
+  const awayLambda = Math.max(0.4, 1.15 - diff / 28);
+  const homeGoals = poissonishSrv(homeLambda), awayGoals = poissonishSrv(awayLambda);
+  const confidence = Math.round(50 + Math.min(38, Math.abs(diff) * 2.6));
+
+  // ボール支配率予想(パス・戦術理解の平均差から算出)
+  const homePossPctRaw = 50 + (homeAvg.passing + homeAvg.tactical - awayAvg.passing - awayAvg.tactical) / 6;
+  const possessionHomePct = Math.max(30, Math.min(70, Math.round(homePossPctRaw)));
+
+  // スタイル分析テキスト
+  const homeStyle = homeAvg.passing + homeAvg.tactical > homeAvg.speed + homeAvg.shooting ? "ボール保持を軸にした組み立て" : "スピードと決定力を活かした縦への速さ";
+  const awayStyle = awayAvg.passing + awayAvg.tactical > awayAvg.speed + awayAvg.shooting ? "ボール保持を軸にした組み立て" : "スピードと決定力を活かした縦への速さ";
+  const styleText = `${homeLabel}は${homeStyle}が持ち味、対する${awayLabel}は${awayStyle}が持ち味とAIは分析しています。${Math.abs(diff) < 2 ? "登録選手の平均能力値はほぼ互角で、拮抗した展開が予想されます。" : (diff > 0 ? homeLabel + "がやや優勢という分析です。" : awayLabel + "がやや優勢という分析です。")}`;
+
+  const { winFactor, loseFactor } = buildWinLossFactorsSrv(homeLabel, awayLabel, homeAvg, awayAvg, homeOverall, awayOverall);
+  const matchFlowSegments = buildMatchFlowDecisionSrv(diff);
+  const winnerLabelForTp = homeOverall >= awayOverall ? homeLabel : awayLabel;
+  const { turningPoint, mvp } = buildTurningPointAndMvpSrv(homeLabel, awayLabel, homeP, awayP, winnerLabelForTp);
+  const { homeDir, awayDir } = buildAttackDirectionDecisionSrv(homeAvg, awayAvg);
+  const homeDangerZones = buildDangerZonesDecisionSrv(homeP.length ? homeP : []);
+  const awayDangerZones = buildDangerZonesDecisionSrv(awayP.length ? awayP : []);
+
+  const homeXIFull = pickLikelyXISrv(homeP), awayXIFull = pickLikelyXISrv(awayP);
+  const toXIEntry = (p) => ({ key: p.key, nameJa: p.nameJa, emoji: p.emoji, overall: p.overall, position: p.position });
+  const homeXI = homeXIFull.map(toXIEntry), awayXI = awayXIFull.map(toXIEntry);
+  const homeFormation = formationStringSrv(homeXIFull), awayFormation = formationStringSrv(awayXIFull);
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      homeGoals, awayGoals, confidence, possessionHomePct,
+      homeOverall, awayOverall,
+      styleText, winFactor, loseFactor,
+      matchFlowSegments, turningPoint, mvp,
+      attackDirection: { homeText: homeDir, awayText: awayDir },
+      homeXI, awayXI, homeFormation, awayFormation,
+      dangerZones: { home: homeDangerZones, away: awayDangerZones },
+    },
+  };
+}
+
+// ============================================================
+// Stage C: 対話エンジン(議論モード) ― RAG + LLM推論
+// ============================================================
+// 全体の流れ: 質問 →(フロントエンド側で議論トリガーを検出)→ Planner(この質問に
+// 必要な情報を決定)→ RAG(知識ベース=API-Footballの実データから事実だけ取得)→
+// LLM推論(取得した事実だけを根拠に考察)→ ①事実②統計③根拠④考察⑤結論⑥信頼度
+// の6部構成で返す。
+//
+// 設計方針:
+//  - 単純な質問(選手データ・順位・試合結果など)はこのAPIを一切使わず、これまで
+//    通りフロントエンドのルールベースで即答する(コスト最適化)。このAPIは
+//    フロントエンドが「議論トリガー」を検出したときだけ呼ばれる。
+//  - ①事実②統計はRAGで取得した実データをサーバー側でそのまま整形する(LLMには
+//    生成させない)。LLMが担当するのは③根拠④考察⑤結論とフォローアップ質問だけ。
+//    これにより、LLMが数字や固有名詞を作ってしまうリスクを最小化する。
+//  - ⑥信頼度はLLMの自己申告ではなく、実際にRAGで取得できたデータの充足率から
+//    機械的に算出する(信頼度自体がハルシネーションしないように)。
+//  - 監督コメント・采配評価は、現状のデータソース(API-Football)では取得できない
+//    ため、常に「取得できていない」ことを明示する(信頼度の理由欄にも反映)。
+
+const knowledgeSource = createKnowledgeSource({ callApiFootball, resolveTeamId, guessSeason });
+
+// LLM呼び出しは実費が発生するため、暴走・悪用でコストが青天井にならないよう
+// 1日あたりの呼び出し上限を設ける(既定値は少なめ。.envで調整可能)。
+const MAX_LLM_CALLS_PER_DAY = parseInt(process.env.MAX_LLM_CALLS_PER_DAY, 10) || 50;
+let llmDailyBudget = { day: null, count: 0 };
+function tryConsumeLlmBudget() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (llmDailyBudget.day !== today) llmDailyBudget = { day: today, count: 0 };
+  if (llmDailyBudget.count >= MAX_LLM_CALLS_PER_DAY) return false;
+  llmDailyBudget.count += 1;
+  return true;
+}
+
+function formatClubFacts(knowledge, needs) {
+  const facts = [];
+  const needSet = new Set(needs);
+  if (needSet.has("recentForm")) {
+    if (knowledge.recentForm.length) {
+      const w = knowledge.recentForm.filter((m) => m.result === "勝ち").length;
+      const d = knowledge.recentForm.filter((m) => m.result === "分け").length;
+      const l = knowledge.recentForm.filter((m) => m.result === "負け").length;
+      facts.push(`直近${knowledge.recentForm.length}試合: ${w}勝${d}分${l}敗`);
+      knowledge.recentForm.slice(0, 5).forEach((m) => {
+        const dateStr = m.date ? new Date(m.date).toISOString().slice(0, 10) : "";
+        facts.push(`${dateStr} ${m.competition || ""} ${m.opponent}(${m.homeAway}) ${m.goalsFor}-${m.goalsAgainst} ${m.result}`);
+      });
+    } else if (knowledge.errors.includes("recent_form_failed")) {
+      facts.push("直近の試合結果は取得できませんでした。");
+    }
+  }
+  if (needSet.has("coach")) {
+    facts.push(knowledge.coachName ? `現在の監督: ${knowledge.coachName}` : "監督名を取得できませんでした。");
+  }
+  if (needSet.has("formation")) {
+    facts.push(knowledge.formation ? `直近試合の基本フォーメーション: ${knowledge.formation}` : "フォーメーション情報は取得できませんでした。");
+  }
+  if (needSet.has("injuries")) {
+    if (knowledge.errors.includes("injuries_failed")) {
+      facts.push("負傷者情報は取得できませんでした。");
+    } else if (knowledge.injuries.length) {
+      facts.push(`負傷・出場停止: ${knowledge.injuries.map((i) => `${i.playerName}(${i.reason || i.type || "詳細不明"})`).join("、")}`);
+    } else {
+      facts.push("現在報告されている負傷・出場停止者は見当たりません。");
+    }
+  }
+  if (needSet.has("transfers")) {
+    if (knowledge.errors.includes("transfers_failed")) {
+      facts.push("移籍情報は取得できませんでした。");
+    } else if (knowledge.transfers.length) {
+      facts.push(`直近の移籍: ${knowledge.transfers.map((t) => `${t.playerName}(${t.direction}・${t.counterpart || ""})`).join("、")}`);
+    } else {
+      facts.push("直近180日以内の目立った移籍情報は見当たりません。");
+    }
+  }
+  return facts;
+}
+
+function formatClubStats(knowledge, needs) {
+  const stats = {};
+  if (needs.includes("recentForm") && knowledge.goalsForTrend && knowledge.goalsForTrend.length) {
+    stats.goalsForTrend = knowledge.goalsForTrend;
+    stats.goalsAgainstTrend = knowledge.goalsAgainstTrend;
+    stats.avgGoalsFor = Number((knowledge.goalsForTrend.reduce((a, b) => a + b, 0) / knowledge.goalsForTrend.length).toFixed(2));
+    stats.avgGoalsAgainst = Number((knowledge.goalsAgainstTrend.reduce((a, b) => a + b, 0) / knowledge.goalsAgainstTrend.length).toFixed(2));
+  }
+  return stats;
+}
+
+// 信頼度(⑥)はLLMに聞くのではなく、実際にRAGで取得できたデータの充足率から
+// 機械的に算出する。理由をつけて返すことで「AIっぽさ」ではなく根拠のある評価にする。
+function computeClubConfidence(knowledge, needs) {
+  if (knowledge.errors.includes("team_not_found")) {
+    return { stars: 1, reasonJa: "クラブの実データを特定できなかったため、一般的な知識のみに基づく考察です。" };
+  }
+  const checks = [];
+  if (needs.includes("recentForm")) checks.push({ ok: knowledge.recentForm.length > 0, label: "直近の試合結果" });
+  if (needs.includes("coach")) checks.push({ ok: !!knowledge.coachName, label: "監督名" });
+  if (needs.includes("formation")) checks.push({ ok: !!knowledge.formation, label: "フォーメーション" });
+  if (needs.includes("injuries")) checks.push({ ok: !knowledge.errors.includes("injuries_failed"), label: "負傷者情報" });
+  if (needs.includes("transfers")) checks.push({ ok: !knowledge.errors.includes("transfers_failed"), label: "移籍情報" });
+  const okLabels = checks.filter((c) => c.ok).map((c) => c.label);
+  const missing = checks.filter((c) => !c.ok).map((c) => c.label);
+  const ratio = checks.length ? okLabels.length / checks.length : 0;
+  const stars = Math.max(1, Math.min(5, Math.round(ratio * 5) || 1));
+  let reasonJa = missing.length === 0
+    ? `${okLabels.join("・")}が一致して取得できているため。`
+    : `${missing.join("・")}が取得できておらず、推測に基づく部分があります(取得できたのは: ${okLabels.join("・") || "なし"})。`;
+  if (needs.includes("coach")) reasonJa += ` また、${knowledge.managerQuoteUnavailableReason}`;
+  return { stars, reasonJa };
+}
+
+function buildDiscussSystemPrompt() {
+  return [
+    "あなたはサッカーの分析官です。以下に与えられた「事実」だけを根拠として、利用者の質問に答えてください。",
+    "事実に無い具体的な数字・固有名詞(スコア・日付・移籍額・選手名など)を新たに作ってはいけません。",
+    "与えられた事実が乏しい場合は、それを正直に述べた上で、一般的なサッカーの見方として考察してください。",
+    "事実と自分の意見は明確に書き分けてください(「〜という結果が出ています」と「私は〜と考えます」のように)。",
+    "利用者が意見や感想を述べている場合は、頭ごなしに否定せず、まずその視点を受け止めてください。",
+    "必ず次の形式で、日本語で出力してください。見出し以外の余計な文章は含めないでください。",
+    "",
+    "###根拠###",
+    "(与えられた事実のうち、この考察で特に重視した点を1〜3文で)",
+    "",
+    "###考察###",
+    "(複数の要因を統合したあなた自身の見解を3〜6文程度で。意見であることが分かる書き方をしてください)",
+    "",
+    "###結論###",
+    "(まとめと、今後の見通しを1〜3文で)",
+    "",
+    "###フォローアップ###",
+    "(議論を続けるための質問を1〜2個、1行に1つずつ)",
+  ].join("\n");
+}
+
+function parseDiscussLlmOutput(rawText) {
+  const text = String(rawText || "");
+  const grab = (label, nextLabels) => {
+    const startIdx = text.indexOf(`###${label}###`);
+    if (startIdx === -1) return "";
+    let end = text.length;
+    for (const n of nextLabels) {
+      const idx = text.indexOf(`###${n}###`, startIdx + 1);
+      if (idx !== -1 && idx < end) end = idx;
+    }
+    return text.slice(startIdx + label.length + 6, end).trim();
+  };
+  const evidence = grab("根拠", ["考察", "結論", "フォローアップ"]);
+  const consideration = grab("考察", ["結論", "フォローアップ"]);
+  const conclusion = grab("結論", ["フォローアップ"]);
+  const followRaw = grab("フォローアップ", []);
+  const parsedOk = !!(evidence || consideration || conclusion);
+  if (!parsedOk) {
+    // LLMが指定フォーマットに従わなかった場合の保険: 空欄のまま返すより、
+    // 生成された文章をそのまま考察欄に入れて表示できるようにする。
+    return { evidence: "", consideration: text.trim().slice(0, 1200), conclusion: "", followUpQuestions: [], parsedOk: false };
+  }
+  const followUpQuestions = followRaw.split("\n").map((s) => s.replace(/^[・\-\d.、\s]+/, "").trim()).filter(Boolean).slice(0, 2);
+  return { evidence, consideration, conclusion, followUpQuestions, parsedOk: true };
+}
+
+async function handleDiscuss(body) {
+  if (!body || typeof body !== "object") return { status: 400, body: { ok: false, error: "invalid JSON body" } };
+  const question = String(body.question || "").trim();
+  if (!question) return { status: 400, body: { ok: false, error: "question is required" } };
+  if (question.length > 500) return { status: 400, body: { ok: false, error: "question is too long (max 500 chars)" } };
+
+  const subject = (body.subject && typeof body.subject === "object") ? body.subject : { type: null };
+  const plan = planInformationNeeds(question, subject);
+
+  let facts = [];
+  let stats = {};
+  let confidence;
+  const knowledgeMeta = { needs: plan.needs, plannerReasoning: plan.reasoning };
+
+  if (subject.type === "club") {
+    if (!subject.labelEn) {
+      facts.push(`「${subject.labelJa || "対象クラブ"}」の英語名が特定できなかったため、実データの取得を省略しました。`);
+      confidence = { stars: 1, reasonJa: "クラブを実データ上で特定できなかったため、一般的な知識のみに基づく考察です。" };
+    } else {
+      const knowledge = await knowledgeSource.gatherClubKnowledge(subject.labelEn, plan.needs);
+      facts = formatClubFacts(knowledge, plan.needs);
+      stats = formatClubStats(knowledge, plan.needs);
+      confidence = computeClubConfidence(knowledge, plan.needs);
+      knowledgeMeta.dataErrors = knowledge.errors;
+    }
+  } else if (subject.type === "player") {
+    const hint = (body.playerHint && typeof body.playerHint === "object") ? body.playerHint : {};
+    const q = new URLSearchParams({ name: hint.name || "", team: hint.team || "", teamEn: hint.teamEn || "", birth: hint.birth || "" });
+    const { body: statsBody } = await handlePlayerSeasonStats(q);
+    if (statsBody.found) {
+      const s = statsBody.stats || {};
+      const playerName = (statsBody.player && statsBody.player.name) || hint.name || "対象選手";
+      facts.push(`${playerName}の${statsBody.season}シーズン実成績: 出場${s.appearances ?? "不明"}試合・${s.goals ?? "不明"}得点・${s.assists ?? "不明"}アシスト・平均レーティング${s.avgRating ?? "不明"}`);
+      stats = { appearances: s.appearances, goals: s.goals, assists: s.assists, avgRating: s.avgRating };
+      confidence = { stars: 4, reasonJa: "今シーズンの実成績データが取得できているため。ただし直近の調子や怪我の詳細までは反映されていません。" };
+    } else {
+      facts.push(`${hint.name || "対象選手"}の実成績データは見つかりませんでした(${statsBody.reason || "不明"})。`);
+      confidence = { stars: 1, reasonJa: "実成績データを取得できなかったため、一般的な知識のみに基づく考察です。" };
+    }
+  } else {
+    facts.push("特定のクラブ・選手データには基づかない、一般的なサッカーの知識に基づく考察です。");
+    confidence = { stars: 2, reasonJa: "特定の実データによる裏付けができないため、確信度は控えめにしています。" };
+  }
+
+  if (!tryConsumeLlmBudget()) {
+    return {
+      status: 200,
+      body: { ok: false, reason: "llm_budget_exceeded", message: "本日はAI考察の利用上限に達しました。しばらくしてから再度お試しください。" },
+    };
+  }
+
+  const userPrompt = [
+    `利用者の質問: 「${question}」`,
+    "",
+    "取得できた事実:",
+    facts.length ? facts.map((f) => `- ${f}`).join("\n") : "(取得できた事実はありません)",
+  ].join("\n");
+
+  let llmOut;
+  try {
+    const { text } = await generateLLM({ systemPrompt: buildDiscussSystemPrompt(), userPrompt, maxTokens: 700 });
+    llmOut = parseDiscussLlmOutput(text);
+  } catch (e) {
+    return {
+      status: 200,
+      body: {
+        ok: false,
+        reason: e.code || "llm_error",
+        message: e.code === "NO_KEY"
+          ? "LLMのAPIキーが設定されていないため、考察機能はまだ利用できません(.envを確認してください)。"
+          : "AIの考察生成に失敗しました。しばらくしてから再度お試しください。",
+      },
+    };
+  }
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      facts,
+      stats,
+      evidence: llmOut.evidence,
+      consideration: llmOut.consideration,
+      conclusion: llmOut.conclusion,
+      confidence,
+      followUpQuestions: llmOut.followUpQuestions,
+      meta: { ...knowledgeMeta, llmProvider: currentProviderName(), parsedOk: llmOut.parsedOk },
+    },
+  };
+}
+
 // ---- 静的ファイル配信(index.htmlなど。npmパッケージなしの簡易実装) ----
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -861,13 +1311,48 @@ function serveStatic(req, res, pathname) {
   });
 }
 
+// POST本文(JSON)を読み取るためのヘルパー(npmパッケージ不使用のため自前実装)。
+// 想定外に巨大なリクエストでメモリを圧迫されないよう、上限バイト数を超えたら
+// 読み取りを中断してエラーにする。
+const MAX_POST_BODY_BYTES = 2 * 1024 * 1024; // 2MB(選手データ数十人分でも十分すぎる余裕)
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let received = 0;
+    const chunks = [];
+    req.on("data", (chunk) => {
+      received += chunk.length;
+      if (received > MAX_POST_BODY_BYTES) {
+        reject(new Error("request body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (received === 0) { resolve(null); return; }
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      } catch (e) {
+        reject(new Error("invalid JSON in request body"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   const parsed = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const pathname = parsed.pathname;
 
   if (pathname.startsWith("/api/")) {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
     const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown";
     if (rateLimited(ip)) {
       res.writeHead(429, { "Content-Type": "application/json; charset=utf-8" });
@@ -901,6 +1386,44 @@ const server = http.createServer(async (req, res) => {
       }
       if (pathname === "/api/accuracy-stats") {
         const { status, body } = await handleAccuracyStats();
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
+      if (pathname === "/api/predict-match") {
+        if (req.method !== "POST") {
+          res.writeHead(405, { "Content-Type": "application/json; charset=utf-8", "Allow": "POST" });
+          res.end(JSON.stringify({ ok: false, error: "method not allowed, use POST" }));
+          return;
+        }
+        let parsedBody;
+        try {
+          parsedBody = await readJsonBody(req);
+        } catch (e) {
+          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+          return;
+        }
+        const { status, body } = await handlePredictMatch(parsedBody);
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
+      if (pathname === "/api/discuss") {
+        if (req.method !== "POST") {
+          res.writeHead(405, { "Content-Type": "application/json; charset=utf-8", "Allow": "POST" });
+          res.end(JSON.stringify({ ok: false, error: "method not allowed, use POST" }));
+          return;
+        }
+        let parsedBody;
+        try {
+          parsedBody = await readJsonBody(req);
+        } catch (e) {
+          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+          return;
+        }
+        const { status, body } = await handleDiscuss(parsedBody);
         res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
         return;
@@ -948,6 +1471,8 @@ module.exports = {
   handleFixtureAnalysis,
   handleAccuracyStats,
   handleAutoCollectPredictions,
+  handlePredictMatch,
+  handleDiscuss,
   getOrLogPrediction,
   resolvePrediction,
   outcomeFromScore,
