@@ -409,6 +409,122 @@ async function handleFixturesToday(query) {
   }
 }
 
+// Statuses API-Football uses to mark a fixture as fully finished (as opposed to
+// not-yet-started, in-play, postponed, cancelled, etc.).
+const FINISHED_STATUSES = new Set(["FT", "AET", "PEN"]);
+
+// Real "before the match" / "after the match" analysis for a specific fixture,
+// requested on demand (only when the user clicks to analyze that one match) —
+// unlike the today-list, this deliberately does NOT run for every fixture eagerly,
+// to keep API quota usage sane (each analysis costs 1-3 extra API-Football calls).
+async function handleFixtureAnalysis(query) {
+  const id = String(query.get("id") || "").trim();
+  if (!id) return { status: 400, body: { found: false, error: "id is required" } };
+
+  const cacheKey = `fixture-analysis:${id}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return { status: 200, body: cached };
+
+  try {
+    const fixtureData = await callApiFootball("/fixtures", { id });
+    const entry = (fixtureData.response || [])[0];
+    if (!entry) {
+      const payload = { found: false, reason: "fixture_not_found", id };
+      cacheSet(cacheKey, payload, 15 * 60 * 1000);
+      return { status: 200, body: payload };
+    }
+
+    const statusShort = entry.fixture.status ? entry.fixture.status.short : null;
+    const base = {
+      found: true,
+      source: "API-Football",
+      fetchedAt: new Date().toISOString(),
+      fixture: {
+        id: entry.fixture.id,
+        date: entry.fixture.date,
+        status: statusShort,
+        venue: entry.fixture.venue ? entry.fixture.venue.name : null,
+        league: entry.league ? entry.league.name : null,
+        home: { name: entry.teams.home.name, logo: entry.teams.home.logo },
+        away: { name: entry.teams.away.name, logo: entry.teams.away.logo },
+        score: entry.goals ? { home: entry.goals.home, away: entry.goals.away } : null,
+      },
+    };
+
+    if (!FINISHED_STATUSES.has(statusShort)) {
+      // Not finished yet (includes not-started, in-play, postponed, etc.) — no
+      // real post-match data exists yet, so there is nothing more to fetch from
+      // API-Football here. The frontend builds the pre-match preview itself
+      // (using our own registered player database for either club, if we have
+      // one registered) since there's no reliable real "predicted lineup" feed.
+      const payload = { ...base, phase: "upcoming" };
+      cacheSet(cacheKey, payload, 5 * 60 * 1000); // short TTL: status can change (kickoff, postponement, etc.)
+      return { status: 200, body: payload };
+    }
+
+    // Finished match: pull REAL per-player match ratings/stats and the real goal/
+    // card timeline. This is genuine professional match data, not a simulation.
+    const [playersData, eventsData] = await Promise.all([
+      callApiFootball("/fixtures/players", { fixture: id }).catch(() => ({ response: [] })),
+      callApiFootball("/fixtures/events", { fixture: id }).catch(() => ({ response: [] })),
+    ]);
+
+    function buildTeamPlayers(teamBlock) {
+      if (!teamBlock) return [];
+      return (teamBlock.players || [])
+        .map((p) => {
+          const s = (p.statistics || [])[0] || {};
+          const rating = s.games && s.games.rating ? Math.round(parseFloat(s.games.rating) * 100) / 100 : null;
+          return {
+            name: p.player.name,
+            photo: p.player.photo,
+            position: s.games ? s.games.position : null,
+            minutes: s.games ? s.games.minutes : null,
+            rating,
+            goals: s.goals ? s.goals.total : null,
+            assists: s.goals ? s.goals.assists : null,
+            yellowCards: s.cards ? s.cards.yellow : null,
+            redCards: s.cards ? s.cards.red : null,
+          };
+        })
+        .filter((p) => p.minutes !== null && p.minutes > 0) // exclude unused substitutes (no real data to show)
+        .sort((a, b) => (b.rating || 0) - (a.rating || 0));
+    }
+    const teams = playersData.response || [];
+    const homeTeamBlock = teams.find((t) => t.team && t.team.name === entry.teams.home.name) || teams[0];
+    const awayTeamBlock = teams.find((t) => t.team && t.team.name === entry.teams.away.name) || teams[1];
+    const homePlayers = buildTeamPlayers(homeTeamBlock);
+    const awayPlayers = buildTeamPlayers(awayTeamBlock);
+
+    const events = (eventsData.response || []).map((e) => ({
+      minute: e.time ? e.time.elapsed : null,
+      extra: e.time ? e.time.extra : null,
+      team: e.team ? e.team.name : null,
+      player: e.player ? e.player.name : null,
+      assist: e.assist ? e.assist.name : null,
+      type: e.type,
+      detail: e.detail,
+    }));
+
+    const payload = {
+      ...base,
+      phase: "finished",
+      homePlayers,
+      awayPlayers,
+      events,
+      motmHome: homePlayers[0] || null,
+      motmAway: awayPlayers[0] || null,
+    };
+    // Finished-match data never changes — safe to cache for a long time.
+    cacheSet(cacheKey, payload, 7 * 24 * 60 * 60 * 1000);
+    return { status: 200, body: payload };
+  } catch (e) {
+    const payload = { found: false, reason: e.code || "error", error: e.message };
+    cacheSet(cacheKey, payload, 5 * 60 * 1000);
+    return { status: 200, body: payload };
+  }
+}
+
 // ---- 静的ファイル配信(index.htmlなど。npmパッケージなしの簡易実装) ----
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -463,6 +579,12 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(body));
         return;
       }
+      if (pathname === "/api/fixtures/analysis") {
+        const { status, body } = await handleFixtureAnalysis(parsed.searchParams);
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
       res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ found: false, error: "unknown endpoint" }));
     } catch (e) {
@@ -480,4 +602,4 @@ server.listen(PORT, () => {
   console.log(`APIキー設定: ${API_KEY ? "あり" : "なし(.envのAPI_FOOTBALL_KEYを設定してください)"}`);
 });
 
-module.exports = { server, handlePlayerSeasonStats, handleFixturesToday, guessSeason };
+module.exports = { server, handlePlayerSeasonStats, handleFixturesToday, handleFixtureAnalysis, guessSeason };
