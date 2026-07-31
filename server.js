@@ -393,6 +393,26 @@ const server = http.createServer(async (req, res) => {
         }
         return;
       }
+      if (pathname === "/api/debug/raw-player") {
+        // Temporary diagnostic endpoint: returns exactly what API-Football says for
+        // /players?id=...&season=..., with NO club-vs-national-team filtering applied,
+        // so we can see the real shape of the "statistics" array (how many entries,
+        // what each entry's team/league name is, and whether "nationality" is present
+        // on the player object) instead of guessing at it.
+        const id = parsed.searchParams.get("id") || "";
+        const season = parsed.searchParams.get("season") || String(guessSeason());
+        try {
+          const data = await callApiFootball("/players", { id, season });
+          const responseCount = (data.response || []).length;
+          const statsCounts = (data.response || []).map((entry) => (entry.statistics || []).length);
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ queried: { id, season }, responseCount, statisticsCountPerResponseEntry: statsCounts, raw: data }));
+        } catch (e) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ queried: { id, season }, error: e.message, code: e.code }));
+        }
+        return;
+      }
       res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ found: false, error: "unknown endpoint" }));
     } catch (e) {
