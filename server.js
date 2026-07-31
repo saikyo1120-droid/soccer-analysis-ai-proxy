@@ -130,19 +130,38 @@ function guessSeason() {
 const SEARCH_LEAGUES = (process.env.SEARCH_LEAGUES || (DEFAULT_LEAGUES.join(",") + ",253,307"))
   .split(",").map((s) => s.trim()).filter(Boolean);
 
-async function resolvePlayerId(name, teamHint, season) {
-  const cacheKey = `resolve:${name}|${teamHint}|${season}`;
+// API-Football's player "name" field is typically a short form like "B. Saka"
+// (built from lastname, sometimes with a first-initial), not the full "Bukayo
+// Saka" we have registered — confirmed via /api/debug/raw-search in production:
+// searching the full name returned 0 results, but searching "Saka" alone found
+// him immediately. So we search by surname (the last whitespace-separated token)
+// first, since that's what actually matches API-Football's indexing, and fall
+// back to the full name afterward in case some player IS indexed that way.
+function searchTermVariants(name) {
+  const trimmed = (name || "").trim();
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  const variants = [];
+  if (parts.length > 1) variants.push(parts[parts.length - 1]); // surname
+  variants.push(trimmed); // full name, as a fallback
+  return variants;
+}
+
+async function resolvePlayerId(name, teamHint, season, birthHint) {
+  const cacheKey = `resolve:${name}|${teamHint}|${season}|${birthHint || ""}`;
   const cached = cacheGet(cacheKey);
   if (cached !== null) return cached;
 
   let results = [];
-  for (const leagueId of SEARCH_LEAGUES) {
-    try {
-      const data = await callApiFootball("/players", { search: name, league: leagueId, season });
-      results = data.response || [];
-      if (results.length) break;
-    } catch (e) {
-      // this league/season combo errored (e.g. league id not valid for this season) — try the next one
+  outer:
+  for (const term of searchTermVariants(name)) {
+    for (const leagueId of SEARCH_LEAGUES) {
+      try {
+        const data = await callApiFootball("/players", { search: term, league: leagueId, season });
+        results = data.response || [];
+        if (results.length) break outer;
+      } catch (e) {
+        // this league/season combo errored (e.g. league id not valid for this season) — try the next one
+      }
     }
   }
   if (!results.length) {
@@ -150,7 +169,15 @@ async function resolvePlayerId(name, teamHint, season) {
     return null;
   }
   let picked = results[0];
-  if (teamHint) {
+  // Surname-based search can legitimately return several unrelated players (e.g.
+  // searching "Saka" also matched "Wan-Bissaka", since it's a substring match).
+  // A birthdate is a near-unique fingerprint, so prefer that when we have one —
+  // it's far more reliable than comparing a Japanese club name string against
+  // API-Football's English team names, which almost never share a substring.
+  if (birthHint) {
+    const match = results.find((r) => r.player && r.player.birth && r.player.birth.date === birthHint);
+    if (match) picked = match;
+  } else if (teamHint) {
     const hintLower = teamHint.toLowerCase();
     const match = results.find((r) =>
       (r.statistics || []).some((s) => (s.team && s.team.name || "").toLowerCase().includes(hintLower) ||
@@ -166,10 +193,11 @@ async function resolvePlayerId(name, teamHint, season) {
 async function handlePlayerSeasonStats(query) {
   const name = String(query.get("name") || "").trim();
   const team = String(query.get("team") || "").trim();
+  const birth = String(query.get("birth") || "").trim(); // YYYY-MM-DD, used to disambiguate same-surname players
   const season = String(query.get("season") || guessSeason());
   if (!name) return { status: 400, body: { found: false, error: "name is required" } };
 
-  const cacheKey = `season-stats:${name}|${team}|${season}`;
+  const cacheKey = `season-stats:${name}|${team}|${birth}|${season}`;
   const cached = cacheGet(cacheKey);
   if (cached) return { status: 200, body: cached };
 
@@ -184,7 +212,7 @@ async function handlePlayerSeasonStats(query) {
   try {
     let player = null;
     for (const s of candidateSeasons) {
-      player = await resolvePlayerId(name, team, s);
+      player = await resolvePlayerId(name, team, s, birth);
       if (player) break;
     }
     if (!player) {
