@@ -226,9 +226,24 @@ async function handlePlayerSeasonStats(query) {
       const data = await callApiFootball("/players", { id: player.id, season: s });
       const entry = (data.response || [])[0];
       if (!entry || !entry.statistics || !entry.statistics.length) continue;
-      const best = entry.statistics.reduce(
+
+      // A player's statistics array can contain BOTH club-level entries (e.g. Arsenal)
+      // AND national-team entries (e.g. England), one per competition they appeared in
+      // that season. This app is club-centric, so we prefer club entries. We detect a
+      // national-team entry by comparing its team name against the player's nationality
+      // (both are plain English strings from the same API-Football response, so this
+      // comparison is reliable even though the club name shown to the user is Japanese).
+      const nationality = (entry.player && entry.player.nationality) || null;
+      const clubStats = nationality
+        ? entry.statistics.filter((st) => !(st.team && st.team.name === nationality))
+        : entry.statistics;
+      // If filtering leaves nothing (e.g. a player who only has national-team stats on
+      // record for this season), fall back to the full list rather than showing no data.
+      const pool = clubStats.length ? clubStats : entry.statistics;
+
+      const best = pool.reduce(
         (acc, cur) => ((cur.games.appearences || 0) > (acc.games.appearences || 0) ? cur : acc),
-        entry.statistics[0]
+        pool[0]
       );
       if ((best.games.appearences || 0) > 0) { statsBlock = best; usedSeason = s; break; }
       if (!statsBlock) { statsBlock = best; usedSeason = s; } // keep as a fallback candidate, but keep looking for a season with actual appearances
