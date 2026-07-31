@@ -299,6 +299,14 @@
   .chat-followup-btn { border: 1px solid var(--series-home); background: transparent; color: var(--series-home); padding: 5px 11px; border-radius: 999px; font-size: 12px; cursor: pointer; }
   .chat-followup-btn:hover { background: var(--series-home); color: #fff; }
 
+  /* Stage C: 対話エンジン(議論モード) ― 信頼度表示・根拠の折りたたみ */
+  .discuss-confidence { font-size: 13px; color: var(--warning); letter-spacing: 1px; margin: 8px 0 6px; }
+  .discuss-confidence .value-note { letter-spacing: normal; margin-left: 4px; }
+  .discuss-facts { margin-top: 8px; font-size: 12.5px; color: var(--text-secondary); }
+  .discuss-facts summary { cursor: pointer; color: var(--text-primary); }
+  .discuss-facts ul { margin: 6px 0 0; padding-left: 18px; }
+  .discuss-facts li { margin-bottom: 3px; }
+
   /* Match Analysis AI */
   .match-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 4px; border-bottom: 1px solid var(--gridline); }
   .match-row:last-child { border-bottom: none; }
@@ -3484,11 +3492,15 @@ async function fetchExternalVerification(player) {
    to the existing AI-simulated section — nothing breaks either way. */
 const API_PROXY_BASE = "https://soccer-analysis-ai-proxy.onrender.com/api";
 
-async function fetchJsonWithTimeout(url, timeoutMs) {
+// fetchOptions (省略可) は fetch() にそのまま渡す追加オプション。POSTでJSONを
+// 送りたい呼び出し元(例: /api/predict-match)は { method: "POST", body: ... ,
+// headers: {...} } を渡す。既存の呼び出し元(引数2つ)は今まで通りGETとして動作する。
+async function fetchJsonWithTimeout(url, timeoutMs, fetchOptions) {
   const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs || 4000) : null;
   try {
-    const res = await fetch(url, controller ? { signal: controller.signal } : {});
+    const opts = Object.assign({}, fetchOptions || {}, controller ? { signal: controller.signal } : {});
+    const res = await fetch(url, opts);
     if (!res.ok) throw new Error("HTTP " + res.status);
     return await res.json();
   } finally {
@@ -3941,7 +3953,7 @@ function renderChatUI(player) {
     : `<p class="value-note">上のボタンから質問を選ぶか、下の入力欄に自由に質問を入力してください。AIは答えるだけでなく、一緒に考える質問も返します。</p>`;
   el.scrollTop = el.scrollHeight;
 }
-function sendChatMessage(player, presetText) {
+async function sendChatMessage(player, presetText) {
   const input = document.getElementById("chatInput");
   const text = (presetText !== undefined ? presetText : input.value).trim();
   if (!text) return;
@@ -3949,6 +3961,16 @@ function sendChatMessage(player, presetText) {
   if (!chatHistories[key]) chatHistories[key] = [];
   chatHistories[key].push({ role: "user", text: escapeHtml(text) });
   const dLevel = effectiveDialogueLevel(text, state.level);
+
+  // Stage C: 議論トリガーを検出したら、単純なキーワード回答ではなくRAG+LLMの
+  // 議論エンジンへ切り替える。それ以外は以下の既存ロジックを完全に維持する。
+  if (isDiscussionTrigger(text)) {
+    if (input) input.value = "";
+    renderChatUI(player);
+    await runDiscussFlow(text, dLevel, player, (msg) => chatHistories[key].push(msg), () => renderChatUI(player));
+    return;
+  }
+
   const answer = beginnerize(answerPlayerQuestion(player, text, state.level));
   const other = detectMentionedPlayer(text, player.key);
   const isComparison = !!(other && /違い|比較|どっちが|どちらが|vs|対/.test(text));
@@ -4437,11 +4459,11 @@ function computeAttrAverages(players) {
   Object.keys(ATTR_LABELS).forEach(k => { out[k] = teamAvg(players, k); });
   return out;
 }
-function buildWinLossFactors(m, homeAvg, awayAvg, homeOverall, awayOverall) {
+function buildWinLossFactors(homeLabel, awayLabel, homeAvg, awayAvg, homeOverall, awayOverall) {
   const attrKeys = Object.keys(ATTR_LABELS);
   const homeWins = homeOverall >= awayOverall;
-  const winner = homeWins ? m.homeLabel : m.awayLabel;
-  const loser = homeWins ? m.awayLabel : m.homeLabel;
+  const winner = homeWins ? homeLabel : awayLabel;
+  const loser = homeWins ? awayLabel : homeLabel;
   const winnerAvg = homeWins ? homeAvg : awayAvg;
   const loserAvg = homeWins ? awayAvg : homeAvg;
   const winKey = attrKeys.slice().sort((a, b) => (winnerAvg[b] - loserAvg[b]) - (winnerAvg[a] - loserAvg[a]))[0];
@@ -4454,30 +4476,35 @@ function pickStandoutPlayer(players) {
   if (!players || !players.length) return null;
   return players.slice().sort((a, b) => b.overall - a.overall)[0];
 }
-function buildTurningPointAndMvp(m, homeP, awayP, winnerLabel) {
-  const winnerPlayers = winnerLabel === m.homeLabel ? homeP : awayP;
+function buildTurningPointAndMvp(homeLabel, homeP, awayP, winnerLabel) {
+  const winnerPlayers = winnerLabel === homeLabel ? homeP : awayP;
   const standout = pickStandoutPlayer(winnerPlayers) || pickStandoutPlayer(homeP.concat(awayP));
   const minute = 8 + Math.floor(Math.random() * 82);
   const half = minute <= 45 ? "前半" : "後半";
   const turningPoint = standout
     ? `${half}${minute}分前後、${standout.nameJa}が試合の流れを引き寄せる場面を作ると予想されます。`
     : `試合中盤にどちらかのチームがギアを上げるタイミングが訪れると予想されます。`;
-  return { turningPoint, mvp: standout };
+  return { turningPoint, mvp: standout ? { key: standout.key, nameJa: standout.nameJa, emoji: standout.emoji, overall: standout.overall } : null };
 }
-function buildAttackDirectionHtml(m, homeAvg, awayAvg) {
+// AIの「判断」部分(どちらの方向から攻めると予想するか)だけを返す。実際の
+// <div>タグの組み立ては、API経由/ローカル計算のどちらでも共通のレンダリング
+// コードを使うため、renderMatchAnalysis側に寄せてある(Stage B: 予測ロジックの
+// API化にあわせて「判断」と「見た目」を分離した)。
+function attackDirectionDecision(homeAvg, awayAvg) {
   const dirFor = (avg) => (avg.speed + avg.dribbling > avg.passing + avg.tactical) ? "サイドを起点にした攻撃" : "中央からの組み立て";
-  const homeDir = dirFor(homeAvg), awayDir = dirFor(awayAvg);
-  return `
-    <div class="value-note" style="margin:2px 0;">↔️ <b>${m.homeLabel}</b>: ${homeDir}が中心になると予想されます。</div>
-    <div class="value-note" style="margin:2px 0;">↔️ <b>${m.awayLabel}</b>: ${awayDir}が中心になると予想されます。</div>`;
+  return { homeText: dirFor(homeAvg), awayText: dirFor(awayAvg) };
 }
-function teamDangerZonesSvg(players, label) {
+// 危険エリアの「判断」(どのエリアが危険か)だけを返す。SVGの描画は
+// dangerZonesSvgFromEntries() 側(API経由/ローカル計算で共通)が担当する。
+function aggregateDangerZones(players) {
   const attackers = players.slice().sort((a, b) => (b.attrs.shooting + b.attrs.dribbling) - (a.attrs.shooting + a.attrs.dribbling)).slice(0, 3);
   const agg = {};
   attackers.forEach(p => (p.zones || []).forEach(([zoneLabel, n]) => { agg[zoneLabel] = Math.max(agg[zoneLabel] || 0, n); }));
-  const entries = Object.entries(agg);
-  if (!entries.length) return `<p class="value-note">この分析に十分な選手データがありません。</p>`;
-  const hotspots = entries.map(([zoneLabel, n]) => {
+  return Object.entries(agg).map(([zoneLabel, n]) => ({ zoneLabel, n }));
+}
+function dangerZonesSvgFromEntries(entries, label) {
+  if (!entries || !entries.length) return `<p class="value-note">この分析に十分な選手データがありません。</p>`;
+  const hotspots = entries.map(({ zoneLabel, n }) => {
     const c = ZONE_COORDS[zoneLabel] || [100, 100];
     return `<circle cx="${c[0]}" cy="${c[1]}" r="${16 + n * 6}" fill="rgba(208,59,59,${0.12 + n * 0.11})" />`;
   }).join("");
@@ -4492,20 +4519,25 @@ function teamDangerZonesSvg(players, label) {
   </svg>
   <p class="value-note" style="text-align:center; margin-top:2px;">${label}の主力アタッカーが仕掛けやすいエリア(推定)</p>`;
 }
-function buildMatchFlowHtml(m, diff) {
-  const phases = ["0-15分", "15-30分", "30-45分", "45-70分", "70-90分"];
+// 試合の流れの「判断」(どの時間帯がどちらのペースか)だけを返す。
+function matchFlowSegmentsDecision(diff) {
   const lean = Math.max(-1, Math.min(1, diff / 30));
-  const segs = phases.map(() => ((lean + (Math.random() - 0.5) * 1.1) >= 0 ? "home" : "away"));
+  const segs = [];
+  for (let i = 0; i < 5; i++) segs.push((lean + (Math.random() - 0.5) * 1.1) >= 0 ? "home" : "away");
+  return segs;
+}
+function matchFlowHtmlFromSegments(segs, homeLabel, awayLabel) {
+  const phases = ["0-15分", "15-30分", "30-45分", "45-70分", "70-90分"];
   const segHtml = segs.map((side, i) => `<div style="flex:1; background:${side === "home" ? "var(--series-home)" : "var(--series-away)"}; opacity:0.78; padding:6px 2px; text-align:center; font-size:10.5px; color:#fff;${i < segs.length - 1 ? " border-right:2px solid var(--surface-1);" : ""}">${phases[i]}</div>`).join("");
   const homeCount = segs.filter(s => s === "home").length;
-  const summary = homeCount === segs.length ? `${m.homeLabel}が終始試合を優位に進めると予想されます。`
-    : homeCount === 0 ? `${m.awayLabel}が終始試合を優位に進めると予想されます。`
-    : homeCount > segs.length / 2 ? `${m.homeLabel}が主導権を握る時間が長いと予想されますが、${m.awayLabel}にもチャンスがある展開です。`
-    : homeCount < segs.length / 2 ? `${m.awayLabel}が主導権を握る時間が長いと予想されますが、${m.homeLabel}にもチャンスがある展開です。`
+  const summary = homeCount === segs.length ? `${homeLabel}が終始試合を優位に進めると予想されます。`
+    : homeCount === 0 ? `${awayLabel}が終始試合を優位に進めると予想されます。`
+    : homeCount > segs.length / 2 ? `${homeLabel}が主導権を握る時間が長いと予想されますが、${awayLabel}にもチャンスがある展開です。`
+    : homeCount < segs.length / 2 ? `${awayLabel}が主導権を握る時間が長いと予想されますが、${homeLabel}にもチャンスがある展開です。`
     : `拮抗した、どちらに転ぶか分からない展開が予想されます。`;
   return `
     <div style="display:flex; border-radius:8px; overflow:hidden; margin:8px 0;">${segHtml}</div>
-    <p class="value-note">${summary}(<span style="color:var(--series-home); font-weight:700;">■</span>${m.homeLabel} / <span style="color:var(--series-away); font-weight:700;">■</span>${m.awayLabel}が優勢と予想される時間帯)</p>`;
+    <p class="value-note">${summary}(<span style="color:var(--series-home); font-weight:700;">■</span>${homeLabel} / <span style="color:var(--series-away); font-weight:700;">■</span>${awayLabel}が優勢と予想される時間帯)</p>`;
 }
 function tacticsBoardSvg(homeXI, awayXI, homeP, awayP) {
   function dotsForSide(xi, isHome) {
@@ -4537,19 +4569,22 @@ function tacticsBoardSvg(homeXI, awayXI, homeP, awayP) {
   </svg>`;
 }
 
-function renderMatchAnalysis(matchupId) {
-  const m = MATCHUPS.find(x => x.id === matchupId);
-  const wrapEl = document.getElementById("matchAnalysisWrap");
-  if (!m || !wrapEl) return;
-  trackRecentMatch("curated:" + m.id, `${m.homeLabel} vs ${m.awayLabel}`);
-  const homeP = playersForSide(m, "home"), awayP = playersForSide(m, "away");
+/* =========================================================
+   Stage B「予測ロジックAPI化」: 試合分析AIの「判断」部分(予想スコア・
+   AI確信度・ボール支配率・勝因/弱点・試合の流れ・ターニングポイント/MVP・
+   攻撃方向・危険エリア・予想布陣)は、まずサーバーのAPI(/api/predict-match)
+   に計算させる。サーバーが利用できない場合(オフライン・初回デプロイ前の
+   サーバー・タイムアウトなど)は、このファイル内にまだ残してある同じロジック
+   (computeMatchAnalysisLocally)でその場に計算し、利用者からは何も変わらない
+   ように見せる(既存のfetchRealPlayerSeasonStats等と同じgraceful-degradation
+   パターン)。どちらの経路でも返すデータの形は完全に同じなので、HTML組み立て側
+   (renderMatchAnalysis)は結果がどちらから来たか気にする必要がない。
+   ========================================================= */
+function toPredictPlayerPayload(p) {
+  return { key: p.key, name: p.name, nameJa: p.nameJa, emoji: p.emoji, overall: p.overall, position: p.position, attrs: p.attrs, zones: p.zones || [] };
+}
+function computeMatchAnalysisLocally(homeLabel, awayLabel, homeP, awayP) {
   const homeOverall = teamAvg(homeP, "overall"), awayOverall = teamAvg(awayP, "overall");
-  const homeTactical = teamAvg(homeP, "tactical"), awayTactical = teamAvg(awayP, "tactical");
-  const homePassing = teamAvg(homeP, "passing"), awayPassing = teamAvg(awayP, "passing");
-  const homeSpeed = teamAvg(homeP, "speed"), awaySpeed = teamAvg(awayP, "speed");
-  const homeShooting = teamAvg(homeP, "shooting"), awayShooting = teamAvg(awayP, "shooting");
-
-  // predicted score — re-randomized on every click (this is a fresh AI prediction, not a fixed fact)
   const diff = homeOverall - awayOverall;
   const homeLambda = Math.max(0.4, 1.35 + diff / 28);
   const awayLambda = Math.max(0.4, 1.15 - diff / 28);
@@ -4561,33 +4596,82 @@ function renderMatchAnalysis(matchupId) {
   const homeGoals = poissonish(homeLambda), awayGoals = poissonish(awayLambda);
   const confidence = Math.round(50 + Math.min(38, Math.abs(diff) * 2.6));
 
-  // possession / shot-quality estimate from squad-average attributes (illustrative, not real match data)
-  const homePossPct = Math.round(50 + (homePassing + homeTactical - awayPassing - awayTactical) / 6);
-  const possClamp = Math.max(30, Math.min(70, homePossPct));
+  const homeAvg = computeAttrAverages(homeP), awayAvg = computeAttrAverages(awayP);
+  const homePossPct = Math.round(50 + (homeAvg.passing + homeAvg.tactical - awayAvg.passing - awayAvg.tactical) / 6);
+  const possessionHomePct = Math.max(30, Math.min(70, homePossPct));
 
-  const homeXI = pickLikelyXI(homeP), awayXI = pickLikelyXI(awayP);
-  const homeFormation = `${homeXI.filter(p=>positionGroup(p.position)==="DF").length}-${homeXI.filter(p=>positionGroup(p.position)==="MF").length}-${homeXI.filter(p=>positionGroup(p.position)==="FW").length}`;
-  const awayFormation = `${awayXI.filter(p=>positionGroup(p.position)==="DF").length}-${awayXI.filter(p=>positionGroup(p.position)==="MF").length}-${awayXI.filter(p=>positionGroup(p.position)==="FW").length}`;
+  const homeStyle = homeAvg.passing + homeAvg.tactical > homeAvg.speed + homeAvg.shooting ? "ボール保持を軸にした組み立て" : "スピードと決定力を活かした縦への速さ";
+  const awayStyle = awayAvg.passing + awayAvg.tactical > awayAvg.speed + awayAvg.shooting ? "ボール保持を軸にした組み立て" : "スピードと決定力を活かした縦への速さ";
+  const styleText = `${homeLabel}は${homeStyle}が持ち味、対する${awayLabel}は${awayStyle}が持ち味とAIは分析しています。${Math.abs(diff) < 2 ? "登録選手の平均能力値はほぼ互角で、拮抗した展開が予想されます。" : (diff > 0 ? homeLabel + "がやや優勢という分析です。" : awayLabel + "がやや優勢という分析です。")}`;
 
-  const styleText = (() => {
-    const homeStyle = homePassing + homeTactical > homeSpeed + homeShooting ? "ボール保持を軸にした組み立て" : "スピードと決定力を活かした縦への速さ";
-    const awayStyle = awayPassing + awayTactical > awaySpeed + awayShooting ? "ボール保持を軸にした組み立て" : "スピードと決定力を活かした縦への速さ";
-    return `${m.homeLabel}は${homeStyle}が持ち味、対する${m.awayLabel}は${awayStyle}が持ち味とAIは分析しています。${Math.abs(homeOverall-awayOverall) < 2 ? "登録選手の平均能力値はほぼ互角で、拮抗した展開が予想されます。" : (homeOverall > awayOverall ? m.homeLabel + "がやや優勢という分析です。" : m.awayLabel + "がやや優勢という分析です。")}`;
-  })();
+  const { winFactor, loseFactor } = buildWinLossFactors(homeLabel, awayLabel, homeAvg, awayAvg, homeOverall, awayOverall);
+  const matchFlowSegments = matchFlowSegmentsDecision(diff);
+  const winnerLabelForTp = homeOverall >= awayOverall ? homeLabel : awayLabel;
+  const { turningPoint, mvp } = buildTurningPointAndMvp(homeLabel, homeP, awayP, winnerLabelForTp);
+  const attackDirection = attackDirectionDecision(homeAvg, awayAvg);
+  const homeDangerZones = aggregateDangerZones(homeP.length ? homeP : [{ attrs: { shooting: 0, dribbling: 0 }, zones: [] }]);
+  const awayDangerZones = aggregateDangerZones(awayP.length ? awayP : [{ attrs: { shooting: 0, dribbling: 0 }, zones: [] }]);
+
+  const homeXIFull = pickLikelyXI(homeP), awayXIFull = pickLikelyXI(awayP);
+  const toXIEntry = p => ({ key: p.key, nameJa: p.nameJa, emoji: p.emoji, overall: p.overall, position: p.position });
+  const homeXI = homeXIFull.map(toXIEntry), awayXI = awayXIFull.map(toXIEntry);
+  const homeFormation = `${homeXIFull.filter(p=>positionGroup(p.position)==="DF").length}-${homeXIFull.filter(p=>positionGroup(p.position)==="MF").length}-${homeXIFull.filter(p=>positionGroup(p.position)==="FW").length}`;
+  const awayFormation = `${awayXIFull.filter(p=>positionGroup(p.position)==="DF").length}-${awayXIFull.filter(p=>positionGroup(p.position)==="MF").length}-${awayXIFull.filter(p=>positionGroup(p.position)==="FW").length}`;
+
+  return {
+    homeGoals, awayGoals, confidence, possessionHomePct, homeOverall, awayOverall,
+    styleText, winFactor, loseFactor, matchFlowSegments, turningPoint, mvp,
+    attackDirection, homeXI, awayXI, homeFormation, awayFormation,
+    dangerZones: { home: homeDangerZones, away: awayDangerZones },
+  };
+}
+// 試合分析APIのタイムアウト。既存の実データ取得(fetchRealPlayerSeasonStats等)は
+// 初回コールドスタート時に最大60秒待つ設計だが、「分析する」ボタンはこれまで
+// 常に一瞬で結果が出ていた最も使用頻度の高い機能のため、「表示速度が落ちない」
+// ことを優先し、短いタイムアウトで即座にローカル計算へフォールバックする。
+const PREDICT_MATCH_TIMEOUT_MS = 1500;
+async function getMatchAnalysisData(homeLabel, awayLabel, homeP, awayP) {
+  try {
+    const payload = {
+      homeLabel, awayLabel,
+      homePlayers: homeP.map(toPredictPlayerPayload),
+      awayPlayers: awayP.map(toPredictPlayerPayload),
+    };
+    const data = await fetchJsonWithTimeout(`${API_PROXY_BASE}/predict-match`, PREDICT_MATCH_TIMEOUT_MS, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (data && data.ok) { backendConfirmedWarm = true; return data; }
+    throw new Error("predict-match API returned ok:false");
+  } catch (e) {
+    return computeMatchAnalysisLocally(homeLabel, awayLabel, homeP, awayP); // API未対応/オフライン/タイムアウト時は、これまでと全く同じロジックでその場に計算
+  }
+}
+
+async function renderMatchAnalysis(matchupId) {
+  const m = MATCHUPS.find(x => x.id === matchupId);
+  const wrapEl = document.getElementById("matchAnalysisWrap");
+  if (!m || !wrapEl) return;
+  trackRecentMatch("curated:" + m.id, `${m.homeLabel} vs ${m.awayLabel}`);
+  const homeP = playersForSide(m, "home"), awayP = playersForSide(m, "away");
+
+  // Stage B: 予想スコア・AI確信度・ボール支配率・勝因/弱点・試合の流れ・
+  // ターニングポイント/MVP・攻撃方向・危険エリア・予想布陣は、すべてこの1回の
+  // API呼び出し(失敗時はローカル計算にフォールバック)で取得する。
+  const data = await getMatchAnalysisData(m.homeLabel, m.awayLabel, homeP, awayP);
+  const { homeGoals, awayGoals, confidence, possessionHomePct: possClamp, styleText, winFactor, loseFactor,
+    matchFlowSegments, turningPoint, mvp, attackDirection, homeXI, awayXI, homeFormation, awayFormation, dangerZones } = data;
+
+  const matchFlowHtml = matchFlowHtmlFromSegments(matchFlowSegments, m.homeLabel, m.awayLabel);
+  const attackDirectionHtml = `
+    <div class="value-note" style="margin:2px 0;">↔️ <b>${m.homeLabel}</b>: ${attackDirection.homeText}が中心になると予想されます。</div>
+    <div class="value-note" style="margin:2px 0;">↔️ <b>${m.awayLabel}</b>: ${attackDirection.awayText}が中心になると予想されます。</div>`;
+  const homeDangerSvg = dangerZonesSvgFromEntries(dangerZones.home, m.homeLabel);
+  const awayDangerSvg = dangerZonesSvgFromEntries(dangerZones.away, m.awayLabel);
+  const boardSvg = tacticsBoardSvg(homeXI, awayXI, homeP, awayP);
 
   const bayernSide = m.homeClub === "バイエルン・ミュンヘン" ? "home" : (m.awayClub === "バイエルン・ミュンヘン" ? "away" : null);
-
-  // visual-upgrade computations (redesign ⑨): win/loss factor, match flow,
-  // turning point + MVP, attack direction, danger zones, tactics board.
-  const homeAvgAttrs = computeAttrAverages(homeP), awayAvgAttrs = computeAttrAverages(awayP);
-  const { winFactor, loseFactor } = buildWinLossFactors(m, homeAvgAttrs, awayAvgAttrs, homeOverall, awayOverall);
-  const matchFlowHtml = buildMatchFlowHtml(m, diff);
-  const winnerLabelForTp = homeOverall >= awayOverall ? m.homeLabel : m.awayLabel;
-  const { turningPoint, mvp } = buildTurningPointAndMvp(m, homeP, awayP, winnerLabelForTp);
-  const attackDirectionHtml = buildAttackDirectionHtml(m, homeAvgAttrs, awayAvgAttrs);
-  const homeDangerSvg = teamDangerZonesSvg(homeP.length ? homeP : [{ attrs: { shooting: 0, dribbling: 0 }, zones: [] }], m.homeLabel);
-  const awayDangerSvg = teamDangerZonesSvg(awayP.length ? awayP : [{ attrs: { shooting: 0, dribbling: 0 }, zones: [] }], m.awayLabel);
-  const boardSvg = tacticsBoardSvg(homeXI, awayXI, homeP, awayP);
 
   wrapEl.innerHTML = `
     <div class="card">
@@ -4755,13 +4839,155 @@ function getDailyFeaturedMatchup() {
   const idx = hashString("matchup|" + dateStr) % MATCHUPS.length;
   return MATCHUPS[idx];
 }
-function heroAskAI(question) {
+
+// ============================================================
+// Stage C: 対話エンジン(議論モード) ― RAG + LLM推論
+// ============================================================
+// 「〜だと思う」「なぜ？」のような意見・考察を求める質問だけを検出し、その場合
+// だけサーバーの /api/discuss(Planner→RAG→LLM推論)を呼ぶ。それ以外の単純な
+// 質問(選手データ・クラブ概要・試合結果など)は、これまで通りすべてルールベースで
+// 即答する(コストゼロ・挙動不変)。この分岐より下のheroAskAI/sendChatMessageの
+// 既存ロジックには一切手を入れていない。
+
+// クラブの日本語表記(PLAYERSデータの club/clubBase() が返す値)から、RAG検索に
+// 必要な英語クラブ名を引くための対応表。実際の試合(API-Football)を登録クラブへ
+// 結びつけるREAL_FIXTURE_CLUB_EN_TO_JA(英→日)の向きを逆にしたもの。
+const CLUB_JA_TO_EN = {
+  "バイエルン・ミュンヘン": "Bayern Munich",
+  "アーセナルFC": "Arsenal",
+  "レアル・マドリード": "Real Madrid",
+  "マンチェスター・シティ": "Manchester City",
+  "ナポリ": "Napoli",
+  "FCバルセロナ": "Barcelona",
+  "レアル・ソシエダ": "Real Sociedad",
+  "インテル・マイアミ": "Inter Miami",
+  "アル・ナスル": "Al-Nassr",
+  "パリ・サンジェルマン": "Paris Saint Germain",
+  "インテル・ミラン": "Inter",
+};
+
+// 議論トリガー検出(ご指示のフレーズ一覧に準拠): 「〜だと思う」「〜な気がする」
+// 「〜では？」「もし〜だったら？」「なぜ？」「本当に？」「どう思う？」など、
+// 意見・仮説・考察を求める言い回しかどうかを判定する。
+function isDiscussionTrigger(q) {
+  // 「思う」は「だと思う/だと思います/どう思う/どう思いますか」など活用形が
+  // 複数あるため、語幹「思(う|います)」で拾う(丁寧形のフォローアップ質問
+  // 「〜と思いますか？」もここで検出できるようにするため)。「気がする」は
+  // い形容詞(「弱い気がする」)・な形容詞(「不安な気がする」)どちらの直後にも
+  // 付くため、直前の「な」を必須にせず「気がする」単独で拾う。「と思う」も
+  // 「だと思う」だけでなく「衰えたと思う？」のような「だ」無しの形も拾えるよう
+  // 「と思(う|います)」で広めに判定する(「どう思う」は「と思う」を含まない
+  // 活用のため別枠で判定)。
+  return /と思(う|います)|どう思(う|います)|気がする|ではないか|もし.{0,20}(たら|なら)|なぜ|何故|本当に|意見を|考察して|議論した/.test(q || "");
+}
+
+// 質問文(と、分かっていれば「今表示中の選手」)から、議論エンジンのRAGが使う
+// 「主題」を決める。クラブが見つかればクラブ優先、次に選手、どちらもなければ
+// 主題なし(その場合はRAGを呼ばず、LLMの一般知識のみで考察する)。
+function buildDiscussSubject(q, contextPlayer) {
+  if (contextPlayer) {
+    return {
+      subject: { type: "player", labelJa: contextPlayer.nameJa },
+      playerHint: { name: contextPlayer.name, teamEn: CLUB_JA_TO_EN[clubBase(contextPlayer)] || "", birth: contextPlayer.birth || "" },
+      resolvedPlayer: contextPlayer,
+    };
+  }
+  const clubJa = detectClubMention(q);
+  if (clubJa) {
+    return { subject: { type: "club", labelJa: clubJa, labelEn: CLUB_JA_TO_EN[clubJa] || null }, playerHint: null, resolvedPlayer: null };
+  }
+  const mentioned = findAllMentionedPlayers(q, 1);
+  if (mentioned.length) {
+    const p = mentioned[0];
+    return {
+      subject: { type: "player", labelJa: p.nameJa },
+      playerHint: { name: p.name, teamEn: CLUB_JA_TO_EN[clubBase(p)] || "", birth: p.birth || "" },
+      resolvedPlayer: p,
+    };
+  }
+  return { subject: { type: null }, playerHint: null, resolvedPlayer: null };
+}
+
+// LLM推論はルールベースの即答と異なり、RAGでの複数回のデータ取得+実際のLLM呼び出しで
+// 数秒かかることがあるため、Stage Bの予測API(1.5秒)より大幅に長いタイムアウトを取る。
+const DISCUSS_TIMEOUT_MS = 15000;
+
+async function fetchDiscussApi(question, subject, playerHint) {
+  try {
+    const url = `${API_PROXY_BASE}/discuss`;
+    return await fetchJsonWithTimeout(url, DISCUSS_TIMEOUT_MS, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, subject, playerHint }),
+    });
+  } catch (e) {
+    return null;
+  }
+}
+
+// 議論エンジンの回答を、通常のチャット吹き出しと同じ見た目で組み立てる。
+// ①事実②統計は折りたたみ(<details>)にして、まず④考察⑤結論を読みやすく前面に出す。
+// ⑥信頼度は★の数と、その理由(なぜその信頼度なのか)を必ず併記する。
+function renderDiscussReplyHtml(resp) {
+  const stars = "★".repeat(resp.confidence.stars) + "☆".repeat(5 - resp.confidence.stars);
+  const factsHtml = resp.facts && resp.facts.length
+    ? `<details class="discuss-facts"><summary>📊 根拠にした事実を見る(${resp.facts.length}件)</summary><ul>${resp.facts.map(f => `<li>${escapeHtml(f)}</li>`).join("")}</ul></details>`
+    : "";
+  let body = "";
+  if (resp.evidence) body += `<p class="value-note">💡 ${escapeHtml(resp.evidence)}</p>`;
+  body += `<p>${escapeHtml(resp.consideration || "(考察を生成できませんでした)")}</p>`;
+  if (resp.conclusion) body += `<p>${escapeHtml(resp.conclusion)}</p>`;
+  const confidenceHtml = `<div class="discuss-confidence">${stars} <span class="value-note">${escapeHtml(resp.confidence.reasonJa)}</span></div>`;
+  const followupsHtml = resp.followUpQuestions && resp.followUpQuestions.length
+    ? `<div class="followup-chip-row">${resp.followUpQuestions.map(q => `<button class="chat-followup-btn" data-q="${escapeHtml(q)}">・${escapeHtml(q)}</button>`).join("")}</div>`
+    : "";
+  return { text: body, extras: `${confidenceHtml}${factsHtml}${followupsHtml}` };
+}
+
+// hero chat・選手個別チャット共通の議論モードフロー。
+// pushFn: 新しいメッセージオブジェクトを履歴配列に積む関数
+// renderFn: 履歴を再描画する関数
+async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn) {
+  const { subject, playerHint, resolvedPlayer } = buildDiscussSubject(q, contextPlayer);
+  const pendingMsg = { role: "ai", text: `<p class="value-note">🧠 AIが考えています…(実データを確認し、考察を組み立てています)</p>`, extras: "" };
+  pushFn(pendingMsg);
+  renderFn();
+
+  const resp = await fetchDiscussApi(q, subject, playerHint);
+
+  if (resp && resp.ok) {
+    const rendered = renderDiscussReplyHtml(resp);
+    pendingMsg.text = rendered.text;
+    pendingMsg.extras = rendered.extras;
+  } else {
+    // 議論エンジンに接続できなかった/失敗した場合: 「考えたふり」はせず正直に状況を
+    // 伝えた上で、参考情報として従来のデータ要約(キーワードベース)を添える。
+    const reason = (resp && resp.message) ? resp.message : "AIの考察機能に接続できませんでした(サーバーの起動直後で時間がかかっている可能性があります)。";
+    let fallback = "";
+    if (subject.type === "club" && subject.labelJa) fallback = buildClubAnswer(subject.labelJa, dLevel);
+    else if (subject.type === "player" && resolvedPlayer) fallback = answerPlayerQuestion(resolvedPlayer, q, dLevel);
+    pendingMsg.text = `<p class="value-note">⚠️ ${escapeHtml(reason)}</p>` +
+      (fallback ? `<p>${escapeHtml(fallback)}</p><p class="value-note">(↑参考として、登録データに基づく要約を表示しています。AIによる考察ではありません)</p>` : "");
+  }
+  renderFn();
+}
+
+async function heroAskAI(question) {
   const q = (question || "").trim();
   if (!q) return;
   heroChatHistory.push({ role: "user", text: escapeHtml(q) });
   renderHeroChatUI();
 
   const dLevel = effectiveDialogueLevel(q, state.level);
+
+  // Stage C: 議論トリガー(「〜だと思う」「なぜ？」等)を検出したら、単純な
+  // キーワード回答ではなくRAG+LLMの議論エンジンへ切り替える。それ以外は
+  // 以下の既存ロジックを完全に維持する。
+  if (isDiscussionTrigger(q)) {
+    await runDiscussFlow(q, dLevel, null, (msg) => heroChatHistory.push(msg), renderHeroChatUI);
+    return;
+  }
+
   const matchIntent = /(今日|本日).*(試合|見るべき|おすすめ)|見るべき試合|おすすめの試合|どの試合を見る/.test(q);
   const comparisonKeyword = /(どっち|どちら|vs|VS|対|比較|違い)/.test(q);
   const mentioned = findAllMentionedPlayers(q, 2);
