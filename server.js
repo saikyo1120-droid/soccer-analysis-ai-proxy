@@ -153,21 +153,41 @@ async function handlePlayerSeasonStats(query) {
   const cached = cacheGet(cacheKey);
   if (cached) return { status: 200, body: cached };
 
+  // Try the requested season, then fall back to the previous season(s). This matters
+  // a lot in the off-season (roughly June-August in Europe): the brand-new season has
+  // 0 official appearances for almost everyone yet, so without this fallback the tool
+  // would report "no data" for most players for weeks at a time even though last
+  // season's real stats are readily available and far more useful to show.
+  const seasonBase = parseInt(season, 10) || guessSeason();
+  const candidateSeasons = [seasonBase, seasonBase - 1, seasonBase - 2];
+
   try {
-    const player = await resolvePlayerId(name, team, season);
+    let player = null;
+    for (const s of candidateSeasons) {
+      player = await resolvePlayerId(name, team, s);
+      if (player) break;
+    }
     if (!player) {
-      const payload = { found: false, reason: "player_not_found", name, season };
+      const payload = { found: false, reason: "player_not_found", name, season: seasonBase };
       cacheSet(cacheKey, payload, 6 * 60 * 60 * 1000);
       return { status: 200, body: payload };
     }
-    const data = await callApiFootball("/players", { id: player.id, season });
-    const entry = (data.response || [])[0];
-    const statsBlock = entry && entry.statistics && entry.statistics.length
-      ? entry.statistics.reduce((best, s) => ((s.games.appearences || 0) > ((best && best.games.appearences) || 0) ? s : best), null)
-      : null;
+
+    let statsBlock = null, usedSeason = null;
+    for (const s of candidateSeasons) {
+      const data = await callApiFootball("/players", { id: player.id, season: s });
+      const entry = (data.response || [])[0];
+      if (!entry || !entry.statistics || !entry.statistics.length) continue;
+      const best = entry.statistics.reduce(
+        (acc, cur) => ((cur.games.appearences || 0) > (acc.games.appearences || 0) ? cur : acc),
+        entry.statistics[0]
+      );
+      if ((best.games.appearences || 0) > 0) { statsBlock = best; usedSeason = s; break; }
+      if (!statsBlock) { statsBlock = best; usedSeason = s; } // keep as a fallback candidate, but keep looking for a season with actual appearances
+    }
 
     if (!statsBlock) {
-      const payload = { found: false, reason: "no_statistics", name, season };
+      const payload = { found: false, reason: "no_statistics", name, season: seasonBase };
       cacheSet(cacheKey, payload, 6 * 60 * 60 * 1000);
       return { status: 200, body: payload };
     }
@@ -175,7 +195,8 @@ async function handlePlayerSeasonStats(query) {
     const payload = {
       found: true,
       source: "API-Football",
-      season,
+      season: usedSeason,
+      requestedSeason: seasonBase,
       fetchedAt: new Date().toISOString(),
       player: { id: player.id, name: player.name, photo: player.photo },
       team: statsBlock.team ? statsBlock.team.name : null,
