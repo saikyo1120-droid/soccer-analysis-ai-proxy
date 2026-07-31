@@ -233,17 +233,21 @@ async function handlePlayerSeasonStats(query) {
       // national-team entry by comparing its team name against the player's nationality
       // (both are plain English strings from the same API-Football response, so this
       // comparison is reliable even though the club name shown to the user is Japanese).
+      // Confirmed via live production data (2026, a World Cup year): a player's club may
+      // not have ANY statistics entry yet this season while the national team already has
+      // several (e.g. summer friendlies/World Cup matches) - in that case clubStats ends up
+      // empty. We must NOT fall back to the national-team entries here, or we'd show
+      // country stats mislabeled/mixed in as if they were club form; instead we skip this
+      // season entirely and let the loop try an earlier season that has real club data.
       const nationality = (entry.player && entry.player.nationality) || null;
       const clubStats = nationality
         ? entry.statistics.filter((st) => !(st.team && st.team.name === nationality))
         : entry.statistics;
-      // If filtering leaves nothing (e.g. a player who only has national-team stats on
-      // record for this season), fall back to the full list rather than showing no data.
-      const pool = clubStats.length ? clubStats : entry.statistics;
+      if (!clubStats.length) continue; // this season only has national-team entries - keep looking at earlier seasons
 
-      const best = pool.reduce(
+      const best = clubStats.reduce(
         (acc, cur) => ((cur.games.appearences || 0) > (acc.games.appearences || 0) ? cur : acc),
-        pool[0]
+        clubStats[0]
       );
       if ((best.games.appearences || 0) > 0) { statsBlock = best; usedSeason = s; break; }
       if (!statsBlock) { statsBlock = best; usedSeason = s; } // keep as a fallback candidate, but keep looking for a season with actual appearances
