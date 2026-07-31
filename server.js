@@ -65,7 +65,22 @@ const UPSTASH_ENABLED = !!(UPSTASH_URL && UPSTASH_TOKEN);
 
 const API_HOST = "v3.football.api-sports.io";
 const API_BASE = `https://${API_HOST}`;
-const STATIC_ROOT = path.join(__dirname, ".."); // index.html が置かれているフォルダ
+
+// index.html がどこに置かれているかは、デプロイ方法によって2パターンある:
+//   (a) このファイル(server.js)と同じフォルダに index.html を置く
+//       (例: GitHubリポジトリの直下に server.js と index.html を一緒に置く構成)
+//   (b) このファイルを "server/" のようなサブフォルダに置き、index.html は
+//       1つ上のフォルダに置く(ローカル開発時のフォルダ構成)
+// 実際にindex.htmlが存在する方を自動的に選ぶことで、どちらの配置でも
+// 「トップページが404になる」という事態を避ける。
+function resolveStaticRoot() {
+  const candidates = [__dirname, path.join(__dirname, "..")];
+  for (const dir of candidates) {
+    if (fs.existsSync(path.join(dir, "index.html"))) return dir;
+  }
+  return candidates[0]; // index.htmlがどちらにも無い場合(APIプロキシ専用デプロイ)。今まで通り404になるだけで、APIエンドポイントの動作には影響しない
+}
+const STATIC_ROOT = resolveStaticRoot();
 
 // ---- ごく簡易なインメモリキャッシュ(TTL付き) ----
 const cache = new Map();
