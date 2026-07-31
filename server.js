@@ -52,6 +52,17 @@ const VIA_RAPIDAPI = String(process.env.API_FOOTBALL_VIA_RAPIDAPI || "false") ==
 const DEFAULT_LEAGUES = (process.env.DEFAULT_LEAGUES || "39,140,78,135,61")
   .split(",").map((s) => s.trim()).filter(Boolean);
 
+// ---- AI予測の的中率を「本物の記録」として残すためのUpstash Redis接続設定 ----
+// なぜ必要か: このファイルの少し下にある「インメモリキャッシュ」はサーバーメモリ上に
+// あるだけなので、Renderの無料プランでは再起動・再デプロイ・スリープ復帰のたびに
+// 消えてしまいます。「AIの予測正答率」は消えてはいけない実績データなので、無料で
+// 使える外部の永続ストレージ(Upstash Redis)にJSON形式で記録します。
+// 未設定でもアプリ全体は普通に動作します(記録機能だけが無効になり、ホーム画面には
+// 「記録を開始していません」という正直な表示になります)。
+const UPSTASH_URL = String(process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/$/, "");
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const UPSTASH_ENABLED = !!(UPSTASH_URL && UPSTASH_TOKEN);
+
 const API_HOST = "v3.football.api-sports.io";
 const API_BASE = `https://${API_HOST}`;
 const STATIC_ROOT = path.join(__dirname, ".."); // index.html が置かれているフォルダ
@@ -66,6 +77,49 @@ function cacheGet(key) {
 }
 function cacheSet(key, data, ttlMs) {
   cache.set(key, { data, expires: Date.now() + ttlMs });
+}
+
+// ---- Upstash Redis REST APIへの薄いラッパー ----
+// Upstashは「1コマンド1リクエスト」のシンプルなREST APIを提供している。ここでは
+// 汎用の「コマンド配列をそのままPOSTする」形式(例: ["SET","key","value"])を使う。
+// これにより GET/SET だけでなく、INCR(正答数などの原子的なカウンター増加)や
+// RPUSH/LRANGE/LREM/LTRIM(未解決の予測一覧・直近の記録一覧)もすべて同じ関数で
+// 呼び出せる。値の中身(JSON文字列)にどんな文字が含まれていても、リクエスト自体を
+// JSON化して送るので壊れる心配がない。
+async function upstashCmd(commandArray) {
+  if (!UPSTASH_ENABLED) {
+    const err = new Error("Upstash未設定(.envのUPSTASH_REDIS_REST_URL/TOKENを確認してください)");
+    err.code = "NO_UPSTASH";
+    throw err;
+  }
+  const res = await fetch(UPSTASH_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(commandArray),
+  });
+  const json = await res.json();
+  if (json && json.error) {
+    const err = new Error("Upstash error: " + json.error);
+    throw err;
+  }
+  return json ? json.result : null;
+}
+async function upstashGetJSON(key) {
+  try {
+    const raw = await upstashCmd(["GET", key]);
+    if (raw === null || raw === undefined) return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+async function upstashSetJSON(key, value) {
+  try {
+    await upstashCmd(["SET", key, JSON.stringify(value)]);
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 
 // ---- ごく簡易なレート制限(IPごと・1分あたり30リクエストまで) ----
@@ -338,6 +392,112 @@ async function handlePlayerSeasonStats(query) {
   }
 }
 
+// ---- AI予測の「本物の記録」システム ----
+// 目的: ホーム画面に表示する「予測正答率」が架空の数字にならないよう、実際に
+// 予測を記録し、試合終了後に本当に当たったかどうかを検証して積み上げる。
+// 「AIの予測」の中身は、このアプリが独自に発明した非公開の計算式ではなく、
+// API-Footballが提供する実際の統計に基づく本物の予測エンドポイント
+// (/predictions?fixture=...)をそのまま採用する。これにより「当たるかどうか
+// 分からない自作ロジック」ではなく「実データに基づく予測」を検証できる。
+// 記録はUpstash Redisに保存するため、Renderが再起動してもリセットされない。
+function outcomeFromScore(homeGoals, awayGoals) {
+  if (homeGoals === null || homeGoals === undefined || awayGoals === null || awayGoals === undefined) return null;
+  if (homeGoals > awayGoals) return "home";
+  if (homeGoals < awayGoals) return "away";
+  return "draw";
+}
+
+// 試合開始前に一度だけ、API-Footballの本物の予測(勝率%)を取得して記録する。
+// 既に記録済みなら再取得・再カウントせず、そのまま既存の記録を返す(冪等性を担保)。
+// 予測データが取得できない(新規昇格チームなどでAPI側にデータが無い)場合は、
+// 架空の値を作らずnullを返し、その試合は正答率の集計対象にしない。
+async function getOrLogPrediction(fixtureId, meta) {
+  const key = `pred:${fixtureId}`;
+  const existing = await upstashGetJSON(key);
+  if (existing) return existing;
+  if (!UPSTASH_ENABLED) return null;
+  try {
+    const data = await callApiFootball("/predictions", { fixture: fixtureId });
+    const entry = (data.response || [])[0];
+    const pct = entry && entry.predictions && entry.predictions.percent;
+    if (!pct || !pct.home || !pct.draw || !pct.away) return null;
+    const homePct = parseInt(pct.home, 10);
+    const drawPct = parseInt(pct.draw, 10);
+    const awayPct = parseInt(pct.away, 10);
+    if (!Number.isFinite(homePct) || !Number.isFinite(drawPct) || !Number.isFinite(awayPct)) return null;
+
+    let predictedWinner = "draw";
+    if (homePct >= drawPct && homePct >= awayPct) predictedWinner = "home";
+    else if (awayPct >= drawPct && awayPct >= homePct) predictedWinner = "away";
+
+    const record = {
+      fixtureId, league: meta.league || null, home: meta.homeName || null, away: meta.awayName || null,
+      kickoff: meta.kickoff || null, homePct, drawPct, awayPct, predictedWinner,
+      loggedAt: new Date().toISOString(), resolved: false, actualWinner: null, correct: null, resolvedAt: null,
+    };
+    await upstashSetJSON(key, record);
+    await upstashCmd(["RPUSH", "pred:pending", String(fixtureId)]).catch(() => {});
+    await upstashCmd(["INCR", "pred:total"]).catch(() => {});
+    await upstashCmd(["SET", "pred:since", record.loggedAt, "NX"]).catch(() => {});
+    return record;
+  } catch (e) {
+    return null; // API側で予測データが無い/エラー時は、架空の予測を作らず記録しない
+  }
+}
+
+// 試合終了後、記録しておいた予測と実際の結果を突き合わせて的中/不的中を確定する。
+// 既に解決済み、またはそもそも記録が無い(=AIが予測していなかった)試合は何もしない。
+async function resolvePrediction(fixtureId, homeGoals, awayGoals) {
+  if (!UPSTASH_ENABLED) return null;
+  const key = `pred:${fixtureId}`;
+  const record = await upstashGetJSON(key);
+  if (!record || record.resolved) return null;
+  const actualWinner = outcomeFromScore(homeGoals, awayGoals);
+  if (!actualWinner) return null;
+
+  const correct = actualWinner === record.predictedWinner;
+  record.resolved = true;
+  record.actualWinner = actualWinner;
+  record.correct = correct;
+  record.resolvedAt = new Date().toISOString();
+
+  await upstashSetJSON(key, record);
+  await upstashCmd(["LREM", "pred:pending", "0", String(fixtureId)]).catch(() => {});
+  await upstashCmd(["INCR", "pred:resolved"]).catch(() => {});
+  if (correct) await upstashCmd(["INCR", "pred:correct"]).catch(() => {});
+  await upstashCmd(["RPUSH", "pred:recent", JSON.stringify(record)]).catch(() => {});
+  await upstashCmd(["LTRIM", "pred:recent", "-20", "-1"]).catch(() => {});
+  return record;
+}
+
+// ホーム画面に表示する「AI予測の実績」の集計値を返す。Upstash未設定の場合は
+// 正直に「記録なし」を返す(架空の数字は絶対に出さない)。
+async function handleAccuracyStats() {
+  if (!UPSTASH_ENABLED) {
+    return { status: 200, body: { configured: false, total: 0, resolved: 0, correct: 0, accuracyPct: null, since: null, recent: [] } };
+  }
+  try {
+    const [totalRaw, resolvedRaw, correctRaw, since, recentRaw] = await Promise.all([
+      upstashCmd(["GET", "pred:total"]),
+      upstashCmd(["GET", "pred:resolved"]),
+      upstashCmd(["GET", "pred:correct"]),
+      upstashCmd(["GET", "pred:since"]),
+      upstashCmd(["LRANGE", "pred:recent", "-10", "-1"]),
+    ]);
+    const total = parseInt(totalRaw, 10) || 0;
+    const resolved = parseInt(resolvedRaw, 10) || 0;
+    const correct = parseInt(correctRaw, 10) || 0;
+    const accuracyPct = resolved > 0 ? Math.round((correct / resolved) * 1000) / 10 : null;
+    const recent = (recentRaw || [])
+      .map((s) => { try { return JSON.parse(s); } catch (e) { return null; } })
+      .filter(Boolean)
+      .reverse();
+    return { status: 200, body: { configured: true, total, resolved, correct, accuracyPct, since: since || null, recent } };
+  } catch (e) {
+    return { status: 200, body: { configured: true, error: e.message, total: 0, resolved: 0, correct: 0, accuracyPct: null, since: null, recent: [] } };
+  }
+}
+
 // Leagues/competitions to hide from "today's real fixtures" even though
 // API-Football includes them in an unrestricted /fixtures?date=... response —
 // youth, reserve, and women's competitions clutter a fan-facing app whose
@@ -399,6 +559,25 @@ async function handleFixturesToday(query) {
       .sort((a, b) => new Date(a.date) - new Date(b.date))
       .slice(0, 80); // a fully unrestricted worldwide day can have hundreds of matches — cap to a sane amount
 
+    // 「ながら解決」: 今日の試合一覧を取得したついでに、記録済みだが未解決のまま
+    // だったAI予測を解決できないか確認する。一覧に既にスコアと試合状況が含まれて
+    // いるため、追加のAPIリクエストを一切消費せずに済む(無料プランの上限に優しい)。
+    if (UPSTASH_ENABLED) {
+      try {
+        const pendingIds = await upstashCmd(["LRANGE", "pred:pending", "0", "-1"]);
+        if (pendingIds && pendingIds.length) {
+          const pendingSet = new Set(pendingIds.map(String));
+          for (const f of fixtures) {
+            if (pendingSet.has(String(f.id)) && FINISHED_STATUSES.has(f.status) && f.score) {
+              await resolvePrediction(f.id, f.score.home, f.score.away);
+            }
+          }
+        }
+      } catch (e) {
+        // ベストエフォート: この掃除処理が失敗しても「今日の試合」表示自体は続行する
+      }
+    }
+
     const payload = { found: true, source: "API-Football", date: today, fetchedAt: new Date().toISOString(), fixtures };
     cacheSet(cacheKey, payload, 15 * 60 * 1000);
     return { status: 200, body: payload };
@@ -457,7 +636,28 @@ async function handleFixtureAnalysis(query) {
       // API-Football here. The frontend builds the pre-match preview itself
       // (using our own registered player database for either club, if we have
       // one registered) since there's no reliable real "predicted lineup" feed.
-      const payload = { ...base, phase: "upcoming" };
+      // We DO, however, log AI-Football's real prediction percentages here so
+      // that once this match finishes we can honestly verify whether the AI's
+      // prediction was correct (see "AI予測の「本物の記録」システム" above).
+      const aiPrediction = await getOrLogPrediction(entry.fixture.id, {
+        league: entry.league ? entry.league.name : null,
+        homeName: entry.teams.home.name,
+        awayName: entry.teams.away.name,
+        kickoff: entry.fixture.date,
+      });
+      const payload = {
+        ...base,
+        phase: "upcoming",
+        aiPrediction: aiPrediction
+          ? {
+              homePct: aiPrediction.homePct,
+              drawPct: aiPrediction.drawPct,
+              awayPct: aiPrediction.awayPct,
+              predictedWinner: aiPrediction.predictedWinner,
+              loggedAt: aiPrediction.loggedAt,
+            }
+          : null,
+      };
       cacheSet(cacheKey, payload, 5 * 60 * 1000); // short TTL: status can change (kickoff, postponement, etc.)
       return { status: 200, body: payload };
     }
@@ -506,6 +706,14 @@ async function handleFixtureAnalysis(query) {
       detail: e.detail,
     }));
 
+    // If we logged a real prediction for this fixture while it was still upcoming,
+    // resolve it now against the real final score (honest win/draw/loss check).
+    // If it was already resolved (e.g. via the "今日の試合"一覧 sweep) or was never
+    // logged at all, this just returns the existing/absent record — no double counting.
+    const scoreForResolve = entry.goals || {};
+    await resolvePrediction(entry.fixture.id, scoreForResolve.home, scoreForResolve.away);
+    const predictionRecord = await upstashGetJSON(`pred:${entry.fixture.id}`);
+
     const payload = {
       ...base,
       phase: "finished",
@@ -514,6 +722,16 @@ async function handleFixtureAnalysis(query) {
       events,
       motmHome: homePlayers[0] || null,
       motmAway: awayPlayers[0] || null,
+      aiPredictionResult: predictionRecord && predictionRecord.resolved
+        ? {
+            predictedWinner: predictionRecord.predictedWinner,
+            actualWinner: predictionRecord.actualWinner,
+            correct: predictionRecord.correct,
+            homePct: predictionRecord.homePct,
+            drawPct: predictionRecord.drawPct,
+            awayPct: predictionRecord.awayPct,
+          }
+        : null,
     };
     // Finished-match data never changes — safe to cache for a long time.
     cacheSet(cacheKey, payload, 7 * 24 * 60 * 60 * 1000);
@@ -585,6 +803,12 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(body));
         return;
       }
+      if (pathname === "/api/accuracy-stats") {
+        const { status, body } = await handleAccuracyStats();
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
       res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ found: false, error: "unknown endpoint" }));
     } catch (e) {
@@ -600,6 +824,17 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`soccer-analysis-ai-proxy: http://localhost:${PORT}/ で起動しました`);
   console.log(`APIキー設定: ${API_KEY ? "あり" : "なし(.envのAPI_FOOTBALL_KEYを設定してください)"}`);
+  console.log(`AI予測の記録(Upstash Redis): ${UPSTASH_ENABLED ? "あり" : "なし(.envのUPSTASH_REDIS_REST_URL/TOKENを設定してください)"}`);
 });
 
-module.exports = { server, handlePlayerSeasonStats, handleFixturesToday, handleFixtureAnalysis, guessSeason };
+module.exports = {
+  server,
+  handlePlayerSeasonStats,
+  handleFixturesToday,
+  handleFixtureAnalysis,
+  handleAccuracyStats,
+  getOrLogPrediction,
+  resolvePrediction,
+  outcomeFromScore,
+  guessSeason,
+};
