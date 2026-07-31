@@ -743,6 +743,87 @@ async function handleFixtureAnalysis(query) {
   }
 }
 
+// ---- ユーザーがサイトを訪れなくても学習が進むための「自動収集」エンドポイント ----
+// なぜ必要か: これまでの予測の記録・解決は「誰かが実際にそのページを開いた時」に
+// しか動かない(ユーザーのアクセスがトリガー)。しかし「ログインしなくても自動で
+// 記録が貯まってほしい」という要望に応えるには、誰も見ていなくても定期的に
+// 「今日の未記録の試合を記録する」「終わっているはずの試合を確認して確定する」を
+// 実行してくれる仕組みが要る。このエンドポイントを外部の無料cronサービス(または
+// このセッションのスケジュール機能)から定期的に叩いてもらうことで、Renderの
+// サーバー自体に常駐タイマーを置かなくても実現できる(無料プランはアイドル時に
+// スリープするため、こうして外部から定期的にアクセスされること自体がスリープ
+// 復帰のきっかけにもなり好都合)。
+// API-Footballの無料枠(1日100リクエスト)を使い切らないよう、1回の実行あたりの
+// 新規記録・解決チェック件数には上限を設けている。
+const AUTO_COLLECT_LOG_CAP = 3; // 1回の実行で新規に記録する試合数の上限
+const AUTO_COLLECT_RESOLVE_CAP = 8; // 1回の実行で解決を試みる保留中予測の上限
+const AUTO_COLLECT_RESOLVE_MIN_AGE_MS = 2 * 60 * 60 * 1000; // キックオフから2時間経っていない試合は「まだ終わっていない可能性が高い」としてスキップ
+
+async function handleAutoCollectPredictions() {
+  if (!UPSTASH_ENABLED) {
+    return { status: 200, body: { ok: true, upstashConfigured: false, logged: 0, resolved: 0, note: "Upstash未設定のため何もしていません" } };
+  }
+
+  let logged = 0;
+  let resolved = 0;
+  const notes = [];
+
+  // フェーズ1: 保留中(まだ結果が確定していない)の予測を、実際の試合結果と突き合わせる。
+  // 「今日の試合」一覧のスイープでは対応できない“前日以前にキックオフした試合”もここで拾える。
+  try {
+    const pendingIds = (await upstashCmd(["LRANGE", "pred:pending", "0", "-1"])) || [];
+    let checked = 0;
+    for (const idStr of pendingIds) {
+      if (checked >= AUTO_COLLECT_RESOLVE_CAP) { notes.push(`resolve cap reached (${AUTO_COLLECT_RESOLVE_CAP})`); break; }
+      const record = await upstashGetJSON(`pred:${idStr}`);
+      if (!record || record.resolved) continue;
+      if (record.kickoff && (Date.now() - new Date(record.kickoff).getTime()) < AUTO_COLLECT_RESOLVE_MIN_AGE_MS) continue; // まだ試合中の可能性が高いので今回はスキップ
+      checked++;
+      try {
+        const data = await callApiFootball("/fixtures", { id: idStr });
+        const entry = (data.response || [])[0];
+        if (!entry) continue;
+        const statusShort = entry.fixture.status ? entry.fixture.status.short : null;
+        if (FINISHED_STATUSES.has(statusShort) && entry.goals) {
+          const r = await resolvePrediction(idStr, entry.goals.home, entry.goals.away);
+          if (r) resolved++;
+        }
+      } catch (e) {
+        notes.push(`resolve check failed for fixture ${idStr}: ${e.message}`);
+      }
+    }
+  } catch (e) {
+    notes.push("resolve phase error: " + e.message);
+  }
+
+  // フェーズ2: 今日の試合一覧から、まだ記録していない今後の試合を少数だけ新規に記録する。
+  // handleFixturesToday()を再利用することで、キャッシュ・除外リーグ(ユース/女子など)の
+  // ロジックを重複させない。
+  try {
+    const todayResult = await handleFixturesToday(new URLSearchParams());
+    const fixtures = (todayResult.body && todayResult.body.fixtures) || [];
+    const upcoming = fixtures.filter((f) => f.status === "NS");
+    let attempted = 0;
+    for (const f of upcoming) {
+      if (attempted >= AUTO_COLLECT_LOG_CAP) { notes.push(`log cap reached (${AUTO_COLLECT_LOG_CAP})`); break; }
+      const existing = await upstashGetJSON(`pred:${f.id}`);
+      if (existing) continue; // 既に記録済み
+      attempted++;
+      const rec = await getOrLogPrediction(f.id, {
+        league: f.league || null,
+        homeName: f.home ? f.home.name : null,
+        awayName: f.away ? f.away.name : null,
+        kickoff: f.date,
+      });
+      if (rec) logged++;
+    }
+  } catch (e) {
+    notes.push("log phase error: " + e.message);
+  }
+
+  return { status: 200, body: { ok: true, upstashConfigured: true, logged, resolved, notes } };
+}
+
 // ---- 静的ファイル配信(index.htmlなど。npmパッケージなしの簡易実装) ----
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -809,6 +890,24 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(body));
         return;
       }
+      if (pathname === "/api/predictions/auto-collect") {
+        // このエンドポイントは(誰かが見ていなくても)API-Footballへの実リクエストを
+        // 能動的に発生させるため、他の読み取り専用エンドポイントより悪用の影響が
+        // 大きい(無料枠1日100リクエストを外部から連打されて使い切られる恐れがある)。
+        // AUTO_COLLECT_SECRETを設定した場合のみ、一致する?key=を要求する
+        // (未設定なら従来通り誰でも呼べる。定期実行の仕組みを外部cronサービスに
+        // 設定する際は、必ずこのシークレットも一緒に渡すことを推奨)。
+        const requiredSecret = process.env.AUTO_COLLECT_SECRET || "";
+        if (requiredSecret && parsed.searchParams.get("key") !== requiredSecret) {
+          res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "invalid or missing key" }));
+          return;
+        }
+        const { status, body } = await handleAutoCollectPredictions();
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
       res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ found: false, error: "unknown endpoint" }));
     } catch (e) {
@@ -833,6 +932,7 @@ module.exports = {
   handleFixturesToday,
   handleFixtureAnalysis,
   handleAccuracyStats,
+  handleAutoCollectPredictions,
   getOrLogPrediction,
   resolvePrediction,
   outcomeFromScore,
