@@ -332,6 +332,24 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(body));
         return;
       }
+      if (pathname === "/api/debug/raw-search") {
+        // Temporary diagnostic endpoint: bypasses all of our own transformation/
+        // fallback logic and returns exactly what API-Football itself says for a
+        // given search+league+season combo, so we can see the ground truth while
+        // tracking down why resolvePlayerId isn't finding known real players.
+        const name = parsed.searchParams.get("name") || "";
+        const league = parsed.searchParams.get("league") || "39";
+        const season = parsed.searchParams.get("season") || String(guessSeason());
+        try {
+          const data = await callApiFootball("/players", { search: name, league, season });
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ queried: { name, league, season }, resultsCount: (data.response || []).length, raw: data }));
+        } catch (e) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ queried: { name, league, season }, error: e.message, code: e.code }));
+        }
+        return;
+      }
       res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ found: false, error: "unknown endpoint" }));
     } catch (e) {
