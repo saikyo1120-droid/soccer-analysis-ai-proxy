@@ -206,6 +206,66 @@ API-Footballの無料枠を消費されるのを防ぐには、`.env`(本番はR
 比例するよう意図的に絞っています(だいたい数十リクエスト程度)。無料枠は1日100
 リクエストなので、通常のユーザー利用分の余力も残る設計です。
 
+### 8. Knowledge Engine / Memory Engine / Hypothesis Engine(Stage E・NEW)を理解する
+
+【Stage E】Stage Dの「学習エンジン」は予測モデルの的中率を改善するものでしたが、
+Stage Eはそれとは別に「AIの知識と考え方そのものが日々深まっていく」ことを目指した
+拡張です。新しく4つのモジュールを追加し、`POST /api/discuss`(議論モード)に
+組み込みました。追加の環境変数設定は不要です(既存のUpstash Redis・API-Footballの
+設定をそのまま使います)。
+
+**① Knowledge Engine(`server/knowledge/knowledgeStore.js`)** ― 「事実(fact)」
+「分析(analysis)」「意見(opinion)」を明確に分けて保存する知識ベースです。内容の
+ハッシュ値で重複を判定し、全く同じ内容は二重登録しません(観測日だけ更新)。
+factは14日・analysisは30日・opinionは3日で「アクティブな知識」の一覧から自動的に
+外れます(削除はせず、履歴としては残ります)。
+
+**② Memory Engine(`server/memory/memoryStore.js`)** ― 議論モードでAIが導いた
+「今の結論」をクラブごとに記憶します。次に同じクラブについて聞かれたとき、結論が
+前回と同じなら「変わっていない」、変わっていれば「なぜ変わったか」を一緒に記録します
+(`POST /api/discuss`のレスポンスの`meta.reasoning.memory`で確認できます)。
+
+**③ Reasoning Engine(`server/reasoning/`)** ― 回答を書く前に、AIが内部的に
+「複数の説明の可能性(仮説)」を検討する仕組みです。具体的には
+`hypothesisGenerator.js`が常に3つの観点(①負傷・出場停止 ②直近フォーム・
+フォーメーション ③移籍による戦力変化)から仮説を立て、`evidenceRanking.js`が
+実際に取得できた根拠の量と質(事実=1.0点、検証済み分析=1.5点、AIの意見=0.5点)で
+スコア化し、最も根拠が強い仮説を選びます。`reasoningEngine.js`が仕上げとして
+「根拠は十分か」「他の可能性も検討したか」「反対意見はあるか」を内部的に自己確認し、
+その結果を(利用者には見せない内部情報として)LLMへのプロンプトに含めます。
+
+**④ Knowledge Graph(`server/knowledge/relationshipIndex.js`)** ― 「このクラブの
+現在の監督は誰か」「直近のフォーメーションは何か」のような一方向の関係を保存する、
+最小限の関係インデックスです。
+
+**正直にお伝えしたい設計上の判断(ご要望に対する開示):**
+- **知識の取得元について**: クラブ公式サイト・ニュース記事・監督の生の発言を
+  スクレイピングする機能は、今回あえて実装していません。任意の外部サイトを無断で
+  スクレイピングすることには利用規約・著作権上のリスクがあるためです。現時点では、
+  このアプリが既に契約しているAPI-Football(実データAPI)からの情報と、そこから
+  AI自身が導き出した分析に限定しています。将来、利用規約上問題のない具体的な
+  ニュースソースを決めていただければ、専用のfetcherを追加する形で拡張できます。
+- **Hypothesis Generator / Evidence Rankingについて**: LLMを呼び出すのではなく、
+  あらかじめ用意した観点テンプレートに実データを機械的に当てはめるルールベースの
+  実装です。質問1件ごとに複数のLLM呼び出しを追加すると、このプロジェクトが最優先
+  としている「コスト最適化」に反するため(現状: 1質問あたりのLLM呼び出しは
+  従来通り1回のまま)。仮説の内容自体は固定でも、実際にどれだけ根拠が集まるかは
+  毎回の実データ次第なので、「根拠に基づいて選ばれる」という実質は保たれています。
+- **Knowledge Graphについて**: 本格的なグラフデータベース(複雑な探索ができるもの)
+  ではなく、Upstash Redis上の単純なキー・バリューによる「一方向の関係の保存」に
+  留めています。「このクラブの監督は誰か」は分かりますが、「この監督が率いた
+  クラブを全部教えて」のような逆方向の探索はできません。
+- **Hypothesis Engineと自社予測モデルの関係**: `server/learning/dailyJob.js`が
+  新しい自社予測を立てる際、「なぜその予測なのか」を状態仮説として一緒に記録し、
+  試合結果が出た時点でその仮説が当たっていたかを検証します。当たっていれば
+  Knowledge Engineに「検証済みの分析」として昇格させ、外れていれば知識としては
+  保存せず正直に破棄します(成長ログの`hypothesesConfirmed`/`hypothesesDiscarded`
+  で件数を確認できます)。
+- **既存の`learn:facts:*`保存のリファクタリング**: 従来アドホックに`learn:facts:*`
+  というRedisキーへ直接読み書きしていた「事実」の保存は、今回すべてKnowledge
+  Engine経由に統一しました。これにより重複排除・失効管理が正式に効くようになって
+  います(以前は同じ内容を何日分も無制限に貯め続ける設計でした)。
+
 ## 正直にお伝えしておきたいこと
 
 - このサーバーのコードはAPI-Football公式ドキュメントの仕様通りに実装し、実際にサーバーを
@@ -280,6 +340,6 @@ API-Footballの無料枠を消費されるのを防ぐには、`.env`(本番はR
 | `GET /api/accuracy-stats` | AI予測の本物の実績(記録数・的中数・正答率)。Upstash未設定時は`configured:false`を返す |
 | `GET /api/predictions/auto-collect?key=...` | 誰も見ていなくても予測の記録・確定を進める(定期cron向け)。`AUTO_COLLECT_SECRET`設定時は`key`が一致しないと403 |
 | `POST /api/predict-match` | 【Stage B】注目カード(「⚽ 試合分析AI」の対戦カード一覧)の試合予測ロジックをサーバー側で計算するAPI。リクエストbody(JSON)に`homeLabel`・`awayLabel`・`homePlayers`・`awayPlayers`(各選手は能力値`attrs`・`overall`・`position`・`zones`を含む)を渡すと、予想スコア・AI確信度・支配率・勝因/敗因・試合の流れ・ターニングポイント・MVP・攻め方・想定スタメン・危険エリアをまとめて返す。フロントエンドは1.5秒以内に応答がない場合、または通信エラー時は、これまで通りブラウザ内で同じロジックを計算してシームレスに表示する(利用者からは違いが分からない設計)。将来、この関数の中身だけを機械学習モデルに差し替えれば、UIやAPIの形は一切変えずにAIの予測精度だけを向上できる |
-| `POST /api/discuss` | 【Stage C】「〜だと思う」「なぜ？」等の意見・考察を求める質問に、Planner(必要な情報を判定)→RAG(API-Footballの実データを取得)→LLM推論(取得した事実だけを根拠に考察)の順で処理し、①事実②統計③根拠④考察⑤結論⑥信頼度(理由付き)+フォローアップ質問を返すAPI。リクエストbodyに`question`・`subject`(`{type:"club"または"player", labelJa, labelEn}`)・`playerHint`を渡す。単純な質問(選手データ・順位・試合結果など)はこのAPIを使わず、これまで通りフロントエンドのルールベースで即答するため、呼ばれるのは議論トリガーを検出したときだけ。`ANTHROPIC_API_KEY`未設定時は`ok:false`で正直な理由を返す |
-| `POST /api/learning/run-daily?key=...` | 【Stage D・NEW】毎日学習エンジンを1回実行する(登録クラブのフォーム分析・事実の記録・自社予測モデルの検証と改善)。`AUTO_COLLECT_SECRET`設定時は`key`が一致しないと403。`.github/workflows/daily-learning.yml`から毎日自動で呼び出される想定 |
-| `GET /api/growth-log` | 【Stage D・NEW】直近の学習エンジン実行結果(今日追加した事実・検証した試合数・自社予測モデルの的中率の変化)を返す。ホーム画面の「🧠 昨日学んだこと」ウィジェットが使用。未実行の場合は`ranYet:false`を正直に返す |
+| `POST /api/discuss` | 【Stage C・Stage Eで拡張】「〜だと思う」「なぜ？」等の意見・考察を求める質問に、Planner(必要な情報+比較すべき観点を判定)→RAG(API-Football実データ+Knowledge Engineの蓄積知識を取得)→Reasoning Engine(仮説生成→根拠ランキング→自己チェック。利用者には非表示)→Memory Engine(前回の結論と比較・保存)→LLM推論(取得した事実+内部推論を根拠に考察)の順で処理し、①事実②統計③根拠④考察⑤結論⑥信頼度(理由付き)+フォローアップ質問を返すAPI。クラブに関する質問の場合、`meta.reasoning`に内部で検討した仮説一覧・選ばれた仮説・自己チェック結果・Memory Engineの記録結果が含まれる(デバッグ・検証用。回答文自体には仮説ラベルをそのまま出力しない)。リクエストbodyに`question`・`subject`(`{type:"club"または"player", labelJa, labelEn}`)・`playerHint`を渡す。単純な質問(選手データ・順位・試合結果など)はこのAPIを使わず、これまで通りフロントエンドのルールベースで即答するため、呼ばれるのは議論トリガーを検出したときだけ。`ANTHROPIC_API_KEY`未設定時は`ok:false`で正直な理由を返す |
+| `POST /api/learning/run-daily?key=...` | 【Stage D・Stage Eで拡張】毎日学習エンジンを1回実行する(登録クラブのフォーム分析・Knowledge Engine経由での事実の記録・自社予測モデルの検証と改善・Hypothesis Engineによる状態仮説の検証)。`AUTO_COLLECT_SECRET`設定時は`key`が一致しないと403。`.github/workflows/daily-learning.yml`から毎日自動で呼び出される想定 |
+| `GET /api/growth-log` | 【Stage D・Stage Eで拡張】直近の学習エンジン実行結果(今日Knowledge Engineに新規保存した知識件数・重複でスキップした件数・検証した試合数・自社予測モデルの的中率の変化・AI自身の予測仮説の的中/破棄件数)を返す。ホーム画面の「🧠 昨日学んだこと」ウィジェットが使用。未実行の場合は`ranYet:false`を正直に返す |

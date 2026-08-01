@@ -31,15 +31,31 @@
  *
  * 依存はすべて呼び出し側から注入されます(server.js自身をrequireしない設計。
  * server/rag/knowledgeSource.js の createKnowledgeSource と同じ方針)。
+ *
+ * Stage E以降の変更点(リファクタリング):
+ *   従来この学習エンジンは「事実」を learn:facts:* というアドホックなRedisの
+ *   キーに直接読み書きしていました(重複排除も失効管理も無い簡易な実装)。
+ *   Stage Eで実装した server/knowledge/knowledgeStore.js(Knowledge Engine)が
+ *   同じ役割(事実/分析/意見の分離保存・重複排除・失効管理)をより正式に担うため、
+ *   このファイルの「事実」保存はKnowledge Engine経由に置き換えました
+ *   (学習エンジン自身をrequire("../knowledge/knowledgeStore")し、注入された
+ *   Upstashの基本関数から自分でインスタンスを作る、既存のDI方針を踏襲)。
+ *
+ *   また、⑥として「Hypothesis Engine」を追加しました: 自社予測モデルが新しい
+ *   予測を立てる際、「なぜその予測なのか」という状態仮説(stateHypothesis)を
+ *   一緒に記録し、試合結果が出て予測を検証するタイミングで、その仮説が
+ *   当たっていたかどうかも検証します。当たっていればKnowledge Engineに
+ *   「検証済みの分析(analysis)」として昇格させ、外れていれば正直に破棄します
+ *   (知識として保存しない)。
  */
 const { REGISTERED_TEAMS } = require("./registeredTeams");
+const { createKnowledgeStore } = require("../knowledge/knowledgeStore");
 
 // ---- 調整可能な上限(API-Football無料プランの1日100リクエスト枠を守るため) ----
 const OWN_PREDICT_LOG_CAP = 5; // 1回の実行で新しく記録する自社予測の件数上限
 const OWN_PREDICT_RESOLVE_CAP = 10; // 1回の実行で解決を試みる保留中予測の件数上限
 const MIN_RESOLVED_FOR_RECALIBRATION = 10; // これ未満の検証データしかない場合は再調整しない(過学習防止)
 const FORM_FACT_DELTA_THRESHOLD = 0.3; // このゲーム差分以上変化した場合だけ「事実」として記録する
-const RECENT_FACTS_KEEP = 60;
 const OWN_PRED_RECENT_KEEP = 30;
 
 const DEFAULT_WEIGHTS = { homeBase: 1.35, awayBase: 1.15, sensitivity: 0.18, version: 0, updatedAt: null };
@@ -112,10 +128,14 @@ async function runDailyLearning(deps) {
     return { ok: false, reason: "NO_UPSTASH", message: "Upstash未設定のため学習エンジンは記録できません(.envのUPSTASH_REDIS_REST_URL/TOKENを確認してください)。" };
   }
 
+  const knowledgeStore = createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON });
+
   const errors = [];
   const factsToday = [];
   let matchesResolvedToday = 0;
   let newPredictionsLogged = 0;
+  let hypothesesConfirmed = 0; // Hypothesis Engine: 検証の結果、当たっていた状態仮説の件数
+  let hypothesesDiscarded = 0; // Hypothesis Engine: 検証の結果、外れて破棄した状態仮説の件数
 
   // ---- ① 登録クラブの実結果から「事実」を抽出 ----
   const teamFormCache = new Map(); // nameEn -> { teamId, currentFormScore, sampleSize }
@@ -167,6 +187,25 @@ async function runDailyLearning(deps) {
       await upstashCmd(["RPUSH", "learn:ownpred:recent", JSON.stringify(record)]).catch(() => {});
       await upstashCmd(["LTRIM", "learn:ownpred:recent", String(-OWN_PRED_RECENT_KEEP), "-1"]).catch(() => {});
       matchesResolvedToday++;
+
+      // ---- Hypothesis Engine: 予測を立てた時点の「状態仮説」を実際の結果で検証する ----
+      // ご要望の「AI自身が毎日仮説を立てる→次の試合で検証→当たれば知識として採用、
+      // 外れたら破棄」をこの自社予測モデルの枠組みで実装したもの。
+      if (record.stateHypothesis && record.originTeamEn) {
+        if (record.correct) {
+          try {
+            await knowledgeStore.saveKnowledgeItem({
+              teamEn: record.originTeamEn, category: "predictionHypothesis", type: "analysis",
+              statement: `${record.stateHypothesis} → 実際の試合結果と一致し、この仮説は正しいことが確認されました。`,
+              computedAt: runAt.toISOString(),
+            });
+            hypothesesConfirmed++;
+          } catch (e) { errors.push(`hypothesis_promote_failed:${fixtureIdStr}:${e.message}`); }
+        } else {
+          // 外れた仮説は知識として保存しない(正直に破棄する。でっち上げない)。
+          hypothesesDiscarded++;
+        }
+      }
     } catch (e) {
       errors.push(`resolve_failed:${fixtureIdStr}:${e.message}`);
     }
@@ -207,11 +246,22 @@ async function runDailyLearning(deps) {
       const weights = (await upstashGetJSON("learn:weights")) || DEFAULT_WEIGHTS;
       const { predictedWinner } = predictOutcome(homeFormScore, awayFormScore, weights);
 
+      // Hypothesis Engine: 「なぜこの予測なのか」を、実際に計算したフォームスコアの
+      // 差から言語化しておく(予測ロジックそのものから導けるので、でっち上げではない)。
+      // 試合終了後、この仮説が実際に当たっていたかどうかを検証する(上の②参照)。
+      const favoredSide = predictedWinner === "home" ? (isHome ? team.nameJa : `${team.nameJa}の対戦相手`)
+        : predictedWinner === "away" ? (isHome ? `${team.nameJa}の対戦相手` : team.nameJa)
+        : null;
+      const stateHypothesis = favoredSide
+        ? `${team.nameJa}(直近フォームスコア${(cached && cached.currentFormScore) ?? "不明"})と対戦相手のフォーム差から、${favoredSide}が優位という仮説`
+        : `${team.nameJa}と対戦相手のフォームは拮抗しており、互角(引き分けに近い)という仮説`;
+
       const record = {
         fixtureId, homeTeamEn: isHome ? team.nameEn : opponentName, awayTeamEn: isHome ? opponentName : team.nameEn,
         homeFormScore, awayFormScore, predictedWinner,
         kickoff: fx.fixture.date, loggedAt: runAt.toISOString(),
         resolved: false, actualWinner: null, correct: null, resolvedAt: null,
+        originTeamEn: team.nameEn, stateHypothesis,
       };
       await upstashSetJSON(`learn:ownpred:${fixtureId}`, record);
       await upstashCmd(["RPUSH", "learn:ownpred:pending", String(fixtureId)]).catch(() => {});
@@ -273,12 +323,22 @@ async function runDailyLearning(deps) {
   }
 
   // ---- ⑤ 今日の知識ベース更新と成長ログ ----
-  if (factsToday.length) {
-    await upstashSetJSON(`learn:facts:${dateKey}`, factsToday);
-    for (const f of factsToday) {
-      await upstashCmd(["RPUSH", "learn:facts:recent", JSON.stringify(f)]).catch(() => {});
+  // Stage E以降: 「事実」の保存先はKnowledge Engine(knowledgeStore.js)に一本化。
+  // 重複した内容(前日と全く同じ事実)は正直に「重複」として扱われ、二重に
+  // カウントしない(knowledgeStore.jsのハッシュベース重複排除による)。
+  let knowledgeItemsSavedToday = 0;
+  let knowledgeItemsDuplicateToday = 0;
+  for (const f of factsToday) {
+    try {
+      const saveResult = await knowledgeStore.saveKnowledgeItem({
+        teamEn: f.teamEn, teamJa: f.teamJa, category: "recentFormTrend", type: "fact",
+        statement: f.statement, computedAt: runAt.toISOString(),
+      });
+      if (saveResult.saved) knowledgeItemsSavedToday++;
+      else if (saveResult.reason === "DUPLICATE") knowledgeItemsDuplicateToday++;
+    } catch (e) {
+      errors.push(`knowledge_save_failed:${f.teamEn}:${e.message}`);
     }
-    await upstashCmd(["LTRIM", "learn:facts:recent", String(-RECENT_FACTS_KEEP), "-1"]).catch(() => {});
   }
 
   const growthLog = {
@@ -287,8 +347,10 @@ async function runDailyLearning(deps) {
     teamsAnalyzed: REGISTERED_TEAMS.length,
     factsAddedToday: factsToday.length,
     facts: factsToday,
+    knowledgeItemsSavedToday, knowledgeItemsDuplicateToday,
     matchesResolvedToday,
     newPredictionsLogged,
+    hypothesesConfirmed, hypothesesDiscarded,
     ownAccuracyBefore, ownAccuracyAfter,
     weightsUpdated,
     totalOwnPredictionsResolved: totalResolved,
@@ -313,15 +375,22 @@ async function getGrowthLog(deps) {
 }
 
 // RAG(gatherClubKnowledge)がこのクラブに関する「学習済みの事実」を回答の根拠に
-// 使えるように、直近の蓄積済みfactsから該当クラブの分だけを取り出す。
+// 使えるように、Knowledge Engineに蓄積されている当該クラブの「事実」だけを
+// 取り出す(Stage E以降、learn:facts:* ではなくKnowledge Engine経由に統一)。
+// 後方互換のため戻り値の形は従来通り { date, statement, teamEn, ... } の配列。
 async function getRecentFactsForTeam(deps, teamNameEnglish) {
-  const { upstashEnabled, upstashCmd } = deps;
+  const { upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON } = deps;
   if (!upstashEnabled || !teamNameEnglish) return [];
   try {
-    const raw = (await upstashCmd(["LRANGE", "learn:facts:recent", "0", "-1"])) || [];
-    return raw
-      .map((s) => { try { return JSON.parse(s); } catch (e) { return null; } })
-      .filter((f) => f && f.teamEn === teamNameEnglish);
+    const knowledgeStore = createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON });
+    const active = await knowledgeStore.getActiveKnowledge(teamNameEnglish);
+    return active.facts
+      .filter((f) => f.category === "recentFormTrend")
+      .map((f) => ({
+        date: f.firstSeenAt ? String(f.firstSeenAt).slice(0, 10) : null,
+        category: f.category, type: f.type, teamEn: f.teamEn, teamJa: f.teamJa,
+        statement: f.statement,
+      }));
   } catch (e) {
     return [];
   }

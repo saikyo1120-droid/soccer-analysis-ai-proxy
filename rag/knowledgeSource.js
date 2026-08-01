@@ -84,7 +84,7 @@ function summarizeTransfers(rawList, teamId, maxCount, sinceDate) {
 const MANAGER_QUOTE_UNAVAILABLE_REASON =
   "監督コメント・采配評価は、現時点で接続している実データソース(API-Football)では取得できません。";
 
-function createKnowledgeSource({ callApiFootball, resolveTeamId, guessSeason, getRecentFacts }) {
+function createKnowledgeSource({ callApiFootball, resolveTeamId, guessSeason, getRecentFacts, getActiveKnowledge, setRelation }) {
   /**
    * @param {string} teamNameEnglish - API-Football側の検索に使う英語クラブ名
    * @param {Set<string>|string[]} needs - Plannerが決めた必要な知識の種類
@@ -108,6 +108,12 @@ function createKnowledgeSource({ callApiFootball, resolveTeamId, guessSeason, ge
       // だけなのでコストはかからない。学習エンジン未実行・Upstash未設定の場合は
       // 常に空配列(正直に「まだ学んだことがない」を表す。架空の事実は作らない)。
       learnedFacts: [],
+      // Knowledge Engine(server/knowledge/knowledgeStore.js)に蓄積されている、
+      // このクラブについて現在「有効」な知識(事実/分析/意見)。上のlearnedFactsと
+      // 重なる場合があるが、こちらは失効管理・重複排除を経た正式な知識ベースの
+      // ビューであり、Reasoning Engineの根拠プール(server/reasoning/evidencePool.js)
+      // が優先的に参照する。Knowledge Engine未設定・データ無しの場合は正直に空。
+      knowledgeEngine: { facts: [], analyses: [], opinions: [], totalStored: 0, totalActive: 0 },
       fetchedTypes: [], errors: [],
     };
 
@@ -124,6 +130,16 @@ function createKnowledgeSource({ callApiFootball, resolveTeamId, guessSeason, ge
         result.learnedFacts = (await getRecentFacts(teamNameEnglish)) || [];
         if (result.learnedFacts.length) result.fetchedTypes.push("learnedFacts");
       } catch (e) { result.errors.push("learned_facts_failed"); }
+    }
+
+    if (typeof getActiveKnowledge === "function") {
+      try {
+        const active = await getActiveKnowledge(teamNameEnglish);
+        if (active) {
+          result.knowledgeEngine = active;
+          if (active.totalActive > 0) result.fetchedTypes.push("knowledgeEngine");
+        }
+      } catch (e) { result.errors.push("knowledge_engine_failed"); }
     }
 
     if (wantsRecentForm) {
@@ -148,6 +164,13 @@ function createKnowledgeSource({ callApiFootball, resolveTeamId, guessSeason, ge
         if (mine) {
           if (needSet.has("formation")) { result.formation = mine.formation || null; result.fetchedTypes.push("formation"); }
           if (needSet.has("coach")) { result.coachName = mine.coach ? mine.coach.name : null; result.fetchedTypes.push("coach"); }
+          // Knowledge Graph(最小限の関係インデックス): 「このクラブの現在の監督は誰か」
+          // 「このクラブの直近フォーメーションは何か」という一方向の関係を記録する。
+          // 失敗しても回答生成自体は継続する(あくまで補助的な蓄積)。
+          if (typeof setRelation === "function") {
+            if (result.coachName) setRelation("team", teamNameEnglish, "manager", "person", result.coachName).catch(() => {});
+            if (result.formation) setRelation("team", teamNameEnglish, "formation", "formation", result.formation).catch(() => {});
+          }
         }
       } catch (e) { result.errors.push("lineup_failed"); }
     }

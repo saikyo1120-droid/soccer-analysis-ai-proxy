@@ -34,6 +34,15 @@ const { createKnowledgeSource } = require("./rag/knowledgeSource");
 const { planInformationNeeds } = require("./discuss/planner");
 const { generateLLM, currentProviderName } = require("./llm");
 
+// Stage E: Knowledge Engine / Memory Engine / Reasoning Engine(Hypothesis
+// Generator + Evidence Ranking)。実体は server/knowledge/・server/memory/・
+// server/reasoning/ にある(利用箇所は下の方の「Stage E」セクションを参照)。
+const { createKnowledgeStore } = require("./knowledge/knowledgeStore");
+const { createRelationshipIndex } = require("./knowledge/relationshipIndex");
+const { createMemoryStore } = require("./memory/memoryStore");
+const { buildEvidencePool } = require("./reasoning/evidencePool");
+const { assembleReasoning, formatReasoningForPrompt } = require("./reasoning/reasoningEngine");
+
 // 毎日学習エンジン(Learning Engine)。実体は server/learning/dailyJob.js。
 // 依存(callApiFootball/resolveTeamId/Upstashアクセス関数)は、このファイル自身が
 // 定義した後にまとめて注入する(利用箇所は下の方の「Stage D」セクションを参照)。
@@ -1070,9 +1079,25 @@ const learningDeps = {
   upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
 };
 
+// ---- Stage E: Knowledge Engine / Memory Engine / Knowledge Graph への依存注入 ----
+// これらもUpstash Redisだけを永続化先とするため、既存のupstashCmd/GetJSON/SetJSON
+// をそのまま注入する(新しいデータベースを別途用意する必要はない)。Upstash未設定の
+// 環境では、すべて「正直に何もしない」フォールバックとして動作する(既存パターンを踏襲)。
+const knowledgeStore = createKnowledgeStore({
+  upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
+});
+const relationshipIndex = createRelationshipIndex({
+  upstashEnabled: UPSTASH_ENABLED, upstashGetJSON, upstashSetJSON,
+});
+const memoryStore = createMemoryStore({
+  upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
+});
+
 const knowledgeSource = createKnowledgeSource({
   callApiFootball, resolveTeamId, guessSeason,
   getRecentFacts: (teamNameEnglish) => getRecentFactsForTeam(learningDeps, teamNameEnglish),
+  getActiveKnowledge: (teamNameEnglish) => knowledgeStore.getActiveKnowledge(teamNameEnglish),
+  setRelation: (...args) => relationshipIndex.setRelation(...args),
 });
 
 // LLM呼び出しは実費が発生するため、暴走・悪用でコストが青天井にならないよう
@@ -1232,7 +1257,15 @@ async function handleDiscuss(body) {
   let facts = [];
   let stats = {};
   let confidence;
-  const knowledgeMeta = { needs: plan.needs, plannerReasoning: plan.reasoning };
+  const knowledgeMeta = { needs: plan.needs, plannerReasoning: plan.reasoning, comparisonAxes: plan.comparisonAxes || [] };
+
+  // Stage E: Reasoning Engine(Hypothesis Generator + Evidence Ranking)と
+  // Memory Engine(前回の結論)。クラブに関する質問で、実データが取得できた
+  // 場合にのみ組み立てる(選手・一般質問は構造化された根拠プールを持たないため
+  // 対象外。将来的に拡張する余地があることをREADMEで開示する)。
+  let reasoningBundle = null;
+  let memorySubjectKey = null;
+  let previousConclusion = null;
 
   if (subject.type === "club") {
     if (!subject.labelEn) {
@@ -1244,6 +1277,20 @@ async function handleDiscuss(body) {
       stats = formatClubStats(knowledge, plan.needs);
       confidence = computeClubConfidence(knowledge, plan.needs);
       knowledgeMeta.dataErrors = knowledge.errors;
+
+      const evidencePool = buildEvidencePool(knowledge, subject.labelEn);
+      reasoningBundle = assembleReasoning(evidencePool, { teamJa: subject.labelJa, teamEn: subject.labelEn });
+      knowledgeMeta.reasoning = {
+        hypothesesConsidered: reasoningBundle.hypotheses.map((h) => ({ label: h.label, score: h.score, evidenceCount: h.evidence.length })),
+        selectedLabel: reasoningBundle.selected ? reasoningBundle.selected.label : null,
+        selfCheck: reasoningBundle.selfCheck,
+      };
+
+      memorySubjectKey = `team:${subject.labelEn}:leadingFactor`;
+      try {
+        previousConclusion = await memoryStore.getLastConclusion(memorySubjectKey);
+      } catch (e) { /* Memory Engine未設定・エラー時は「前回の結論なし」として続行する */ }
+      if (previousConclusion) knowledgeMeta.reasoning.previousConclusion = previousConclusion.statement;
     }
   } else if (subject.type === "player") {
     const hint = (body.playerHint && typeof body.playerHint === "object") ? body.playerHint : {};
@@ -1271,11 +1318,13 @@ async function handleDiscuss(body) {
     };
   }
 
+  const reasoningPromptBlock = reasoningBundle ? formatReasoningForPrompt(reasoningBundle, previousConclusion) : "";
   const userPrompt = [
     `利用者の質問: 「${question}」`,
     "",
     "取得できた事実:",
     facts.length ? facts.map((f) => `- ${f}`).join("\n") : "(取得できた事実はありません)",
+    ...(reasoningPromptBlock ? ["", reasoningPromptBlock] : []),
   ].join("\n");
 
   let llmOut;
@@ -1293,6 +1342,36 @@ async function handleDiscuss(body) {
           : "AIの考察生成に失敗しました。しばらくしてから再度お試しください。",
       },
     };
+  }
+
+  // ---- Stage E: Memory Engineへの結論の保存 + Knowledge Engineへの分析の昇格 ----
+  // 「AIは昨日こう考えていたが、今日はこう考える」を成立させるための書き込み。
+  // Redisへの書き込みのみでLLM呼び出しを追加しないため、失敗しても回答は返す
+  // (ベストエフォート。既存のUpstash利用パターンと同じ方針)。
+  if (reasoningBundle && reasoningBundle.selected && memorySubjectKey) {
+    try {
+      const nowIso = new Date().toISOString();
+      const selected = reasoningBundle.selected;
+      const changeReason = selected.evidence.length
+        ? `新しい根拠(${selected.evidence.slice(0, 3).map((e) => e.statement).join(" / ")})に基づき判断が更新されました。`
+        : "根拠が変化したため判断が更新されました。";
+      const memoryResult = await memoryStore.saveConclusion(
+        memorySubjectKey,
+        { statement: selected.statement, confidence: selected.score, reasoning: reasoningBundle.selfCheck.verdict, computedAt: nowIso },
+        changeReason
+      );
+      knowledgeMeta.reasoning.memory = { saved: memoryResult.saved, changed: memoryResult.changed, revision: memoryResult.revision };
+
+      // 根拠が実際にあった仮説だけを「AI自身の分析」としてKnowledge Engineに
+      // 昇格させる(根拠0件の仮説を知識として保存すると、でっち上げた知識に
+      // なってしまうため保存しない)。
+      if (selected.score > 0) {
+        await knowledgeStore.saveKnowledgeItem({
+          teamEn: subject.labelEn, category: selected.id, type: "analysis",
+          statement: selected.statement, computedAt: nowIso,
+        });
+      }
+    } catch (e) { /* ベストエフォート: Memory/Knowledge Engineへの保存失敗は回答自体に影響させない */ }
   }
 
   return {
@@ -1528,4 +1607,7 @@ module.exports = {
   runDailyLearning,
   getGrowthLog,
   learningDeps,
+  knowledgeStore,
+  memoryStore,
+  relationshipIndex,
 };

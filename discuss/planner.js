@@ -26,10 +26,22 @@ const CLUB_NEED_TRIGGERS = [
 // (「弱い/強い/どう思う」のような一般的な意見・考察の質問に対応するため)。
 const CLUB_BASE_NEEDS = ["recentForm", "coach", "injuries"];
 
+// Planner改良(「何を取得すべきか」だけでなく「何を比較すべきか」まで決める):
+// 各needに対して、Hypothesis Generator/Reasoning Engineが実際に比較検討すべき
+// 観点を人間が読める形で言語化しておく。これにより、Plannerの判断内容が
+// meta.plannerReasoningやReasoning Engineへの入力として一貫して使える。
+const COMPARISON_AXES_BY_NEED = {
+  recentForm: "直近5試合 vs その前5試合の得失点差(フォームの変化)",
+  injuries: "負傷・出場停止による主力選手の有無",
+  transfers: "直近180日以内の移籍による戦力の増減",
+  formation: "直近試合のフォーメーション・システムの変化",
+  coach: "監督(采配傾向)の変化",
+};
+
 /**
  * @param {string} question - 利用者の質問文
  * @param {{type: ("club"|"player"|null), labelJa?: string, labelEn?: string}} subject
- * @returns {{needs: string[], reasoning: string}}
+ * @returns {{needs: string[], reasoning: string, comparisonAxes: string[]}}
  */
 function planInformationNeeds(question, subject) {
   const q = String(question || "");
@@ -39,6 +51,7 @@ function planInformationNeeds(question, subject) {
     return {
       needs: ["playerSeasonStats"],
       reasoning: "選手についての質問のため、今シーズンの実成績データ(出場数・得点・アシスト・平均レーティング)を取得します。",
+      comparisonAxes: ["今シーズンの実成績(出場・得点・アシスト・平均レーティング)"],
     };
   }
 
@@ -50,7 +63,10 @@ function planInformationNeeds(question, subject) {
     if (matched.length) {
       reasonParts.push(`質問文から特に関連が強いと判断した項目: ${matched.join("・")}`);
     }
-    return { needs, reasoning: reasonParts.join(" ") };
+    // 「何を比較すべきか」: needsに対応する比較観点を、質問文と特に関連が強いと
+    // 判断したもの(matched)を優先しつつ、基本セット分も含めて並べる。
+    const comparisonAxes = needs.map((n) => COMPARISON_AXES_BY_NEED[n]).filter(Boolean);
+    return { needs, reasoning: reasonParts.join(" "), comparisonAxes };
   }
 
   // クラブでも選手でもない質問(例: 「なぜ4-3-3が主流なの？」のような一般的な
@@ -59,7 +75,8 @@ function planInformationNeeds(question, subject) {
   return {
     needs: [],
     reasoning: "特定のクラブ・選手に紐づく質問ではないため、実データの取得は行わず、一般的なサッカーの知識に基づいて考察します。",
+    comparisonAxes: [],
   };
 }
 
-module.exports = { planInformationNeeds, CLUB_NEED_TRIGGERS, CLUB_BASE_NEEDS };
+module.exports = { planInformationNeeds, CLUB_NEED_TRIGGERS, CLUB_BASE_NEEDS, COMPARISON_AXES_BY_NEED };
