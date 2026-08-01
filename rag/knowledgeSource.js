@@ -84,7 +84,7 @@ function summarizeTransfers(rawList, teamId, maxCount, sinceDate) {
 const MANAGER_QUOTE_UNAVAILABLE_REASON =
   "監督コメント・采配評価は、現時点で接続している実データソース(API-Football)では取得できません。";
 
-function createKnowledgeSource({ callApiFootball, resolveTeamId, guessSeason }) {
+function createKnowledgeSource({ callApiFootball, resolveTeamId, guessSeason, getRecentFacts }) {
   /**
    * @param {string} teamNameEnglish - API-Football側の検索に使う英語クラブ名
    * @param {Set<string>|string[]} needs - Plannerが決めた必要な知識の種類
@@ -103,6 +103,11 @@ function createKnowledgeSource({ callApiFootball, resolveTeamId, guessSeason }) 
       formation: null, coachName: null,
       injuries: [], transfers: [],
       managerQuote: null, managerQuoteUnavailableReason: MANAGER_QUOTE_UNAVAILABLE_REASON,
+      // 毎日学習エンジン(server/learning/dailyJob.js)が過去に蓄積した「事実」
+      // (例: 直近フォームの変化)。API-Football呼び出しではなくRedisからの読み取り
+      // だけなのでコストはかからない。学習エンジン未実行・Upstash未設定の場合は
+      // 常に空配列(正直に「まだ学んだことがない」を表す。架空の事実は作らない)。
+      learnedFacts: [],
       fetchedTypes: [], errors: [],
     };
 
@@ -113,6 +118,13 @@ function createKnowledgeSource({ callApiFootball, resolveTeamId, guessSeason }) 
       return result;
     }
     const season = guessSeason();
+
+    if (typeof getRecentFacts === "function") {
+      try {
+        result.learnedFacts = (await getRecentFacts(teamNameEnglish)) || [];
+        if (result.learnedFacts.length) result.fetchedTypes.push("learnedFacts");
+      } catch (e) { result.errors.push("learned_facts_failed"); }
+    }
 
     if (wantsRecentForm) {
       try {

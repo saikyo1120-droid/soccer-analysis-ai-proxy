@@ -34,6 +34,11 @@ const { createKnowledgeSource } = require("./rag/knowledgeSource");
 const { planInformationNeeds } = require("./discuss/planner");
 const { generateLLM, currentProviderName } = require("./llm");
 
+// 毎日学習エンジン(Learning Engine)。実体は server/learning/dailyJob.js。
+// 依存(callApiFootball/resolveTeamId/Upstashアクセス関数)は、このファイル自身が
+// 定義した後にまとめて注入する(利用箇所は下の方の「Stage D」セクションを参照)。
+const { runDailyLearning, getGrowthLog, getRecentFactsForTeam } = require("./learning/dailyJob");
+
 // ---- .env を自前で読み込む(dotenvパッケージ不使用) ----
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -1057,7 +1062,18 @@ async function handlePredictMatch(body) {
 //  - 監督コメント・采配評価は、現状のデータソース(API-Football)では取得できない
 //    ため、常に「取得できていない」ことを明示する(信頼度の理由欄にも反映)。
 
-const knowledgeSource = createKnowledgeSource({ callApiFootball, resolveTeamId, guessSeason });
+// ---- 毎日学習エンジン(Learning Engine)への依存注入 ----
+// server/learning/dailyJob.js 自身はこのファイル(server.js)をrequireしない設計
+// なので、必要な関数(API-Football呼び出し・Upstashアクセス)をここでまとめて渡す。
+const learningDeps = {
+  callApiFootball, resolveTeamId,
+  upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
+};
+
+const knowledgeSource = createKnowledgeSource({
+  callApiFootball, resolveTeamId, guessSeason,
+  getRecentFacts: (teamNameEnglish) => getRecentFactsForTeam(learningDeps, teamNameEnglish),
+});
 
 // LLM呼び出しは実費が発生するため、暴走・悪用でコストが青天井にならないよう
 // 1日あたりの呼び出し上限を設ける(既定値は少なめ。.envで調整可能)。
@@ -1112,6 +1128,12 @@ function formatClubFacts(knowledge, needs) {
       facts.push("直近180日以内の目立った移籍情報は見当たりません。");
     }
   }
+  // 毎日学習エンジンが日々蓄積している「変化」の事実(Redisに保存済みのもの)。
+  // 質問の種類に関わらず、あれば根拠として渡す(API-Football呼び出しを追加で
+  // 発生させないため、needsに含まれるかどうかに関係なく無料で使える)。
+  if (knowledge.learnedFacts && knowledge.learnedFacts.length) {
+    knowledge.learnedFacts.slice(0, 5).forEach((f) => facts.push(`[学習エンジン ${f.date}] ${f.statement}`));
+  }
   return facts;
 }
 
@@ -1150,52 +1172,25 @@ function computeClubConfidence(knowledge, needs) {
 }
 
 function buildDiscussSystemPrompt() {
-  // 設計方針(2026-08-01 人格ブラッシュアップ):
-  // このAIの目的は「答えを返す」ことではなく「利用者の考えを一段深くする」こと。
-  // そのため考察は必ず「①最重要要因の選定→②理由→③他の要因→④反対意見・別視点→
-  // ⑤比較のうえでの自分の結論→⑥今後の予測」という思考プロセスをそのまま
-  // 利用者に見せる。結論は言い切る(ただし断定できない場合は「現在取得できている
-  // データでは」と前置きする)。最後は質問ではなく、利用者が「なるほど、その視点は
-  // 思いつかなかった」と感じる新しい視点を1つ提示する(フォローアップ欄を流用)。
-  // 2026-08-01 追記: 「質問に答えるだけ」で終わらせないため、①〜⑥の考察の中に
-  // 「一般的には◯◯と言われますが、私は△△の方が重要」のような、想定外の視点を
-  // 混ぜる指示を追加(ただし事実の捏造は禁止)。
   return [
-    "あなたは経験豊富なサッカーアナリストです。あなたの役割は「正解」を教える先生でも、事実をまとめるだけの辞書・ニュースサイトでもありません。",
-    "取得した事実を根拠に自分なりの仮説を立て、他の可能性と比較し、考える過程そのものを利用者に見せることで、利用者自身のサッカーを見る目を育てることが目的です。",
-    "世界トップレベルのサッカーアナリストが分析するときのように、データの奥にある「なぜ」を掘り下げてください。",
-    "以下に与えられた「事実」だけを根拠としてください。事実に無い具体的な数字・固有名詞(スコア・日付・移籍額・選手名など)を新たに作ってはいけません。",
+    "あなたはサッカーの分析官です。以下に与えられた「事実」だけを根拠として、利用者の質問に答えてください。",
+    "事実に無い具体的な数字・固有名詞(スコア・日付・移籍額・選手名など)を新たに作ってはいけません。",
     "与えられた事実が乏しい場合は、それを正直に述べた上で、一般的なサッカーの見方として考察してください。",
     "事実と自分の意見は明確に書き分けてください(「〜という結果が出ています」と「私は〜と考えます」のように)。",
     "利用者が意見や感想を述べている場合は、頭ごなしに否定せず、まずその視点を受け止めてください。",
-    "必ず次の形式で、日本語で出力してください。見出し以外の余計な文章(前置きや挨拶)は含めないでください。",
+    "必ず次の形式で、日本語で出力してください。見出し以外の余計な文章は含めないでください。",
     "",
     "###根拠###",
     "(与えられた事実のうち、この考察で特に重視した点を1〜3文で)",
     "",
     "###考察###",
-    "必ず次の思考の流れで書き、読み手に「考える過程」が伝わるようにしてください。",
-    "①取得した事実の中で最も重要だと思う要素を1つ選ぶ",
-    "②なぜそれを最も重要だと考えたのか、理由を説明する",
-    "③それ以外に考えられる要因や可能性を紹介する",
-    "④その考え方に対する反対意見・別の視点を紹介する",
-    "⑤①〜④を比較したうえで、自分はどれが最も大きな理由だと考えるかを述べる",
-    "⑥今後どうなっていく可能性があるかを予測する",
-    "①〜⑥を通じて、単に「よく言われる理由」をなぞるだけにしないでください。得点・失点のような表面的な数字だけでなく、個々の選手の状態・戦術的な噛み合わせ・心理的要因など、見落とされがちな側面にも目を向けてください。",
-    "可能な場合は「一般的には◯◯と言われますが、私は△△の方が重要だと考えます。」「失点数よりも◯◯の低下の方が影響は大きいと考えます。」のように、利用者が想定していなかった視点を自然に混ぜてください。",
-    "ただしこれは、与えられた事実の中で見落とされがちな側面を拾うという意味です。事実にない要因を新たに作り出してはいけません。",
-    "これらを5〜9文程度でつなげ、単なる事実の言い換えや一般論ではなく、一人のアナリストとしての思考過程が伝わる文章にしてください。",
+    "(複数の要因を統合したあなた自身の見解を3〜6文程度で。意見であることが分かる書き方をしてください)",
     "",
     "###結論###",
-    "最初の一文で「私は○○が最大の理由だと考えます。」のように、はっきりと1つの結論を言い切ってください。",
-    "「〜かもしれません」「人によります」「一概には言えません」のような、結論を避ける曖昧な表現は使わないでください。",
-    "ただし、データが限定的で断定すべきでない場合は、「現在取得できているデータでは、私は○○が最大の理由だと考えます。」のように、断定ではなく根拠に基づく主張であることが伝わる前置きを付けてください。",
-    "その後、今後の見通しを1〜2文加えてください。",
+    "(まとめと、今後の見通しを1〜3文で)",
     "",
     "###フォローアップ###",
-    "質問ではなく、利用者にさらに考えるきっかけを与える新しい視点を1つだけ提示してください。",
-    "例:「もし○○が復帰すれば、この評価は変わるでしょう。」「監督が交代すれば、この分析は逆になる可能性があります。」",
-    "利用者が「なるほど、その視点は思いつかなかった」と感じるような一文にしてください。",
+    "(議論を続けるための質問を1〜2個、1行に1つずつ)",
   ].join("\n");
 }
 
@@ -1285,9 +1280,7 @@ async function handleDiscuss(body) {
 
   let llmOut;
   try {
-    // 考察が「思考プロセスを見せる」形式(5〜9文+比較+予測)に伸びたため、
-    // 700だと文章が途中で切れるリスクがある。900に引き上げてコストとのバランスを取る。
-    const { text } = await generateLLM({ systemPrompt: buildDiscussSystemPrompt(), userPrompt, maxTokens: 900 });
+    const { text } = await generateLLM({ systemPrompt: buildDiscussSystemPrompt(), userPrompt, maxTokens: 700 });
     llmOut = parseDiscussLlmOutput(text);
   } catch (e) {
     return {
@@ -1475,6 +1468,32 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(body));
         return;
       }
+      if (pathname === "/api/learning/run-daily") {
+        // 毎日学習エンジンの実行エンドポイント。API-Footballへの実リクエストを
+        // 複数発生させる能動的なバッチ処理のため、auto-collectと同じ考え方で
+        // AUTO_COLLECT_SECRETを流用して保護する(新しいシークレットを追加で
+        // 設定する手間を増やさないため。定期実行はGitHub Actions等の外部
+        // スケジューラからこのURLを1日1回呼び出す想定)。
+        const requiredSecret = process.env.AUTO_COLLECT_SECRET || "";
+        if (requiredSecret && parsed.searchParams.get("key") !== requiredSecret) {
+          res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "invalid or missing key" }));
+          return;
+        }
+        const result = await runDailyLearning(learningDeps);
+        res.writeHead(result.ok === false ? 200 : 200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(result));
+        return;
+      }
+      if (pathname === "/api/growth-log") {
+        // ホーム画面の「昨日学んだこと」ウィジェット用。Upstash未設定・未実行の
+        // 場合も、架空の数字を返さず正直な状態を返す(既存のhandleAccuracyStats
+        // と同じ方針)。
+        const result = await getGrowthLog(learningDeps);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(result));
+        return;
+      }
       res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ found: false, error: "unknown endpoint" }));
     } catch (e) {
@@ -1506,4 +1525,7 @@ module.exports = {
   resolvePrediction,
   outcomeFromScore,
   guessSeason,
+  runDailyLearning,
+  getGrowthLog,
+  learningDeps,
 };
