@@ -46,11 +46,24 @@ const { assembleReasoning, formatReasoningForPrompt } = require("./reasoning/rea
 // 毎日学習エンジン(Learning Engine)。実体は server/learning/dailyJob.js。
 // 依存(callApiFootball/resolveTeamId/Upstashアクセス関数)は、このファイル自身が
 // 定義した後にまとめて注入する(利用箇所は下の方の「Stage D」セクションを参照)。
-const { runDailyLearning, getGrowthLog, getRecentFactsForTeam } = require("./learning/dailyJob");
+const { runDailyLearning, getGrowthLog, getRecentFactsForTeam, computeFormScore } = require("./learning/dailyJob");
 // /debug診断ページが「毎日学習エンジンが対象にしている全クラブ」を横断して
 // Knowledge Engine / Memory Engineの件数を集計するために使う一覧(新機能ではなく
 // 既存のクラブ一覧を読み取り専用で再利用するだけ)。
 const { REGISTERED_TEAMS } = require("./learning/registeredTeams");
+
+// Prediction Engine v2(拡張特徴量)。/api/match-analysis(AIマッチ分析カード)が
+// 「毎日学習エンジンが自動で立てる予測」とは別に、利用者が指定した任意の2クラブに
+// ついて、その場で(オンデマンドで)同じロジックを使って分析するために使う。
+const {
+  computeGoalRateFeatures, computeFatigueFeature,
+  fetchInjuryCountFeature, fetchStandingsFeature, fetchHeadToHeadFeature,
+  inferLeagueIdFromFixtures,
+} = require("./learning/features");
+const {
+  EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, predictOutcomeV2,
+  computeMatchProbabilities, mostLikelyScoreline, computeFactorImportance,
+} = require("./learning/predictionModel");
 
 // ---- .env を自前で読み込む(dotenvパッケージ不使用) ----
 function loadEnvFile(filePath) {
@@ -1094,6 +1107,10 @@ async function handlePredictMatch(body) {
 const learningDeps = {
   callApiFootball, resolveTeamId,
   upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
+  // Knowledge Engine Layer2(固定知識の自動生成)・Layer3(AIの毎日の見解)は
+  // LLMを使う。未設定(APIキー無し)の環境でも安全に動く(dailyJob.js側で
+  // generateLLMが無い場合は正直にスキップし、llmSkippedReasonsに記録する)。
+  generateLLM,
 };
 
 // ---- Stage E: Knowledge Engine / Memory Engine / Knowledge Graph への依存注入 ----
@@ -1116,6 +1133,210 @@ const knowledgeSource = createKnowledgeSource({
   getActiveKnowledge: (teamNameEnglish) => knowledgeStore.getActiveKnowledge(teamNameEnglish),
   setRelation: (...args) => relationshipIndex.setRelation(...args),
 });
+
+// ============================================================
+// 「AIマッチ分析」カード ― /api/match-analysis
+// ============================================================
+// ご要望(第一段階の最後の項目): 「試合予想では単なる勝敗ではなく、AIが試合を
+// 読むようにしてください」への回答。毎日学習エンジン(dailyJob.js)が登録クラブの
+// “次の試合”について自動で行っている予測ロジック(Prediction Engine v2 =
+// server/learning/predictionModel.js + server/learning/features.js)を、この
+// エンドポイントでは「利用者が指定した任意の2クラブ」に対して、その場
+// (オンデマンド)で同じロジックを使って実行する。
+//
+// 正直な設計上の注意点:
+//   ①この分析は毎日学習エンジンの自動予測ループ(learn:ownpred:*)とは独立している。
+//     つまりこのエンドポイントを呼んでも学習データとしては記録されない(実際の
+//     試合結果と突き合わせて「当たったか」を検証できるのは、あくまで毎日学習
+//     エンジンが自動登録した“実際の次の試合”に対する予測だけ)。任意の2クラブの
+//     組み合わせ(まだ対戦カードが組まれていない場合など)は「検証しようがない」
+//     ため、この区別は意図的なもの。
+//   ②怪我人・順位・過去対戦などはAPI-Footballの実データ、確率(勝率)はポワソン
+//     分布に基づく計算、重要度(★)は学習済みの重み(learn:weights、無ければ既定値)
+//     に基づく――すべて実データ・実計算であり、LLMは「試合展開の文章化」だけを
+//     担当する(数字自体はLLMに作らせない。既存の議論モードと同じ設計方針)。
+async function resolveMatchTeamLabel(nameRaw) {
+  const raw = String(nameRaw || "").trim();
+  const hit = REGISTERED_TEAMS.find(
+    (t) => t.nameJa === raw || t.nameEn.toLowerCase() === raw.toLowerCase()
+  );
+  return hit ? { nameEn: hit.nameEn, nameJa: hit.nameJa } : { nameEn: raw, nameJa: raw };
+}
+
+async function gatherTeamMatchContext(teamId, nowMs) {
+  const data = await callApiFootball("/fixtures", { team: teamId, last: 10 });
+  const fixtures = (data && data.response) || [];
+  const form = computeFormScore(fixtures, teamId);
+  const goalRates = computeGoalRateFeatures(fixtures, teamId);
+  const fatigue = computeFatigueFeature(fixtures, nowMs);
+  return { teamId, fixtures, ...form, ...goalRates, ...fatigue };
+}
+
+function starsDisplay(stars) {
+  const s = Math.max(0, Math.min(5, stars || 0));
+  return "★".repeat(s) + "☆".repeat(5 - s);
+}
+
+async function handleMatchAnalysis(query, clientIp) {
+  const homeRaw = (query.get("home") || "").trim();
+  const awayRaw = (query.get("away") || "").trim();
+  if (!homeRaw || !awayRaw) return { status: 400, body: { ok: false, error: "home and away (club name) are required" } };
+  if (homeRaw.toLowerCase() === awayRaw.toLowerCase()) return { status: 400, body: { ok: false, error: "home and away must be different clubs" } };
+
+  const [home, away] = await Promise.all([resolveMatchTeamLabel(homeRaw), resolveMatchTeamLabel(awayRaw)]);
+
+  let homeTeamId, awayTeamId;
+  try {
+    [homeTeamId, awayTeamId] = await Promise.all([resolveTeamId(home.nameEn), resolveTeamId(away.nameEn)]);
+  } catch (e) {
+    return { status: 200, body: { ok: false, reason: "team_lookup_failed", message: e.message } };
+  }
+  if (!homeTeamId || !awayTeamId) {
+    return {
+      status: 200,
+      body: {
+        ok: false, reason: "team_not_found",
+        message: `クラブが特定できませんでした(${!homeTeamId ? home.nameJa : away.nameJa})。クラブ名の表記をご確認ください。`,
+      },
+    };
+  }
+
+  const nowMs = Date.now();
+  let homeForm, awayForm;
+  try {
+    [homeForm, awayForm] = await Promise.all([
+      gatherTeamMatchContext(homeTeamId, nowMs),
+      gatherTeamMatchContext(awayTeamId, nowMs),
+    ]);
+  } catch (e) {
+    return { status: 200, body: { ok: false, reason: "fixtures_fetch_failed", message: e.message } };
+  }
+
+  const season = guessSeason();
+  const leagueId = inferLeagueIdFromFixtures(homeForm.fixtures) || inferLeagueIdFromFixtures(awayForm.fixtures);
+  const [homeInjuries, awayInjuries, homeStandings, awayStandings, h2h] = await Promise.all([
+    fetchInjuryCountFeature(homeTeamId, season, callApiFootball),
+    fetchInjuryCountFeature(awayTeamId, season, callApiFootball),
+    fetchStandingsFeature(leagueId, season, homeTeamId, callApiFootball),
+    fetchStandingsFeature(leagueId, season, awayTeamId, callApiFootball),
+    fetchHeadToHeadFeature(homeTeamId, awayTeamId, callApiFootball),
+  ]);
+
+  const dataNotes = [];
+  if (!leagueId) dataNotes.push("リーグIDを特定できなかったため、順位データは考慮されていません。");
+  if (homeInjuries.error) dataNotes.push(`${home.nameJa}の負傷者情報の取得に失敗しました。`);
+  if (awayInjuries.error) dataNotes.push(`${away.nameJa}の負傷者情報の取得に失敗しました。`);
+  if (h2h.sampleSize === 0) dataNotes.push("過去の直接対戦データが見つかりませんでした。");
+
+  const homeCtx = {
+    formScore: homeForm.currentFormScore, avgGoalsFor: homeForm.avgGoalsFor, avgGoalsAgainst: homeForm.avgGoalsAgainst,
+    injuryCount: homeInjuries.injuryCount, pointsPerGame: homeStandings.played ? (homeStandings.points / homeStandings.played) : null,
+    matchesLast7Days: homeForm.matchesLast7Days,
+  };
+  const awayCtx = {
+    formScore: awayForm.currentFormScore, avgGoalsFor: awayForm.avgGoalsFor, avgGoalsAgainst: awayForm.avgGoalsAgainst,
+    injuryCount: awayInjuries.injuryCount, pointsPerGame: awayStandings.played ? (awayStandings.points / awayStandings.played) : null,
+    matchesLast7Days: awayForm.matchesLast7Days,
+  };
+  const features = computeMatchFeatures(homeCtx, awayCtx, h2h);
+
+  let weights = EXTENDED_DEFAULT_WEIGHTS;
+  if (UPSTASH_ENABLED) {
+    try {
+      const stored = await upstashGetJSON("learn:weights");
+      if (stored) weights = { ...EXTENDED_DEFAULT_WEIGHTS, ...stored };
+    } catch (e) { /* ベストエフォート: 取得失敗時は既定重みを使う */ }
+  }
+
+  const { homeLambda, awayLambda, predictedWinner } = predictOutcomeV2(features, weights);
+  const winProbability = computeMatchProbabilities(homeLambda, awayLambda);
+  const predictedScoreline = mostLikelyScoreline(homeLambda, awayLambda);
+  const importanceRaw = computeFactorImportance(features, weights);
+  const totalContribution = importanceRaw.reduce((s, i) => s + i.contribution, 0) || 1;
+  const keyFactors = importanceRaw.map((i) => ({
+    key: i.key, labelJa: i.labelJa, stars: i.stars, starsDisplay: starsDisplay(i.stars),
+    weightPct: Math.round((i.contribution / totalContribution) * 1000) / 10,
+  }));
+  const topFactor = keyFactors.find((f) => f.stars > 0) || null;
+
+  const winnerLabelJa = predictedWinner === "home" ? home.nameJa : predictedWinner === "away" ? away.nameJa : null;
+  const confidenceStars = Math.max(1, Math.min(5, Math.round(Math.max(winProbability.homeWinPct, winProbability.drawPct, winProbability.awayWinPct) / 20)));
+
+  // ---- 決定論的な(LLMを使わない)フォールバック用の試合展開予想・逆シナリオ ----
+  // 実データ(疲労・怪我人・順位・過去対戦)から機械的に文章を組み立てる。
+  // LLM未設定/予算超過の場合でも「試合を読む」機能自体は動く(正直な設計)。
+  function buildDeterministicNarrative() {
+    const parts = [];
+    if (topFactor) parts.push(`AIが最も重視したのは「${topFactor.labelJa}」です(寄与度${topFactor.weightPct}%)。`);
+    if (homeForm.matchesLast7Days >= 3) parts.push(`${home.nameJa}は直近7日間で${homeForm.matchesLast7Days}試合とやや過密日程です。`);
+    if (awayForm.matchesLast7Days >= 3) parts.push(`${away.nameJa}は直近7日間で${awayForm.matchesLast7Days}試合とやや過密日程です。`);
+    if (homeInjuries.injuryCount) parts.push(`${home.nameJa}には現在${homeInjuries.injuryCount}名の負傷・出場停止者がいます。`);
+    if (awayInjuries.injuryCount) parts.push(`${away.nameJa}には現在${awayInjuries.injuryCount}名の負傷・出場停止者がいます。`);
+    parts.push(winnerLabelJa ? `総合的に見て${winnerLabelJa}がやや優位という予想です。` : "両者の実力は拮抗しており、僅差の展開が予想されます。");
+    return parts.join(" ");
+  }
+  function buildDeterministicReverseScenario() {
+    const underdog = predictedWinner === "home" ? away.nameJa : predictedWinner === "home" ? null : predictedWinner === "away" ? home.nameJa : null;
+    if (!underdog) return "両者拮抗のため、わずかなミス・セットプレー・退場者の有無などで試合展開が大きく変わり得ます。";
+    return `もし${underdog}が試合序盤を無失点で乗り切れれば、${h2h.sampleSize ? "過去の対戦成績も踏まえ、" : ""}終盤にかけて流れが変わる可能性があります。`;
+  }
+
+  let narrative = { text: buildDeterministicNarrative(), source: "deterministic" };
+  let reverseScenario = { text: buildDeterministicReverseScenario(), source: "deterministic" };
+
+  if (typeof generateLLM === "function" && tryConsumeLlmBudgetForIp(clientIp) && tryConsumeLlmBudget()) {
+    try {
+      const systemPrompt = [
+        "あなたはサッカーの試合展開を予想するアナリストAIです。",
+        "与えられた実データ・計算済みの数値だけを根拠にしてください。数字を新しく作らないでください。",
+        "出力は次のJSON形式のみ: {\"narrative\": \"...\", \"reverseScenario\": \"...\"}",
+        "narrativeは試合展開の予想を100〜160文字程度の日本語で。reverseScenarioは予想が外れる場合の代替シナリオを80〜140文字程度の日本語で。",
+      ].join("\n");
+      const userPrompt = [
+        `${home.nameJa}(ホーム) vs ${away.nameJa}(アウェイ)`,
+        `AI勝率: ${home.nameJa}${winProbability.homeWinPct}% / 引き分け${winProbability.drawPct}% / ${away.nameJa}${winProbability.awayWinPct}%`,
+        `予想スコア: ${predictedScoreline}`,
+        `重要度が高い要素: ${keyFactors.filter((f) => f.stars > 0).map((f) => `${f.labelJa}(${f.starsDisplay})`).join("、") || "(まだ強く学習された要素はありません)"}`,
+        `${home.nameJa}: 直近7日${homeForm.matchesLast7Days}試合、負傷者${homeInjuries.injuryCount ?? "不明"}名、順位${homeStandings.position ?? "不明"}位`,
+        `${away.nameJa}: 直近7日${awayForm.matchesLast7Days}試合、負傷者${awayInjuries.injuryCount ?? "不明"}名、順位${awayStandings.position ?? "不明"}位`,
+        `過去対戦: ${h2h.sampleSize}試合中 ${home.nameJa}側${h2h.homeSideWins}勝 ${away.nameJa}側${h2h.awaySideWins}勝 ${h2h.draws}分`,
+      ].join("\n");
+      const { text } = await generateLLM({ systemPrompt, userPrompt, maxTokens: 400 });
+      const start = text.indexOf("{");
+      const end = text.lastIndexOf("}");
+      if (start !== -1 && end !== -1) {
+        const parsed = JSON.parse(text.slice(start, end + 1));
+        if (parsed.narrative) narrative = { text: String(parsed.narrative).slice(0, 400), source: "ai_generated" };
+        if (parsed.reverseScenario) reverseScenario = { text: String(parsed.reverseScenario).slice(0, 400), source: "ai_generated" };
+      }
+    } catch (e) {
+      console.error("[match-analysis] generateLLM failed, falling back to deterministic narrative:", e.code || "(no code)", "-", e.message);
+      // フォールバック(上で既に決定論的な文章をセット済み)のまま続行する。
+    }
+  }
+
+  const conclusion = winnerLabelJa
+    ? `AIは${predictedScoreline}で${winnerLabelJa}の勝利と予想します。`
+    : `AIは${predictedScoreline}の引き分けに近い、拮抗した試合と予想します。`;
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      home, away,
+      winProbability: { ...winProbability, confidenceStars, confidenceStarsDisplay: starsDisplay(confidenceStars) },
+      predictedScoreline,
+      keyFactors,
+      mostImportantFactor: topFactor ? topFactor.labelJa : "(まだ強く学習された要素はありません)",
+      narrative, reverseScenario, conclusion,
+      featuresUsed: features,
+      weightsInfo: { version: weights.version || 0, updatedAt: weights.updatedAt || null },
+      dataNotes,
+      note: "この分析は毎日学習エンジンの自動予測ループとは独立した、都度(オンデマンド)分析です。実際の試合結果との答え合わせ・学習は毎日学習エンジンが自動登録した予測に対してのみ行われます。",
+      generatedAt: new Date().toISOString(),
+    },
+  };
+}
 
 // ---- 開発者向け自己診断ページ(/debug.html)用のデータ集計 ----
 // 目的: 「コード上は実装されている」ではなく「本番で実際に動いているか」を、
@@ -1192,8 +1413,12 @@ async function handleDebugStatus() {
   const learning = await getGrowthLog(learningDeps);
 
   // ---- Knowledge Engine: 登録済みクラブ全体を横断して件数を集計 ----
+  // 4層構造(Layer1事実/Layer2固定知識/Layer3見解/Layer4振り返り)導入後は、
+  // 単なる合計件数だけでなく層ごとの件数も出す(「本当に増えているか」を
+  // 種類別に確認できるようにするため)。
   let knowledgeTotalActive = 0;
   let knowledgeTotalStored = 0;
+  let layerFactsCount = 0, layerAnalysesCount = 0, layerOpinionsCount = 0, layerProfilesCount = 0, layerReflectionsCount = 0;
   const knowledgeByTeam = [];
   if (UPSTASH_ENABLED) {
     for (const team of REGISTERED_TEAMS) {
@@ -1201,8 +1426,17 @@ async function handleDebugStatus() {
         const active = await knowledgeStore.getActiveKnowledge(team.nameEn);
         knowledgeTotalActive += active.totalActive;
         knowledgeTotalStored += active.totalStored;
+        layerFactsCount += active.facts.length;
+        layerAnalysesCount += active.analyses.length;
+        layerOpinionsCount += active.opinions.length;
+        layerProfilesCount += active.profiles.length;
+        layerReflectionsCount += active.reflections.length;
         if (active.totalStored > 0) {
-          knowledgeByTeam.push({ teamEn: team.nameEn, teamJa: team.nameJa, active: active.totalActive, stored: active.totalStored });
+          knowledgeByTeam.push({
+            teamEn: team.nameEn, teamJa: team.nameJa, active: active.totalActive, stored: active.totalStored,
+            layer1Facts: active.facts.length, layer2Profiles: active.profiles.length,
+            layer3Opinions: active.opinions.length, layer4Reflections: active.reflections.length,
+          });
         }
       } catch (e) {
         // ベストエフォート: 1クラブ分の集計に失敗しても他クラブの集計は続行する
@@ -1213,6 +1447,13 @@ async function handleDebugStatus() {
     totalActiveItems: knowledgeTotalActive,
     totalStoredItems: knowledgeTotalStored,
     registeredTeamsChecked: REGISTERED_TEAMS.length,
+    byLayer: {
+      layer1Facts: layerFactsCount,
+      layer2Profiles: layerProfilesCount,
+      layer3Opinions: layerOpinionsCount,
+      layer4Reflections: layerReflectionsCount,
+      analysesPromotedFromHypotheses: layerAnalysesCount,
+    },
     byTeam: knowledgeByTeam,
   };
 
@@ -1244,7 +1485,13 @@ async function handleDebugStatus() {
   };
 
   // ---- Prediction Engine(自前の学習モデル。learn:ownpred:* / learn:weights) ----
-  const predictionEngineInfo = { totalOwnPredictions: 0, resolved: 0, correct: 0, accuracyPct: null, currentWeights: null, weightsLastUpdatedAt: null };
+  const predictionEngineInfo = {
+    totalOwnPredictions: 0, resolved: 0, correct: 0, accuracyPct: null, currentWeights: null, weightsLastUpdatedAt: null,
+    // v2(拡張特徴量: 怪我人・順位・過去対戦・過密日程・得失点率)がすでに学習を
+    // 始めているか(=既定値の0から動いたか)を一目で分かるようにする。
+    v2ExtendedFeaturesLearning: { started: false, nonZeroWeights: [] },
+    weightsHistoryRecent: [],
+  };
   if (UPSTASH_ENABLED) {
     try {
       const [totalRaw, resolvedRaw, correctRaw, weights, weightsHistoryRaw] = await Promise.all([
@@ -1252,7 +1499,7 @@ async function handleDebugStatus() {
         upstashCmd(["GET", "learn:ownpred:resolved"]),
         upstashCmd(["GET", "learn:ownpred:correct"]),
         upstashGetJSON("learn:weights"),
-        upstashCmd(["LRANGE", "learn:weights:history", "-1", "-1"]),
+        upstashCmd(["LRANGE", "learn:weights:history", "-5", "-1"]),
       ]);
       const resolved = parseInt(resolvedRaw, 10) || 0;
       const correct = parseInt(correctRaw, 10) || 0;
@@ -1261,8 +1508,18 @@ async function handleDebugStatus() {
       predictionEngineInfo.correct = correct;
       predictionEngineInfo.accuracyPct = resolved > 0 ? Math.round((correct / resolved) * 1000) / 10 : null;
       predictionEngineInfo.currentWeights = weights || null;
-      if (weightsHistoryRaw && weightsHistoryRaw[0]) {
-        try { predictionEngineInfo.weightsLastUpdatedAt = JSON.parse(weightsHistoryRaw[0]).updatedAt || null; } catch (e) { /* ignore */ }
+      if (weights) {
+        const extendedKeys = ["goalRateSensitivity", "injurySensitivity", "standingsSensitivity", "headToHeadSensitivity", "fatigueSensitivity"];
+        const nonZero = extendedKeys.filter((k) => typeof weights[k] === "number" && Math.abs(weights[k]) > 0.0001);
+        predictionEngineInfo.v2ExtendedFeaturesLearning = { started: nonZero.length > 0, nonZeroWeights: nonZero };
+      }
+      if (weightsHistoryRaw && weightsHistoryRaw.length) {
+        const parsedHistory = weightsHistoryRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
+        predictionEngineInfo.weightsHistoryRecent = parsedHistory.map((h) => ({
+          date: h.date, method: h.method, adopted: h.adopted, oldAccuracy: h.oldAccuracy, newAccuracy: h.newAccuracy, sampleSize: h.sampleSize,
+        }));
+        const last = parsedHistory[parsedHistory.length - 1];
+        if (last) predictionEngineInfo.weightsLastUpdatedAt = (last.newWeights && last.newWeights.updatedAt) || null;
       }
     } catch (e) {
       predictionEngineInfo.error = e.message;
@@ -1734,6 +1991,18 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         const { status, body } = await handlePredictMatch(parsedBody);
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
+      if (pathname === "/api/match-analysis") {
+        // 「AIマッチ分析」カード: ?home=<クラブ名>&away=<クラブ名>(日本語名/英語名どちらも可)。
+        // GET(副作用が無い読み取り専用の分析リクエストのため、/api/fixtures/analysis等と
+        // 同じくGETに統一)。LLM呼び出しを含む可能性があるため、/api/discussと同じ
+        // IPベースの日次予算(tryConsumeLlmBudgetForIp)を関数内部で共有する
+        // (ただし予算超過時もエラーにはせず、決定論的な文章にフォールバックする)。
+        const maRequestIp = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown";
+        const { status, body } = await handleMatchAnalysis(parsed.searchParams, maRequestIp);
         res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
         return;

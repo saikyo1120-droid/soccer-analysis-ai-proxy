@@ -360,6 +360,18 @@
     <div id="growthLogDetails" style="display:none; margin-top:10px;"></div>
   </div>
 
+  <div class="card" id="aiMatchAnalysisCard">
+    <h2>🧠 AIマッチ分析(クラブ対戦シミュレーション)</h2>
+    <p class="value-note" style="margin-bottom:12px;">登録クラブ同士を選ぶと、実データ(直近フォーム・得失点・怪我人数・順位・過去対戦・過密日程)をもとに、AIが勝率・重視した要素・試合展開・予想スコアまで読み解きます。単なる勝敗ではなく「AIがどう試合を読んだか」を見られる分析です。</p>
+    <div class="compare-select-row">
+      <select id="maHomeSelect" style="padding:7px 10px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary);"></select>
+      <span style="align-self:center; color:var(--text-muted);">vs</span>
+      <select id="maAwaySelect" style="padding:7px 10px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary);"></select>
+      <button class="apply-btn" id="maAnalyzeBtn" style="margin-top:0; width:auto; padding:9px 18px;">分析する ▶</button>
+    </div>
+    <div id="maResultWrap" style="margin-top:12px;"></div>
+  </div>
+
   <div class="card" id="dashboardCard">
     <h2>🏠 今日のサッカー</h2>
     <p class="value-note" style="margin-bottom:12px;">ホーム画面を開くだけで、今日ピックアップされた注目の試合・選手が分かります(登録データから毎日自動で選出)。</p>
@@ -3567,6 +3579,71 @@ async function fetchGrowthLog() {
   } catch (e) { return null; }
 }
 
+// 「AIマッチ分析」カード(第一段階のご要望: 単なる勝敗ではなく、AIが試合を
+// 読むように――勝率内訳・重視した要素(★)・試合展開予想・逆シナリオ・予想
+// スコアまで表示する)。裏側は server/server.js の /api/match-analysis で、
+// Prediction Engine v2(実データの特徴量 + 学習済みの重み + ポワソン分布)に
+// よる本物の計算。プロキシ未接続/APIキー未設定の場合はその旨を正直に表示する。
+async function fetchMatchAnalysis(homeJa, awayJa) {
+  try {
+    const homeEn = CLUB_JA_TO_EN[homeJa] || homeJa;
+    const awayEn = CLUB_JA_TO_EN[awayJa] || awayJa;
+    const url = `${API_PROXY_BASE}/match-analysis?home=${encodeURIComponent(homeEn)}&away=${encodeURIComponent(awayEn)}`;
+    const data = await fetchJsonWithTimeout(url, backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+    backendConfirmedWarm = true;
+    return data || null;
+  } catch (e) {
+    return { ok: false, reason: "network_error", message: "分析サーバーに接続できませんでした(実データ連携サーバーが休止中の場合、初回は最大1分ほどかかることがあります。もう一度お試しください)。" };
+  }
+}
+
+function populateMatchAnalysisSelects() {
+  const homeSel = document.getElementById("maHomeSelect");
+  const awaySel = document.getElementById("maAwaySelect");
+  if (!homeSel || !awaySel) return;
+  const names = Object.keys(CLUB_JA_TO_EN);
+  const optionsHtml = names.map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join("");
+  homeSel.innerHTML = optionsHtml;
+  awaySel.innerHTML = optionsHtml;
+  if (names.length > 1) awaySel.selectedIndex = 1;
+}
+
+function renderMatchAnalysisResult(data, homeJa, awayJa) {
+  const wrap = document.getElementById("maResultWrap");
+  if (!wrap) return;
+  if (!data || !data.ok) {
+    wrap.innerHTML = `<p class="value-note">⚠️ ${escapeHtml((data && data.message) || "分析に失敗しました。実データ連携サーバー(API-Football)が未接続の可能性があります。")}</p>`;
+    return;
+  }
+  const wp = data.winProbability;
+  const factorsHtml = (data.keyFactors || []).filter((f) => f.stars > 0).slice(0, 6).map((f) => `
+    <div class="scout-star-row"><span>${escapeHtml(f.labelJa)}</span><span class="stars">${escapeHtml(f.starsDisplay)} <span class="value-note">(寄与度${f.weightPct}%)</span></span></div>
+  `).join("") || `<p class="value-note">まだ強く学習された要素はありません(毎日学習エンジンの検証データが十分に蓄積されると、ここに表示されます)。</p>`;
+  const notesHtml = (data.dataNotes || []).length ? `<p class="value-note" style="margin-top:8px; opacity:.8;">※ ${data.dataNotes.map(escapeHtml).join(" / ")}</p>` : "";
+  wrap.innerHTML = `
+    <div class="verdict-block">
+      <div class="verdict-stars">${escapeHtml(wp.confidenceStarsDisplay)}</div>
+      <div class="verdict-label">${escapeHtml(homeJa)} ${wp.homeWinPct}% ・ 引分 ${wp.drawPct}% ・ ${escapeHtml(awayJa)} ${wp.awayWinPct}%</div>
+      <p class="value-note" style="margin-top:6px;">AI予想スコア: <strong>${escapeHtml(data.predictedScoreline)}</strong> ・ AIが一番気にしていること: <strong>${escapeHtml(data.mostImportantFactor)}</strong></p>
+    </div>
+    <h3 class="sim-subhead">📋 AIが重視した要素(重要度順)</h3>
+    ${factorsHtml}
+    <div class="compare-comment" style="margin-top:10px;">
+      <strong>🗣️ 試合展開予想${data.narrative.source === "ai_generated" ? "" : "(簡易版)"}:</strong> ${escapeHtml(data.narrative.text)}
+    </div>
+    <div class="compare-comment" style="margin-top:8px;">
+      <strong>🔄 もし予想と違ったら:</strong> ${escapeHtml(data.reverseScenario.text)}
+    </div>
+    <p style="margin-top:12px; font-weight:700;">🏁 ${escapeHtml(data.conclusion)}</p>
+    ${notesHtml}
+    <p class="value-note" style="margin-top:8px; opacity:.7;">${escapeHtml(data.note || "")}</p>
+  `;
+}
+
+// 初期化(セレクトボックスへのクラブ一覧投入・ボタンのイベント登録)は、
+// CLUB_JA_TO_EN の定義後(このファイル下部)でまとめて行う
+// (initMatchAnalysisWidget を参照)。
+
 async function renderRealPerformancePanel(player) {
   const el = document.getElementById("livePerfPanel");
   if (!el) return;
@@ -4881,6 +4958,33 @@ const CLUB_JA_TO_EN = {
   "パリ・サンジェルマン": "Paris Saint Germain",
   "インテル・ミラン": "Inter",
 };
+
+// 「AIマッチ分析」カードの初期化(セレクト投入・ボタンのイベント登録)。
+// 定義自体はこのファイル上部(fetchMatchAnalysis/populateMatchAnalysisSelects/
+// renderMatchAnalysisResult)にあるが、CLUB_JA_TO_EN(直前で定義)に依存するため、
+// ここで初めて実行する。
+function initMatchAnalysisWidget() {
+  populateMatchAnalysisSelects();
+  const btn = document.getElementById("maAnalyzeBtn");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    const homeJa = document.getElementById("maHomeSelect").value;
+    const awayJa = document.getElementById("maAwaySelect").value;
+    const wrap = document.getElementById("maResultWrap");
+    if (homeJa === awayJa) {
+      wrap.innerHTML = `<p class="value-note">⚠️ 異なる2クラブを選んでください。</p>`;
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = "分析中…";
+    wrap.innerHTML = `<p class="value-note">🔄 AIが実データを分析しています…(初回はサーバー起動のため最大1分ほどかかることがあります)</p>`;
+    const data = await fetchMatchAnalysis(homeJa, awayJa);
+    renderMatchAnalysisResult(data, homeJa, awayJa);
+    btn.disabled = false;
+    btn.textContent = "分析する ▶";
+  });
+}
+initMatchAnalysisWidget();
 
 // 議論トリガー検出(ご指示のフレーズ一覧に準拠): 「〜だと思う」「〜な気がする」
 // 「〜では？」「もし〜だったら？」「なぜ？」「本当に？」「どう思う？」など、

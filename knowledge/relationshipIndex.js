@@ -33,7 +33,35 @@ function createRelationshipIndex({ upstashEnabled, upstashGetJSON, upstashSetJSO
     return (await upstashGetJSON(`graph:${subjectType}:${subjectId}:${relation}`)) || null;
   }
 
-  return { setRelation, getRelation };
+  /**
+   * 「レアル・マドリード → 監督(アンチェロッティ) → フォーメーション傾向(4-3-3)
+   * → 戦術的特徴 → …」のような一方向の連鎖を、あらかじめ決めた関係の並び
+   * (path)に沿ってたどる。正直な制約(ファイル冒頭のコメント参照): これは
+   * 本物のグラフDBの探索ではなく、setRelationで保存済みの単一方向の関係を
+   * 順番に辿っているだけの単純な処理。分岐(1つのクラブに複数の関係)や
+   * 逆探索はできない。
+   *
+   * @param {string} startType
+   * @param {string} startId
+   * @param {string[]} path - 辿る関係名の配列。例: ["manager", "formationTendency", "tacticalStyle"]
+   * @returns {Array<{step:string, subjectType:string, subjectId:string, relation:string, target:object|null}>}
+   */
+  async function getRelationChain(startType, startId, path) {
+    const chain = [];
+    let curType = startType;
+    let curId = startId;
+    for (const relation of path || []) {
+      if (!curType || !curId) break;
+      const rel = await getRelation(curType, curId, relation);
+      chain.push({ subjectType: curType, subjectId: curId, relation, target: rel });
+      if (!rel || !rel.targetId) break;
+      curType = rel.targetType;
+      curId = rel.targetId;
+    }
+    return chain;
+  }
+
+  return { setRelation, getRelation, getRelationChain };
 }
 
 module.exports = { createRelationshipIndex };

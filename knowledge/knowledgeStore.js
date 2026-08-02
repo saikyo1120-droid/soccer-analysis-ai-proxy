@@ -16,11 +16,30 @@
  * クラブの公式RSSフィードなど、利用規約上問題のない情報源を具体的に決めて
  * いただければ、その情報源専用のfetcherを追加する形で拡張できます。
  *
- * 3種類の知識タイプ(混ぜて保存しない):
- *   "fact"     ― 客観的に計算できる数値(例: 得失点差の変化、怪我人リスト)
- *   "analysis" ― 事実を根拠にした解釈(例: Hypothesis Engineが実際の試合結果で
- *                検証し「確からしい」と判定した仮説)
- *   "opinion"  ― LLMが下した主観的な考察(議論モードの「考察」欄そのもの)
+ * 4層構造(2026年8月・知識拡張フェーズで導入): 「単なるデータベース」ではなく、
+ * 更新頻度と性質が異なる知識を明示的に分離することで、後から「今日は何が
+ * 新しく増えたか/何が更新されたか/何が古くなったか」を追跡できるようにする。
+ *
+ *   Layer1 "fact"      ― 毎日更新される客観的な数値(例: 得失点差の変化)。
+ *                         取得元: API-Footballの実データ。既定14日で失効。
+ *   Layer2 "profile"   ― クラブ・監督・選手の「固定的な」知識(戦術傾向・
+ *                         プレースタイル・フォーメーション傾向・長所短所)。
+ *                         API-Footballには存在しない定性的な情報のため、
+ *                         Layer1の実データを根拠としてLLMに生成させ、必ず
+ *                         「AIによる推定」と明示する(捏造した事実として
+ *                         紛れ込ませない)。毎日は再生成せず、既定60日で
+ *                         失効(その頃に自動で作り直す=知識の鮮度を保つ)。
+ *   Layer3 "opinion"   ― AI自身が「今どう考えているか」という主観的な見解
+ *                         (議論モードの考察、および毎日学習エンジンが生成する
+ *                         「AIの現在の見立て」)。前日と見解が変わった場合の
+ *                         変化理由は Memory Engine(server/memory/memoryStore.js)
+ *                         側で管理する(このopinionはその内容をKnowledge Engine
+ *                         からも検索できるようミラーしたもの)。既定7日で失効
+ *                         (毎日更新される想定のため短め)。
+ *   Layer4 "reflection"― 試合終了後の振り返り(予想は当たったか/外れたか・
+ *                         なぜか・次回への改善点)。当たった場合もハズレた
+ *                         場合も両方保存する(以前はハズレた仮説を記録して
+ *                         いなかった)。長期の学習履歴として既定90日保持。
  *
  * 重複排除: 同じクラブ・カテゴリ・内容の知識は、内容のハッシュ値で判定して
  * 二重登録しない(全く同じ「事実」を毎日再登録して知識ベースが際限なく
@@ -32,7 +51,7 @@
  */
 const crypto = require("crypto");
 
-const DEFAULT_EXPIRY_DAYS = { fact: 14, analysis: 30, opinion: 3 };
+const DEFAULT_EXPIRY_DAYS = { fact: 14, analysis: 30, opinion: 7, profile: 60, reflection: 90 };
 const MAX_ITEMS_PER_TEAM = 80;
 
 function stableHash(input) {
@@ -60,7 +79,7 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
   async function saveKnowledgeItem(item) {
     if (!upstashEnabled) return { saved: false, reason: "NO_UPSTASH", hash: null };
     if (!item || !item.teamEn || !item.type || !item.statement) return { saved: false, reason: "INVALID_ITEM", hash: null };
-    if (!["fact", "analysis", "opinion"].includes(item.type)) return { saved: false, reason: "INVALID_TYPE", hash: null };
+    if (!["fact", "analysis", "opinion", "profile", "reflection"].includes(item.type)) return { saved: false, reason: "INVALID_TYPE", hash: null };
 
     const hash = computeItemHash(item);
     const existing = await upstashGetJSON(`knowledge:item:${hash}`);
@@ -85,7 +104,7 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
    * もう使われない、という設計)。
    */
   async function getActiveKnowledge(teamEn, nowMs) {
-    const empty = { facts: [], analyses: [], opinions: [], totalStored: 0, totalActive: 0 };
+    const empty = { facts: [], analyses: [], opinions: [], profiles: [], reflections: [], totalStored: 0, totalActive: 0 };
     if (!upstashEnabled || !teamEn) return empty;
     const now = nowMs || Date.now();
     const hashes = (await upstashCmd(["LRANGE", `knowledge:byTeam:${teamEn}`, "0", "-1"]).catch(() => [])) || [];
@@ -99,12 +118,40 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
       facts: active.filter((i) => i.type === "fact"),
       analyses: active.filter((i) => i.type === "analysis"),
       opinions: active.filter((i) => i.type === "opinion"),
+      profiles: active.filter((i) => i.type === "profile"),
+      reflections: active.filter((i) => i.type === "reflection"),
       totalStored: items.length,
       totalActive: active.length,
     };
   }
 
-  return { saveKnowledgeItem, getActiveKnowledge };
+  /**
+   * 「昨日より知識が増えていることが分かるようにする」ためのヘルパー。
+   * firstSeenAtが指定の日付(YYYY-MM-DD)と一致するアイテムを「新しく覚えた
+   * 知識」、lastSeenAt(≠firstSeenAt)がその日付のアイテムを「更新された知識」
+   * として分類する。isExpiredで除外された「古くなった知識」の件数も返す。
+   */
+  async function getKnowledgeDiffForTeam(teamEn, dateKey, nowMs) {
+    const empty = { newItems: [], updatedItems: [], staleCount: 0 };
+    if (!upstashEnabled || !teamEn || !dateKey) return empty;
+    const now = nowMs || Date.now();
+    const hashes = (await upstashCmd(["LRANGE", `knowledge:byTeam:${teamEn}`, "0", "-1"]).catch(() => [])) || [];
+    const items = [];
+    for (const h of hashes) {
+      const record = await upstashGetJSON(`knowledge:item:${h}`);
+      if (record) items.push(record);
+    }
+    const newItems = items.filter((i) => String(i.firstSeenAt || "").slice(0, 10) === dateKey);
+    const updatedItems = items.filter((i) => {
+      const first = String(i.firstSeenAt || "").slice(0, 10);
+      const last = String(i.lastSeenAt || "").slice(0, 10);
+      return last === dateKey && first !== dateKey;
+    });
+    const staleCount = items.filter((i) => isExpired(i, now)).length;
+    return { newItems, updatedItems, staleCount };
+  }
+
+  return { saveKnowledgeItem, getActiveKnowledge, getKnowledgeDiffForTeam };
 }
 
 module.exports = { createKnowledgeStore, computeItemHash, isExpired, DEFAULT_EXPIRY_DAYS };

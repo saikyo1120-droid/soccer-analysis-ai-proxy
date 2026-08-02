@@ -120,11 +120,17 @@ async function load() {
 
   // Knowledge Engine
   const ke = data.knowledgeEngine || {};
-  html.push(`<div class="card"><h2>Knowledge Engine ${badge((ke.totalActiveItems || 0) > 0, 'データあり', 'データなし')}</h2>
+  const keLayer = ke.byLayer || {};
+  html.push(`<div class="card"><h2>Knowledge Engine(4層構造) ${badge((ke.totalActiveItems || 0) > 0, 'データあり', 'データなし')}</h2>
     <table>
       <tr><th>有効な知識アイテム数(全クラブ合計)</th><td>${esc(ke.totalActiveItems)}</td></tr>
       <tr><th>保存済み総数(失効含む)</th><td>${esc(ke.totalStoredItems)}</td></tr>
       <tr><th>確認したクラブ数</th><td>${esc(ke.registeredTeamsChecked)}</td></tr>
+      <tr><th>Layer1 事実(fact)</th><td>${esc(keLayer.layer1Facts)}</td></tr>
+      <tr><th>Layer2 固定知識(profile・AI生成)</th><td>${esc(keLayer.layer2Profiles)}</td></tr>
+      <tr><th>Layer3 AIの現在の見解(opinion)</th><td>${esc(keLayer.layer3Opinions)}</td></tr>
+      <tr><th>Layer4 振り返り(reflection)</th><td>${esc(keLayer.layer4Reflections)}</td></tr>
+      <tr><th>仮説から昇格した分析(analysis)</th><td>${esc(keLayer.analysesPromotedFromHypotheses)}</td></tr>
     </table>
     ${ke.byTeam && ke.byTeam.length ? `<div class="raw">${esc(JSON.stringify(ke.byTeam, null, 2))}</div>` : '<div class="muted">クラブ別データはまだありません。</div>'}
     </div>`);
@@ -140,15 +146,19 @@ async function load() {
 
   // Prediction Engine
   const pe = data.predictionEngine || {};
-  html.push(`<div class="card"><h2>Prediction Engine(自前の学習モデル) ${badge((pe.totalOwnPredictions || 0) > 0, 'データあり', 'データなし')}</h2>
+  const peV2 = pe.v2ExtendedFeaturesLearning || {};
+  html.push(`<div class="card"><h2>Prediction Engine(自前の学習モデル・v1+v2) ${badge((pe.totalOwnPredictions || 0) > 0, 'データあり', 'データなし')}</h2>
     <table>
       <tr><th>記録した予測数</th><td>${esc(pe.totalOwnPredictions)}</td></tr>
       <tr><th>解決済み(結果判明)</th><td>${esc(pe.resolved)}</td></tr>
       <tr><th>的中数</th><td>${esc(pe.correct)}</td></tr>
       <tr><th>正答率</th><td>${pe.accuracyPct != null ? pe.accuracyPct + '%' : 'まだ記録なし'}</td></tr>
       ${pe.weightsLastUpdatedAt ? `<tr><th>重みパラメータ最終更新</th><td>${esc(pe.weightsLastUpdatedAt)}</td></tr>` : ''}
+      <tr><th>v2拡張特徴量の学習開始</th><td>${badge(!!peV2.started, '学習済みの重みあり', 'まだ既定値(0)のまま')}</td></tr>
+      ${peV2.nonZeroWeights && peV2.nonZeroWeights.length ? `<tr><th>学習が進んだ特徴量</th><td>${esc(peV2.nonZeroWeights.join('、'))}</td></tr>` : ''}
     </table>
     ${pe.currentWeights ? `<div class="raw">${esc(JSON.stringify(pe.currentWeights, null, 2))}</div>` : ''}
+    ${pe.weightsHistoryRecent && pe.weightsHistoryRecent.length ? `<div class="muted" style="margin-top:8px;">直近の重み更新履歴(採用/不採用):</div><div class="raw">${esc(JSON.stringify(pe.weightsHistoryRecent, null, 2))}</div>` : ''}
     </div>`);
 
   html.push(`<div class="card muted">生データ(JSON全体):<div class="raw">${esc(JSON.stringify(data, null, 2))}</div></div>`);
