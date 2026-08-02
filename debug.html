@@ -87,9 +87,17 @@ async function load() {
     </div>`);
 
   // LLM
-  html.push(`<div class="card"><h2>LLM (${esc(data.llm && data.llm.provider)}) ${badge(data.llm && data.llm.configured)}</h2>
-    <table><tr><th>APIキー設定済み</th><td>${data.llm && data.llm.configured ? 'はい' : 'いいえ'}</td></tr></table>
-    <div class="muted">${esc(data.llm && data.llm.note)}</div></div>`);
+  const llm = data.llm || {};
+  const tc = llm.testCall || {};
+  const llmOverallOk = tc.attempted ? !!tc.ok : !!llm.configured;
+  html.push(`<div class="card"><h2>LLM (${esc(llm.provider)}) ${badge(llmOverallOk)}</h2>
+    <table>
+      <tr><th>APIキー設定済み</th><td>${llm.configured ? 'はい' : 'いいえ'}</td></tr>
+      <tr><th>実接続テスト</th><td>${tc.attempted ? (tc.ok ? `成功(${tc.tookMs}ms, 応答: "${esc(tc.sampleResponse)}")` : '失敗') : '未実施'}</td></tr>
+      ${tc.attempted && !tc.ok ? `<tr><th>エラーコード</th><td class="err">${esc(tc.code || '不明')}</td></tr>` : ''}
+    </table>
+    ${tc.attempted && !tc.ok ? `<div class="raw err">${esc(tc.error)}</div>` : ''}
+    <div class="muted">${esc(llm.note)}</div></div>`);
 
   // Learning Engine
   const le = data.learningEngine || {};
@@ -132,7 +140,7 @@ async function load() {
 
   // Prediction Engine
   const pe = data.predictionEngine || {};
-  html.push(`<div class="card"><h2>Prediction Engine(自前の学習モデル) ${badge((pe.resolved || 0) > 0, 'データあり', 'データなし')}</h2>
+  html.push(`<div class="card"><h2>Prediction Engine(自前の学習モデル) ${badge((pe.totalOwnPredictions || 0) > 0, 'データあり', 'データなし')}</h2>
     <table>
       <tr><th>記録した予測数</th><td>${esc(pe.totalOwnPredictions)}</td></tr>
       <tr><th>解決済み(結果判明)</th><td>${esc(pe.resolved)}</td></tr>

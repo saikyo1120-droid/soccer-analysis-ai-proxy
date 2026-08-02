@@ -122,14 +122,35 @@ API-Footballの無料枠を消費されるのを防ぐには、`.env`(本番はR
 一致した場合のみ動作するようになります(未設定の場合は誰でも呼び出せる状態の
 ままです)。
 
-**定期的に呼び出す方法(いずれか一つでOK・すべて無料):**
-- 外部の無料cronサービスを使う(推奨・最も安定): [cron-job.org](https://cron-job.org/)
+**定期的に呼び出す方法(推奨: GitHub Actions・追加登録不要):**
+このリポジトリには `.github/workflows/predictions-auto-collect.yml` が同梱されて
+おり、6時間おき(1日4回)に自動でこのエンドポイントを呼び出す設定が既に入って
+います(`daily-learning.yml`と同じ仕組み)。有効にするには、リポジトリの
+Settings → Secrets and variables → Actions で以下の1つを追加登録するだけです
+(`LEARNING_SECRET_KEY`は`daily-learning.yml`用に既に登録済みのものをそのまま
+使います)。
+- `AUTO_COLLECT_ENDPOINT_URL` : 例) `https://あなたのRenderのURL/api/predictions/auto-collect`
+
+**その他の方法(いずれでもOK・すべて無料):**
+- 外部の無料cronサービスを使う: [cron-job.org](https://cron-job.org/)
   や [UptimeRobot](https://uptimerobot.com/) に無料登録し、「4時間おきに
   `https://あなたのRenderのURL/api/predictions/auto-collect?key=設定した文字列`
   にアクセスする」だけの設定を1つ作成する。コード不要、画面操作だけで完了します。
 - このプロジェクトを一緒に作っているAIアシスタント(このチャット)に、定期実行の
   スケジュールタスクを設定してもらう(このアシスタントのセッション上の仕組みに
-  依存するため、外部cronサービスの方が長期的には独立性が高くおすすめです)。
+  依存するため、GitHub Actionsや外部cronサービスの方が長期的には独立性が高く
+  おすすめです)。
+
+**「毎日たくさん試合があるのに件数が全然増えない」場合について:**
+API-Footballの無料プラン(1日100リクエスト)を使い切らないよう、1回の実行で
+新規に記録できる試合数はあえて少なめ(最大3件)に制限してあります。1日4回の
+実行でも1日最大12件程度が上限です。世界中の試合をもっと網羅的に・素早く
+記録したい場合は、①`predictions-auto-collect.yml`のcron間隔を短くする、
+②API-Footballを有料プラン(Pro: $19/月・7,500req/日)に切り替えた上で
+サーバー側の`AUTO_COLLECT_LOG_CAP`/`AUTO_COLLECT_RESOLVE_CAP`の上限値も
+引き上げる、のいずれかの対応が必要です(無料プランのままでは、件数を大幅に
+増やすとAPI-Footballの利用上限に引っかかり、他の機能(選手検索・試合分析など)
+にも影響が出るおそれがあります)。
 
 ### 6. AI対話エンジン(議論モード)を有効にする(任意・費用が発生します)
 
@@ -351,4 +372,4 @@ factは14日・analysisは30日・opinionは3日で「アクティブな知識�
 | `POST /api/discuss` | 【Stage C・Stage Eで拡張】「〜だと思う」「なぜ？」等の意見・考察を求める質問に、Planner(必要な情報+比較すべき観点を判定)→RAG(API-Football実データ+Knowledge Engineの蓄積知識を取得)→Reasoning Engine(仮説生成→根拠ランキング→自己チェック。利用者には非表示)→Memory Engine(前回の結論と比較・保存)→LLM推論(取得した事実+内部推論を根拠に考察)の順で処理し、①事実②統計③根拠④考察⑤結論⑥信頼度(理由付き)+フォローアップ質問を返すAPI。クラブに関する質問の場合、`meta.reasoning`に内部で検討した仮説一覧・選ばれた仮説・自己チェック結果・Memory Engineの記録結果が含まれる(デバッグ・検証用。回答文自体には仮説ラベルをそのまま出力しない)。リクエストbodyに`question`・`subject`(`{type:"club"または"player", labelJa, labelEn}`)・`playerHint`を渡す。単純な質問(選手データ・順位・試合結果など)はこのAPIを使わず、これまで通りフロントエンドのルールベースで即答するため、呼ばれるのは議論トリガーを検出したときだけ。`ANTHROPIC_API_KEY`未設定時は`ok:false`で正直な理由を返す |
 | `POST /api/learning/run-daily?key=...` | 【Stage D・Stage Eで拡張】毎日学習エンジンを1回実行する(登録クラブのフォーム分析・Knowledge Engine経由での事実の記録・自社予測モデルの検証と改善・Hypothesis Engineによる状態仮説の検証)。`AUTO_COLLECT_SECRET`設定時は`key`が一致しないと403。`.github/workflows/daily-learning.yml`から毎日自動で呼び出される想定 |
 | `GET /api/growth-log` | 【Stage D・Stage Eで拡張】直近の学習エンジン実行結果(今日Knowledge Engineに新規保存した知識件数・重複でスキップした件数・検証した試合数・自社予測モデルの的中率の変化・AI自身の予測仮説の的中/破棄件数)を返す。ホーム画面の「🧠 昨日学んだこと」ウィジェットが使用。未実行の場合は`ranYet:false`を正直に返す |
-| `GET /api/debug-status?key=...` / `GET /debug.html` | 【開発者専用・NEW】「コード上は実装されている」ではなく「本番で今、実際に動いているか」を確認するための自己診断ページ。Redis(Upstash)への実際のPING接続確認、API-Footballへの実際の接続確認(`/status`)、LLMのAPIキー設定状況(実費が発生するため実際の呼び出しはしない)、Learning Engineの最終実行結果、Knowledge Engine/Memory Engineの登録クラブ横断の件数集計、自社予測モデル(Prediction Engine)の正答率を1画面にまとめて表示する。一般利用者向けの機能ではないため、`AUTO_COLLECT_SECRET`を設定している場合は他の保護付きエンドポイントと同じ`?key=`方式で保護される(未設定の場合は開いたまま。既存のrun-daily/auto-collectと同じトレードオフ) |
+| `GET /api/debug-status?key=...` / `GET /debug.html` | 【開発者専用・更新】「コード上は実装されている」ではなく「本番で今、実際に動いているか」を確認するための自己診断ページ。Redis(Upstash)への実際のPING接続確認、API-Footballへの実際の接続確認(`/status`)、Learning Engineの最終実行結果、Knowledge Engine/Memory Engineの登録クラブ横断の件数集計、自社予測モデル(Prediction Engine)の正答率を1画面にまとめて表示する。**LLM(Anthropic)は、APIキーが設定されていれば実際にごく小さいテスト呼び出しを1回行い(コストはごく僅かだが発生する)、成功/失敗と、失敗時は実際のHTTPステータス・エラー内容をそのまま表示する**(以前は「キーが設定されているか」しか見ておらず、「キーはあるのに呼び出し自体は失敗し続けている」状態を検知できなかった)。一般利用者向けの機能ではないため、`AUTO_COLLECT_SECRET`を設定している場合は他の保護付きエンドポイントと同じ`?key=`方式で保護される(未設定の場合は開いたまま。既存のrun-daily/auto-collectと同じトレードオフ) |

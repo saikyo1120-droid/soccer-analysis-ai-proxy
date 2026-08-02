@@ -252,8 +252,21 @@ async function resolveTeamId(teamNameEnglish) {
   const cached = cacheGet(cacheKey);
   if (cached !== null) return cached;
   try {
-    const data = await callApiFootball("/teams", { search: name });
-    const list = data.response || [];
+    let data = await callApiFootball("/teams", { search: name });
+    let list = data.response || [];
+    // 実際に確認された不具合(team_not_found:Al-Nassr): API-Football側の表記が
+    // ハイフンの有無で揺れている場合、検索文字列をそのまま渡すとヒットしない
+    // ことがある。ハイフンを空白に置き換えた表記・完全に取り除いた表記でも
+    // 追加で試す(既存の成功しているクラブの挙動には影響しない=最初の検索で
+    // ヒットすればそのまま使うだけ)。
+    if (!list.length && name.includes("-")) {
+      const variants = [name.replace(/-/g, " "), name.replace(/-/g, "")];
+      for (const variant of variants) {
+        const retryData = await callApiFootball("/teams", { search: variant });
+        list = retryData.response || [];
+        if (list.length) break;
+      }
+    }
     if (!list.length) { cacheSet(cacheKey, null, 24 * 60 * 60 * 1000); return null; }
     const exact = list.find((r) => (r.team && r.team.name || "").toLowerCase() === name.toLowerCase());
     const id = (exact || list[0]).team.id;
@@ -1141,12 +1154,39 @@ async function handleDebugStatus() {
     }
   }
 
-  // ---- LLM(Anthropic等)の設定状況。実費が発生するため実際の呼び出しはしない ----
+  // ---- LLM(Anthropic等)の実接続確認 ----
+  // 以前は「APIキーが設定されているか」しか見ておらず、これでは「キーはある
+  // ものの実際の呼び出しは失敗し続けている」状態(本番で実際に発生した不具合)を
+  // 検知できなかった。これが「/debug.htmlはOKと出るのに、実際にAIに質問すると
+  // 失敗する」というズレの直接原因だった。ここで極小トークン数(5)の実際のテスト
+  // 呼び出しを1回行い、生の成功/失敗と、失敗時は実際のHTTPステータス・エラー本文
+  // をそのまま返す(このページ自体がAUTO_COLLECT_SECRETで保護されているため、
+  // 一般公開はされない)。コストはほぼゼロ(入力十数トークン・出力5トークン程度)。
   const llmInfo = {
     provider: process.env.LLM_PROVIDER || "anthropic",
     configured: !!process.env.ANTHROPIC_API_KEY,
-    note: "実費が発生するため、この診断ページはLLMへの実際のテスト呼び出しは行いません(APIキーの設定有無のみ確認)。",
+    note: "「実接続テスト」は、このページを開くたびに実際にごく小さいテスト呼び出しを1回行います(コストはごくわずかですが、ゼロではありません)。",
   };
+  if (llmInfo.configured) {
+    try {
+      const testStart = Date.now();
+      const { text } = await generateLLM({
+        systemPrompt: "あなたは接続テスト用です。「OK」とだけ返してください。",
+        userPrompt: "テスト",
+        maxTokens: 5,
+      });
+      llmInfo.testCall = { attempted: true, ok: true, tookMs: Date.now() - testStart, sampleResponse: text };
+    } catch (e) {
+      llmInfo.testCall = {
+        attempted: true,
+        ok: false,
+        code: e.code || null,
+        error: e.message || String(e),
+      };
+    }
+  } else {
+    llmInfo.testCall = { attempted: false, ok: false, error: "APIキーが未設定のためテスト呼び出しをスキップしました。" };
+  }
 
   // ---- Learning Engine(既存のgetGrowthLogをそのまま再利用) ----
   const learning = await getGrowthLog(learningDeps);
@@ -1515,6 +1555,11 @@ async function handleDiscuss(body, clientIp) {
     const { text } = await generateLLM({ systemPrompt: buildDiscussSystemPrompt(), userPrompt, maxTokens: 700 });
     llmOut = parseDiscussLlmOutput(text);
   } catch (e) {
+    // これまでここでエラーの中身(実際のAnthropic APIのHTTPステータス・応答本文)を
+    // 一切ログに残していなかったため、本番で「AIの考察生成に失敗しました」が
+    // 続いても原因(APIキー不正・クレジット不足・レート制限・モデル名不正 等)を
+    // 特定する手段がなかった。Renderの「Logs」タブで実際の原因が読めるようにする。
+    console.error("[discuss] generateLLM failed:", e.code || "(no code)", "-", e.message);
     return {
       status: 200,
       body: {
