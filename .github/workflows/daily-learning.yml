@@ -1,0 +1,48 @@
+name: Daily Learning Engine
+
+# 「毎日学習エンジン」を毎日決まった時間に自動実行するための仕組みです。
+# GitHub Actionsは無料で使えるスケジューラで、新しいアカウント登録は不要です
+# (このリポジトリのGitHubアカウントでそのまま動きます)。
+#
+# 毎日 日本時間4:00(UTC 19:00、前日)に、本番サイトの
+# POST /api/learning/run-daily?key=<秘密のキー> を呼び出します。
+#
+# 事前準備(1回だけ):
+#   このリポジトリの Settings → Secrets and variables → Actions →
+#   「New repository secret」から、以下の2つを登録してください。
+#     LEARNING_ENDPOINT_URL : 例) https://soccer-analysis-ai-proxy.onrender.com/api/learning/run-daily
+#     LEARNING_SECRET_KEY   : Renderの環境変数 AUTO_COLLECT_SECRET と同じ値
+#   (AUTO_COLLECT_SECRETを設定していない場合はこのワークフローの?key=部分を
+#    削除しても動きますが、誰でもこのエンドポイントを叩けてしまうため、
+#    AUTO_COLLECT_SECRETの設定を強く推奨します)
+
+on:
+  schedule:
+    - cron: "0 19 * * *" # 毎日 UTC 19:00 = 日本時間 翌4:00
+  workflow_dispatch: {} # 「Actions」タブから手動実行もできるようにしておく(動作確認用)
+
+jobs:
+  run-daily-learning:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the daily learning engine endpoint
+        run: |
+          curl -sS -X POST "${LEARNING_ENDPOINT_URL}?key=${LEARNING_SECRET_KEY}" \
+            --max-time 120 \
+            --retry 2 \
+            --retry-delay 30 \
+            -w "\nHTTP status: %{http_code}\n" \
+            -o response.json
+          cat response.json
+          # Renderの無料プランはアクセスが無いとスリープするため、初回リクエストの
+          # 起動待ちで失敗することがある。念のためもう一度だけ叩き直す。
+          if ! grep -q '"ok":true' response.json; then
+            echo "1回目が失敗した可能性があるため、60秒待って再試行します"
+            sleep 60
+            curl -sS -X POST "${LEARNING_ENDPOINT_URL}?key=${LEARNING_SECRET_KEY}" \
+              --max-time 120 -w "\nHTTP status: %{http_code}\n" -o response.json
+            cat response.json
+          fi
+        env:
+          LEARNING_ENDPOINT_URL: ${{ secrets.LEARNING_ENDPOINT_URL }}
+          LEARNING_SECRET_KEY: ${{ secrets.LEARNING_SECRET_KEY }}
