@@ -7,7 +7,14 @@
  * 他のプロバイダー(openai/gemini/openrouter/local)は、この形に合わせて実装すれば
  * すぐに差し替えられるプレースホルダーとして用意してあります。
  */
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+// 実際に本番で発生した不具合への対処: Renderの環境変数にAPIキーを貼り付ける際、
+// 末尾に見えない改行やスペースが紛れ込むことがある(コピー元によっては、コピー
+// した文字列の末尾に改行が1つ付いてくる場合がある)。これが混入すると、fetchの
+// リクエストヘッダーとして不正な値になり、"Headers.append: ... is an invalid
+// header value" という分かりにくいエラーで全リクエストが失敗し続ける
+// (APIキー自体は正しいのに、です)。.trim()で前後の空白・改行を必ず取り除く
+// ことで、この種の貼り付けミスの影響を受けないようにする。
+const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || "").trim();
 // 既定モデル: コスト最適化の方針(設計書②)に合わせて軽量モデルを既定にしています。
 // 2026年8月時点でAnthropic公式ドキュメント(platform.claude.com/docs)を確認し、
 // 直接のAnthropic API経由では入手できなくなっていた旧モデル(claude-3-5-haiku-
