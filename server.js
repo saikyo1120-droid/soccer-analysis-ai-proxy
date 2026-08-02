@@ -60,6 +60,7 @@ const {
   computeGoalRateFeatures, computeFatigueFeature,
   fetchInjuryCountFeature, fetchStandingsFeature, fetchHeadToHeadFeature,
   inferLeagueIdFromFixtures, computeHomeAwaySplit, fetchCoachCareer,
+  fetchLatestFormation, fetchTeamTopScorer,
 } = require("./learning/features");
 const {
   EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, predictOutcomeV2,
@@ -1251,20 +1252,35 @@ async function handleMatchAnalysis(query, clientIp) {
   }
 
   const season = guessSeason();
-  const leagueId = inferLeagueIdFromFixtures(homeForm.fixtures) || inferLeagueIdFromFixtures(awayForm.fixtures);
-  const [homeInjuries, awayInjuries, homeStandings, awayStandings, h2h] = await Promise.all([
+  // 2026年8月・本番監査での修正: 以前はhomeとawayで同じ1つのleagueIdを使い
+  // 回していたため、両クラブが異なるリーグ所属の場合(例: セリエAのナポリ
+  // vs ラ・リーガのバルセロナ)、アウェイ側の順位が誤ったリーグで検索され
+  // 「見つからない」扱いになっていた。それぞれ自分自身のfixturesから
+  // 推定したリーグIDを使うよう分離する。
+  const homeLeagueId = inferLeagueIdFromFixtures(homeForm.fixtures);
+  const awayLeagueId = inferLeagueIdFromFixtures(awayForm.fixtures);
+  const [homeInjuries, awayInjuries, homeStandings, awayStandings, h2h, homeFormationInfo, awayFormationInfo, homeTopScorerInfo, awayTopScorerInfo] = await Promise.all([
     fetchInjuryCountFeature(homeTeamId, season, callApiFootball),
     fetchInjuryCountFeature(awayTeamId, season, callApiFootball),
-    fetchStandingsFeature(leagueId, season, homeTeamId, callApiFootball),
-    fetchStandingsFeature(leagueId, season, awayTeamId, callApiFootball),
+    fetchStandingsFeature(homeLeagueId, season, homeTeamId, callApiFootball),
+    fetchStandingsFeature(awayLeagueId, season, awayTeamId, callApiFootball),
     fetchHeadToHeadFeature(homeTeamId, awayTeamId, callApiFootball),
+    // 2026年8月・本番監査(⑦情報拡張)対応: 「フォーメーション相性」「勝敗を
+    // 左右する選手」への追加。いずれも実データのみ(取得できなければnull)。
+    fetchLatestFormation(homeForm.fixtures, homeTeamId, callApiFootball),
+    fetchLatestFormation(awayForm.fixtures, awayTeamId, callApiFootball),
+    fetchTeamTopScorer(homeLeagueId, season, homeTeamId, callApiFootball),
+    fetchTeamTopScorer(awayLeagueId, season, awayTeamId, callApiFootball),
   ]);
 
   const dataNotes = [];
-  if (!leagueId) dataNotes.push("リーグIDを特定できなかったため、順位データは考慮されていません。");
+  if (!homeLeagueId) dataNotes.push(`${home.nameJa}のリーグIDを特定できなかったため、順位・得点ランキングデータは考慮されていません。`);
+  if (!awayLeagueId) dataNotes.push(`${away.nameJa}のリーグIDを特定できなかったため、順位・得点ランキングデータは考慮されていません。`);
   if (homeInjuries.error) dataNotes.push(`${home.nameJa}の負傷者情報の取得に失敗しました。`);
   if (awayInjuries.error) dataNotes.push(`${away.nameJa}の負傷者情報の取得に失敗しました。`);
   if (h2h.sampleSize === 0) dataNotes.push("過去の直接対戦データが見つかりませんでした。");
+  if (!homeFormationInfo.formation) dataNotes.push(`${home.nameJa}の直近フォーメーション情報は取得できませんでした。`);
+  if (!awayFormationInfo.formation) dataNotes.push(`${away.nameJa}の直近フォーメーション情報は取得できませんでした。`);
 
   const homeCtx = {
     formScore: homeForm.currentFormScore, avgGoalsFor: homeForm.avgGoalsFor, avgGoalsAgainst: homeForm.avgGoalsAgainst,
@@ -1308,8 +1324,13 @@ async function handleMatchAnalysis(query, clientIp) {
     if (topFactor) parts.push(`AIが最も重視したのは「${topFactor.labelJa}」です(寄与度${topFactor.weightPct}%)。`);
     if (homeForm.matchesLast7Days >= 3) parts.push(`${home.nameJa}は直近7日間で${homeForm.matchesLast7Days}試合とやや過密日程です。`);
     if (awayForm.matchesLast7Days >= 3) parts.push(`${away.nameJa}は直近7日間で${awayForm.matchesLast7Days}試合とやや過密日程です。`);
-    if (homeInjuries.injuryCount) parts.push(`${home.nameJa}には現在${homeInjuries.injuryCount}名の負傷・出場停止者がいます。`);
-    if (awayInjuries.injuryCount) parts.push(`${away.nameJa}には現在${awayInjuries.injuryCount}名の負傷・出場停止者がいます。`);
+    const homeInjuredNames = (homeInjuries.injuredPlayers || []).slice(0, 3).join("・");
+    const awayInjuredNames = (awayInjuries.injuredPlayers || []).slice(0, 3).join("・");
+    if (homeInjuries.injuryCount) parts.push(`${home.nameJa}には現在${homeInjuries.injuryCount}名の負傷・出場停止者がいます${homeInjuredNames ? `(${homeInjuredNames}等)` : ""}。`);
+    if (awayInjuries.injuryCount) parts.push(`${away.nameJa}には現在${awayInjuries.injuryCount}名の負傷・出場停止者がいます${awayInjuredNames ? `(${awayInjuredNames}等)` : ""}。`);
+    if (homeFormationInfo.formation && awayFormationInfo.formation) parts.push(`直近の採用フォーメーションは${home.nameJa}が${homeFormationInfo.formation}、${away.nameJa}が${awayFormationInfo.formation}です。`);
+    if (homeTopScorerInfo.player) parts.push(`${home.nameJa}は${homeTopScorerInfo.player.name}(今季${homeTopScorerInfo.player.goals}得点)の得点力に注目です。`);
+    if (awayTopScorerInfo.player) parts.push(`${away.nameJa}は${awayTopScorerInfo.player.name}(今季${awayTopScorerInfo.player.goals}得点)の得点力に注目です。`);
     parts.push(winnerLabelJa ? `総合的に見て${winnerLabelJa}がやや優位という予想です。` : "両者の実力は拮抗しており、僅差の展開が予想されます。");
     return parts.join(" ");
   }
@@ -1335,8 +1356,8 @@ async function handleMatchAnalysis(query, clientIp) {
         `AI勝率: ${home.nameJa}${winProbability.homeWinPct}% / 引き分け${winProbability.drawPct}% / ${away.nameJa}${winProbability.awayWinPct}%`,
         `予想スコア: ${predictedScoreline}`,
         `重要度が高い要素: ${keyFactors.filter((f) => f.stars > 0).map((f) => `${f.labelJa}(${f.starsDisplay})`).join("、") || "(まだ強く学習された要素はありません)"}`,
-        `${home.nameJa}: 直近7日${homeForm.matchesLast7Days}試合、負傷者${homeInjuries.injuryCount ?? "不明"}名、順位${homeStandings.position ?? "不明"}位`,
-        `${away.nameJa}: 直近7日${awayForm.matchesLast7Days}試合、負傷者${awayInjuries.injuryCount ?? "不明"}名、順位${awayStandings.position ?? "不明"}位`,
+        `${home.nameJa}: 直近7日${homeForm.matchesLast7Days}試合、負傷者${homeInjuries.injuryCount ?? "不明"}名${(homeInjuries.injuredPlayers || []).length ? `(${homeInjuries.injuredPlayers.slice(0, 3).join("・")}等)` : ""}、順位${homeStandings.position ?? "不明"}位、フォーメーション${homeFormationInfo.formation || "不明"}、注目選手${homeTopScorerInfo.player ? `${homeTopScorerInfo.player.name}(今季${homeTopScorerInfo.player.goals}得点)` : "特になし"}`,
+        `${away.nameJa}: 直近7日${awayForm.matchesLast7Days}試合、負傷者${awayInjuries.injuryCount ?? "不明"}名${(awayInjuries.injuredPlayers || []).length ? `(${awayInjuries.injuredPlayers.slice(0, 3).join("・")}等)` : ""}、順位${awayStandings.position ?? "不明"}位、フォーメーション${awayFormationInfo.formation || "不明"}、注目選手${awayTopScorerInfo.player ? `${awayTopScorerInfo.player.name}(今季${awayTopScorerInfo.player.goals}得点)` : "特になし"}`,
         `過去対戦: ${h2h.sampleSize}試合中 ${home.nameJa}側${h2h.homeSideWins}勝 ${away.nameJa}側${h2h.awaySideWins}勝 ${h2h.draws}分`,
       ].join("\n");
       const { text } = await generateLLM({ systemPrompt, userPrompt, maxTokens: 400 });
@@ -1353,9 +1374,39 @@ async function handleMatchAnalysis(query, clientIp) {
     }
   }
 
+  // 2026年8月・本番監査で発見・修正: 以前は「予想勝者」(勝率の内訳から判定)と
+  // 「最も可能性の高い1点刻みのスコア」(ポワソン分布の格子上の最頻値)を
+  // 単純に組み合わせていたため、「1-1でナポリの勝利」のような自己矛盾した
+  // 文章になることがあった(ポワソン分布モデルの性質上、優勢な側がいても
+  // 単独最頻値スコアが引き分けスコアになることは普通に起こる)。実際に発生を
+  // 確認したため、スコアが引き分け目の場合は「優勢だが接戦」という正直な
+  // 表現に分ける。
+  const [scoreHomeGoals, scoreAwayGoals] = predictedScoreline.split("-").map((n) => parseInt(n, 10));
+  const scorelineIsDraw = scoreHomeGoals === scoreAwayGoals;
   const conclusion = winnerLabelJa
-    ? `AIは${predictedScoreline}で${winnerLabelJa}の勝利と予想します。`
+    ? (scorelineIsDraw
+        ? `AIは${winnerLabelJa}がやや優勢と予想しますが、最も可能性が高い正確なスコアは${predictedScoreline}の接戦です。`
+        : `AIは${predictedScoreline}で${winnerLabelJa}の勝利と予想します。`)
     : `AIは${predictedScoreline}の引き分けに近い、拮抗した試合と予想します。`;
+
+  // 2026年8月・本番監査(⑦情報拡張)対応: 「怪我人の影響」「フォーメーション
+  // 相性」「勝敗を左右する選手」。すべて実データのみ(取得できない場合は
+  // 正直にnull/空配列を返し、AIが作った文章では埋めない)。
+  const injuries = {
+    home: { count: homeInjuries.injuryCount ?? null, injured: homeInjuries.injuredPlayers || [], suspended: homeInjuries.suspendedPlayers || [] },
+    away: { count: awayInjuries.injuryCount ?? null, injured: awayInjuries.injuredPlayers || [], suspended: awayInjuries.suspendedPlayers || [] },
+  };
+  const formation = {
+    home: homeFormationInfo.formation || null,
+    away: awayFormationInfo.formation || null,
+    note: (homeFormationInfo.formation && awayFormationInfo.formation)
+      ? `直近の実試合で採用したフォーメーション(${home.nameJa}: ${homeFormationInfo.formation} ・ ${away.nameJa}: ${awayFormationInfo.formation})です。次の試合の先発フォーメーションは試合直前まで確定しないため、参考値としてご覧ください。`
+      : "直近試合のフォーメーションを一部取得できませんでした。",
+  };
+  const keyPlayers = {
+    home: homeTopScorerInfo.player ? { ...homeTopScorerInfo.player, note: "今シーズンの得点ランキング上位選手(実データ)" } : null,
+    away: awayTopScorerInfo.player ? { ...awayTopScorerInfo.player, note: "今シーズンの得点ランキング上位選手(実データ)" } : null,
+  };
 
   return {
     status: 200,
@@ -1367,6 +1418,7 @@ async function handleMatchAnalysis(query, clientIp) {
       keyFactors,
       mostImportantFactor: topFactor ? topFactor.labelJa : "(まだ強く学習された要素はありません)",
       narrative, reverseScenario, conclusion,
+      injuries, formation, keyPlayers,
       featuresUsed: features,
       weightsInfo: { version: weights.version || 0, updatedAt: weights.updatedAt || null },
       dataNotes,

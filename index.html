@@ -3620,6 +3620,30 @@ function renderMatchAnalysisResult(data, homeJa, awayJa) {
     <div class="scout-star-row"><span>${escapeHtml(f.labelJa)}</span><span class="stars">${escapeHtml(f.starsDisplay)} <span class="value-note">(寄与度${f.weightPct}%)</span></span></div>
   `).join("") || `<p class="value-note">まだ強く学習された要素はありません(毎日学習エンジンの検証データが十分に蓄積されると、ここに表示されます)。</p>`;
   const notesHtml = (data.dataNotes || []).length ? `<p class="value-note" style="margin-top:8px; opacity:.8;">※ ${data.dataNotes.map(escapeHtml).join(" / ")}</p>` : "";
+
+  // 2026年8月・本番監査(⑦情報拡張)対応: 怪我人の実名・直近フォーメーション・
+  // 注目選手(実データのみ・取得できない場合は正直に非表示)を追加表示する。
+  function injuryLineHtml(side, label) {
+    if (!side || !side.count) return `<div class="value-note" style="margin:2px 0;">${escapeHtml(label)}: 負傷・出場停止者なし</div>`;
+    const names = [...side.injured, ...side.suspended].slice(0, 4).join("・");
+    return `<div class="value-note" style="margin:2px 0;">${escapeHtml(label)}: ${side.count}名${names ? `(${escapeHtml(names)}等)` : ""}</div>`;
+  }
+  const injuriesHtml = data.injuries ? `
+    <h3 class="sim-subhead">🚑 怪我人・出場停止の影響</h3>
+    ${injuryLineHtml(data.injuries.home, homeJa)}
+    ${injuryLineHtml(data.injuries.away, awayJa)}
+  ` : "";
+  const formationHtml = (data.formation && (data.formation.home || data.formation.away)) ? `
+    <h3 class="sim-subhead">🧩 直近フォーメーション</h3>
+    <div class="value-note" style="margin:2px 0;">${escapeHtml(homeJa)}: ${escapeHtml(data.formation.home || "不明")} ・ ${escapeHtml(awayJa)}: ${escapeHtml(data.formation.away || "不明")}</div>
+    <p class="value-note" style="margin:2px 0; opacity:.75;">${escapeHtml(data.formation.note || "")}</p>
+  ` : "";
+  const keyPlayersHtmlBlock = (data.keyPlayers && (data.keyPlayers.home || data.keyPlayers.away)) ? `
+    <h3 class="sim-subhead">👤 注目選手(今シーズンの得点ランキング上位)</h3>
+    ${data.keyPlayers.home ? `<div class="value-note" style="margin:2px 0;">${escapeHtml(homeJa)}: ${escapeHtml(data.keyPlayers.home.name)}(${data.keyPlayers.home.goals}得点${data.keyPlayers.home.assists ? `・${data.keyPlayers.home.assists}アシスト` : ""})</div>` : ""}
+    ${data.keyPlayers.away ? `<div class="value-note" style="margin:2px 0;">${escapeHtml(awayJa)}: ${escapeHtml(data.keyPlayers.away.name)}(${data.keyPlayers.away.goals}得点${data.keyPlayers.away.assists ? `・${data.keyPlayers.away.assists}アシスト` : ""})</div>` : ""}
+  ` : "";
+
   wrap.innerHTML = `
     <div class="verdict-block">
       <div class="verdict-stars">${escapeHtml(wp.confidenceStarsDisplay)}</div>
@@ -3634,6 +3658,9 @@ function renderMatchAnalysisResult(data, homeJa, awayJa) {
     <div class="compare-comment" style="margin-top:8px;">
       <strong>🔄 もし予想と違ったら:</strong> ${escapeHtml(data.reverseScenario.text)}
     </div>
+    ${injuriesHtml}
+    ${formationHtml}
+    ${keyPlayersHtmlBlock}
     <p style="margin-top:12px; font-weight:700;">🏁 ${escapeHtml(data.conclusion)}</p>
     ${notesHtml}
     <p class="value-note" style="margin-top:8px; opacity:.7;">${escapeHtml(data.note || "")}</p>

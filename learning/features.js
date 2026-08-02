@@ -75,14 +75,27 @@ function computeFatigueFeature(fixtures, referenceDateMs) {
   return { matchesLast7Days: recentCount };
 }
 
+// 2026年8月・本番監査(⑦情報拡張)対応: これまでは人数(injuryCount)だけを
+// 返し、実際には取得できていた「誰が」「どんな理由で」(負傷/出場停止)を
+// 捨てていた。API-Footballの/injuriesは負傷・出場停止の両方をまとめて
+// 返すため(player.reasonに"Suspended"等が入る)、ここで種別も分けて返す。
+// 実データにある情報をそのまま構造化するだけで、AIの推測は加えない。
 function computeInjuryCountFeature(injuriesResponse) {
   const list = injuriesResponse || [];
-  const names = new Set();
+  const seen = new Map(); // name -> {name, reason, type}
   for (const r of list) {
     const name = r && r.player && r.player.name;
-    if (name) names.add(name);
+    if (!name || seen.has(name)) continue;
+    const reason = (r.player && r.player.reason) || null;
+    const isSuspension = !!(reason && /suspend/i.test(reason));
+    seen.set(name, { name, reason, type: isSuspension ? "suspension" : "injury" });
   }
-  return { injuryCount: names.size };
+  const players = [...seen.values()];
+  return {
+    injuryCount: players.length,
+    injuredPlayers: players.filter((p) => p.type === "injury").map((p) => p.name),
+    suspendedPlayers: players.filter((p) => p.type === "suspension").map((p) => p.name),
+  };
 }
 
 // API-Footballの/standingsは大会によって配列がグループ分けされてネストする
@@ -240,6 +253,61 @@ function inferLeagueIdFromFixtures(fixtures) {
   return withLeague ? withLeague.league.id : null;
 }
 
+// 2026年8月・本番監査(⑦情報拡張)対応: 「フォーメーション相性」への正直な
+// 回答。試合前の予想スタメン・フォーメーションはAPI-Football側でもキックオフ
+// 直前(約1時間前)まで確定しないため取得できない。代わりに「直近の実際の
+// 試合で採用したフォーメーション」を/fixtures/lineupsから取得する(これは
+// 実際にプレーされた試合の事実であり、AIの推測ではない)。試合中止・
+// ラインナップ未登録などで取得できない場合はnullを正直に返す。
+function computeFixtureFormation(lineupsResponse, teamId) {
+  const mine = (lineupsResponse || []).find((t) => t.team && t.team.id === teamId);
+  if (!mine) return { formation: null, coachName: null };
+  return { formation: mine.formation || null, coachName: mine.coach ? mine.coach.name : null };
+}
+
+async function fetchLatestFormation(fixtures, teamId, callApiFootball) {
+  const sorted = [...(fixtures || [])]
+    .filter((f) => f && f.fixture && f.fixture.date && f.fixture.status && f.fixture.status.short === "FT")
+    .sort((a, b) => new Date(b.fixture.date) - new Date(a.fixture.date));
+  const latest = sorted[0];
+  if (!latest) return { formation: null, coachName: null, error: "no_finished_fixture" };
+  try {
+    const data = await callApiFootball("/fixtures/lineups", { fixture: latest.fixture.id });
+    return { ...computeFixtureFormation(data.response, teamId), sourceFixtureId: latest.fixture.id, sourceFixtureDate: latest.fixture.date };
+  } catch (e) {
+    return { formation: null, coachName: null, error: e.message };
+  }
+}
+
+// 2026年8月・本番監査(⑦情報拡張)対応: 「勝敗を左右する選手」への正直な
+// 回答。「この選手が勝敗を決める」と断定できる根拠はAI-Footballには無いため、
+// 代わりに「今シーズンのその選手の得点ランキング上位」という、実データで
+// 裏付けられる客観的な事実を返す(架空の"キーマン診断"にはしない)。
+function pickTeamTopScorer(topscorersResponse, teamId) {
+  const list = topscorersResponse || [];
+  const mine = list.find((row) => (row.statistics || []).some((s) => s.team && s.team.id === teamId));
+  if (!mine) return null;
+  const stat = (mine.statistics || []).find((s) => s.team && s.team.id === teamId) || mine.statistics[0];
+  return {
+    name: mine.player ? mine.player.name : null,
+    goals: (stat && stat.goals && stat.goals.total) || 0,
+    assists: (stat && stat.goals && stat.goals.assists) || 0,
+  };
+}
+
+async function fetchTeamTopScorer(leagueId, season, teamId, callApiFootball) {
+  if (!leagueId) return { player: null, error: "no_league_id" };
+  try {
+    const data = await callApiFootball("/players/topscorers", { league: leagueId, season });
+    const player = pickTeamTopScorer(data.response, teamId);
+    // そのチームの選手がリーグ得点ランキング上位(トップ20程度)に一人もいない
+    // ことは普通にあり得る(それ自体は正直な「該当なし」)。
+    return { player: player || null };
+  } catch (e) {
+    return { player: null, error: e.message };
+  }
+}
+
 module.exports = {
   computeGoalRateFeatures,
   computeFatigueFeature,
@@ -253,4 +321,8 @@ module.exports = {
   fetchHeadToHeadFeature,
   fetchCoachCareer,
   inferLeagueIdFromFixtures,
+  computeFixtureFormation,
+  fetchLatestFormation,
+  pickTeamTopScorer,
+  fetchTeamTopScorer,
 };
