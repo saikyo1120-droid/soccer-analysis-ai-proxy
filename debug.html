@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="robots" content="noindex, nofollow" />
+<title>開発者向け自己診断ページ / soccer-analysis-ai-proxy</title>
+<style>
+  :root { color-scheme: dark light; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic", sans-serif; margin: 0; padding: 24px; background: #0f172a; color: #e2e8f0; line-height: 1.6; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #94a3b8; font-size: 13px; margin-bottom: 20px; }
+  .keybar { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
+  input[type="text"] { flex: 1; min-width: 200px; padding: 8px 10px; border-radius: 6px; border: 1px solid #334155; background: #1e293b; color: #e2e8f0; font-size: 14px; }
+  button { padding: 8px 16px; border-radius: 6px; border: none; background: #2563eb; color: white; font-size: 14px; cursor: pointer; }
+  button:hover { background: #1d4ed8; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 16px; margin-bottom: 14px; }
+  .card h2 { font-size: 15px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .ok { background: #14532d; color: #86efac; }
+  .bad { background: #7f1d1d; color: #fca5a5; }
+  .warn { background: #78350f; color: #fcd34d; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  td, th { text-align: left; padding: 4px 8px 4px 0; border-bottom: 1px solid #334155; vertical-align: top; }
+  th { color: #94a3b8; font-weight: 500; width: 40%; }
+  .raw { white-space: pre-wrap; word-break: break-all; font-family: ui-monospace, monospace; font-size: 12px; color: #94a3b8; max-height: 220px; overflow: auto; background: #0f172a; padding: 8px; border-radius: 6px; margin-top: 8px; }
+  .muted { color: #64748b; font-size: 12px; }
+  .err { color: #fca5a5; }
+</style>
+</head>
+<body>
+  <h1>🔧 開発者向け自己診断ページ</h1>
+  <div class="sub">soccer-analysis-ai-proxy ― 「実装されているか」ではなく「本番で今、実際に動いているか」を確認するためのページです。一般利用者向けではありません。</div>
+
+  <div class="keybar">
+    <input type="text" id="keyInput" placeholder="AUTO_COLLECT_SECRETを設定している場合はここに入力(未設定なら空欄のままでOK)" />
+    <button onclick="load()">再読み込み</button>
+  </div>
+
+  <div id="root"><div class="card muted">読み込み中...</div></div>
+
+<script>
+function badge(ok, okLabel, badLabel) {
+  return `<span class="badge ${ok ? 'ok' : 'bad'}">${ok ? (okLabel || 'OK') : (badLabel || 'NG')}</span>`;
+}
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+}
+async function load() {
+  const root = document.getElementById('root');
+  root.innerHTML = '<div class="card muted">読み込み中...</div>';
+  const key = document.getElementById('keyInput').value.trim();
+  const url = '/api/debug-status' + (key ? ('?key=' + encodeURIComponent(key)) : '');
+  let data;
+  try {
+    const res = await fetch(url);
+    if (res.status === 403) {
+      root.innerHTML = '<div class="card"><h2>🔒 アクセス拒否 (403)</h2><div>AUTO_COLLECT_SECRETと同じキーを上の欄に入力してください。</div></div>';
+      return;
+    }
+    data = await res.json();
+  } catch (e) {
+    root.innerHTML = `<div class="card"><h2 class="err">取得に失敗しました</h2><div>${esc(e.message)}</div></div>`;
+    return;
+  }
+
+  const html = [];
+
+  html.push(`<div class="card muted">最終更新: ${esc(data.generatedAt)}</div>`);
+
+  // Redis
+  html.push(`<div class="card"><h2>Redis (Upstash) ${badge(data.redis && data.redis.reachable)}</h2>
+    <table>
+      <tr><th>設定済み</th><td>${data.redis && data.redis.configured ? 'はい' : 'いいえ'}</td></tr>
+      <tr><th>実接続(PING)</th><td>${data.redis && data.redis.reachable ? '成功' : '失敗/未確認'}</td></tr>
+      ${data.redis && data.redis.error ? `<tr><th>エラー</th><td class="err">${esc(data.redis.error)}</td></tr>` : ''}
+    </table></div>`);
+
+  // API-Football
+  html.push(`<div class="card"><h2>API-Football ${badge(data.apiFootball && data.apiFootball.reachable)}</h2>
+    <table>
+      <tr><th>キー設定済み</th><td>${data.apiFootball && data.apiFootball.configured ? 'はい' : 'いいえ'}</td></tr>
+      <tr><th>実接続確認(/status)</th><td>${data.apiFootball && data.apiFootball.reachable ? '成功' : '失敗/未確認'}</td></tr>
+      ${data.apiFootball && data.apiFootball.error ? `<tr><th>エラー</th><td class="err">${esc(data.apiFootball.error)}</td></tr>` : ''}
+    </table>
+    ${data.apiFootball && data.apiFootball.accountInfo ? `<div class="raw">${esc(JSON.stringify(data.apiFootball.accountInfo, null, 2))}</div>` : ''}
+    </div>`);
+
+  // LLM
+  html.push(`<div class="card"><h2>LLM (${esc(data.llm && data.llm.provider)}) ${badge(data.llm && data.llm.configured)}</h2>
+    <table><tr><th>APIキー設定済み</th><td>${data.llm && data.llm.configured ? 'はい' : 'いいえ'}</td></tr></table>
+    <div class="muted">${esc(data.llm && data.llm.note)}</div></div>`);
+
+  // Learning Engine
+  const le = data.learningEngine || {};
+  html.push(`<div class="card"><h2>Learning Engine(毎日学習エンジン) ${badge(le.ranYet === true, '実行済み', '未実行')}</h2>
+    <table>
+      <tr><th>Redis設定</th><td>${le.configured ? 'あり' : 'なし'}</td></tr>
+      <tr><th>これまでに一度でも実行された</th><td>${le.ranYet === true ? 'はい' : (le.ranYet === false ? 'いいえ' : '不明')}</td></tr>
+      ${le.ranAt ? `<tr><th>最終実行日時</th><td>${esc(le.ranAt)}</td></tr>` : ''}
+      ${le.date ? `<tr><th>最終実行日</th><td>${esc(le.date)}</td></tr>` : ''}
+      ${le.teamsAnalyzed != null ? `<tr><th>分析対象クラブ数</th><td>${esc(le.teamsAnalyzed)}</td></tr>` : ''}
+      ${le.factsAddedToday != null ? `<tr><th>当日追加した事実数</th><td>${esc(le.factsAddedToday)}</td></tr>` : ''}
+      ${le.knowledgeItemsSavedToday != null ? `<tr><th>当日Knowledge Engineに保存</th><td>${esc(le.knowledgeItemsSavedToday)}件(重複スキップ${esc(le.knowledgeItemsDuplicateToday)}件)</td></tr>` : ''}
+      ${le.matchesResolvedToday != null ? `<tr><th>当日検証した試合数</th><td>${esc(le.matchesResolvedToday)}</td></tr>` : ''}
+      ${le.hypothesesConfirmed != null ? `<tr><th>仮説の確定/破棄</th><td>確定${esc(le.hypothesesConfirmed)}件 / 破棄${esc(le.hypothesesDiscarded)}件</td></tr>` : ''}
+      ${le.errors && le.errors.length ? `<tr><th>エラー</th><td class="err">${esc(le.errors.length)}件</td></tr>` : ''}
+      ${le.message ? `<tr><th>メッセージ</th><td>${esc(le.message)}</td></tr>` : ''}
+    </table>
+    ${le.errors && le.errors.length ? `<div class="raw">${esc(JSON.stringify(le.errors, null, 2))}</div>` : ''}
+    </div>`);
+
+  // Knowledge Engine
+  const ke = data.knowledgeEngine || {};
+  html.push(`<div class="card"><h2>Knowledge Engine ${badge((ke.totalActiveItems || 0) > 0, 'データあり', 'データなし')}</h2>
+    <table>
+      <tr><th>有効な知識アイテム数(全クラブ合計)</th><td>${esc(ke.totalActiveItems)}</td></tr>
+      <tr><th>保存済み総数(失効含む)</th><td>${esc(ke.totalStoredItems)}</td></tr>
+      <tr><th>確認したクラブ数</th><td>${esc(ke.registeredTeamsChecked)}</td></tr>
+    </table>
+    ${ke.byTeam && ke.byTeam.length ? `<div class="raw">${esc(JSON.stringify(ke.byTeam, null, 2))}</div>` : '<div class="muted">クラブ別データはまだありません。</div>'}
+    </div>`);
+
+  // Memory Engine
+  const me = data.memoryEngine || {};
+  html.push(`<div class="card"><h2>Memory Engine ${badge((me.subjectsWithConclusion || 0) > 0, 'データあり', 'データなし')}</h2>
+    <table>
+      <tr><th>結論を記憶しているクラブ数</th><td>${esc(me.subjectsWithConclusion)} / ${esc(me.registeredTeamsChecked)}</td></tr>
+    </table>
+    ${me.details && me.details.length ? `<div class="raw">${esc(JSON.stringify(me.details, null, 2))}</div>` : '<div class="muted">記憶されている結論はまだありません(議論モードでクラブについて質問すると記録されます)。</div>'}
+    </div>`);
+
+  // Prediction Engine
+  const pe = data.predictionEngine || {};
+  html.push(`<div class="card"><h2>Prediction Engine(自前の学習モデル) ${badge((pe.resolved || 0) > 0, 'データあり', 'データなし')}</h2>
+    <table>
+      <tr><th>記録した予測数</th><td>${esc(pe.totalOwnPredictions)}</td></tr>
+      <tr><th>解決済み(結果判明)</th><td>${esc(pe.resolved)}</td></tr>
+      <tr><th>的中数</th><td>${esc(pe.correct)}</td></tr>
+      <tr><th>正答率</th><td>${pe.accuracyPct != null ? pe.accuracyPct + '%' : 'まだ記録なし'}</td></tr>
+      ${pe.weightsLastUpdatedAt ? `<tr><th>重みパラメータ最終更新</th><td>${esc(pe.weightsLastUpdatedAt)}</td></tr>` : ''}
+    </table>
+    ${pe.currentWeights ? `<div class="raw">${esc(JSON.stringify(pe.currentWeights, null, 2))}</div>` : ''}
+    </div>`);
+
+  html.push(`<div class="card muted">生データ(JSON全体):<div class="raw">${esc(JSON.stringify(data, null, 2))}</div></div>`);
+
+  root.innerHTML = html.join('');
+}
+load();
+</script>
+</body>
+</html>

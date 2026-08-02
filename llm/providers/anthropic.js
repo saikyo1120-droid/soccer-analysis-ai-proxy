@@ -9,10 +9,14 @@
  */
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 // 既定モデル: コスト最適化の方針(設計書②)に合わせて軽量モデルを既定にしています。
-// Anthropicのモデルは時期によって新しいものが追加されるため、最新の推奨モデルIDは
-// https://docs.anthropic.com/en/docs/about-claude/models で確認し、必要なら
+// 2026年8月時点でAnthropic公式ドキュメント(platform.claude.com/docs)を確認し、
+// 直接のAnthropic API経由では入手できなくなっていた旧モデル(claude-3-5-haiku-
+// 20241022。Bedrock/Google Cloud経由でのみ現在も提供)から、現行の軽量モデル
+// claude-haiku-4-5(入力$1/output$5 per MTok)に更新しました。Anthropicのモデルは
+// 時期によって新しいものが追加されるため、最新の推奨モデルIDは
+// https://platform.claude.com/docs/en/about-claude/models で確認し、必要なら
 // .env の ANTHROPIC_MODEL で上書きしてください。
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-3-5-haiku-20241022";
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5";
 const ANTHROPIC_API_BASE = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION = "2023-06-01";
 

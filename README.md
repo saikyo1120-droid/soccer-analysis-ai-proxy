@@ -149,11 +149,19 @@ API-Footballの無料枠を消費されるのを防ぐには、`.env`(本番はR
    Anthropicのコンソール側でも設定できます)
 3. 左メニューの「API Keys」→「Create Key」でキーを発行し、コピーする
 4. `.env`(本番はRenderの環境変数)の `ANTHROPIC_API_KEY` に貼り付ける
-5. 併せて `MAX_LLM_CALLS_PER_DAY`(1日あたりのAI考察の呼び出し上限)を設定して
-   ください。既定値は50件/日です。まずは少なめの値から様子を見て、実際の利用状況
-   を見ながら調整することをおすすめします(この上限に達すると、それ以上はLLMを
-   呼び出さず、正直に「本日は利用上限に達しました」と表示するだけになります＝
-   上限を超えて課金されることはありません)。
+5. 併せて、コストの暴走を防ぐ安全装置(2段階)を設定できます。詳しくは
+   `.env.example` を参照してください。
+   - `PER_IP_LLM_CALLS_PER_DAY`(利用者ごとの1日あたり上限。既定10回): 世界中の
+     誰でも使える公開サービスを想定し、一人(または悪意あるアクセス)がその日の
+     予算を独り占めして、他の利用者が誰も使えなくなる事態を防ぎます。
+   - `MAX_LLM_CALLS_PER_DAY`(サイト全体の1日あたり上限。既定2000回): ①をすり
+     抜けるような異常アクセスからサービス全体を守る、最後の安全弁です。
+   - いずれの上限に達した場合も、それ以上はLLMを呼び出さず、正直にその旨を
+     表示するだけです(上限を超えて課金されることはありません)。
+   - **さらに安心したい場合**: 上記はあくまでこのアプリのコード側の安全装置です。
+     Anthropic Console(https://platform.claude.com/ → 組織の設定 → 請求)側でも
+     「使用量上限」を別途設定しておくことを強く推奨します。アプリ側の仕組みが
+     万が一機能しなくても、設定した金額以上は絶対に請求されなくなります。
 6. サーバーを再起動すれば設定完了です
 
 **将来、Claude以外のAIに乗り換えたい場合:** `.env` の `LLM_PROVIDER` を
@@ -343,3 +351,4 @@ factは14日・analysisは30日・opinionは3日で「アクティブな知識�
 | `POST /api/discuss` | 【Stage C・Stage Eで拡張】「〜だと思う」「なぜ？」等の意見・考察を求める質問に、Planner(必要な情報+比較すべき観点を判定)→RAG(API-Football実データ+Knowledge Engineの蓄積知識を取得)→Reasoning Engine(仮説生成→根拠ランキング→自己チェック。利用者には非表示)→Memory Engine(前回の結論と比較・保存)→LLM推論(取得した事実+内部推論を根拠に考察)の順で処理し、①事実②統計③根拠④考察⑤結論⑥信頼度(理由付き)+フォローアップ質問を返すAPI。クラブに関する質問の場合、`meta.reasoning`に内部で検討した仮説一覧・選ばれた仮説・自己チェック結果・Memory Engineの記録結果が含まれる(デバッグ・検証用。回答文自体には仮説ラベルをそのまま出力しない)。リクエストbodyに`question`・`subject`(`{type:"club"または"player", labelJa, labelEn}`)・`playerHint`を渡す。単純な質問(選手データ・順位・試合結果など)はこのAPIを使わず、これまで通りフロントエンドのルールベースで即答するため、呼ばれるのは議論トリガーを検出したときだけ。`ANTHROPIC_API_KEY`未設定時は`ok:false`で正直な理由を返す |
 | `POST /api/learning/run-daily?key=...` | 【Stage D・Stage Eで拡張】毎日学習エンジンを1回実行する(登録クラブのフォーム分析・Knowledge Engine経由での事実の記録・自社予測モデルの検証と改善・Hypothesis Engineによる状態仮説の検証)。`AUTO_COLLECT_SECRET`設定時は`key`が一致しないと403。`.github/workflows/daily-learning.yml`から毎日自動で呼び出される想定 |
 | `GET /api/growth-log` | 【Stage D・Stage Eで拡張】直近の学習エンジン実行結果(今日Knowledge Engineに新規保存した知識件数・重複でスキップした件数・検証した試合数・自社予測モデルの的中率の変化・AI自身の予測仮説の的中/破棄件数)を返す。ホーム画面の「🧠 昨日学んだこと」ウィジェットが使用。未実行の場合は`ranYet:false`を正直に返す |
+| `GET /api/debug-status?key=...` / `GET /debug.html` | 【開発者専用・NEW】「コード上は実装されている」ではなく「本番で今、実際に動いているか」を確認するための自己診断ページ。Redis(Upstash)への実際のPING接続確認、API-Footballへの実際の接続確認(`/status`)、LLMのAPIキー設定状況(実費が発生するため実際の呼び出しはしない)、Learning Engineの最終実行結果、Knowledge Engine/Memory Engineの登録クラブ横断の件数集計、自社予測モデル(Prediction Engine)の正答率を1画面にまとめて表示する。一般利用者向けの機能ではないため、`AUTO_COLLECT_SECRET`を設定している場合は他の保護付きエンドポイントと同じ`?key=`方式で保護される(未設定の場合は開いたまま。既存のrun-daily/auto-collectと同じトレードオフ) |

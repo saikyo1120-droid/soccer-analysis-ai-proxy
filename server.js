@@ -47,6 +47,10 @@ const { assembleReasoning, formatReasoningForPrompt } = require("./reasoning/rea
 // 依存(callApiFootball/resolveTeamId/Upstashアクセス関数)は、このファイル自身が
 // 定義した後にまとめて注入する(利用箇所は下の方の「Stage D」セクションを参照)。
 const { runDailyLearning, getGrowthLog, getRecentFactsForTeam } = require("./learning/dailyJob");
+// /debug診断ページが「毎日学習エンジンが対象にしている全クラブ」を横断して
+// Knowledge Engine / Memory Engineの件数を集計するために使う一覧(新機能ではなく
+// 既存のクラブ一覧を読み取り専用で再利用するだけ)。
+const { REGISTERED_TEAMS } = require("./learning/registeredTeams");
 
 // ---- .env を自前で読み込む(dotenvパッケージ不使用) ----
 function loadEnvFile(filePath) {
@@ -1100,15 +1104,178 @@ const knowledgeSource = createKnowledgeSource({
   setRelation: (...args) => relationshipIndex.setRelation(...args),
 });
 
+// ---- 開発者向け自己診断ページ(/debug.html)用のデータ集計 ----
+// 目的: 「コード上は実装されている」ではなく「本番で実際に動いているか」を、
+// 実際にRedis/API-Footballへ接続確認しに行った上で開発者(Sai)自身が一目で
+// 確認できるようにする。一般利用者向けの新しいAI機能ではなく、既存の各エンジンの
+// 状態を読み取り専用で可視化するだけの運用ツール。
+// AUTO_COLLECT_SECRETが設定されている場合、そのキー一致を要求する(内部の
+// 学習件数・知識件数などをむやみに一般公開しないため。既存のrun-daily/
+// auto-collectエンドポイントと同じ保護パターン)。
+async function handleDebugStatus() {
+  const generatedAt = new Date().toISOString();
+
+  // ---- Redis(Upstash)への実接続確認(設定の有無だけでなく、実際にPINGが通るか) ----
+  const redisInfo = { configured: UPSTASH_ENABLED, reachable: false, error: null };
+  if (UPSTASH_ENABLED) {
+    try {
+      const pong = await upstashCmd(["PING"]);
+      redisInfo.reachable = !!pong;
+      redisInfo.raw = pong;
+    } catch (e) {
+      redisInfo.reachable = false;
+      redisInfo.error = e.message;
+    }
+  }
+
+  // ---- API-Footballへの実接続確認(/status は認証確認用の軽量エンドポイント) ----
+  const apiFootballInfo = { configured: !!API_KEY, viaRapidApi: VIA_RAPIDAPI, reachable: false, error: null };
+  if (API_KEY) {
+    try {
+      const status = await callApiFootball("/status");
+      apiFootballInfo.reachable = true;
+      apiFootballInfo.accountInfo = status && status.response ? status.response : null;
+    } catch (e) {
+      apiFootballInfo.reachable = false;
+      apiFootballInfo.error = e.message;
+    }
+  }
+
+  // ---- LLM(Anthropic等)の設定状況。実費が発生するため実際の呼び出しはしない ----
+  const llmInfo = {
+    provider: process.env.LLM_PROVIDER || "anthropic",
+    configured: !!process.env.ANTHROPIC_API_KEY,
+    note: "実費が発生するため、この診断ページはLLMへの実際のテスト呼び出しは行いません(APIキーの設定有無のみ確認)。",
+  };
+
+  // ---- Learning Engine(既存のgetGrowthLogをそのまま再利用) ----
+  const learning = await getGrowthLog(learningDeps);
+
+  // ---- Knowledge Engine: 登録済みクラブ全体を横断して件数を集計 ----
+  let knowledgeTotalActive = 0;
+  let knowledgeTotalStored = 0;
+  const knowledgeByTeam = [];
+  if (UPSTASH_ENABLED) {
+    for (const team of REGISTERED_TEAMS) {
+      try {
+        const active = await knowledgeStore.getActiveKnowledge(team.nameEn);
+        knowledgeTotalActive += active.totalActive;
+        knowledgeTotalStored += active.totalStored;
+        if (active.totalStored > 0) {
+          knowledgeByTeam.push({ teamEn: team.nameEn, teamJa: team.nameJa, active: active.totalActive, stored: active.totalStored });
+        }
+      } catch (e) {
+        // ベストエフォート: 1クラブ分の集計に失敗しても他クラブの集計は続行する
+      }
+    }
+  }
+  const knowledgeEngineInfo = {
+    totalActiveItems: knowledgeTotalActive,
+    totalStoredItems: knowledgeTotalStored,
+    registeredTeamsChecked: REGISTERED_TEAMS.length,
+    byTeam: knowledgeByTeam,
+  };
+
+  // ---- Memory Engine: 現状「team:<英名>:leadingFactor」という1クラブ1サブジェクトのみ運用中 ----
+  let memorySubjectsWithConclusion = 0;
+  const memoryDetails = [];
+  if (UPSTASH_ENABLED) {
+    for (const team of REGISTERED_TEAMS) {
+      try {
+        const subjectKey = `team:${team.nameEn}:leadingFactor`;
+        const conclusion = await memoryStore.getLastConclusion(subjectKey);
+        if (conclusion) {
+          memorySubjectsWithConclusion++;
+          memoryDetails.push({
+            teamEn: team.nameEn, teamJa: team.nameJa,
+            statement: conclusion.statement, revision: conclusion.revision,
+            computedAt: conclusion.computedAt, lastConfirmedAt: conclusion.lastConfirmedAt || null,
+          });
+        }
+      } catch (e) {
+        // ベストエフォート
+      }
+    }
+  }
+  const memoryEngineInfo = {
+    subjectsWithConclusion: memorySubjectsWithConclusion,
+    registeredTeamsChecked: REGISTERED_TEAMS.length,
+    details: memoryDetails,
+  };
+
+  // ---- Prediction Engine(自前の学習モデル。learn:ownpred:* / learn:weights) ----
+  const predictionEngineInfo = { totalOwnPredictions: 0, resolved: 0, correct: 0, accuracyPct: null, currentWeights: null, weightsLastUpdatedAt: null };
+  if (UPSTASH_ENABLED) {
+    try {
+      const [totalRaw, resolvedRaw, correctRaw, weights, weightsHistoryRaw] = await Promise.all([
+        upstashCmd(["GET", "learn:ownpred:total"]),
+        upstashCmd(["GET", "learn:ownpred:resolved"]),
+        upstashCmd(["GET", "learn:ownpred:correct"]),
+        upstashGetJSON("learn:weights"),
+        upstashCmd(["LRANGE", "learn:weights:history", "-1", "-1"]),
+      ]);
+      const resolved = parseInt(resolvedRaw, 10) || 0;
+      const correct = parseInt(correctRaw, 10) || 0;
+      predictionEngineInfo.totalOwnPredictions = parseInt(totalRaw, 10) || 0;
+      predictionEngineInfo.resolved = resolved;
+      predictionEngineInfo.correct = correct;
+      predictionEngineInfo.accuracyPct = resolved > 0 ? Math.round((correct / resolved) * 1000) / 10 : null;
+      predictionEngineInfo.currentWeights = weights || null;
+      if (weightsHistoryRaw && weightsHistoryRaw[0]) {
+        try { predictionEngineInfo.weightsLastUpdatedAt = JSON.parse(weightsHistoryRaw[0]).updatedAt || null; } catch (e) { /* ignore */ }
+      }
+    } catch (e) {
+      predictionEngineInfo.error = e.message;
+    }
+  }
+
+  return {
+    status: 200,
+    body: {
+      generatedAt,
+      redis: redisInfo,
+      apiFootball: apiFootballInfo,
+      llm: llmInfo,
+      learningEngine: learning,
+      knowledgeEngine: knowledgeEngineInfo,
+      memoryEngine: memoryEngineInfo,
+      predictionEngine: predictionEngineInfo,
+    },
+  };
+}
+
 // LLM呼び出しは実費が発生するため、暴走・悪用でコストが青天井にならないよう
-// 1日あたりの呼び出し上限を設ける(既定値は少なめ。.envで調整可能)。
-const MAX_LLM_CALLS_PER_DAY = parseInt(process.env.MAX_LLM_CALLS_PER_DAY, 10) || 50;
+// 2段階の上限を設ける(世界中の誰でも使える公開サービスを想定した設計)。
+//   ①IPごとの1日あたり上限(既定10回): 一人(または悪意あるアクセス)がその日の
+//     予算を独り占めして、他の利用者が誰も使えなくなる事態を防ぐ。
+//   ②サイト全体の1日あたり上限(既定2000回): ①をすり抜けるような異常アクセス
+//     (IPを分散させた大量アクセス等)からサービス全体を守る、最後の安全弁。
+// どちらも.envで調整可能。またAnthropic Console側(platform.claude.com)の
+// 「使用量上限」設定も、アプリのバグ等に依存しない最終的な安全弁として
+// 別途設定しておくことを強く推奨する(server/README.md参照)。
+const PER_IP_LLM_CALLS_PER_DAY = parseInt(process.env.PER_IP_LLM_CALLS_PER_DAY, 10) || 10;
+const MAX_LLM_CALLS_PER_DAY = parseInt(process.env.MAX_LLM_CALLS_PER_DAY, 10) || 2000;
 let llmDailyBudget = { day: null, count: 0 };
+let llmIpDailyBudget = { day: null, counts: new Map() };
+
 function tryConsumeLlmBudget() {
   const today = new Date().toISOString().slice(0, 10);
   if (llmDailyBudget.day !== today) llmDailyBudget = { day: today, count: 0 };
   if (llmDailyBudget.count >= MAX_LLM_CALLS_PER_DAY) return false;
   llmDailyBudget.count += 1;
+  return true;
+}
+
+// IPは末尾の1件のみ厳密照合はせず、既存の簡易レート制限(rateLimited関数)と
+// 同じ抽出方法をそのまま踏襲する(x-forwarded-forの先頭が実クライアントIPである
+// Renderの構成を想定。プロキシ構成が変わる場合は要調整)。
+function tryConsumeLlmBudgetForIp(ip) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (llmIpDailyBudget.day !== today) llmIpDailyBudget = { day: today, counts: new Map() };
+  const key = ip || "unknown";
+  const current = llmIpDailyBudget.counts.get(key) || 0;
+  if (current >= PER_IP_LLM_CALLS_PER_DAY) return false;
+  llmIpDailyBudget.counts.set(key, current + 1);
   return true;
 }
 
@@ -1245,11 +1412,34 @@ function parseDiscussLlmOutput(rawText) {
   return { evidence, consideration, conclusion, followUpQuestions, parsedOk: true };
 }
 
-async function handleDiscuss(body) {
+async function handleDiscuss(body, clientIp) {
   if (!body || typeof body !== "object") return { status: 400, body: { ok: false, error: "invalid JSON body" } };
   const question = String(body.question || "").trim();
   if (!question) return { status: 400, body: { ok: false, error: "question is required" } };
   if (question.length > 500) return { status: 400, body: { ok: false, error: "question is too long (max 500 chars)" } };
+
+  // 予算チェックはPlanner/RAG/Reasoning Engineより先に行う。どうせLLMを呼べない
+  // ならAPI-Football側のクォータも消費させないため。①IPごとの上限→②サイト全体の
+  // 上限、の順でチェックする(①で弾かれた場合は②の枠を消費しない=他の利用者の
+  // 分は減らさない)。
+  if (!tryConsumeLlmBudgetForIp(clientIp)) {
+    return {
+      status: 200,
+      body: {
+        ok: false, reason: "llm_budget_exceeded_per_ip",
+        message: `本日、あなたがご利用いただけるAI考察の回数の上限(${PER_IP_LLM_CALLS_PER_DAY}回)に達しました。日付が変わると(日本時間の朝ごろ)また使えるようになります。`,
+      },
+    };
+  }
+  if (!tryConsumeLlmBudget()) {
+    return {
+      status: 200,
+      body: {
+        ok: false, reason: "llm_budget_exceeded_global",
+        message: "本日はサイト全体でのAI考察の利用が集中しているため、一時的に利用を制限しています。しばらくしてから再度お試しください。",
+      },
+    };
+  }
 
   const subject = (body.subject && typeof body.subject === "object") ? body.subject : { type: null };
   const plan = planInformationNeeds(question, subject);
@@ -1309,13 +1499,6 @@ async function handleDiscuss(body) {
   } else {
     facts.push("特定のクラブ・選手データには基づかない、一般的なサッカーの知識に基づく考察です。");
     confidence = { stars: 2, reasonJa: "特定の実データによる裏付けができないため、確信度は控えめにしています。" };
-  }
-
-  if (!tryConsumeLlmBudget()) {
-    return {
-      status: 200,
-      body: { ok: false, reason: "llm_budget_exceeded", message: "本日はAI考察の利用上限に達しました。しばらくしてから再度お試しください。" },
-    };
   }
 
   const reasoningPromptBlock = reasoningBundle ? formatReasoningForPrompt(reasoningBundle, previousConclusion) : "";
@@ -1524,7 +1707,8 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ ok: false, error: e.message }));
           return;
         }
-        const { status, body } = await handleDiscuss(parsedBody);
+        const discussClientIp = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown";
+        const { status, body } = await handleDiscuss(parsedBody, discussClientIp);
         res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
         return;
@@ -1573,6 +1757,23 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(result));
         return;
       }
+      if (pathname === "/api/debug-status") {
+        // 開発者向け自己診断ページ(/debug.html)専用のJSONエンドポイント。
+        // AUTO_COLLECT_SECRETが設定されている場合は、他の保護付きエンドポイント
+        // (run-daily/auto-collect)と同じ ?key= 方式で保護する(内部の件数・
+        // 構成情報を一般公開しないため)。未設定の場合は、それらのエンドポイントと
+        // 同様に開いたままになる(README/.env.exampleで開示済みのトレードオフ)。
+        const requiredSecret = process.env.AUTO_COLLECT_SECRET || "";
+        if (requiredSecret && parsed.searchParams.get("key") !== requiredSecret) {
+          res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "invalid or missing key" }));
+          return;
+        }
+        const { status, body } = await handleDebugStatus();
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
       res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ found: false, error: "unknown endpoint" }));
     } catch (e) {
@@ -1606,6 +1807,7 @@ module.exports = {
   guessSeason,
   runDailyLearning,
   getGrowthLog,
+  handleDebugStatus,
   learningDeps,
   knowledgeStore,
   memoryStore,
