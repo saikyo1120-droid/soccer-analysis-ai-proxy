@@ -221,11 +221,92 @@ function fitWeightsGradientDescent(records, initialWeights, opts) {
   return weights;
 }
 
+// ---- 2026年8月・知識拡張フェーズ: 「利用者にも学習内容を見えるようにする」----
+// learn:weights:history の1件(dailyJob.jsが保存する{adopted, method, oldWeights,
+// newWeights, oldAccuracy, newAccuracy, sampleSize, note})を、ユーザーの要望に
+// あった「✓ ホーム補正を少し弱めました / 理由: ...」という形式の日本語文へ
+// 機械的に変換する。LLMは使わない(実際に変化した数値そのものから導くため、
+// 「賢くなったように見せかける」でっち上げの余地がない。変化が無ければ
+// 「更新なし」と正直に返す)。
+const WEIGHT_LABELS_JA = {
+  homeBase: "ホームチームの基礎的な強さ",
+  awayBase: "アウェイチームの基礎的な強さ",
+  sensitivity: "フォーム(直近の調子)の重要度",
+  goalRateSensitivity: "得点力・失点率の重要度",
+  injurySensitivity: "怪我人の影響の重要度",
+  standingsSensitivity: "順位・勝点の重要度",
+  headToHeadSensitivity: "過去対戦成績の重要度",
+  fatigueSensitivity: "過密日程(疲労)の影響の重要度",
+};
+const WEIGHT_CHANGE_THRESHOLD = 0.005; // これ未満の変化は「実質変化なし」として無視する
+
+function describeOneWeightChange(key, oldVal, newVal) {
+  const label = WEIGHT_LABELS_JA[key];
+  if (!label) return null;
+  const before = typeof oldVal === "number" ? oldVal : 0;
+  const after = typeof newVal === "number" ? newVal : 0;
+  const diff = after - before;
+  if (Math.abs(diff) < WEIGHT_CHANGE_THRESHOLD) return null;
+  // homeBase/awayBaseは「大きさそのもの」、sensitivity系は「重要度(絶対値)」の
+  // 増減として説明する(符号が逆向きに振れても、モデルへの影響力という意味では
+  // 「強めた」ことになるため、絶対値の変化で判定する)。
+  const beforeMag = key === "homeBase" || key === "awayBase" ? before : Math.abs(before);
+  const afterMag = key === "homeBase" || key === "awayBase" ? after : Math.abs(after);
+  const magDiff = afterMag - beforeMag;
+  if (Math.abs(magDiff) < WEIGHT_CHANGE_THRESHOLD) return null;
+  const direction = magDiff > 0 ? "強めました" : "弱めました";
+  const magnitude = Math.abs(magDiff) >= 0.15 ? "大きく" : Math.abs(magDiff) >= 0.05 ? "" : "少し";
+  return `✓ ${label}を${magnitude}${direction}`;
+}
+
+/**
+ * @param {object} entry - learn:weights:historyの1件
+ * @returns {{date, method, adopted, bullets: string[], reason: string|null, sampleSize}}
+ */
+function describeWeightsHistoryEntry(entry) {
+  if (!entry) return null;
+  const methodLabelJa = entry.method === "gradient_descent_v2" ? "拡張特徴量モデル(v2)" : "基本モデル(v1・フォーム差のみ)";
+  if (!entry.adopted) {
+    return {
+      date: entry.date, method: entry.method, methodLabelJa, adopted: false,
+      bullets: [],
+      reason: entry.note || `${methodLabelJa}の重みを見直しましたが、直近${entry.sampleSize ?? "?"}件の検証結果では既存の重みを上回らなかったため、更新を見送りました。`,
+      sampleSize: entry.sampleSize ?? null,
+      oldAccuracy: entry.oldAccuracy ?? null, newAccuracy: entry.newAccuracy ?? null,
+    };
+  }
+  const oldW = entry.oldWeights || {};
+  const newW = entry.newWeights || {};
+  const keys = Object.keys(WEIGHT_LABELS_JA);
+  const bullets = keys.map((k) => describeOneWeightChange(k, oldW[k], newW[k])).filter(Boolean);
+  const accUp = typeof entry.oldAccuracy === "number" && typeof entry.newAccuracy === "number";
+  const reason = accUp
+    ? `直近${entry.sampleSize ?? "?"}試合の検証結果で、的中率が${entry.oldAccuracy}%→${entry.newAccuracy}%に上がったため(${methodLabelJa})。`
+    : `直近の検証結果でこちらの重みの方が的中率が高かったため(${methodLabelJa})。`;
+  return {
+    date: entry.date, method: entry.method, methodLabelJa, adopted: true,
+    bullets: bullets.length ? bullets : ["✓ 重みの数値を微調整しました(表示閾値未満の小さな変化)"],
+    reason,
+    sampleSize: entry.sampleSize ?? null,
+    oldAccuracy: entry.oldAccuracy ?? null, newAccuracy: entry.newAccuracy ?? null,
+  };
+}
+
+// weights:historyの配列(古い→新しい順を想定。RPUSHで積んでいるためRedisの
+// LRANGEはそのまま古い→新しい順になる)から、実際に採用された(adopted:true)
+// 変更だけを新しい順に抽出して返す。「昨日の学習」ウィジェット用。
+function buildLearningSummary(historyEntries, limit) {
+  const list = (historyEntries || []).map(describeWeightsHistoryEntry).filter(Boolean);
+  const adopted = list.filter((e) => e.adopted).reverse();
+  return adopted.slice(0, limit || 5);
+}
+
 module.exports = {
   EXTENDED_DEFAULT_WEIGHTS,
   FEATURE_WEIGHT_MAP,
   FEATURE_LABELS_JA,
   LEARNABLE_KEYS,
+  WEIGHT_LABELS_JA,
   computeMatchFeatures,
   predictOutcomeV2,
   poissonPmf,
@@ -236,4 +317,6 @@ module.exports = {
   backtestAccuracyV2,
   computeNegativeLogLikelihood,
   fitWeightsGradientDescent,
+  describeWeightsHistoryEntry,
+  buildLearningSummary,
 };

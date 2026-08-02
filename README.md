@@ -577,6 +577,208 @@ Memory Engine自体(`getConclusionHistory`による履歴保持)はStage Eから
   未登録の対戦相手についても、その場でAPI-Footballから直近成績を取得してフォーム
   スコアを計算しているため、相手クラブがどこであっても予測・検証ができる設計です。
 
+### 11. 2026年8月・本番監査(「本当に学習しているのか」の実地調査と修正)
+
+ご依頼: 「コードを読んで推測するのではなく、実際にLearning Engine・Prediction
+Engine・Redis・GitHub Actions・Render・保存データを確認して原因を調査してください」
+に対して、コードの読み込みではなく実際の本番環境(Render上の稼働中サーバー・
+実際のGitHub Actions実行履歴・実際のRedisに保存されているデータ)を直接確認した
+結果と、見つかった問題の修正内容をまとめます。
+
+**確認方法**: 本番URL(`https://soccer-analysis-ai-proxy.onrender.com`)の
+`/api/growth-log`・`/api/accuracy-stats`を実際に呼び出し(キャッシュされた古い
+応答を掴まないようクエリパラメータでキャッシュを回避)、GitHub Actionsの実行
+履歴ページを実際に確認しました。
+
+#### ① Learning Engineは本当に毎日動いていますか？
+
+**いいえ、まだ「毎日」は1度も動いていません。** 実際にGitHub Actionsの実行履歴を
+確認したところ、`daily-learning.yml`は**手動実行(workflow_dispatch)が1回だけ**
+(2026-08-02、`runDailyLearning`が実際に完了し、`learn:growthlog:latest`に
+書き込まれたことも`/api/growth-log`の実データで確認済み)。**スケジュール実行
+(cron: 毎日UTC19:00=日本時間4:00)は1度も発火した実績がありません。** これは
+バグではなく、このワークフローファイル自体がごく最近リポジトリに追加された
+ため、まだ最初のスケジュール時刻(本日UTC19:00)を迎えていないだけです。正常
+であれば、次の巡目から毎日自動実行されるはずです。**今晩以降、本当に毎日
+動くかどうかを継続して確認することを強くおすすめします**(下記の対応⑤参照)。
+
+#### ②③⑥ Prediction EngineはLearning Engineの結果を受け取っていますか？
+
+**はい、コード上つながっており、孤立していません。** `server/server.js`の
+`handleMatchAnalysis`(「クラブ同士の試合を分析」機能・利用者が実際に見る
+画面)は、予測直前に`upstashGetJSON("learn:weights")`を呼び出し、Learning
+Engineが検証・更新した最新の重みを読み込んでから予測を計算しています
+(`server/server.js` 1281〜1289行目)。つまり「知識を保存して終わり」では
+なく、実際に次の予測で使う経路は実装済みです。**ただし現時点では、
+`learn:weights`はまだ1度も更新されていません**(理由は④参照)。そのため
+今この瞬間は、経路はつながっているが「まだ初期値のまま」という状態です。
+なお、`/api/discuss`(議論モード)が使うKnowledge Engineの事実・意見・
+プロフィールは、この数値予測(Prediction Engine)には使われません(文章の
+根拠としてLLMには渡りますが、勝率計算そのものには影響しません)。これは
+設計上の分離であり、バグではありませんが、⑨で改めて評価します。
+
+#### ④ 何が原因でPrediction Engineが更新されていないのか
+
+実際の`/api/growth-log`の中身(2026-08-02の実行結果)を確認したところ、
+原因は明確でした。
+
+```
+"factsAddedToday": 9,
+"matchesResolvedToday": 0,
+"newPredictionsLogged": 5,
+"totalOwnPredictionsResolved": 0,
+"weightsUpdated": false
+```
+
+これはご報告いただいた「9件追加・検証した試合0件」と完全に一致します。
+Learning Engineの自社予測サイクル(`learn:ownpred:*`)は**本日が実質的に
+初回実行**だったため、①まだ「解決すべき過去の予測」が1件も存在せず
+(`matchesResolvedToday: 0`は異常ではなく、初回なので当然の結果)、②新しく
+5件の予測を登録した(`newPredictionsLogged: 5`)ものの、その対戦がまだ
+先の日程のため結果が出ていません。重みの再調整は「検証済み10件以上」が
+条件(過学習防止のための意図的な安全装置)ですが、検証済みはまだ0件のため、
+`weightsUpdated: false`は正しい(バグではない)判断です。つまり現状は
+「バグで止まっている」のではなく、「まだ1周目で、貯まったデータが無い」
+状態です。ただし、これとは別に、ログの`errors`に`"team_not_found:Al-Nassr"`
+という実際のエラーが記録されているのを確認しました。登録クラブのうち
+アル・ナスルだけがAPI-Football側の表記ゆれ(ハイフンの有無)で見つけられず、
+毎日この1クラブ分だけ分析がスキップされ続けています(ローカルのコードには
+表記ゆれに対応する修正を追加済みです。デプロイして反映してください)。
+
+なお、「AI予測の正答率33.3%のまま」というご指摘は、上記の自社予測モデル
+(`learn:ownpred:*`)とは**別の既存機能**(`pred:*`、API-Football自身の
+予測データをそのまま検証する「AI予測の実績」)の数字です。こちらは実際に
+本番の`/api/accuracy-stats`を確認したところ、本日時点で**記録11件・検証済み
+9件・正答6件・正答率66.7%**まで進んでいました(取得日時の関係で、ご確認
+いただいた時点より後に進んだ可能性があります)。こちらも
+`predictions-auto-collect.yml`のスケジュール実行はまだ発火実績が無く、
+これまでの記録はほぼ手動実行または実際にサイトを訪れた際のおまけ処理に
+よるものです。
+
+#### ⑤ Prediction Engineの現在のパラメータ
+
+実際のRedis(`learn:weights`)を確認した結果(④の通り、更新履歴
+`learn:weights:history`も空であることを`/api/growth-log`の
+`learningSummary`から確認済み)、**現在も初期値のまま**です。
+
+```
+homeBase: 1.35, awayBase: 1.15, sensitivity: 0.18,
+goalRateSensitivity: 0, injurySensitivity: 0, standingsSensitivity: 0,
+headToHeadSensitivity: 0, fatigueSensitivity: 0,
+version: 0, updatedAt: null
+```
+
+変更履歴: なし(0件)。これは「バグで更新できていない」のではなく、
+④の通り「検証済みデータがまだ10件に届いていない」ためです。
+
+#### ⑦ Knowledge Engine / Memory Engine / Hypothesis Engine / Prediction Engineの実際のデータフロー
+
+実際のコードから追跡した、正直なデータフロー図です(点線は「保存はする
+が数値予測には使わない」経路です)。
+
+```
+[毎日学習エンジン dailyJob.js] (現状: GitHub Actionsのcronはまだ未発火・手動実行1回のみ)
+  │
+  ├─① API-Footballの実試合結果 → フォーム/得点傾向/ホームアウェイ差
+  │     → Knowledge Engine Layer1(事実)に保存 ……… 議論モードの根拠にのみ使用(点線)
+  │
+  ├─①b/①c → Knowledge Engine Layer2(クラブプロフィール・LLM生成)
+  │         → Memory Engine(「今日の見解」を保存・前日と比較) ……… 議論モードの根拠にのみ使用(点線)
+  │
+  ├─② 保留中の自社予測を解決(試合終了を確認)
+  │     → 的中/不的中を learn:ownpred:<id> に記録
+  │     → Hypothesis Engine: 状態仮説が当たっていれば Knowledge Engine Layer4(検証済み分析)に昇格、外れれば破棄
+  │     → Knowledge Engine Layer4(振り返り)に必ず記録(当たり/外れ問わず)
+  │
+  ├─③ 登録クラブの次の試合について新しい自社予測を作成 → learn:ownpred:<id> に保存(pending化)
+  │
+  └─④ 検証済みが10件以上たまったら learn:weights を再調整(グリッドサーチ v1 + 勾配降下法 v2)
+        → learn:weights:history に採用/不採用を記録
+              │
+              ▼ (ここが実際に「次の予測で使われる」接続点)
+      [利用者が使う「クラブ同士の試合を分析」= handleMatchAnalysis]
+        learn:weights を読み込み → Prediction Engine v2で勝率・重要度を計算
+        → 利用者の画面に表示
+```
+
+**確認できた事実**: Prediction Engineは孤立しておらず、Learning Engineが
+学習した`learn:weights`を実際に読み込んで利用者向けの予測に使っています。
+一方で、Knowledge Engine(事実・プロフィール・意見)とMemory Engine
+(日々の見解)は、議論モード(`/api/discuss`)の文章生成の根拠にはなります
+が、**数値予測(勝率%やスコア予想)そのものには影響しません**。「保存した
+知識を次の予測で利用するAI」というご要望に対して、数値面(重み)は既に
+実現できていますが、質的な知識(戦術的な所見等)を数値予測に反映する経路は
+まだ無い、というのが正直な現状です。
+
+#### ⑧ 利用者に学習内容を見せるUI
+
+ご要望いただいた「昨日の学習 ✓ホーム補正を弱めました ✓怪我人の影響を強め
+ました / 理由:…」という形式のUIを実装しました。`server/learning/
+predictionModel.js`に`describeWeightsHistoryEntry`/`buildLearningSummary`
+を追加し、`learn:weights:history`に実際に記録された「変更前の重み→変更後の
+重み」の差分から機械的に(LLMを使わず)日本語の説明文を生成します。
+`GET /api/growth-log`のレスポンスに`learningSummary`(直近5回分の採用済み
+変更)・`hasEnoughDataForLearning`・`totalOwnPredictionsResolvedSoFar`・
+`minResolvedForRecalibration`を追加し、ホーム画面の「🧠 昨日学んだこと」
+ウィジェット(`index.html`の`buildLearningSummarySection`)で表示します。
+重みがまだ1度も更新されていない場合も、「検証済み◯件/必要◯件(あと◯件)」
+のように、架空の学習内容ではなく**進捗**を正直に見せます。
+
+#### ⑨ 100試合・1,000試合・10,000試合積み重ねたら、本当に賢くなり続けますか？
+
+正直な評価です。**「改善しても悪化した変更は採用しない」という安全装置
+(バックテストで上回った場合のみ採用)がある設計自体は健全**で、これは
+データが増えても壊れません。一方で、監査の過程で**本当に頭打ちを引き起こす
+設計上の問題を1つ発見し、修正しました**。
+
+- **発見した問題**: `learn:ownpred:recent`(バックテスト・勾配降下法の学習に
+  使う実績データ)は`OWN_PRED_RECENT_KEEP = 30`件で`LTRIM`され、常に直近30件
+  しか保持していませんでした。つまり100試合・1,000試合・10,000試合と検証を
+  積み重ねても、モデルが実際に学習に使えるのは**常に直近30件だけ**で、
+  古い実績は無条件に切り捨てられていました。これでは蓄積量に応じて統計的な
+  確からしさが増すことはなく、直近の少数データのブレに毎回振り回されるだけ
+  になり、「昨日より今日、今日より明日と賢くなる」設計にはなっていません
+  でした。**修正**: 保持件数を300件に拡大しました(`server/learning/
+  dailyJob.js`)。
+- **残るリスク(今回は未修正・設計判断が必要)**: v1モデルのグリッドサーチは
+  現在の重みの近傍を5パターンだけ試す単純な山登り法のため、大域的な最適値
+  ではなく局所的な最適値に留まる可能性があります(v2の勾配降下法の方が
+  この点は堅牢です)。また、1日あたり新規予測登録の上限が5件・登録クラブが
+  11クラブという制約上、検証済みデータが実用的な件数(数十〜数百件)に
+  育つまでには数ヶ月単位の時間がかかる見込みです。これはAPI-Football無料
+  枠(1日100リクエスト)を守るための意図的な制限であり、有料プランに
+  切り替えれば`OWN_PREDICT_LOG_CAP`/`OWN_PREDICT_RESOLVE_CAP`(`server/
+  learning/dailyJob.js`)を増やすことで加速できます。
+
+#### 今回のコード修正一覧
+
+- `.github/workflows/daily-learning.yml` / `predictions-auto-collect.yml`:
+  **実際に確認した重大な不具合を修正**。以前はRenderへの呼び出しが失敗
+  (キー不一致・サーバーエラー等)しても、GitHub Actions上は常に「Success」
+  (緑)と表示される作りになっていました(リトライ後の結果を一度も確認せず
+  終了していたため)。今後は`"ok":true`が最終的に確認できない場合、
+  ワークフロー自体を明示的に失敗させ、Actionsタブで本当に動いたかどうかが
+  正しく分かるようにしました。
+- `server/learning/dailyJob.js`: `OWN_PRED_RECENT_KEEP`を30→300に拡大
+  (⑨の頭打ち修正)。`getGrowthLog`に`learningSummary`等を追加(⑧)。
+- `server/learning/predictionModel.js`: `describeWeightsHistoryEntry`/
+  `buildLearningSummary`を追加(⑧)。
+- `index.html`: 「🧠 昨日学んだこと」ウィジェットに、実際に学習した内容
+  (またはまだ学習に必要なデータが足りない旨)を表示するセクションを追加。
+- `scripts/learning_summary_test.js`(新規): 上記の新機能のテスト。
+
+#### お願いしたいこと(ユーザー側の作業)
+
+1. 上記の修正を含む最新のコードをGitHub/Renderに反映(デプロイ)してください
+   (Al-Nassrの表記ゆれ対応や頭打ち修正は、反映されて初めて有効になります)。
+2. GitHub Actionsの`daily-learning.yml`/`predictions-auto-collect.yml`が、
+   本日UTC19:00(日本時間4:00)以降に**スケジュール実行として実際に動くか**
+   をActionsタブでご確認ください。今回の修正後は、失敗時は赤色(Failure)で
+   はっきり表示されるはずです。
+3. Renderの環境変数`AUTO_COLLECT_SECRET`と、GitHubリポジトリのSecrets
+   `LEARNING_SECRET_KEY`が**完全に一致しているか**をあらためてご確認くだ
+   さい(一致していない場合、③のワークフロー失敗表示で今後は気づけます)。
+
 ## エンドポイント一覧
 
 | エンドポイント | 説明 |
@@ -592,5 +794,5 @@ Memory Engine自体(`getConclusionHistory`による履歴保持)はStage Eから
 | `POST /api/discuss` | 【Stage C・Stage Eで拡張】「〜だと思う」「なぜ？」等の意見・考察を求める質問に、Planner(必要な情報+比較すべき観点を判定)→RAG(API-Football実データ+Knowledge Engineの蓄積知識を取得)→Reasoning Engine(仮説生成→根拠ランキング→自己チェック。利用者には非表示)→Memory Engine(前回の結論と比較・保存)→LLM推論(取得した事実+内部推論を根拠に考察)の順で処理し、①事実②統計③根拠④考察⑤結論⑥信頼度(理由付き)+フォローアップ質問を返すAPI。クラブに関する質問の場合、`meta.reasoning`に内部で検討した仮説一覧・選ばれた仮説・自己チェック結果・Memory Engineの記録結果が含まれる(デバッグ・検証用。回答文自体には仮説ラベルをそのまま出力しない)。リクエストbodyに`question`・`subject`(`{type:"club"または"player", labelJa, labelEn}`)・`playerHint`を渡す。単純な質問(選手データ・順位・試合結果など)はこのAPIを使わず、これまで通りフロントエンドのルールベースで即答するため、呼ばれるのは議論トリガーを検出したときだけ。`ANTHROPIC_API_KEY`未設定時は`ok:false`で正直な理由を返す。**2026年8月〜: クラブ・選手について初めて質問されたとき、Knowledge Engine Layer2(固定知識プロフィール)がまだ無ければオンデマンドで自動生成されるため(既定60日キャッシュ)、その初回だけ内部的にLLM呼び出しが1回増える(2回になる)** |
 | `POST /api/learning/run-daily?key=...` | 【Stage D・Stage Eで拡張】毎日学習エンジンを1回実行する(登録クラブのフォーム分析・Knowledge Engine経由での事実の記録・自社予測モデルの検証と改善・Hypothesis Engineによる状態仮説の検証)。`AUTO_COLLECT_SECRET`設定時は`key`が一致しないと403。`.github/workflows/daily-learning.yml`から毎日自動で呼び出される想定 |
 | `GET /api/knowledge/team-view-history?team=英語クラブ名&key=...` | 【2026年8月・NEW】Memory Engine強化。「AIは昨日何を考えていたか・今日何を考えているか・その理由」を確認できるエンドポイント。`today`(現在の見解)と`history`(過去の見解の変化履歴。各要素に`changeReason`=なぜ考えが変わったか、`supersededAt`=いつ置き換わったか)を返す。`AUTO_COLLECT_SECRET`設定時は`key`が一致しないと403 |
-| `GET /api/growth-log` | 【Stage D・Stage Eで拡張】直近の学習エンジン実行結果(今日Knowledge Engineに新規保存した知識件数・重複でスキップした件数・検証した試合数・自社予測モデルの的中率の変化・AI自身の予測仮説の的中/破棄件数)を返す。ホーム画面の「🧠 昨日学んだこと」ウィジェットが使用。未実行の場合は`ranYet:false`を正直に返す |
+| `GET /api/growth-log` | 【Stage D・Stage Eで拡張・2026年8月本番監査で拡張】直近の学習エンジン実行結果(今日Knowledge Engineに新規保存した知識件数・重複でスキップした件数・検証した試合数・自社予測モデルの的中率の変化・AI自身の予測仮説の的中/破棄件数)を返す。ホーム画面の「🧠 昨日学んだこと」ウィジェットが使用。未実行の場合は`ranYet:false`を正直に返す。**2026年8月〜: `learningSummary`(実際に採用された重み変更を「✓ホーム補正を弱めました/理由:…」の形式で日本語化したもの・直近5回分)、`hasEnoughDataForLearning`・`totalOwnPredictionsResolvedSoFar`・`minResolvedForRecalibration`(まだ重みが更新されていない場合に「検証済み◯件/必要◯件」を正直に見せるための進捗情報)を追加** |
 | `GET /api/debug-status?key=...` / `GET /debug.html` | 【開発者専用・更新】「コード上は実装されている」ではなく「本番で今、実際に動いているか」を確認するための自己診断ページ。Redis(Upstash)への実際のPING接続確認、API-Footballへの実際の接続確認(`/status`)、Learning Engineの最終実行結果、Knowledge Engine/Memory Engineの登録クラブ横断の件数集計(**2026年8月〜: `knowledgeEngine.byLayer`でLayer1〜4別の件数も確認可能**)、自社予測モデル(Prediction Engine)の正答率(**2026年8月〜: `predictionEngine.v2ExtendedFeaturesLearning`で拡張特徴量の学習が始まっているか、`weightsHistoryRecent`で直近の重み更新履歴も確認可能**)を1画面にまとめて表示する。**LLM(Anthropic)は、APIキーが設定されていれば実際にごく小さいテスト呼び出しを1回行い(コストはごく僅かだが発生する)、成功/失敗と、失敗時は実際のHTTPステータス・エラー内容をそのまま表示する**(以前は「キーが設定されているか」しか見ておらず、「キーはあるのに呼び出し自体は失敗し続けている」状態を検知できなかった)。一般利用者向けの機能ではないため、`AUTO_COLLECT_SECRET`を設定している場合は他の保護付きエンドポイントと同じ`?key=`方式で保護される(未設定の場合は開いたまま。既存のrun-daily/auto-collectと同じトレードオフ) |

@@ -61,6 +61,7 @@ const {
 const {
   EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, predictOutcomeV2,
   computeFactorImportance, backtestAccuracyV2, fitWeightsGradientDescent,
+  buildLearningSummary,
 } = require("./predictionModel");
 
 // ---- 調整可能な上限(API-Football無料プランの1日100リクエスト枠を守るため) ----
@@ -68,7 +69,16 @@ const OWN_PREDICT_LOG_CAP = 5; // 1回の実行で新しく記録する自社予
 const OWN_PREDICT_RESOLVE_CAP = 10; // 1回の実行で解決を試みる保留中予測の件数上限
 const MIN_RESOLVED_FOR_RECALIBRATION = 10; // これ未満の検証データしかない場合は再調整しない(過学習防止)
 const FORM_FACT_DELTA_THRESHOLD = 0.3; // このゲーム差分以上変化した場合だけ「事実」として記録する
-const OWN_PRED_RECENT_KEEP = 30;
+// 2026年8月・監査で発見された「頭打ち」の直接原因のひとつを修正:
+// 以前は30件固定だったため、試合を100件・1000件と積み重ねても、
+// バックテスト(backtestAccuracy/backtestAccuracyV2)と重み学習
+// (fitWeightsGradientDescent)は常に「直近30件」しか見ておらず、
+// 古い検証結果は無条件で捨てられていた。これでは蓄積した実績が
+// 統計的な確からしさの向上に一切つながらず、直近の少数データの
+// ノイズに毎回振り回されるだけになる(=改善しているように見えて
+// 実際には安定しない/頭打ちになる設計上のバグ)。300件に拡大し、
+// 積み上がったデータが実際に学習の安定性・精度向上に寄与するようにする。
+const OWN_PRED_RECENT_KEEP = 300;
 
 const DEFAULT_WEIGHTS = { homeBase: 1.35, awayBase: 1.15, sensitivity: 0.18, version: 0, updatedAt: null };
 
@@ -624,16 +634,38 @@ async function runDailyLearning(deps) {
   return { ok: true, ...growthLog };
 }
 
+// 「昨日の学習」ウィジェット用に、実際に採用された重み変更の履歴を人が読める
+// 日本語の箇条書きに変換して添える(ご要望⑧への対応。実データからの機械的な
+// 生成であり、LLMによるでっち上げではない)。重みが一度も更新されていない
+// 場合は空配列を返す(「まだ検証データが足りません」も正直に区別できるよう、
+// hasEnoughDataForLearningフラグも合わせて返す)。
 async function getGrowthLog(deps) {
-  const { upstashEnabled, upstashGetJSON } = deps;
+  const { upstashEnabled, upstashGetJSON, upstashCmd } = deps;
   if (!upstashEnabled) {
     return { configured: false, message: "Upstash未設定のため学習ログはまだありません(.envのUPSTASH_REDIS_REST_URL/TOKENを確認してください)。" };
   }
   const latest = await upstashGetJSON("learn:growthlog:latest");
+  let learningSummary = [];
+  try {
+    const historyRaw = (await upstashCmd(["LRANGE", "learn:weights:history", "-10", "-1"]).catch(() => [])) || [];
+    const historyEntries = historyRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
+    learningSummary = buildLearningSummary(historyEntries, 5);
+  } catch (e) { /* ベストエフォート: 失敗しても成長ログ本体は返す */ }
+  const totalResolvedRaw = await upstashCmd(["GET", "learn:ownpred:resolved"]).catch(() => null);
+  const totalResolved = parseInt(totalResolvedRaw, 10) || 0;
+  const hasEnoughDataForLearning = totalResolved >= MIN_RESOLVED_FOR_RECALIBRATION;
   if (!latest) {
-    return { configured: true, ranYet: false, message: "学習エンジンはまだ一度も実行されていません。" };
+    return {
+      configured: true, ranYet: false, message: "学習エンジンはまだ一度も実行されていません。",
+      learningSummary, hasEnoughDataForLearning, totalOwnPredictionsResolvedSoFar: totalResolved,
+      minResolvedForRecalibration: MIN_RESOLVED_FOR_RECALIBRATION,
+    };
   }
-  return { configured: true, ranYet: true, ...latest };
+  return {
+    configured: true, ranYet: true, ...latest,
+    learningSummary, hasEnoughDataForLearning, totalOwnPredictionsResolvedSoFar: totalResolved,
+    minResolvedForRecalibration: MIN_RESOLVED_FOR_RECALIBRATION,
+  };
 }
 
 // RAG(gatherClubKnowledge)がこのクラブに関する「学習済みの事実」を回答の根拠に
@@ -663,4 +695,5 @@ module.exports = {
   computeFormScore, predictOutcome, backtestAccuracy, outcomeFromScore,
   DEFAULT_WEIGHTS, REGISTERED_TEAMS,
   buildReflectionText,
+  MIN_RESOLVED_FOR_RECALIBRATION, OWN_PRED_RECENT_KEEP,
 };

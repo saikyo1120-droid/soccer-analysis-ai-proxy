@@ -5571,6 +5571,41 @@ function buildGrowthFactRow(fact) {
   return `<div class="value-note" style="margin:4px 0;">・${escapeHtml(fact.statement)}</div>`;
 }
 
+// 2026年8月・監査対応: 「Prediction Engineが学習した内容を利用者にも見えるように
+// してほしい」というご要望への対応。learn:weights:history(実際に採用された
+// 重みの変更履歴)を、サーバー側(predictionModel.js/describeWeightsHistoryEntry)
+// が実データから機械的に日本語化したものをそのまま表示する(LLMのでっち上げ
+// ではない)。まだ1件も重みが更新されていない場合も、「なぜまだ変わっていない
+// か」(検証済み件数が閾値に届いていない、等)を正直に見せる。
+function buildLearningSummarySection(log) {
+  const entries = log.learningSummary || [];
+  if (entries.length > 0) {
+    const rows = entries.map((e) => {
+      const bulletsHtml = e.bullets.map((b) => `<div class="value-note" style="margin:2px 0 2px 8px;">${escapeHtml(b)}</div>`).join("");
+      return `
+        <div style="margin:8px 0; padding:8px 10px; border-left:3px solid #4c8bf5; background:rgba(76,139,245,0.06);">
+          <div class="value-note"><strong>${escapeHtml(formatDateJa(e.date + "T00:00:00Z"))}の学習</strong>(${escapeHtml(e.methodLabelJa)})</div>
+          ${bulletsHtml}
+          <div class="value-note" style="margin-top:4px; opacity:.85;">理由: ${escapeHtml(e.reason)}</div>
+        </div>`;
+    }).join("");
+    return `
+      <p class="value-note" style="margin:10px 0 4px;">🔧 Prediction Engineが実際に学習して変更した内容(直近${entries.length}回分・新しい順):</p>
+      ${rows}
+    `;
+  }
+  // まだ一度も採用された変更が無い場合: 架空の「学習しました」は出さず、
+  // 今どこまで進んでいるか(検証済み件数/必要件数)を正直に見せる。
+  const resolved = log.totalOwnPredictionsResolvedSoFar ?? 0;
+  const need = log.minResolvedForRecalibration ?? 10;
+  const remain = Math.max(0, need - resolved);
+  return `
+    <p class="value-note" style="margin:10px 0 4px;">🔧 Prediction Engineの重み更新: まだ1回もありません。</p>
+    <div class="value-note" style="margin:2px 0 2px 8px;">検証済みの自社予測: ${resolved}件 / 更新の判断に必要な件数: ${need}件(あと${remain}件)</div>
+    <div class="value-note" style="margin:2px 0 2px 8px; opacity:.8;">※少ないデータで重みを動かすと過学習(たまたまの偏りに合わせて悪化させる)おそれがあるため、あえて${need}件貯まるまでは重みを固定しています。</div>
+  `;
+}
+
 async function renderGrowthLogWidget() {
   const summaryEl = document.getElementById("growthLogSummary");
   const detailsEl = document.getElementById("growthLogDetails");
@@ -5623,10 +5658,11 @@ async function renderGrowthLogWidget() {
       : `<div class="value-note" style="margin:4px 0;">🧪 AI自身が立てた予測仮説の検証: 今回は検証できた仮説がありませんでした(試合がまだ終了していない等)。</div>`;
     detailsEl.innerHTML = `
       ${accLine}
+      ${buildLearningSummarySection(log)}
       ${hypothesisLine}
       <p class="value-note" style="margin:8px 0 4px;">今日追加された事実(すべてAPI-Footballの実データから算出):</p>
       ${factsHtml}
-      <p class="value-note" style="margin-top:8px; opacity:.8;">※「自社予測モデル」はホーム画面の「AI予測の実績」(API-Football自体の予測データ)とは別の、このアプリ独自の実験的な予測モデルです。※「今日追加した知識」はKnowledge Engine(事実/分析/意見を分離・重複排除・失効管理する知識ベース)に新規保存された件数です。</p>
+      <p class="value-note" style="margin-top:8px; opacity:.8;">※「自社予測モデル」はホーム画面の「AI予測の実績」(API-Football自体の予測データ)とは別の、このアプリ独自の実験的な予測モデルです。この学習結果(重み)は「クラブ同士の試合を分析」機能の予測にも実際に使われます。※「今日追加した知識」はKnowledge Engine(事実/分析/意見を分離・重複排除・失効管理する知識ベース)に新規保存された件数です。</p>
     `;
     toggleBtn.addEventListener("click", () => {
       const isHidden = detailsEl.style.display === "none";
