@@ -56,7 +56,7 @@ const { createClubProfileEngine } = require("../knowledge/clubProfileEngine");
 const {
   computeGoalRateFeatures, computeFatigueFeature,
   fetchInjuryCountFeature, fetchStandingsFeature, fetchHeadToHeadFeature,
-  inferLeagueIdFromFixtures,
+  inferLeagueIdFromFixtures, computeHomeAwaySplit,
 } = require("./features");
 const {
   EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, predictOutcomeV2,
@@ -208,6 +208,26 @@ async function runDailyLearning(deps) {
           delta: form.delta,
           source: "API-Footballの実試合結果(直近10試合)から算出",
         });
+      }
+
+      // ---- 2026年8月・知識拡張フェーズ: ホーム/アウェイの差(実データ) ----
+      // 既に取得済みのfixturesデータから追加のAPI呼び出し無しで計算できる。
+      // 勝率差が明確な場合(20ポイント以上)だけ「事実」として記録する
+      // (毎日ほぼ変わらない/僅差の場合まで記録すると知識ベースが埋もれるため)。
+      const homeAway = computeHomeAwaySplit(fixtures, teamId);
+      if (homeAway.home.sampleSize >= 2 && homeAway.away.sampleSize >= 2 && homeAway.home.winRate !== null && homeAway.away.winRate !== null) {
+        const winRateDiff = homeAway.home.winRate - homeAway.away.winRate;
+        if (Math.abs(winRateDiff) >= 0.2) {
+          factsToday.push({
+            date: dateKey,
+            category: "ホームアウェイ差",
+            type: "fact",
+            teamEn: team.nameEn,
+            teamJa: team.nameJa,
+            statement: `${team.nameJa}は直近${homeAway.home.sampleSize}試合のホーム勝率${Math.round(homeAway.home.winRate * 100)}%に対し、直近${homeAway.away.sampleSize}試合のアウェイ勝率は${Math.round(homeAway.away.winRate * 100)}%と、${winRateDiff > 0 ? "ホームでの強さ" : "アウェイでの粘り強さ"}が目立ちます。`,
+            source: "API-Footballの実試合結果(直近10試合、ホーム/アウェイ別集計)から算出",
+          });
+        }
       }
     } catch (e) {
       errors.push(`form_failed:${team.nameEn}:${e.message}`);

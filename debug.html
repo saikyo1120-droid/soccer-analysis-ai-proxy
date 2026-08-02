@@ -131,6 +131,7 @@ async function load() {
       <tr><th>Layer3 AIの現在の見解(opinion)</th><td>${esc(keLayer.layer3Opinions)}</td></tr>
       <tr><th>Layer4 振り返り(reflection)</th><td>${esc(keLayer.layer4Reflections)}</td></tr>
       <tr><th>仮説から昇格した分析(analysis)</th><td>${esc(keLayer.analysesPromotedFromHypotheses)}</td></tr>
+      <tr><th>選手Layer2プロフィール(累計・オンデマンド生成)</th><td>${esc(ke.onDemandPlayerProfilesGenerated)}人分</td></tr>
     </table>
     ${ke.byTeam && ke.byTeam.length ? `<div class="raw">${esc(JSON.stringify(ke.byTeam, null, 2))}</div>` : '<div class="muted">クラブ別データはまだありません。</div>'}
     </div>`);

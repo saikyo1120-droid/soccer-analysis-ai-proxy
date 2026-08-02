@@ -76,6 +76,13 @@ function buildEvidencePool(knowledge, teamEn) {
     (ke.facts || []).forEach((item) => pool.push({ category: item.category || "recentForm", type: "fact", teamEn, statement: item.statement }));
     (ke.analyses || []).forEach((item) => pool.push({ category: item.category || "recentForm", type: "analysis", teamEn, statement: item.statement }));
     (ke.opinions || []).forEach((item) => pool.push({ category: item.category || "recentForm", type: "opinion", teamEn, statement: item.statement }));
+    // Layer2(固定知識プロフィール)・Layer4(振り返り)は、2026年8月の知識拡張
+    // フェーズまでは保存されるだけで議論モードの根拠プールには渡っていなかった
+    // (取りこぼし)。実データを根拠にした導出情報という位置づけはanalysisに近い
+    // ため、ここでもanalysis扱いとして根拠プールに含める(evidenceRanking.jsの
+    // 重み付けをそのまま流用)。
+    (ke.profiles || []).forEach((item) => pool.push({ category: item.category || "clubProfile", type: "analysis", teamEn, statement: item.statement }));
+    (ke.reflections || []).forEach((item) => pool.push({ category: item.category || "matchReflection", type: "analysis", teamEn, statement: item.statement }));
   }
 
   return pool;

@@ -84,14 +84,23 @@ function summarizeTransfers(rawList, teamId, maxCount, sinceDate) {
 const MANAGER_QUOTE_UNAVAILABLE_REASON =
   "監督コメント・采配評価は、現時点で接続している実データソース(API-Football)では取得できません。";
 
-function createKnowledgeSource({ callApiFootball, resolveTeamId, guessSeason, getRecentFacts, getActiveKnowledge, setRelation }) {
+function createKnowledgeSource({
+  callApiFootball, resolveTeamId, guessSeason, getRecentFacts, getActiveKnowledge, setRelation,
+  // 2026年8月・知識拡張フェーズで追加(すべて任意注入。未指定でも従来通り動く):
+  //   ensureClubProfile   … Knowledge Engine Layer2(固定知識)をオンデマンドで生成・キャッシュ
+  //   fetchCoachCareer    … 監督遍歴(/coachs)を取得
+  //   saveKnowledgeItem   … 監督遍歴等の新しい実データをKnowledge EngineのLayer1事実として保存
+  ensureClubProfile, fetchCoachCareer, saveKnowledgeItem,
+}) {
   /**
    * @param {string} teamNameEnglish - API-Football側の検索に使う英語クラブ名
    * @param {Set<string>|string[]} needs - Plannerが決めた必要な知識の種類
    *   ("recentForm" | "formation" | "coach" | "injuries" | "transfers")
    *   未指定の場合はすべて取得する(後方互換のため)。
+   * @param {string} [teamNameJapanese] - Layer2プロフィール生成時の表示用日本語名
+   *   (未指定の場合はteamNameEnglishをそのまま使う。既存呼び出し元との後方互換のため任意)。
    */
-  async function gatherClubKnowledge(teamNameEnglish, needs) {
+  async function gatherClubKnowledge(teamNameEnglish, needs, teamNameJapanese) {
     const needSet = needs ? new Set(needs) : new Set(["recentForm", "formation", "coach", "injuries", "transfers"]);
     // フォーメーション・監督名は直近試合のラインナップに依存するため、
     // どちらかが必要なら直近成績も最低限(1試合分)は取得する。
@@ -174,6 +183,71 @@ function createKnowledgeSource({ callApiFootball, resolveTeamId, guessSeason, ge
         }
       } catch (e) { result.errors.push("lineup_failed"); }
     }
+    // ---- 2026年8月・知識拡張フェーズ: 監督遍歴(Layer1事実+Knowledge Graph) ----
+    // 同じクラブについて何度も聞かれるたびに/coachsを呼び直さないよう、既に
+    // 有効な"managerHistory"事実が無い場合だけ取得する(getActiveKnowledgeで
+    // 既に取得済みのresult.knowledgeEngine.factsをそのまま流用してチェックする
+    // ため、追加のRedis読み取りは発生しない)。
+    result.managerCareer = null;
+    if (needSet.has("coach") && result.coachName && typeof fetchCoachCareer === "function") {
+      const hasRecentManagerHistoryFact = (result.knowledgeEngine.facts || []).some((f) => f.category === "managerHistory");
+      if (!hasRecentManagerHistoryFact) {
+        try {
+          const career = await fetchCoachCareer(teamId);
+          if (career && career.career && career.career.length) {
+            result.managerCareer = career;
+            result.fetchedTypes.push("managerCareer");
+            const previousClub = career.career.find((c) => c.teamId !== teamId && c.end);
+            const statement = previousClub
+              ? `${career.currentCoachName || result.coachName}監督の在籍歴: 現在${teamNameEnglish}(${(career.career.find((c) => c.teamId === teamId) || {}).start || "不明"}〜)、前職${previousClub.teamName}(${previousClub.start || "不明"}〜${previousClub.end})。`
+              : `${career.currentCoachName || result.coachName}監督のクラブ在籍歴データを取得しました(前職の記録は見つかりませんでした)。`;
+            if (typeof saveKnowledgeItem === "function") {
+              saveKnowledgeItem({
+                teamEn: teamNameEnglish, category: "managerHistory", type: "fact",
+                statement, detail: career, computedAt: new Date().toISOString(),
+                source: "API-Footballの実データ(/coachs)",
+              }).catch(() => {});
+            }
+            if (previousClub && typeof setRelation === "function") {
+              setRelation("person", career.currentCoachName || result.coachName, "previousClub", "team", previousClub.teamName).catch(() => {});
+            }
+          }
+        } catch (e) { result.errors.push("coach_career_failed"); }
+      }
+    }
+
+    // ---- 2026年8月・知識拡張フェーズ: Layer2固定知識(クラブプロフィール)を
+    // オンデマンドで生成・キャッシュする。これまで毎日学習エンジンの登録
+    // 11クラブでしか作られなかったが、ここに置くことで「議論モードで実際に
+    // 質問されたクラブ」から知識が蓄積されていく(主要リーグ全クラブへの
+    // 現実的な対応方法。README参照)。既に有効なプロフィールがあれば
+    // 内部で自動的にスキップされるため、追加コストは初回のみ。
+    if (typeof ensureClubProfile === "function") {
+      try {
+        const groundingFacts = [];
+        if (result.goalsForTrend && result.goalsForTrend.length) {
+          const avgGf = result.goalsForTrend.reduce((a, b) => a + b, 0) / result.goalsForTrend.length;
+          groundingFacts.push(`直近試合の平均得点: ${Math.round(avgGf * 100) / 100}`);
+        }
+        if (result.coachName) groundingFacts.push(`現在の監督: ${result.coachName}`);
+        if (result.formation) groundingFacts.push(`直近のフォーメーション: ${result.formation}`);
+        if (result.learnedFacts && result.learnedFacts.length) {
+          result.learnedFacts.slice(0, 3).forEach((f) => groundingFacts.push(f.statement));
+        }
+        const profileResult = await ensureClubProfile(teamNameEnglish, teamNameJapanese || teamNameEnglish, groundingFacts, new Date().toISOString(), result.coachName);
+        if (profileResult && profileResult.profile) {
+          result.clubProfile = profileResult.profile;
+          if (profileResult.generated) result.fetchedTypes.push("clubProfileGenerated");
+          // 今回のリクエストで初めて生成された場合、getActiveKnowledgeは生成前の
+          // 時点のスナップショットのままなので、根拠プールにすぐ反映されるよう
+          // ここで直接追加しておく(次回以降は自然にgetActiveKnowledge経由で入る)。
+          if (profileResult.generated && result.knowledgeEngine && Array.isArray(result.knowledgeEngine.profiles)) {
+            result.knowledgeEngine.profiles.push(profileResult.profile);
+          }
+        }
+      } catch (e) { result.errors.push("club_profile_failed"); }
+    }
+
     // 直近成績を「フォーメーション/監督名のためだけ」に最小取得した場合(last=1)は、
     // 直近成績そのものは要求されていないので結果には含めない。
     if (!needSet.has("recentForm")) result.recentForm = [];

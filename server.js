@@ -40,6 +40,7 @@ const { generateLLM, currentProviderName } = require("./llm");
 const { createKnowledgeStore } = require("./knowledge/knowledgeStore");
 const { createRelationshipIndex } = require("./knowledge/relationshipIndex");
 const { createMemoryStore } = require("./memory/memoryStore");
+const { createClubProfileEngine } = require("./knowledge/clubProfileEngine");
 const { buildEvidencePool } = require("./reasoning/evidencePool");
 const { assembleReasoning, formatReasoningForPrompt } = require("./reasoning/reasoningEngine");
 
@@ -58,12 +59,15 @@ const { REGISTERED_TEAMS } = require("./learning/registeredTeams");
 const {
   computeGoalRateFeatures, computeFatigueFeature,
   fetchInjuryCountFeature, fetchStandingsFeature, fetchHeadToHeadFeature,
-  inferLeagueIdFromFixtures,
+  inferLeagueIdFromFixtures, computeHomeAwaySplit, fetchCoachCareer,
 } = require("./learning/features");
 const {
   EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, predictOutcomeV2,
   computeMatchProbabilities, mostLikelyScoreline, computeFactorImportance,
 } = require("./learning/predictionModel");
+// 選手個人の実データ統計(2026年8月・知識拡張フェーズ)。
+const { computePlayerRealStats } = require("./learning/playerFeatures");
+const { createPlayerProfileEngine } = require("./knowledge/playerProfileEngine");
 
 // ---- .env を自前で読み込む(dotenvパッケージ不使用) ----
 function loadEnvFile(filePath) {
@@ -431,6 +435,11 @@ async function handlePlayerSeasonStats(query) {
       return { status: 200, body: payload };
     }
 
+    // 2026年8月・知識拡張フェーズ: これまでは出場数・得点・アシスト・カードのみ
+    // 抽出していたが、実はAPI-Footballの同じレスポンスにキーパス・パス成功率・
+    // ドリブル成功率・守備指標・デュエル勝率も含まれていることが分かったため、
+    // 追加のAPI呼び出し無しでそのまま抽出する(server/learning/playerFeatures.js)。
+    const extendedStats = computePlayerRealStats(statsBlock) || {};
     const payload = {
       found: true,
       source: "API-Football",
@@ -447,6 +456,14 @@ async function handlePlayerSeasonStats(query) {
         assists: statsBlock.goals ? statsBlock.goals.assists : null,
         yellowCards: statsBlock.cards ? statsBlock.cards.yellow : null,
         redCards: statsBlock.cards ? statsBlock.cards.red : null,
+        // NEW(2026年8月): 実データのみ。取得できない項目はnull(捏造しない)。
+        position: extendedStats.position,
+        keyPasses: extendedStats.keyPasses,
+        passAccuracyPct: extendedStats.passAccuracyPct,
+        dribbleSuccessRatePct: extendedStats.dribbleSuccessRatePct,
+        dribbleAttempts: extendedStats.dribbleAttempts,
+        defensiveActions: extendedStats.defensiveActions,
+        duelWinRatePct: extendedStats.duelWinRatePct,
       },
     };
     cacheSet(cacheKey, payload, 6 * 60 * 60 * 1000);
@@ -1127,11 +1144,32 @@ const memoryStore = createMemoryStore({
   upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
 });
 
+// ---- 2026年8月・知識拡張フェーズ: クラブ/選手のLayer2固定知識を「議論モードで
+// 実際に質問されたとき」にもオンデマンドで生成・キャッシュできるようにする
+// (これまでは毎日学習エンジンの登録11クラブ限定だった。RAG経路にも同じ
+// エンジンを共有することで、"主要リーグ全クラブ・全選手"に対応する現実的な
+// 方法として、質問されたクラブ・選手から知識が蓄積されていく設計にする)。
+const clubProfileEngine = createClubProfileEngine({
+  generateLLM, knowledgeStore, setRelation: relationshipIndex.setRelation,
+});
+const playerProfileEngine = createPlayerProfileEngine({
+  generateLLM, knowledgeStore, setRelation: relationshipIndex.setRelation,
+  // 選手は登録クラブのような固定リストが無い(オンデマンドで増えていく)ため、
+  // 「累計で何人の選手について知識を持つようになったか」を/api/debug-statusで
+  // 可視化できるよう、軽量なカウンターだけ別途記録する。
+  onProfileGenerated: () => {
+    if (UPSTASH_ENABLED) upstashCmd(["INCR", "knowledge:trackedPlayerProfiles"]).catch(() => {});
+  },
+});
+
 const knowledgeSource = createKnowledgeSource({
   callApiFootball, resolveTeamId, guessSeason,
   getRecentFacts: (teamNameEnglish) => getRecentFactsForTeam(learningDeps, teamNameEnglish),
   getActiveKnowledge: (teamNameEnglish) => knowledgeStore.getActiveKnowledge(teamNameEnglish),
   setRelation: (...args) => relationshipIndex.setRelation(...args),
+  ensureClubProfile: (...args) => clubProfileEngine.ensureClubProfile(...args),
+  fetchCoachCareer: (...args) => fetchCoachCareer(...args),
+  saveKnowledgeItem: (...args) => knowledgeStore.saveKnowledgeItem(...args),
 });
 
 // ============================================================
@@ -1443,6 +1481,15 @@ async function handleDebugStatus() {
       }
     }
   }
+  // ---- 選手のKnowledge Engine(2026年8月〜: オンデマンド生成のため固定リストが
+  // 無く、登録クラブのように横断集計できない。累計生成数だけ軽量カウンターで追う) ----
+  let trackedPlayerProfiles = 0;
+  if (UPSTASH_ENABLED) {
+    try {
+      trackedPlayerProfiles = parseInt((await upstashCmd(["GET", "knowledge:trackedPlayerProfiles"])) || "0", 10) || 0;
+    } catch (e) { /* ベストエフォート */ }
+  }
+
   const knowledgeEngineInfo = {
     totalActiveItems: knowledgeTotalActive,
     totalStoredItems: knowledgeTotalStored,
@@ -1455,6 +1502,10 @@ async function handleDebugStatus() {
       analysesPromotedFromHypotheses: layerAnalysesCount,
     },
     byTeam: knowledgeByTeam,
+    // 2026年8月・知識拡張フェーズ: 議論モードで質問された選手について、累計何人分の
+    // Layer2プロフィール(プレースタイル等)を生成済みか(クラブと違い固定リストが
+    // 無いオンデマンド方式のため、個別内訳ではなく累計数のみ)。
+    onDemandPlayerProfilesGenerated: trackedPlayerProfiles,
   };
 
   // ---- Memory Engine: 現状「team:<英名>:leadingFactor」という1クラブ1サブジェクトのみ運用中 ----
@@ -1541,6 +1592,41 @@ async function handleDebugStatus() {
   };
 }
 
+// ---- Memory Engine強化: 「AIは昨日何を考えていたか・今日何を考えているか・
+// その理由」を実際に確認できるようにする(2026年8月・知識拡張フェーズ)。
+// 仕組み自体(getConclusionHistory)はStage Eから既に実装されていたが、これまで
+// どのエンドポイントからも呼ばれておらず、実質的に検証不可能だった(正直な
+// ギャップ)。ここで初めて公開する。
+async function handleTeamViewHistory(query) {
+  const teamEn = String(query.get("team") || "").trim();
+  if (!teamEn) return { status: 400, body: { ok: false, error: "team (English club name) is required" } };
+  if (!UPSTASH_ENABLED) {
+    return { status: 200, body: { ok: false, reason: "NO_UPSTASH", message: "Upstash未設定のためMemory Engineの記録はありません。" } };
+  }
+  const subjectKey = `team:${teamEn}:dailyView`;
+  const [current, history] = await Promise.all([
+    memoryStore.getLastConclusion(subjectKey),
+    memoryStore.getConclusionHistory(subjectKey, 30),
+  ]);
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      team: teamEn,
+      today: current ? { statement: current.statement, computedAt: current.computedAt, revision: current.revision } : null,
+      // history[0]が直近の変化(=多くの場合「昨日の見解」)。それぞれ
+      // 「その時点の見解」「変化理由」「いつ何に置き換わったか」を含む。
+      history: history.map((h) => ({
+        statement: h.statement, computedAt: h.computedAt,
+        changeReason: h.changeReason, supersededAt: h.supersededAt, supersededBy: h.supersededBy,
+      })),
+      note: history.length === 0
+        ? "見解の変化履歴はまだありません(毎日学習エンジンが2回以上実行され、かつ見解が変わった場合に記録されます)。"
+        : null,
+    },
+  };
+}
+
 // LLM呼び出しは実費が発生するため、暴走・悪用でコストが青天井にならないよう
 // 2段階の上限を設ける(世界中の誰でも使える公開サービスを想定した設計)。
 //   ①IPごとの1日あたり上限(既定10回): 一人(または悪意あるアクセス)がその日の
@@ -1622,6 +1708,16 @@ function formatClubFacts(knowledge, needs) {
   // 発生させないため、needsに含まれるかどうかに関係なく無料で使える)。
   if (knowledge.learnedFacts && knowledge.learnedFacts.length) {
     knowledge.learnedFacts.slice(0, 5).forEach((f) => facts.push(`[学習エンジン ${f.date}] ${f.statement}`));
+  }
+  // 2026年8月・知識拡張フェーズ: 監督遍歴(実データ)・Layer2固定知識(AI推定の
+  // 戦術傾向)も、質問の種類に関わらずあれば根拠として渡す(coachName)・
+  // needsに関係なく利用可能)。
+  if (knowledge.managerCareer && knowledge.managerCareer.career && knowledge.managerCareer.career.length) {
+    const prev = knowledge.managerCareer.career.find((c) => c.end);
+    if (prev) facts.push(`[監督遍歴] ${knowledge.managerCareer.currentCoachName || knowledge.coachName}監督の前職: ${prev.teamName}(${prev.start || "不明"}〜${prev.end})`);
+  }
+  if (knowledge.clubProfile && knowledge.clubProfile.statement) {
+    facts.push(knowledge.clubProfile.statement);
   }
   return facts;
 }
@@ -1759,7 +1855,7 @@ async function handleDiscuss(body, clientIp) {
       facts.push(`「${subject.labelJa || "対象クラブ"}」の英語名が特定できなかったため、実データの取得を省略しました。`);
       confidence = { stars: 1, reasonJa: "クラブを実データ上で特定できなかったため、一般的な知識のみに基づく考察です。" };
     } else {
-      const knowledge = await knowledgeSource.gatherClubKnowledge(subject.labelEn, plan.needs);
+      const knowledge = await knowledgeSource.gatherClubKnowledge(subject.labelEn, plan.needs, subject.labelJa);
       facts = formatClubFacts(knowledge, plan.needs);
       stats = formatClubStats(knowledge, plan.needs);
       confidence = computeClubConfidence(knowledge, plan.needs);
@@ -1787,8 +1883,46 @@ async function handleDiscuss(body, clientIp) {
       const s = statsBody.stats || {};
       const playerName = (statsBody.player && statsBody.player.name) || hint.name || "対象選手";
       facts.push(`${playerName}の${statsBody.season}シーズン実成績: 出場${s.appearances ?? "不明"}試合・${s.goals ?? "不明"}得点・${s.assists ?? "不明"}アシスト・平均レーティング${s.avgRating ?? "不明"}`);
-      stats = { appearances: s.appearances, goals: s.goals, assists: s.assists, avgRating: s.avgRating };
+      // 2026年8月・知識拡張フェーズ: キーパス・パス成功率・ドリブル成功率・
+      // 守備指標・デュエル勝率も、取得できたものだけ事実として渡す(いずれも実データ)。
+      const extraParts = [];
+      if (s.keyPasses !== null && s.keyPasses !== undefined) extraParts.push(`キーパス${s.keyPasses}本`);
+      if (s.passAccuracyPct !== null && s.passAccuracyPct !== undefined) extraParts.push(`パス成功率${s.passAccuracyPct}%`);
+      if (s.dribbleSuccessRatePct !== null && s.dribbleSuccessRatePct !== undefined) extraParts.push(`ドリブル成功率${s.dribbleSuccessRatePct}%(${s.dribbleAttempts}回試行)`);
+      if (s.defensiveActions !== null && s.defensiveActions !== undefined) extraParts.push(`守備指標(タックル+インターセプト)${s.defensiveActions}回`);
+      if (s.duelWinRatePct !== null && s.duelWinRatePct !== undefined) extraParts.push(`デュエル(競り合い)勝率${s.duelWinRatePct}%`);
+      if (extraParts.length) facts.push(`${playerName}の追加実成績: ${extraParts.join("・")}`);
+      stats = { appearances: s.appearances, goals: s.goals, assists: s.assists, avgRating: s.avgRating, keyPasses: s.keyPasses, passAccuracyPct: s.passAccuracyPct, dribbleSuccessRatePct: s.dribbleSuccessRatePct, defensiveActions: s.defensiveActions, duelWinRatePct: s.duelWinRatePct };
       confidence = { stars: 4, reasonJa: "今シーズンの実成績データが取得できているため。ただし直近の調子や怪我の詳細までは反映されていません。" };
+
+      // ---- Knowledge Engine Layer2(選手プロフィール)をオンデマンドで生成・
+      // キャッシュする(既に有効なプロフィールがあれば内部でスキップされる)。
+      // 「主要リーグ全選手」への現実的な対応方法: 質問された選手から知識が
+      // 蓄積されていく設計(クラブと同じ思想。README参照)。
+      if (statsBody.player && statsBody.player.id) {
+        const playerKey = `player:${statsBody.player.id}`;
+        try {
+          const groundingFacts = extraParts.length ? [`実成績: 出場${s.appearances ?? "不明"}試合・${s.goals ?? "不明"}得点・${s.assists ?? "不明"}アシスト`, ...extraParts] : [`実成績: 出場${s.appearances ?? "不明"}試合・${s.goals ?? "不明"}得点・${s.assists ?? "不明"}アシスト`];
+          const playerProfileResult = await playerProfileEngine.ensurePlayerProfile(
+            playerKey, playerName, hint.teamEn || null, groundingFacts, new Date().toISOString(), hint.teamEn || null
+          );
+          if (playerProfileResult && playerProfileResult.profile && playerProfileResult.profile.statement) {
+            facts.push(playerProfileResult.profile.statement);
+          }
+        } catch (e) { /* ベストエフォート: プロフィール生成に失敗しても選手の実成績自体は回答に使う */ }
+
+        // 実成績スナップショットをLayer1事実として保存(「昨日より知識が増えている」
+        // 追跡・重複排除の対象にするため。knowledgeStoreのteamEnフィールドを
+        // 選手用の主体キーとして流用している点はplayerProfileEngine.js冒頭の
+        // コメントの通り)。
+        try {
+          await knowledgeStore.saveKnowledgeItem({
+            teamEn: playerKey, teamJa: playerName, category: "playerSeasonStats", type: "fact",
+            statement: `${playerName}の${statsBody.season}シーズン実成績: 出場${s.appearances ?? "不明"}試合・${s.goals ?? "不明"}得点・${s.assists ?? "不明"}アシスト${extraParts.length ? "・" + extraParts.join("・") : ""}`,
+            computedAt: new Date().toISOString(), source: "API-Footballの実データ(/players)",
+          });
+        } catch (e) { /* ベストエフォート */ }
+      }
     } else {
       facts.push(`${hint.name || "対象選手"}の実成績データは見つかりませんでした(${statsBody.reason || "不明"})。`);
       confidence = { stars: 1, reasonJa: "実成績データを取得できなかったため、一般的な知識のみに基づく考察です。" };
@@ -2071,6 +2205,21 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(result));
         return;
       }
+      if (pathname === "/api/knowledge/team-view-history") {
+        // 「AIは昨日何を考えていたか・今日何を考えているか・その理由」を確認する
+        // エンドポイント(Memory Engine強化)。内部の考察内容を含むため、他の
+        // 保護付きエンドポイントと同じ?key=方式に揃える(AUTO_COLLECT_SECRET未設定なら開いたまま)。
+        const requiredSecret = process.env.AUTO_COLLECT_SECRET || "";
+        if (requiredSecret && parsed.searchParams.get("key") !== requiredSecret) {
+          res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "invalid or missing key" }));
+          return;
+        }
+        const { status, body } = await handleTeamViewHistory(parsed.searchParams);
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
       if (pathname === "/api/debug-status") {
         // 開発者向け自己診断ページ(/debug.html)専用のJSONエンドポイント。
         // AUTO_COLLECT_SECRETが設定されている場合は、他の保護付きエンドポイント
@@ -2122,8 +2271,12 @@ module.exports = {
   runDailyLearning,
   getGrowthLog,
   handleDebugStatus,
+  handleTeamViewHistory,
+  handleMatchAnalysis,
   learningDeps,
   knowledgeStore,
   memoryStore,
   relationshipIndex,
+  clubProfileEngine,
+  playerProfileEngine,
 };

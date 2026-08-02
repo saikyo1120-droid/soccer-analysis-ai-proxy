@@ -16,20 +16,30 @@
  *   - 移籍の試合への影響度: API-Footballの/transfersは移籍の記録はあるが
  *     「その移籍が今の実力にどれだけ影響しているか」を表す数値ではないため、
  *     安易に数値化すると根拠のない特徴量になってしまう。
- *   - 監督交代後の成績: 「いつ監督が交代したか」を確実に取れるクリーンな
- *     フィールドがAPI-Footballに無く、/fixtures/lineupsのcoach名の変化を
- *     日々突き合わせるような複雑な検出ロジックが必要になるため今回は見送り。
  *   - ローテーション(疲労による選手起用の変化): スタメンと同じ理由で保留。
  *     代わりに「直近の試合間隔(過密日程かどうか)」を疲労の代理指標として
  *     採用した(下記 computeFatigueFeature)。
+ *
+ * 【2026年8月・知識拡張フェーズで追加】監督交代後の成績について: 前回は
+ * 「いつ監督が交代したか」を確実に取れるクリーンなフィールドが無いとして見送って
+ * いましたが、API-Footballに/coachsという専用エンドポイントがあり、監督ごとの
+ * career(在籍クラブ・在任開始日・終了日)を取得できることが分かったため、
+ * fetchCoachCareer/computeCoachCareerとして実装しました(下記)。ただし正直な
+ * 注意点として、このcareerデータの正確性・最新性はAPI-Football側のデータベース
+ * 更新頻度に依存します(監督交代の翌日には反映されていない可能性があります)。
+ * 「監督交代後の成績」(交代前後で的中率がどう変わったか、まで)は本ラウンドでは
+ * 実装しておらず、career情報を知識として保存するところまでが今回の範囲です。
  *
  * 実装した特徴量(すべて実データから計算。AIの推測は混ぜない):
  *   - computeGoalRateFeatures: 直近試合の平均得点・平均失点(既に取得済みの
  *     fixturesデータから追加のAPI呼び出しなしで計算できる)
  *   - computeFatigueFeature: 直近7日以内の試合数(過密日程の代理指標)
+ *   - computeHomeAwaySplit: ホーム/アウェイ別の勝率・平均得点・平均失点(既に
+ *     取得済みのfixturesデータから追加のAPI呼び出しなしで計算できる)
  *   - fetchInjuryCountFeature: 現在の負傷者数(/injuries)
  *   - fetchStandingsFeature: 現在の順位・勝点(/standings)
  *   - fetchHeadToHeadFeature: 過去の直接対戦成績(/fixtures/headtohead)
+ *   - fetchCoachCareer: 監督遍歴(在籍クラブ・在任期間)(/coachs)
  */
 
 // ---- 純粋関数(すでに取得済みのデータから計算するもの。追加のAPI呼び出し無し) ----
@@ -129,6 +139,35 @@ function computeHeadToHeadFeature(h2hFixtures, homeTeamId, awayTeamId) {
   };
 }
 
+// ホーム/アウェイでの成績差(ご要望「ホームとアウェイの差」への回答)。既に
+// 取得済みのfixturesデータから追加のAPI呼び出し無しで計算できる、実データのみの
+// 客観的な数値(勝率・平均得点・平均失点をホーム/アウェイ別に集計するだけ)。
+function computeHomeAwaySplit(fixtures, teamId) {
+  const withGoals = (fixtures || []).filter(
+    (f) => f && f.fixture && f.teams && f.goals && f.goals.home !== null && f.goals.home !== undefined && f.goals.away !== null && f.goals.away !== undefined
+  );
+  const summarize = (list) => {
+    if (!list.length) return { sampleSize: 0, winRate: null, avgGoalsFor: null, avgGoalsAgainst: null };
+    let wins = 0, gf = 0, ga = 0;
+    for (const f of list) {
+      const isHome = f.teams.home && f.teams.home.id === teamId;
+      const goalsFor = isHome ? f.goals.home : f.goals.away;
+      const goalsAgainst = isHome ? f.goals.away : f.goals.home;
+      gf += goalsFor; ga += goalsAgainst;
+      if (goalsFor > goalsAgainst) wins++;
+    }
+    return {
+      sampleSize: list.length,
+      winRate: Math.round((wins / list.length) * 100) / 100,
+      avgGoalsFor: Math.round((gf / list.length) * 100) / 100,
+      avgGoalsAgainst: Math.round((ga / list.length) * 100) / 100,
+    };
+  };
+  const homeGames = withGoals.filter((f) => f.teams.home && f.teams.home.id === teamId);
+  const awayGames = withGoals.filter((f) => f.teams.away && f.teams.away.id === teamId);
+  return { home: summarize(homeGames), away: summarize(awayGames) };
+}
+
 // ---- API-Football呼び出しを伴う取得関数 ----
 
 async function fetchInjuryCountFeature(teamId, season, callApiFootball) {
@@ -147,6 +186,40 @@ async function fetchStandingsFeature(leagueId, season, teamId, callApiFootball) 
     return computeStandingsFeature(data.response, teamId);
   } catch (e) {
     return { position: null, points: null, played: null, goalsForAvg: null, goalsAgainstAvg: null, error: e.message };
+  }
+}
+
+// 監督遍歴(ご要望「監督遍歴」への回答)。API-Footballの/coachsエンドポイントは
+// 監督ごとに career(在籍クラブとstart/end)の配列を返す(endがnullなら現職)。
+// これにより「いつ監督が交代したか」を、日々のラインナップ突き合わせのような
+// 複雑な検出ロジック無しで、実データからそのまま取得できる。
+function computeCoachCareer(coachsResponse, teamId) {
+  const empty = { currentCoachName: null, career: [] };
+  const list = coachsResponse || [];
+  // teamIdが在籍クラブ一覧(career)に含まれる監督を優先して選ぶ(通常は1名のみ該当)。
+  const coach = list.find((c) => (c.career || []).some((entry) => entry.team && entry.team.id === teamId)) || list[0];
+  if (!coach) return empty;
+  const career = (coach.career || [])
+    .map((entry) => ({
+      teamName: entry.team ? entry.team.name : null,
+      teamId: entry.team ? entry.team.id : null,
+      start: entry.start || null,
+      end: entry.end || null,
+    }))
+    .filter((e) => e.teamName)
+    .sort((a, b) => new Date(b.start || 0) - new Date(a.start || 0));
+  return {
+    currentCoachName: coach.name || null,
+    career,
+  };
+}
+
+async function fetchCoachCareer(teamId, callApiFootball) {
+  try {
+    const data = await callApiFootball("/coachs", { team: teamId });
+    return computeCoachCareer(data.response, teamId);
+  } catch (e) {
+    return { currentCoachName: null, career: [], error: e.message };
   }
 }
 
@@ -173,8 +246,11 @@ module.exports = {
   computeInjuryCountFeature,
   computeStandingsFeature,
   computeHeadToHeadFeature,
+  computeHomeAwaySplit,
+  computeCoachCareer,
   fetchInjuryCountFeature,
   fetchStandingsFeature,
   fetchHeadToHeadFeature,
+  fetchCoachCareer,
   inferLeagueIdFromFixtures,
 };

@@ -28,12 +28,14 @@ function buildProfilePrompt(teamJa, teamEn, groundingFacts) {
     : "(現時点で参照できる実データはありません。一般的なサッカーの知識のみに基づいて推定してください。)";
   const systemPrompt = [
     "あなたはサッカークラブの戦術傾向を分析するアシスタントです。",
-    "与えられた実データ(直近成績・監督名・フォーメーション等)を踏まえつつ、",
+    "与えられた実データ(直近成績・監督名・フォーメーション・ホームアウェイ別成績等)を踏まえつつ、",
     "一般的に知られているそのクラブの傾向についてまとめてください。",
-    "存在しない具体的な数値(移籍金額・年俸など)を作ってはいけません。",
+    "存在しない具体的な数値(移籍金額・年俸・xG・保持率など)を作ってはいけません。",
     "必ず次の見出し形式でJSONを1つだけ出力してください(説明文は不要):",
-    '{"tacticalStyle": "...", "formationTendency": "...", "strengths": ["...", "..."], "weaknesses": ["...", "..."], "buildUp": "...", "pressing": "...", "setPieces": "..."}',
+    '{"tacticalStyle": "...", "formationTendency": "...", "strengths": ["...", "..."], "weaknesses": ["...", "..."], "buildUp": "...", "pressing": "...", "setPieces": "...", "counterAttack": "...", "possessionStyle": "...", "homeAwayNote": "..."}',
     "各値は40〜80文字程度の日本語で、断定しすぎず「傾向がある」「とされる」のような表現を使ってください。",
+    "counterAttackはカウンター攻撃の活用傾向、possessionStyleはボール保持の傾向(数値の保持率は作らず定性的に)、",
+    "homeAwayNoteは与えられたホーム/アウェイ別成績の実データがあればそれに基づいたコメント(無ければ「データ不足のため言及しない」のような一言)にしてください。",
   ].join("\n");
   const userPrompt = [
     `対象クラブ: ${teamJa}(${teamEn})`,
@@ -59,6 +61,9 @@ function parseProfileJson(rawText) {
       buildUp: String(obj.buildUp || "").slice(0, 200),
       pressing: String(obj.pressing || "").slice(0, 200),
       setPieces: String(obj.setPieces || "").slice(0, 200),
+      counterAttack: String(obj.counterAttack || "").slice(0, 200),
+      possessionStyle: String(obj.possessionStyle || "").slice(0, 200),
+      homeAwayNote: String(obj.homeAwayNote || "").slice(0, 200),
     };
   } catch (e) {
     return null;
@@ -74,7 +79,7 @@ function createClubProfileEngine({ generateLLM, knowledgeStore, setRelation }) {
    * 無い/失効している場合だけ新しく生成する。「知識の不足を自動で補完する」
    * 仕組みの一部(Layer2版)。
    */
-  async function ensureClubProfile(teamEn, teamJa, groundingFacts, nowIso) {
+  async function ensureClubProfile(teamEn, teamJa, groundingFacts, nowIso, coachName) {
     const existing = await knowledgeStore.getActiveKnowledge(teamEn);
     const existingProfile = existing.profiles && existing.profiles.length ? existing.profiles[0] : null;
     if (existingProfile) return { generated: false, profile: existingProfile };
@@ -86,7 +91,7 @@ function createClubProfileEngine({ generateLLM, knowledgeStore, setRelation }) {
     const { systemPrompt, userPrompt } = buildProfilePrompt(teamJa, teamEn, groundingFacts || []);
     let parsed = null;
     try {
-      const { text } = await generateLLM({ systemPrompt, userPrompt, maxTokens: 500 });
+      const { text } = await generateLLM({ systemPrompt, userPrompt, maxTokens: 550 });
       parsed = parseProfileJson(text);
     } catch (e) {
       return { generated: false, profile: null, reason: `LLM_ERROR:${e.code || e.message}` };
@@ -101,6 +106,9 @@ function createClubProfileEngine({ generateLLM, knowledgeStore, setRelation }) {
       parsed.buildUp ? `ビルドアップ: ${parsed.buildUp}` : null,
       parsed.pressing ? `プレス: ${parsed.pressing}` : null,
       parsed.setPieces ? `セットプレー: ${parsed.setPieces}` : null,
+      parsed.counterAttack ? `カウンター: ${parsed.counterAttack}` : null,
+      parsed.possessionStyle ? `ボール保持傾向: ${parsed.possessionStyle}` : null,
+      parsed.homeAwayNote ? `ホーム/アウェイ傾向: ${parsed.homeAwayNote}` : null,
     ].filter(Boolean).join(" / ");
 
     const item = {
@@ -112,9 +120,13 @@ function createClubProfileEngine({ generateLLM, knowledgeStore, setRelation }) {
 
     // Knowledge Graph: 「このクラブの戦術的特徴は○○」という関係も併せて記録する
     // (単なるデータベースではなく、後で「チーム→戦術→…」とたどれるようにするため)。
+    // coachNameが分かっている場合は「監督→好むフォーメーション」の関係も記録し、
+    // team→manager→formation という2ホップの連鎖(ご要望の多段リンクの例)を
+    // たどれるようにする。
     if (result.saved && typeof setRelation === "function") {
       if (parsed.tacticalStyle) setRelation("team", teamEn, "tacticalStyle", "tactic", parsed.tacticalStyle).catch(() => {});
       if (parsed.formationTendency) setRelation("team", teamEn, "formationTendency", "formation", parsed.formationTendency).catch(() => {});
+      if (coachName && parsed.formationTendency) setRelation("person", coachName, "preferredFormation", "formation", parsed.formationTendency).catch(() => {});
     }
 
     return { generated: true, saved: result.saved, profile: { ...item, hash: result.hash } };
