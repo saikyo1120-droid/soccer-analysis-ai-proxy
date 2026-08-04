@@ -1,0 +1,15 @@
+{
+  "name": "soccer-analysis-ai-proxy",
+  "version": "2.0.0",
+  "description": "API-Football用の簡易プロキシサーバー(APIキーをブラウザに露出させないためのバックエンド)。外部パッケージ不使用・npm install不要。",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {}
+}
