@@ -48,6 +48,9 @@ const { assembleReasoning, formatReasoningForPrompt } = require("./reasoning/rea
 // 依存(callApiFootball/resolveTeamId/Upstashアクセス関数)は、このファイル自身が
 // 定義した後にまとめて注入する(利用箇所は下の方の「Stage D」セクションを参照)。
 const { runDailyLearning, getGrowthLog, getRecentFactsForTeam, computeFormScore } = require("./learning/dailyJob");
+// 2026年8月・優先順位⑨: 「今日追加した知識0件」が正常な0件(前回から変化なし)
+// なのか、異常な0件(未実行・キー未設定・予算切れ等)なのかを実データから判定する。
+const { diagnoseZeroKnowledge, diagnoseZeroVerification, getRunHistory, buildEngineStatuses } = require("./learning/healthCheck");
 // /debug診断ページが「毎日学習エンジンが対象にしている全クラブ」を横断して
 // Knowledge Engine / Memory Engineの件数を集計するために使う一覧(新機能ではなく
 // 既存のクラブ一覧を読み取り専用で再利用するだけ)。
@@ -1633,6 +1636,60 @@ async function handleMatchAnalysis(query, clientIp) {
 // AUTO_COLLECT_SECRETが設定されている場合、そのキー一致を要求する(内部の
 // 学習件数・知識件数などをむやみに一般公開しないため。既存のrun-daily/
 // auto-collectエンドポイントと同じ保護パターン)。
+/**
+ * 2026年8月・優先順位⑨「Learning Engineを総点検してください」。
+ *
+ * ご要望の「GitHub Actions / cron / Render / Upstash / Prediction / Learning /
+ * Knowledge / Memory / Hypothesis すべてログを確認し、毎日正常に動くことを
+ * 実証してください」に対する回答となるエンドポイント。
+ *
+ * 私(AI)からはGitHub ActionsやRenderの管理画面へ直接ログインできないため、
+ * 「私が確認しました」で終わらせずに、アプリ自身が毎日の実行ログを実データとして
+ * 読み出し、Saiさん自身がいつでも確認できる形にしています。
+ * 過去N日分の実行履歴(learn:growthlog:YYYY-MM-DD)がそのまま
+ * 「毎日動いている/動いていない」の証拠になります(欠けている日は推測で
+ * 埋めず、正直に「実行記録なし」と表示します)。
+ *
+ * このエンドポイントは一般利用者にも見せる前提です(AIの健全性を隠さない方針)が、
+ * debug-statusのような内部件数の詳細までは返しません。
+ */
+async function handleLearningHealth(searchParams) {
+  const generatedAt = new Date().toISOString();
+  const days = Math.max(1, Math.min(60, parseInt((searchParams && searchParams.get("days")) || "14", 10) || 14));
+  const growthLog = await getGrowthLog(learningDeps).catch(() => ({ ranYet: false }));
+  const todayDateKey = new Date().toISOString().slice(0, 10);
+  const runHistory = await getRunHistory(learningDeps, days, todayDateKey).catch(() => ({ available: false, reasonJa: "実行履歴の読み出しに失敗しました。", days: [] }));
+
+  const zeroKnowledge = diagnoseZeroKnowledge(growthLog);
+  const zeroVerification = diagnoseZeroVerification(growthLog);
+  const engines = buildEngineStatuses({
+    growthLog,
+    runHistory,
+    upstashEnabled: UPSTASH_ENABLED,
+    apiKeyConfigured: !!API_KEY,
+    llmConfigured: !!process.env.ANTHROPIC_API_KEY,
+    engineTotals: growthLog.engineTotals,
+  });
+
+  const errorCount = engines.filter((e) => e.status === "error").length;
+  const warnCount = engines.filter((e) => e.status === "warn").length;
+  const overall = errorCount > 0 ? "error" : warnCount > 0 ? "warn" : "ok";
+  const overallMessageJa = errorCount > 0
+    ? `${errorCount}件の重大な問題が見つかりました(下の一覧の❌印を確認してください)。`
+    : warnCount > 0
+      ? `重大な問題はありませんが、${warnCount}件の注意点があります。`
+      : "すべての構成要素が正常に動作しています。";
+
+  return {
+    status: 200,
+    body: {
+      ok: true, generatedAt, overall, overallMessageJa,
+      zeroKnowledge, zeroVerification, engines, runHistory,
+      apiBudget: growthLog.apiBudget || null,
+    },
+  };
+}
+
 async function handleDebugStatus() {
   const generatedAt = new Date().toISOString();
 
@@ -2519,8 +2576,25 @@ const server = http.createServer(async (req, res) => {
         // 場合も、架空の数字を返さず正直な状態を返す(既存のhandleAccuracyStats
         // と同じ方針)。
         const result = await getGrowthLog(learningDeps);
+        // 2026年8月・優先順位⑨: 「0件」の理由をサーバー側で判定して同梱する。
+        // これまでは画面に「0件」としか出ず、正常な0件(前回から変化なし)と
+        // 異常な0件(未実行・キー未設定・予算切れ)を利用者が区別できなかった。
+        try {
+          result.zeroKnowledgeDiagnosis = diagnoseZeroKnowledge(result);
+          result.zeroVerificationDiagnosis = diagnoseZeroVerification(result);
+        } catch (e) { /* 診断は付加情報なので、失敗しても本体は返す */ }
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(result));
+        return;
+      }
+      if (pathname === "/api/learning/health") {
+        // 2026年8月・優先順位⑨「Learning Engineを総点検してください」。
+        // GitHub Actions / cron / Render / Upstash / Prediction / Learning /
+        // Knowledge / Memory / Hypothesis の状態を実データから判定し、
+        // 「毎日動いていること」を過去N日分の実行履歴で実証する。
+        const { status, body } = await handleLearningHealth(parsed.searchParams);
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
         return;
       }
       if (pathname === "/api/knowledge/team-view-history") {
@@ -2590,6 +2664,7 @@ module.exports = {
   runDailyLearning,
   getGrowthLog,
   handleDebugStatus,
+  handleLearningHealth,
   handleTeamViewHistory,
   handleMatchAnalysis,
   learningDeps,
