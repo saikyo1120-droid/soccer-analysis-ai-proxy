@@ -20,6 +20,10 @@ const CLUB_NEED_TRIGGERS = [
   { need: "coach", pattern: /監督|采配|指揮官|解任|更迭/ },
   { need: "formation", pattern: /フォーメーション|布陣|システム|戦術|陣形/ },
   { need: "recentForm", pattern: /得点|失点|守備|攻撃|連勝|連敗|勝率|調子|成績|結果/ },
+  // 2026年8月・「議論できるAI」強化フェーズ(ご要望③): Reasoning Engineの
+  // 「順位・置かれた状況」仮説(hypothesisGenerator.jsのstandings)を実データで
+  // 裏付けられるように追加。順位・勝点・昇格降格に関する質問文で発火する。
+  { need: "standings", pattern: /順位|何位|首位|最下位|降格|昇格|勝点|得失点差/ },
 ];
 
 // クラブに関する質問なら、少なくともこれらは基本セットとして常に含める
@@ -36,6 +40,7 @@ const COMPARISON_AXES_BY_NEED = {
   transfers: "直近180日以内の移籍による戦力の増減",
   formation: "直近試合のフォーメーション・システムの変化",
   coach: "監督(采配傾向)の変化",
+  standings: "現在の順位・勝点(モチベーション・置かれた状況への影響)",
 };
 
 /**

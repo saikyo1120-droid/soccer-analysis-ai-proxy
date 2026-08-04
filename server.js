@@ -1171,6 +1171,12 @@ const knowledgeSource = createKnowledgeSource({
   ensureClubProfile: (...args) => clubProfileEngine.ensureClubProfile(...args),
   fetchCoachCareer: (...args) => fetchCoachCareer(...args),
   saveKnowledgeItem: (...args) => knowledgeStore.saveKnowledgeItem(...args),
+  // 2026年8月・「議論できるAI」強化フェーズ(ご要望③): Reasoning Engineが
+  // 「順位・置かれた状況」の仮説を実データで裏付けられるように、Prediction
+  // Engine v2で既に使っているのと同じ実データ取得関数をそのまま注入する
+  // (新しいAPI呼び出しロジックを増やさず、既存の信頼できる関数を再利用)。
+  fetchStandingsFeature: (...args) => fetchStandingsFeature(...args),
+  inferLeagueIdFromFixtures: (...args) => inferLeagueIdFromFixtures(...args),
 });
 
 // ============================================================
@@ -1339,17 +1345,57 @@ async function handleMatchAnalysis(query, clientIp) {
     if (!underdog) return "両者拮抗のため、わずかなミス・セットプレー・退場者の有無などで試合展開が大きく変わり得ます。";
     return `もし${underdog}が試合序盤を無失点で乗り切れれば、${h2h.sampleSize ? "過去の対戦成績も踏まえ、" : ""}終盤にかけて流れが変わる可能性があります。`;
   }
+  // 2026年8月・「議論できるAI」強化フェーズ(ご要望⑥・⑦戦術相性): フォーメーション
+  // 単体の並記だけでは「相性」の判断になっていなかった(正直なギャップ)。
+  // 両フォーメーションが揃っている場合のみ、素朴な戦術知識(サイドの数的優位・
+  // 中盤の枚数差)から相性の見立てを機械的に組み立てる。これはAPI-Footballの
+  // 実データそのものではなく「AIの見解」であるため、必ずその旨を明示する。
+  function buildDeterministicTacticalCompatibility() {
+    const hf = homeFormationInfo.formation;
+    const af = awayFormationInfo.formation;
+    if (!hf || !af) return "両クラブの直近フォーメーションが揃わなかったため、戦術相性の見立ては省略します。";
+    const wingCount = (f) => { const parts = String(f).split("-").map((n) => parseInt(n, 10)); return parts.length >= 3 ? (parts[1] || 0) : 0; };
+    const midCount = (f) => { const parts = String(f).split("-").map((n) => parseInt(n, 10)); return parts.length >= 3 ? parts.slice(1, parts.length - 1).reduce((s, n) => s + n, 0) : 0; };
+    const backCount = (f) => { const parts = String(f).split("-").map((n) => parseInt(n, 10)); return parts[0] || 0; };
+    const hMid = midCount(hf), aMid = midCount(af);
+    const hBack = backCount(hf), aBack = backCount(af);
+    if (hMid !== aMid) {
+      const stronger = hMid > aMid ? home.nameJa : away.nameJa;
+      const weaker = hMid > aMid ? away.nameJa : home.nameJa;
+      return `${home.nameJa}(${hf}) vs ${away.nameJa}(${af}): 中盤の人数は${stronger}が上回っており(${Math.max(hMid, aMid)}人 対 ${Math.min(hMid, aMid)}人)、${weaker}は中盤でボールを奪われやすくなる可能性があります(AI見解・フォーメーション上の一般論に基づく簡易的な見立てです)。`;
+    }
+    if (hBack !== aBack) {
+      return `${home.nameJa}(${hf}) vs ${away.nameJa}(${af}): 最終ラインの人数が異なるため(${hBack}枚 対 ${aBack}枚)、少ない方は裏のスペースを使われるリスクがあります(AI見解・簡易的な見立てです)。`;
+    }
+    return `${home.nameJa}(${hf}) vs ${away.nameJa}(${af}): 両者とも似た構造のフォーメーションのため、個々の選手の質やコンディションが試合の分かれ目になりそうです(AI見解・簡易的な見立てです)。`;
+  }
+  // ⑩この試合最大の見どころ: 実データの中から最も「話題性」が高そうな1点を
+  // 機械的に選ぶ(でっち上げず、実際に取得できたデータの中から選ぶだけ)。
+  function buildDeterministicBiggestHighlight() {
+    const candidates = [];
+    if (h2h.sampleSize >= 3) candidates.push({ score: h2h.sampleSize, text: `過去${h2h.sampleSize}試合の直接対戦成績(${home.nameJa}${h2h.homeSideWins}勝-${h2h.draws}分-${h2h.awaySideWins}勝${away.nameJa})が、今回もどちらに転ぶか。` });
+    if (homeTopScorerInfo.player && awayTopScorerInfo.player) candidates.push({ score: 5, text: `両チームの得点源、${homeTopScorerInfo.player.name}(今季${homeTopScorerInfo.player.goals}得点)と${awayTopScorerInfo.player.name}(今季${awayTopScorerInfo.player.goals}得点)、どちらが仕事をするか。` });
+    if ((homeInjuries.injuryCount || 0) + (awayInjuries.injuryCount || 0) >= 3) candidates.push({ score: 4, text: `両クラブ合わせて${(homeInjuries.injuryCount || 0) + (awayInjuries.injuryCount || 0)}名の負傷・出場停止者を抱える中、主力不在の穴をどう埋めるか。` });
+    if (homeStandings.position && awayStandings.position) candidates.push({ score: 3, text: `${homeStandings.position}位の${home.nameJa}と${awayStandings.position}位の${away.nameJa}、順位差を覆せるか。` });
+    if (!candidates.length) return topFactor ? `AIが最も重視した「${topFactor.labelJa}」の差が、実際の試合でどう出るか。` : "両者拮抗のカードで、僅かな差がどちらに転ぶか。";
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates[0].text;
+  }
 
   let narrative = { text: buildDeterministicNarrative(), source: "deterministic" };
   let reverseScenario = { text: buildDeterministicReverseScenario(), source: "deterministic" };
+  let tacticalCompatibility = { text: buildDeterministicTacticalCompatibility(), source: "deterministic" };
+  let biggestHighlight = { text: buildDeterministicBiggestHighlight(), source: "deterministic" };
 
   if (typeof generateLLM === "function" && tryConsumeLlmBudgetForIp(clientIp) && tryConsumeLlmBudget()) {
     try {
       const systemPrompt = [
         "あなたはサッカーの試合展開を予想するアナリストAIです。",
         "与えられた実データ・計算済みの数値だけを根拠にしてください。数字を新しく作らないでください。",
-        "出力は次のJSON形式のみ: {\"narrative\": \"...\", \"reverseScenario\": \"...\"}",
+        "出力は次のJSON形式のみ: {\"narrative\": \"...\", \"reverseScenario\": \"...\", \"tacticalCompatibility\": \"...\", \"biggestHighlight\": \"...\"}",
         "narrativeは試合展開の予想を100〜160文字程度の日本語で。reverseScenarioは予想が外れる場合の代替シナリオを80〜140文字程度の日本語で。",
+        "tacticalCompatibilityは両者のフォーメーション・戦術面の相性についての見立てを80〜140文字程度の日本語で(あなたの見解であることが伝わる書き方をしてください)。",
+        "biggestHighlightはこの試合で最も注目すべき1点を60〜100文字程度の日本語で、断定的に1つだけ挙げてください。",
       ].join("\n");
       const userPrompt = [
         `${home.nameJa}(ホーム) vs ${away.nameJa}(アウェイ)`,
@@ -1360,13 +1406,15 @@ async function handleMatchAnalysis(query, clientIp) {
         `${away.nameJa}: 直近7日${awayForm.matchesLast7Days}試合、負傷者${awayInjuries.injuryCount ?? "不明"}名${(awayInjuries.injuredPlayers || []).length ? `(${awayInjuries.injuredPlayers.slice(0, 3).join("・")}等)` : ""}、順位${awayStandings.position ?? "不明"}位、フォーメーション${awayFormationInfo.formation || "不明"}、注目選手${awayTopScorerInfo.player ? `${awayTopScorerInfo.player.name}(今季${awayTopScorerInfo.player.goals}得点)` : "特になし"}`,
         `過去対戦: ${h2h.sampleSize}試合中 ${home.nameJa}側${h2h.homeSideWins}勝 ${away.nameJa}側${h2h.awaySideWins}勝 ${h2h.draws}分`,
       ].join("\n");
-      const { text } = await generateLLM({ systemPrompt, userPrompt, maxTokens: 400 });
+      const { text } = await generateLLM({ systemPrompt, userPrompt, maxTokens: 500 });
       const start = text.indexOf("{");
       const end = text.lastIndexOf("}");
       if (start !== -1 && end !== -1) {
         const parsed = JSON.parse(text.slice(start, end + 1));
         if (parsed.narrative) narrative = { text: String(parsed.narrative).slice(0, 400), source: "ai_generated" };
         if (parsed.reverseScenario) reverseScenario = { text: String(parsed.reverseScenario).slice(0, 400), source: "ai_generated" };
+        if (parsed.tacticalCompatibility) tacticalCompatibility = { text: String(parsed.tacticalCompatibility).slice(0, 400), source: "ai_generated" };
+        if (parsed.biggestHighlight) biggestHighlight = { text: String(parsed.biggestHighlight).slice(0, 300), source: "ai_generated" };
       }
     } catch (e) {
       console.error("[match-analysis] generateLLM failed, falling back to deterministic narrative:", e.code || "(no code)", "-", e.message);
@@ -1418,6 +1466,12 @@ async function handleMatchAnalysis(query, clientIp) {
       keyFactors,
       mostImportantFactor: topFactor ? topFactor.labelJa : "(まだ強く学習された要素はありません)",
       narrative, reverseScenario, conclusion,
+      // 2026年8月・「議論できるAI」強化フェーズ(ご要望⑥): ⑦戦術相性の明示的な
+      // 見立てと、⑩この試合最大の見どころ。11項目のうち、④鍵になる時間帯だけは
+      // 現時点で正直に未実装(README「AIマッチ分析の11項目」参照: /fixtures/events
+      // をこのオンデマンドAPI呼び出し内で全クラブ分取得するとAPI-Football無料枠
+      // (1日100リクエスト)を容易に超えるため、理由と代替案を明記した上で見送り)。
+      tacticalCompatibility, biggestHighlight,
       injuries, formation, keyPlayers,
       featuresUsed: features,
       weightsInfo: { version: weights.version || 0, updatedAt: weights.updatedAt || null },
@@ -1808,6 +1862,12 @@ function computeClubConfidence(knowledge, needs) {
   return { stars, reasonJa };
 }
 
+// 2026年8月・「議論できるAI」強化フェーズ(ご要望⑤): 「検索AIのように事実を
+// 並べるだけ」ではなく、①世の中の一般論 ②AI独自の意見 ③反対意見(あえて逆側
+// から見た視点) ④最終結論 ⑤今後の見通し、という「議論の型」を毎回踏ませる。
+// さらにご要望④(Memory Engineの活用)に対応し、②AI独自の意見の中で、前回との
+// 評価の変化(あれば)に必ず触れさせる(userPromptに前回結論を渡すreasoning
+// PromptBlock/previousConclusionと連動。formatReasoningForPrompt参照)。
 function buildDiscussSystemPrompt() {
   return [
     "あなたはサッカーの分析官です。以下に与えられた「事実」だけを根拠として、利用者の質問に答えてください。",
@@ -1815,16 +1875,29 @@ function buildDiscussSystemPrompt() {
     "与えられた事実が乏しい場合は、それを正直に述べた上で、一般的なサッカーの見方として考察してください。",
     "事実と自分の意見は明確に書き分けてください(「〜という結果が出ています」と「私は〜と考えます」のように)。",
     "利用者が意見や感想を述べている場合は、頭ごなしに否定せず、まずその視点を受け止めてください。",
+    "あなたは単に事実を検索して並べる「検索AI」ではありません。以下の型に沿って、自分の頭で考えて議論してください。",
+    "「AIが前回下した結論」が与えられていて、かつ今回の結論が変わった場合は、②AI独自の意見の中で必ず",
+    "「以前は〜と評価していましたが、今回は〜に評価を変えました」という趣旨の文を含めてください。",
+    "前回の結論が無い、または今回と同じ場合は、変化した体で書かない(でっち上げない)でください。",
     "必ず次の形式で、日本語で出力してください。見出し以外の余計な文章は含めないでください。",
     "",
-    "###根拠###",
-    "(与えられた事実のうち、この考察で特に重視した点を1〜3文で)",
+    "###一般論###",
+    "(この話題について、サッカー界で一般的に言われている見方・定説を2〜4文で)",
     "",
-    "###考察###",
-    "(複数の要因を統合したあなた自身の見解を3〜6文程度で。意見であることが分かる書き方をしてください)",
+    "###AI独自の意見###",
+    "(与えられた実データを踏まえた、あなた自身の見解を3〜6文で。単なる一般論の繰り返しではなく、あなた独自の視点を出してください。評価が前回から変わった場合はその旨に必ず触れてください)",
     "",
-    "###結論###",
-    "(まとめと、今後の見通しを1〜3文で)",
+    "###反対意見###",
+    "(AI独自の意見に対して、最も説得力のある反対の視点・懸念点を2〜4文で。あなたの意見を弱める材料も正直に示してください)",
+    "",
+    "###最終結論###",
+    "(一般論・AI独自の意見・反対意見を踏まえた、あなたの最終的な結論を2〜3文で)",
+    "",
+    "###今後どうなると思うか###",
+    "(今後の見通しを1〜3文で)",
+    "",
+    "###最も重要だと考える点###",
+    "(必ず1文だけ、「私は○○が最も重要だと考えます。」という形式で。○○にはこの考察で最も重視した具体的な要素を入れてください)",
     "",
     "###フォローアップ###",
     "(議論を続けるための質問を1〜2個、1行に1つずつ)",
@@ -1833,6 +1906,7 @@ function buildDiscussSystemPrompt() {
 
 function parseDiscussLlmOutput(rawText) {
   const text = String(rawText || "");
+  const LABEL_ORDER = ["一般論", "AI独自の意見", "反対意見", "最終結論", "今後どうなると思うか", "最も重要だと考える点", "フォローアップ"];
   const grab = (label, nextLabels) => {
     const startIdx = text.indexOf(`###${label}###`);
     if (startIdx === -1) return "";
@@ -1843,18 +1917,24 @@ function parseDiscussLlmOutput(rawText) {
     }
     return text.slice(startIdx + label.length + 6, end).trim();
   };
-  const evidence = grab("根拠", ["考察", "結論", "フォローアップ"]);
-  const consideration = grab("考察", ["結論", "フォローアップ"]);
-  const conclusion = grab("結論", ["フォローアップ"]);
+  const generalView = grab("一般論", LABEL_ORDER.slice(1));
+  const aiOpinion = grab("AI独自の意見", LABEL_ORDER.slice(2));
+  const counterArgument = grab("反対意見", LABEL_ORDER.slice(3));
+  const finalConclusion = grab("最終結論", LABEL_ORDER.slice(4));
+  const futureOutlook = grab("今後どうなると思うか", LABEL_ORDER.slice(5));
+  const mostImportantOpinion = grab("最も重要だと考える点", LABEL_ORDER.slice(6));
   const followRaw = grab("フォローアップ", []);
-  const parsedOk = !!(evidence || consideration || conclusion);
+  const parsedOk = !!(generalView || aiOpinion || counterArgument || finalConclusion || futureOutlook || mostImportantOpinion);
   if (!parsedOk) {
     // LLMが指定フォーマットに従わなかった場合の保険: 空欄のまま返すより、
-    // 生成された文章をそのまま考察欄に入れて表示できるようにする。
-    return { evidence: "", consideration: text.trim().slice(0, 1200), conclusion: "", followUpQuestions: [], parsedOk: false };
+    // 生成された文章をそのままAI独自の意見欄に入れて表示できるようにする。
+    return {
+      generalView: "", aiOpinion: text.trim().slice(0, 1200), counterArgument: "", finalConclusion: "",
+      futureOutlook: "", mostImportantOpinion: "", followUpQuestions: [], parsedOk: false,
+    };
   }
   const followUpQuestions = followRaw.split("\n").map((s) => s.replace(/^[・\-\d.、\s]+/, "").trim()).filter(Boolean).slice(0, 2);
-  return { evidence, consideration, conclusion, followUpQuestions, parsedOk: true };
+  return { generalView, aiOpinion, counterArgument, finalConclusion, futureOutlook, mostImportantOpinion, followUpQuestions, parsedOk: true };
 }
 
 async function handleDiscuss(body, clientIp) {
@@ -2051,9 +2131,15 @@ async function handleDiscuss(body, clientIp) {
       ok: true,
       facts,
       stats,
-      evidence: llmOut.evidence,
-      consideration: llmOut.consideration,
-      conclusion: llmOut.conclusion,
+      // 2026年8月・「議論できるAI」強化フェーズ(ご要望⑤): 検索AIのような
+      // 「事実の要約」ではなく、一般論→AI独自の意見→反対意見→最終結論→
+      // 今後どうなるか、という「議論の型」をそのままフィールドとして返す。
+      generalView: llmOut.generalView,
+      aiOpinion: llmOut.aiOpinion,
+      counterArgument: llmOut.counterArgument,
+      finalConclusion: llmOut.finalConclusion,
+      futureOutlook: llmOut.futureOutlook,
+      mostImportantOpinion: llmOut.mostImportantOpinion,
       confidence,
       followUpQuestions: llmOut.followUpQuestions,
       meta: { ...knowledgeMeta, llmProvider: currentProviderName(), parsedOk: llmOut.parsedOk },

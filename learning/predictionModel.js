@@ -301,12 +301,123 @@ function buildLearningSummary(historyEntries, limit) {
   return adopted.slice(0, limit || 5);
 }
 
+// ---- 2026年8月・Failure Learning(ご要望①): 「何故外れたのか」を分類する ----
+// 従来のサイクル(試合終了→正解/不正解→重み更新)は、外れた事実を数として
+// 数えるだけで「何が原因で外れたのか」を一切言語化していなかった(正直な
+// ギャップ)。ここでは、その予測を行った時点で実際に計算されていた特徴量
+// (features)と、その時点で使っていた重み(weightsSnapshot)だけを根拠に、
+// 機械的に(LLMを使わず)原因を分類する。でっち上げを避けるため、判定は
+// 次の2パターンのみに限定する:
+//   ①「重視しすぎた」: その特徴量が予測した方向に強く効いていた(重みが
+//     一定以上ある)のに、実際の結果はその方向ではなかった。
+//   ②「軽視した」: 実際の結果の方向を示す特徴量の値はあったのに、その
+//     特徴量の重みがほぼ0(＝まだ学習で重視されていなかった)ため、
+//     予測に反映されていなかった。
+// どちらにも当てはまらない場合(v1のみの古いレコード等、拡張特徴量が無い場合を
+// 含む)は、正直に「セットプレー・スタメン発表・審判の判定など、現在の
+// モデルが数値化していない要因の影響」という限界を明示する(存在しない
+// 原因をでっち上げない)。
+const FAILURE_REASON_LABELS_JA = {
+  home_bonus_overweighted: "ホーム補正が強すぎた",
+  formDiff_overweighted: "直近フォームを重視しすぎた",
+  formDiff_underweighted: "直近フォームを軽視した",
+  goalRateDiff_overweighted: "得点力・失点率を重視しすぎた",
+  goalRateDiff_underweighted: "得点力・失点率を軽視した",
+  injuryDiff_overweighted: "怪我人を重視しすぎた",
+  injuryDiff_underweighted: "怪我人を軽視した",
+  standingsDiff_overweighted: "順位・勝点を重視しすぎた",
+  standingsDiff_underweighted: "順位・勝点を軽視した",
+  headToHeadDiff_overweighted: "過去対戦を重視しすぎた",
+  headToHeadDiff_underweighted: "過去対戦を軽視した",
+  fatigueDiff_overweighted: "過密日程を重視しすぎた",
+  fatigueDiff_underweighted: "過密日程を軽視した",
+  unmodeled_factors: "セットプレー・スタメン発表・審判の判定など、現在のモデルが数値化していない要因の影響",
+};
+
+const OUTCOME_SIGN = { home: 1, away: -1, draw: 0 };
+
+/**
+ * @param {object} record - learn:ownpred:<fixtureId> の1件(resolved済み・resultが確定済み)
+ * @param {object} weightsUsed - その予測を行った時点の重み(record.weightsSnapshot)
+ * @returns {Array<{id, labelJa, detail}>} 的中していれば空配列
+ */
+function classifyFailureReasons(record, weightsUsed) {
+  if (!record || record.correct || !record.actualWinner || !record.predictedWinner) return [];
+  const weights = weightsUsed || record.weightsSnapshot || EXTENDED_DEFAULT_WEIGHTS;
+  const predictedSign = OUTCOME_SIGN[record.predictedWinner] ?? 0;
+  const actualSign = OUTCOME_SIGN[record.actualWinner] ?? 0;
+  const outcomeLabelJa = (w) => (w === "home" ? "ホーム勝利" : w === "away" ? "アウェイ勝利" : "引き分け");
+  const reasons = [];
+
+  const homeBiasMag = (weights.homeBase ?? 0) - (weights.awayBase ?? 0);
+  if (predictedSign > 0 && actualSign <= 0 && homeBiasMag >= 0.3) {
+    reasons.push({
+      id: "home_bonus_overweighted",
+      labelJa: FAILURE_REASON_LABELS_JA.home_bonus_overweighted,
+      detail: `ホームアドバンテージ(基礎値の差+${homeBiasMag.toFixed(2)})の影響でホームチーム優位と予想しましたが、実際は${outcomeLabelJa(record.actualWinner)}でした。`,
+    });
+  }
+
+  const features = record.features;
+  if (features && typeof features === "object") {
+    for (const [fKey, wKey] of Object.entries(FEATURE_WEIGHT_MAP)) {
+      const fVal = features[fKey] || 0;
+      const wVal = weights[wKey] || 0;
+      const contributionSign = Math.sign(fVal * wVal);
+      const featureSign = Math.sign(fVal);
+      const labelJa = FEATURE_LABELS_JA[fKey];
+
+      if (contributionSign !== 0 && contributionSign === predictedSign && predictedSign !== actualSign && Math.abs(wVal) >= 0.05) {
+        reasons.push({
+          id: `${fKey}_overweighted`,
+          labelJa: FAILURE_REASON_LABELS_JA[`${fKey}_overweighted`] || `${labelJa}を重視しすぎた`,
+          detail: `${labelJa}の差(${fVal.toFixed(2)})を根拠に予想しましたが、実際の結果(${outcomeLabelJa(record.actualWinner)})はそれを裏付けませんでした。`,
+        });
+      }
+      if (featureSign !== 0 && featureSign === actualSign && actualSign !== predictedSign && Math.abs(wVal) < 0.03) {
+        reasons.push({
+          id: `${fKey}_underweighted`,
+          labelJa: FAILURE_REASON_LABELS_JA[`${fKey}_underweighted`] || `${labelJa}を軽視した`,
+          detail: `${labelJa}の差(${fVal.toFixed(2)})は実際の結果(${outcomeLabelJa(record.actualWinner)})の方向を示していましたが、モデルはこの要素をまだ十分に学習していませんでした。`,
+        });
+      }
+    }
+  }
+
+  if (!reasons.length) {
+    reasons.push({
+      id: "unmodeled_factors",
+      labelJa: FAILURE_REASON_LABELS_JA.unmodeled_factors,
+      detail: "セットプレーの流れ・審判の判定・スタメン発表直前の変更など、現在のモデルが数値化していない要因が結果に影響した可能性があります。",
+    });
+  }
+
+  return reasons.slice(0, 3);
+}
+
+// 直近の解決済み予測(learn:ownpred:recentなど)の failureReasons を横断集計し、
+// 「最近よく外れる原因」を頻度順に返す(AIの成長レポート・議論モードの根拠に使う)。
+function summarizeFailureReasons(records, limit) {
+  const counts = new Map();
+  for (const r of records || []) {
+    if (!r || r.correct !== false || !Array.isArray(r.failureReasons)) continue;
+    for (const reason of r.failureReasons) {
+      if (!reason || !reason.id) continue;
+      const prev = counts.get(reason.id) || { id: reason.id, labelJa: reason.labelJa, count: 0 };
+      prev.count += 1;
+      counts.set(reason.id, prev);
+    }
+  }
+  return Array.from(counts.values()).sort((a, b) => b.count - a.count).slice(0, limit || 5);
+}
+
 module.exports = {
   EXTENDED_DEFAULT_WEIGHTS,
   FEATURE_WEIGHT_MAP,
   FEATURE_LABELS_JA,
   LEARNABLE_KEYS,
   WEIGHT_LABELS_JA,
+  FAILURE_REASON_LABELS_JA,
   computeMatchFeatures,
   predictOutcomeV2,
   poissonPmf,
@@ -319,4 +430,6 @@ module.exports = {
   fitWeightsGradientDescent,
   describeWeightsHistoryEntry,
   buildLearningSummary,
+  classifyFailureReasons,
+  summarizeFailureReasons,
 };

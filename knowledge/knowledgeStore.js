@@ -95,6 +95,12 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
     await upstashSetJSON(`knowledge:item:${hash}`, record);
     await upstashCmd(["RPUSH", `knowledge:byTeam:${item.teamEn}`, hash]).catch(() => {});
     await upstashCmd(["LTRIM", `knowledge:byTeam:${item.teamEn}`, String(-MAX_ITEMS_PER_TEAM), "-1"]).catch(() => {});
+    // 2026年8月・「AIの成長レポート」ウィジェット(ご要望⑦)対応: 登録クラブ
+    // 全件をループして数えるgetActiveKnowledge()はホーム画面が読み込まれる
+    // たびに呼ぶには重すぎる(Upstash読み取りが多すぎる)ため、軽量な累計
+    // カウンター(knowledge:trackedPlayerProfilesと同じ既存パターン)を別途持つ。
+    // 失効しても減らない「累計保存件数」であることは呼び出し側で正直に明示する。
+    await upstashCmd(["INCR", "knowledge:totalItemsSavedCounter"]).catch(() => {});
     return { saved: true, hash };
   }
 

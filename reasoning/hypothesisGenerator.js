@@ -16,33 +16,37 @@
  *   将来、要件が「仮説の内容自体をAIに自由に発想させたい」に変わった場合は、
  *   ここをLLM呼び出しに置き換える拡張ポイントとして分離してある。
  *
- * 常に3つの観点(factor)から仮説を生成する(利用者の要望「最低3つの仮説」に
- * 対応)。ただし、根拠が1件も見つからなかった観点は、正直に「根拠なし」の仮説
- * として返す(存在しない根拠をでっち上げない)。
+ * 2026年8月・「議論できるAI」強化フェーズ: ご要望(「最低5つ以上の仮説を
+ * 立てて比較してほしい」)に対応し、9つの観点(factor)に拡張した。怪我・
+ * 移籍のような従来の3観点に加えて、戦術/フォーメーション・直近フォーム・
+ * 監督・ホームアウェイ差・疲労(過密日程)・勢い(メンタルの代理指標)・
+ * 順位を独立した観点として扱う。根拠が1件も見つからなかった観点は、正直に
+ * 「根拠なし」の仮説として返す(存在しない根拠をでっち上げない)。
+ *
+ * 「相性(対戦相手との相性)」は、この層(単一クラブの議論モード)では
+ * 対戦相手が定まっていないため評価できない。2クラブの組み合わせが分かる
+ * AIマッチ分析(server.jsのhandleMatchAnalysis)側で、過去対戦成績という
+ * 実データとして既に扱っている(README「議論できるAIへの強化」参照)。
  */
 
 const HYPOTHESIS_FACTORS = [
   {
     id: "defense_injury",
-    label: "守備陣の状態(負傷・出場停止)が原因という仮説",
+    label: "怪我・出場停止(守備陣・主力の状態)が原因という仮説",
     relevantCategories: ["injuries"],
     buildStatement: (teamJa, matched) =>
       matched.length
-        ? `${teamJa}の守備の状態は、負傷・出場停止による選手の入れ替わりが影響している可能性がある。`
+        ? `${teamJa}の状態は、負傷・出場停止による選手の入れ替わりが影響している可能性がある。`
         : `${teamJa}について、負傷・出場停止に関する情報は見当たらなかった。`,
   },
   {
-    id: "form_tactics",
-    label: "直近のフォーム・戦術(フォーメーション)の変化が原因という仮説",
-    // 注: 「監督の在籍」自体(coach)は変化の根拠にならないため含めない。フォーメーション
-    // (formation)は実際に取得できた場合のみ根拠になる(質問がフォーメーションに
-    // 言及した場合など)。各カテゴリは1回のRAG取得につきevidenceを最大1件しか
-    // 生成しないため、他のカテゴリ(injuries/transfers)と点数のスケールが揃う。
-    relevantCategories: ["recentForm", "formation"],
+    id: "tactics_formation",
+    label: "戦術・フォーメーションの変化が原因という仮説",
+    relevantCategories: ["formation", "clubProfile"],
     buildStatement: (teamJa, matched) =>
       matched.length
-        ? `${teamJa}の直近の結果は、フォームの変化やフォーメーション・采配の傾向が影響している可能性がある。`
-        : `${teamJa}について、直近フォームやフォーメーションに関する情報は見当たらなかった。`,
+        ? `${teamJa}の結果は、フォーメーションや戦術的な方針(ビルドアップ・プレス・保持率等)が影響している可能性がある。`
+        : `${teamJa}について、戦術・フォーメーションに関する情報は見当たらなかった。`,
   },
   {
     id: "squad_transfers",
@@ -52,6 +56,60 @@ const HYPOTHESIS_FACTORS = [
       matched.length
         ? `${teamJa}の状態は、直近の移籍(加入・退団)による戦力変化が影響している可能性がある。`
         : `${teamJa}について、直近の移籍に関する情報は見当たらなかった。`,
+  },
+  {
+    id: "recent_form",
+    label: "直近フォーム(得失点差の推移)が原因という仮説",
+    relevantCategories: ["recentForm"],
+    buildStatement: (teamJa, matched) =>
+      matched.length
+        ? `${teamJa}の直近の試合結果の推移そのものが、現在の評価に直接影響している可能性がある。`
+        : `${teamJa}について、直近の試合結果の推移に関する情報は見当たらなかった。`,
+  },
+  {
+    id: "coach",
+    label: "監督(采配・就任時期)が原因という仮説",
+    relevantCategories: ["coach"],
+    buildStatement: (teamJa, matched) =>
+      matched.length
+        ? `${teamJa}の状態は、現在の監督の采配方針が影響している可能性がある。`
+        : `${teamJa}について、監督に関する情報は見当たらなかった。`,
+  },
+  {
+    id: "home_away",
+    label: "ホーム/アウェイの違いが原因という仮説",
+    relevantCategories: ["homeAway"],
+    buildStatement: (teamJa, matched) =>
+      matched.length
+        ? `${teamJa}はホームとアウェイで成績差が大きく、開催地が結果に影響している可能性がある。`
+        : `${teamJa}について、ホーム/アウェイの明確な成績差は確認できなかった。`,
+  },
+  {
+    id: "fatigue",
+    label: "過密日程・疲労が原因という仮説",
+    relevantCategories: ["fatigue"],
+    buildStatement: (teamJa, matched) =>
+      matched.length
+        ? `${teamJa}は直近の試合間隔が短く、疲労の蓄積が影響している可能性がある。`
+        : `${teamJa}について、過密日程を示す情報は見当たらなかった。`,
+  },
+  {
+    id: "momentum",
+    label: "勢い・メンタル面(連続結果)が原因という仮説",
+    relevantCategories: ["streak"],
+    buildStatement: (teamJa, matched) =>
+      matched.length
+        ? `${teamJa}は結果が連続しており、勢い(またはその逆の重圧)がメンタル面に影響している可能性がある。`
+        : `${teamJa}について、連続した結果(勢いの根拠になるもの)は確認できなかった。`,
+  },
+  {
+    id: "standings",
+    label: "リーグ順位・置かれた状況が原因という仮説",
+    relevantCategories: ["standings"],
+    buildStatement: (teamJa, matched) =>
+      matched.length
+        ? `${teamJa}の現在のリーグ順位が、モチベーションや戦い方の選択に影響している可能性がある。`
+        : `${teamJa}について、現在の順位に関する情報は見当たらなかった(質問文に順位への言及が無かった可能性があります)。`,
   },
 ];
 

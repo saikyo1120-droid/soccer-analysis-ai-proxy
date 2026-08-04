@@ -50,6 +50,7 @@ function createMemoryStore({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
     if (!previous) {
       const record = { ...conclusion, subjectKey, revision: 1 };
       await upstashSetJSON(`memory:current:${subjectKey}`, record);
+      await upstashCmd(["INCR", "memory:totalConclusionsSavedCounter"]).catch(() => {});
       return { saved: true, changed: true, reason: "INITIAL", revision: 1 };
     }
 
@@ -78,6 +79,10 @@ function createMemoryStore({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
     const revision = (previous.revision || 1) + 1;
     const record = { ...conclusion, subjectKey, revision };
     await upstashSetJSON(`memory:current:${subjectKey}`, record);
+    // 2026年8月・「AIの成長レポート」ウィジェット(ご要望⑦)対応: 登録クラブ
+    // 全件をループするhandleDebugStatusの集計方式はホーム画面には重すぎるため、
+    // 軽量な累計カウンター(knowledgeStore.jsと同じパターン)を別途持つ。
+    await upstashCmd(["INCR", "memory:totalConclusionsSavedCounter"]).catch(() => {});
     return { saved: true, changed: true, reason: "CHANGED", revision, previousStatement: previous.statement };
   }
 

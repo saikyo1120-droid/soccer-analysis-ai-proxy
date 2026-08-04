@@ -84,13 +84,57 @@ function summarizeTransfers(rawList, teamId, maxCount, sinceDate) {
 const MANAGER_QUOTE_UNAVAILABLE_REASON =
   "監督コメント・采配評価は、現時点で接続している実データソース(API-Football)では取得できません。";
 
+// 2026年8月・「議論できるAI」強化フェーズ: Reasoning Engineが最低5つ以上の
+// 仮説を比較検討できるよう、直近成績(recentForm)からAPI呼び出しを追加せず
+// に計算できる観点を増やす(疲労/ホームアウェイ差/勢い)。いずれも実データ
+// (直近試合の日付・結果)から機械的に算出するだけで、AIの推測は加えない。
+function computeFatigueNote(recentForm, nowMs) {
+  if (!recentForm || !recentForm.length) return null;
+  const now = nowMs || Date.now();
+  const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+  const matchesLast7Days = recentForm.filter((m) => {
+    const d = new Date(m.date).getTime();
+    return !Number.isNaN(d) && d <= now && now - d <= sevenDaysMs;
+  }).length;
+  return { matchesLast7Days };
+}
+
+function computeHomeAwaySplitFromRecent(recentForm) {
+  if (!recentForm || !recentForm.length) return null;
+  const home = recentForm.filter((m) => m.homeAway === "ホーム");
+  const away = recentForm.filter((m) => m.homeAway === "アウェイ");
+  const winRate = (list) => (list.length ? Math.round((list.filter((m) => m.result === "勝ち").length / list.length) * 100) / 100 : null);
+  if (!home.length && !away.length) return null;
+  return {
+    home: { sampleSize: home.length, winRate: winRate(home) },
+    away: { sampleSize: away.length, winRate: winRate(away) },
+  };
+}
+
+// 「勢い(連続結果)」＝メンタル面の代理指標。実際に連続している結果のみを
+// 事実として返す(2試合未満の連続では「勢い」と呼べる根拠が薄いため返さない)。
+function computeStreak(recentForm) {
+  if (!recentForm || !recentForm.length) return null;
+  const first = recentForm[0].result;
+  if (first === "不明") return null;
+  let count = 0;
+  for (const m of recentForm) {
+    if (m.result === first) count++;
+    else break;
+  }
+  return count >= 2 ? { result: first, count } : null;
+}
+
 function createKnowledgeSource({
   callApiFootball, resolveTeamId, guessSeason, getRecentFacts, getActiveKnowledge, setRelation,
   // 2026年8月・知識拡張フェーズで追加(すべて任意注入。未指定でも従来通り動く):
   //   ensureClubProfile   … Knowledge Engine Layer2(固定知識)をオンデマンドで生成・キャッシュ
   //   fetchCoachCareer    … 監督遍歴(/coachs)を取得
   //   saveKnowledgeItem   … 監督遍歴等の新しい実データをKnowledge EngineのLayer1事実として保存
+  //   fetchStandingsFeature / inferLeagueIdFromFixtures … 2026年8月「議論できるAI」
+  //     強化フェーズで追加。質問文が順位に言及した場合のみ追加の1リクエストで取得する。
   ensureClubProfile, fetchCoachCareer, saveKnowledgeItem,
+  fetchStandingsFeature, inferLeagueIdFromFixtures,
 }) {
   /**
    * @param {string} teamNameEnglish - API-Football側の検索に使う英語クラブ名
@@ -110,6 +154,9 @@ function createKnowledgeSource({
       teamNameEnglish, teamId: null,
       recentForm: [], goalsForTrend: null, goalsAgainstTrend: null,
       formation: null, coachName: null,
+      // 2026年8月・「議論できるAI」強化フェーズで追加(いずれも既に取得済みの
+      // recentFormから追加API呼び出し無しで計算。データが無ければ正直にnull)。
+      fatigue: null, homeAwaySplit: null, streak: null, standings: null,
       injuries: [], transfers: [],
       managerQuote: null, managerQuoteUnavailableReason: MANAGER_QUOTE_UNAVAILABLE_REASON,
       // 毎日学習エンジン(server/learning/dailyJob.js)が過去に蓄積した「事実」
@@ -151,15 +198,23 @@ function createKnowledgeSource({
       } catch (e) { result.errors.push("knowledge_engine_failed"); }
     }
 
+    let rawFixturesForLeagueId = [];
     if (wantsRecentForm) {
       try {
         const lastN = needSet.has("recentForm") ? 10 : 1;
         const data = await callApiFootball("/fixtures", { team: teamId, last: lastN });
         const list = (data.response || []).filter((f) => f.goals && f.goals.home !== null && f.goals.away !== null);
+        rawFixturesForLeagueId = data.response || [];
         result.recentForm = summarizeRecentForm(list, teamId);
         if (needSet.has("recentForm") && result.recentForm.length) {
           result.goalsForTrend = result.recentForm.map((m) => m.goalsFor);
           result.goalsAgainstTrend = result.recentForm.map((m) => m.goalsAgainst);
+          // 2026年8月・「議論できるAI」強化フェーズ: 既に取得済みのrecentFormから
+          // 追加のAPI呼び出し無しで計算できる観点(疲労/ホームアウェイ差/勢い)を
+          // 増やし、Reasoning Engineが比較検討できる仮説の幅を広げる。
+          result.fatigue = computeFatigueNote(result.recentForm);
+          result.homeAwaySplit = computeHomeAwaySplitFromRecent(result.recentForm);
+          result.streak = computeStreak(result.recentForm);
         }
         result.fetchedTypes.push("recentForm");
       } catch (e) { result.errors.push("recent_form_failed"); }
@@ -171,7 +226,12 @@ function createKnowledgeSource({
         const data = await callApiFootball("/fixtures/lineups", { fixture: latestFixtureId });
         const mine = (data.response || []).find((t) => t.team && t.team.id === teamId);
         if (mine) {
-          if (needSet.has("formation")) { result.formation = mine.formation || null; result.fetchedTypes.push("formation"); }
+          // 2026年8月・「議論できるAI」強化フェーズ: coach取得のためにこのAPI呼び出しは
+          // どのみち発生するため、追加コスト無しでformationも常に取り込む(以前は
+          // needSet.has("formation")の場合のみ取り込んでいたため、「監督」だけを尋ねた
+          // 質問では戦術仮説の根拠が無駄に空になっていた)。
+          result.formation = mine.formation || null;
+          if (result.formation) result.fetchedTypes.push("formation");
           if (needSet.has("coach")) { result.coachName = mine.coach ? mine.coach.name : null; result.fetchedTypes.push("coach"); }
           // Knowledge Graph(最小限の関係インデックス): 「このクラブの現在の監督は誰か」
           // 「このクラブの直近フォーメーションは何か」という一方向の関係を記録する。
@@ -182,6 +242,26 @@ function createKnowledgeSource({
           }
         }
       } catch (e) { result.errors.push("lineup_failed"); }
+    }
+
+    // 2026年8月・「議論できるAI」強化フェーズ: 順位(リーグ内での立ち位置)。
+    // 質問文が順位に言及した場合のみ追加の1リクエストを発生させる(Planner側の
+    // "standings" needで判定。README「議論できるAIへの強化」参照)。
+    result.standings = null;
+    if (needSet.has("standings") && typeof fetchStandingsFeature === "function" && typeof inferLeagueIdFromFixtures === "function") {
+      try {
+        const leagueId = inferLeagueIdFromFixtures(rawFixturesForLeagueId);
+        if (leagueId) {
+          const season2 = guessSeason();
+          const standings = await fetchStandingsFeature(leagueId, season2, teamId, callApiFootball);
+          if (standings && standings.position !== null && standings.position !== undefined) {
+            result.standings = standings;
+            result.fetchedTypes.push("standings");
+          }
+        } else {
+          result.errors.push("standings_league_id_not_found");
+        }
+      } catch (e) { result.errors.push("standings_failed"); }
     }
     // ---- 2026年8月・知識拡張フェーズ: 監督遍歴(Layer1事実+Knowledge Graph) ----
     // 同じクラブについて何度も聞かれるたびに/coachsを呼び直さないよう、既に

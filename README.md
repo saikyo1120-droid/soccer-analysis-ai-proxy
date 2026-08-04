@@ -945,6 +945,197 @@ predictionModel.js`に`describeWeightsHistoryEntry`/`buildLearningSummary`
   (怪我人実名・フォーメーション・注目選手)を拡張しました。これらは
   「新機能」ではなく「既存機能を正しく動かす」ための修正です。
 
+### 13. 2026年8月・「議論できるAIへの強化」フェーズ(Knowledge/Reasoning/Memory/Learningを毎日成長させる)
+
+第12章の総点検(58点/100点)を受けて、「質問に答えるAI」ではなく「サッカーに
+ついて議論できるAI」(ChatGPTに聞くより、このAIに聞いた方が面白いと思われる
+レベル)を目指す方向へ舵を切ったフェーズです。ご要望は7項目あり、実装できた
+ものと、理由・代替案付きで見送ったものを正直にまとめます。
+
+#### ① Prediction EngineにFailure Learning(外れた理由の分析)を追加
+
+従来の学習ループ(試合終了→正解/不正解→重み更新)は「何故外れたのか」を
+一切言語化していませんでした。`server/learning/predictionModel.js`に
+`classifyFailureReasons(record, weights)`を追加し、予測を行った時点で
+実際に使っていた特徴量(`features`)と重み(`weightsSnapshot`)だけを根拠に、
+LLMを使わず機械的に理由を分類します。判定ロジックは2パターンのみ:
+
+- **重視しすぎた**: その特徴量が予測した方向に強く効いていた(重みが一定
+  以上ある)のに、実際の結果はその方向ではなかった(例:「過去対戦を
+  重視しすぎた」「ホーム補正が強すぎた」)。
+- **軽視した**: 実際の結果の方向を示す特徴量の値はあったのに、その重みが
+  ほぼ0(＝まだ学習で重視されていなかった)ため予測に反映されなかった
+  (例:「怪我人を軽視した」)。
+
+どちらにも当てはまらない場合(古いv1形式のレコード等)は、正直に
+「セットプレー・スタメン発表・審判の判定など、現在のモデルが数値化して
+いない要因の影響」という限界を明示します(存在しない原因をでっち上げない)。
+
+外れた理由は`record.failureReasons`として保存されるほか、Knowledge Engine
+に`predictionFailureReason`(analysis)として単独保存され、議論モードの
+根拠プール(`evidencePool.js`)からも参照できます。「次回の予測へ反映する」
+というご要望への対応は二重に効きます: ①この失敗パターン自体が
+`fitWeightsGradientDescent`(勾配降下法による重み再学習)の入力データ
+そのものであり、既に重み更新に反映されている。②`summarizeFailureReasons()`
+が直近の頻出理由を集計し、「AIの成長レポート」ウィジェットと成長ログで
+可視化される(下記⑦参照)。テスト: `scripts/failure_learning_test.js`。
+
+#### ② Knowledge Engineの毎日成長(実装できたものと、見送ったもの)
+
+ご要望の項目数が多いため、表で正直に整理します。
+
+| 項目 | 対応状況 | 実装内容 / 理由 |
+|---|---|---|
+| ホームとアウェイの違い | ✅ 実装済み(既存) | 既存の毎日学習エンジンが実データから勝率差を算出し、Knowledge Engineに`ホームアウェイ差`factとして保存(2026年8月・知識拡張フェーズより) |
+| 監督交代による変化 | ✅ 新規実装 | Memory Engine(`team:<club>:coachName`)に前回の監督名を記録し、API-Football実データ(`/coachs`)との差分で交代を検知。初回記録は「交代」として扱わない(でっち上げ防止)。Knowledge Engineに`coachChange`factとして保存 |
+| 補強の影響 | ✅ 新規実装 | API-Football実データ(`/transfers`)から直近30日以内の加入・退団を`transferImpact`factとして保存 |
+| 戦術・プレースタイル・得点/失点パターン | ⚠️ 部分実装(AI見解) | API-Footballにこれらの実データは存在しないため、既存のLayer3(AIの日次見解)生成と同じLLM呼び出しに相乗りし、得点・失点の数値傾向を根拠にした`playstyleAnalysis`(opinion、**必ず「AI見解」ラベル付き**)として保存。新しいAPI呼び出しは追加していない(コスト0) |
+| フォーメーション変化 | ⚠️ 既存機能を再利用 | `fetchLatestFormation`は既にオンデマンド(議論モード・AIマッチ分析)で実装済み。「毎日」の変化検知としては未統合(下記「見送った理由」参照) |
+| 得意な時間帯・苦手な時間帯 | ❌ 見送り | API-Footballの`/fixtures/events`(ゴールの発生分数)が必要。登録11クラブ全てを毎日確認すると、既存の学習ループ(1日あたり最大50〜70リクエスト程度)に加えて100リクエスト超が必要になり、無料プランの1日100リクエスト枠を容易に超える。**代替案**: ①監督交代・補強と同じ「数クラブずつのローテーション」方式で低頻度に導入する、②有料プランへの移行を検討する、のいずれか。今回はコスト超過リスクを避けるため見送った |
+| セットプレー傾向 | ❌ 見送り | 同上(`/fixtures/events`のゴール種別データが必要なため、同じ制約を受ける) |
+| 選手側(プレースタイル・特徴・長所・弱点・現在の調子・成長中か・下降中か・得意/苦手な相手) | ❌ 未着手 | 既存の`playerProfileEngine`(選手のLayer2固定知識)を拡張すれば技術的には実装可能(追加APIコストはほぼ0、LLMプロンプト拡張のみ)だが、今回のフェーズでは①〜⑦の実装量が大きく、時間の都合で着手できなかった。**次の優先候補として引き継ぐ** |
+
+「取得できるものはAPI、取得できないものはAIの分析として『AI見解』ラベル付き
+で保存する」というご指示は、上記の通り全ての新規実装で徹底しています
+(`isAiGenerated: true`かつ本文に「【AI見解】」を明記)。テスト:
+`scripts/knowledge_coach_transfer_test.js`。
+
+#### ③ Reasoning Engineを5仮説以上の比較方式に拡張
+
+`server/reasoning/hypothesisGenerator.js`の観点(factor)を、従来の3つ
+(怪我・移籍・戦術)から**9つ**に拡張しました: 怪我・出場停止/戦術・
+フォーメーション/移籍/直近フォーム/監督/ホームアウェイ差/過密日程(疲労)/
+勢い(連続結果)/リーグ順位。「相性(対戦相手との相性)」は、この層
+(単一クラブの議論モード)では対戦相手が定まらないため意図的に除外し、
+2クラブの組み合わせが分かるAIマッチ分析側の過去対戦データで扱っています。
+
+疲労・ホームアウェイ差・勢いは、既に取得済みの`recentForm`データから
+追加のAPI呼び出し無しで計算します(`computeFatigueNote`/
+`computeHomeAwaySplitFromRecent`/`computeStreak`、いずれも
+`server/rag/knowledgeSource.js`)。順位のみ`/standings`への追加呼び出しが
+必要なため、Planner(`server/discuss/planner.js`)に新しい`standings`
+トリガー(「順位」「何位」「首位」「降格」「昇格」「勝点」等)を追加し、
+質問文がこれらに触れたときだけ取得します(コストを抑えるPlanner設計方針を
+踏襲)。9つの観点は全て`evidencePool.js`→`hypothesisGenerator.js`→
+`reasoningEngine.js`のパイプラインで比較・ランキングされ、根拠が1件も
+無い観点は正直に「根拠なし」の仮説として返します(でっち上げない)。
+採用されなかった仮説も`meta.reasoning.hypothesesConsidered`に全件残る
+ため、「採用しなかった仮説も内部では保存してください」というご要望にも
+対応しています(Redisへの永続化はしていませんが、レスポンスの中に
+毎回すべて含まれ、Knowledge Engineには「採用された」仮説だけがanalysisとして
+昇格保存されます)。テスト: `scripts/reasoning_engine_test.js`(純粋関数)、
+`scripts/reasoning_hypothesis_wiring_test.js`(順位トリガーのエンドツーエンド配線確認)。
+
+#### ④ Memory Engineの活用強化
+
+2つの要望に対応しました。
+
+**(a) 「以前はこう評価していましたが、今回評価を変えました」の言語化**:
+Memory Engine自体(`memoryStore.js`)は既に変化検知・変化理由の記録を
+実装済みでしたが、その情報がLLMの回答本文に確実に反映される保証が
+ありませんでした。下記⑤の議論モード再設計にあわせて、システムプロンプトに
+「前回の結論が与えられていて、かつ今回の結論が変わった場合は、②AI独自の
+意見の中で必ず『以前は〜と評価していましたが、今回は〜に評価を変えました』
+という趣旨の文を含めてください。前回の結論が無い、または今回と同じ場合は、
+変化した体で書かない(でっち上げない)でください」という明示的な指示を
+追加しました。
+
+**(b) 試合予測の記憶(前回の予測・結果・外れた理由・学んだこと・次回改善点)**:
+毎日学習エンジンの予測解決ループに、`memoryStore.saveConclusion()`への
+書き込みを追加しました。サブジェクトキーは`team:<クラブ英語名>:predictionMemory`で、
+内容は「対戦カード: 予測は◯◯ / 結果は◯◯(的中/不的中) / 外れた理由:
+◯◯(①のFailure Learningの出力) / 学んだこと: ◯◯ / 次回改善点: ◯◯」を
+1つの文章にまとめたものです。Memory Engineの既存の変化検知の仕組み
+(内容が変われば自動的に前の内容を履歴へ退避する)をそのまま再利用している
+ため、対戦カードが変わるたびに「前回の予測」が自動的に履歴として残ります
+(`getConclusionHistory()`で取得可能)。テスト: `scripts/memory_prediction_test.js`。
+
+#### ⑤ 議論モードの回答構成を再設計(検索AIから議論できるAIへ)
+
+`POST /api/discuss`の出力形式を全面的に作り替えました。以前は
+「###根拠### / ###考察### / ###結論### / ###フォローアップ###」という
+「事実の要約」に近い構成でしたが、新しくは:
+
+1. **一般論**(この話題について世間で一般的に言われている見方)
+2. **AI独自の意見**(実データを踏まえたAI自身の見解。評価が変わった場合は必ず言及)
+3. **反対意見**(AI独自の意見に対する、最も説得力のある反対の視点・懸念点)
+4. **最終結論**
+5. **今後どうなると思うか**
+6. **最も重要だと考える点**(必ず「私は○○が最も重要だと考えます。」の1文)
+
+という「議論の型」を毎回踏ませます。システムプロンプト(`buildDiscussSystemPrompt`)
+で明示的にこの構造を指示し、`parseDiscussLlmOutput`で各セクションを
+パースして、レスポンスの`generalView`/`aiOpinion`/`counterArgument`/
+`finalConclusion`/`futureOutlook`/`mostImportantOpinion`フィールドとして
+返します(旧`evidence`/`consideration`/`conclusion`から名称・構成を刷新。
+既存の呼び出し元がある場合は移行が必要です)。ホーム画面のチャットUI
+(`renderDiscussReplyHtml`)もこの6要素をそれぞれ見出し付きで表示するよう
+更新しました。テスト: `scripts/server_discuss_test.js`、
+`scripts/server_discuss_reasoning_memory_test.js`。
+
+#### ⑥ AIマッチ分析を11項目のフル分析に拡張
+
+第12章時点で①勝率②予想スコア③試合展開⑤キープレイヤー⑥怪我人の影響
+⑧逆転シナリオ⑨AIが最も重要視した要素⑪AIの結論の8項目は実装済みでした。
+このフェーズで新たに:
+
+- **⑦戦術相性**: 両クラブの直近フォーメーションが揃っている場合、中盤の
+  人数差・最終ラインの人数差から機械的に相性の見立てを組み立てる
+  deterministicなフォールバック(`tacticalCompatibility`)を実装し、LLM
+  利用可能時はより自然な文章に置き換えます。これはAPI-Footballの実データ
+  そのものではなく「AIの見解」であるため、本文に必ずその旨を明示します。
+- **⑩この試合最大の見どころ**: 過去対戦の蓄積・両クラブの得点源対決・
+  負傷者数・順位差など、実際に取得できたデータの中から最も話題性が
+  高そうな1点を機械的に選ぶ(`biggestHighlight`)。
+
+これで11項目中10項目が実装済みです。唯一実装を見送ったのは:
+
+- **④鍵になる時間帯**: `/fixtures/events`(ゴールの発生分数)の集計が必要です。
+  このエンドポイントはオンデマンド(利用者が呼ぶたびに実行される、回数の
+  上限が無い)ため、ここで両クラブ分の`/fixtures/events`を毎回取得すると
+  API-Football無料プランの1日100リクエスト枠を容易に超えるリスクがあります。
+  **代替案**: ②の「得意な時間帯・苦手な時間帯」と同じデータソースのため、
+  毎日学習エンジン側(予算が管理されたバッチ処理)でクラブごとに低頻度で
+  事前集計し、Knowledge Engineの`fact`として溜めておき、AIマッチ分析は
+  その蓄積済みデータを読むだけにする設計が現実的です。今回はコスト超過
+  リスクを避けるため見送りました。
+
+テスト: `scripts/server_match_analysis_test.js`。
+
+#### ⑦ AIが毎日成長していることをユーザーが見えるようにする(AIの成長レポート)
+
+ホーム画面の既存ウィジェット(旧「🧠 昨日学んだこと」)を「📈 AIの成長
+レポート」として拡張しました。表示内容:
+
+- 今日追加した知識・今日学んだこと(既存)
+- 予測精度の変化・重み変更の内容と理由(既存)
+- **外れた理由**(①のFailure Learning。今日外れた分と、直近の頻出理由トップ5)
+- **監督交代・補強のチェック結果**(②の新機能。ローテーションで確認した内容)
+- **Knowledge/Prediction/Memory各エンジンの累計件数**(`engineTotals`)
+
+累計件数は、ホーム画面が読み込まれるたびに登録11クラブ全件をループする
+実装(`/debug.html`の開発者向け集計と同じ方式)では重すぎるため、
+`knowledgeStore.saveKnowledgeItem`/`memoryStore.saveConclusion`が保存の
+都度INCRする軽量カウンター(`knowledge:totalItemsSavedCounter`/
+`memory:totalConclusionsSavedCounter`)をO(1)で読むだけにしています。
+これは「現在アクティブな件数」ではなく「これまでの累計保存件数」(知識の
+失効等では減らない)である点を、ウィジェット本文で正直に注記しています。
+テスト: `scripts/learning_summary_test.js`、`scripts/pw_growth_log_check.js`(実データでのE2E描画確認)。
+
+#### この章のまとめ・設計方針として維持したもの
+
+- 実装した全ての新機能は、既存プロジェクトの一貫した設計原則(実データ
+  以外は必ず「AI見解」と明示する、でっち上げない、API呼び出しコストを
+  常に意識する、LLM呼び出しは既存の呼び出しに相乗りしてコストを増やさない)
+  を踏襲しています。
+- 見送った項目(得意/苦手な時間帯・セットプレー傾向・鍵になる時間帯・
+  選手側のAI見解拡張)は、いずれも「技術的に不可能」ではなく「API予算・
+  実装時間の制約で今回は見送った」ものです。理由と代替案を上記の通り
+  明記しましたので、優先順位が変われば次のフェーズで着手できます。
+- ルールベースのReasoning Engine(LLMを使わない仮説生成)という設計判断は
+  維持しました。理由は`hypothesisGenerator.js`冒頭のコメントの通りです
+  (質問1件ごとに複数のLLM呼び出しを追加するとコスト最適化方針に反する)。
+
 ## エンドポイント一覧
 
 | エンドポイント | 説明 |
@@ -955,10 +1146,10 @@ predictionModel.js`に`describeWeightsHistoryEntry`/`buildLearningSummary`
 | `GET /api/fixtures/analysis?id=試合ID` | 特定の試合の事前/事後分析(試合前はAI予測を記録、試合後は予測を検証) |
 | `GET /api/accuracy-stats` | AI予測の本物の実績(記録数・的中数・正答率)。Upstash未設定時は`configured:false`を返す |
 | `GET /api/predictions/auto-collect?key=...` | 誰も見ていなくても予測の記録・確定を進める(定期cron向け)。`AUTO_COLLECT_SECRET`設定時は`key`が一致しないと403 |
-| `GET /api/match-analysis?home=クラブ名&away=クラブ名` | 【2026年8月・NEW、同月の総点検で拡張】「AIマッチ分析」カード。任意の登録クラブ2つ(日本語名/英語名どちらも可)について、Prediction Engine v2(実データの特徴量+学習済みの重み+ポワソン分布)でAI勝率内訳・★付き重要度ランキング・試合展開予想(LLM。未設定/予算超過時は決定論的な文章に自動フォールバック)・逆シナリオ・予想スコア付き結論を返す。**2026年8月(総点検)〜: `injuries`(怪我人・出場停止の実名)・`formation`(直近実試合のフォーメーション)・`keyPlayers`(今季得点ランキング上位選手)を追加。また、結論文がスコアと矛盾する不具合(例:「1-1で勝利」)と、ホーム/アウェイが異なるリーグ所属の場合に順位・得点ランキングが誤ったリーグで検索される不具合を修正**。`POST /api/discuss`と同じIPごとの日次LLM予算を共有するが、予算超過時も数値計算部分は必ず返す。毎日学習エンジンの自動予測ループとは独立したオンデマンド分析(詳細は本README「9. Knowledge Engine 4層構造 / Prediction Engine v2 / AIマッチ分析」「12. プロジェクト全体総点検」参照) |
+| `GET /api/match-analysis?home=クラブ名&away=クラブ名` | 【2026年8月・NEW、同月の総点検・「議論できるAI」強化フェーズで拡張】「AIマッチ分析」カード。任意の登録クラブ2つ(日本語名/英語名どちらも可)について、Prediction Engine v2(実データの特徴量+学習済みの重み+ポワソン分布)でAI勝率内訳・★付き重要度ランキング・試合展開予想(LLM。未設定/予算超過時は決定論的な文章に自動フォールバック)・逆シナリオ・予想スコア付き結論を返す。**2026年8月(総点検)〜: `injuries`(怪我人・出場停止の実名)・`formation`(直近実試合のフォーメーション)・`keyPlayers`(今季得点ランキング上位選手)を追加。また、結論文がスコアと矛盾する不具合(例:「1-1で勝利」)と、ホーム/アウェイが異なるリーグ所属の場合に順位・得点ランキングが誤ったリーグで検索される不具合を修正**。**2026年8月(議論できるAI強化)〜: 11項目のうち残っていた`tacticalCompatibility`(⑦戦術相性の明示的な見立て。フォーメーション同士の噛み合わせを機械的に判定するdeterministicフォールバック+LLM見解)・`biggestHighlight`(⑩この試合最大の見どころ)を追加。④「鍵になる時間帯」のみ未実装(理由・代替案は本README「13.」参照)**。`POST /api/discuss`と同じIPごとの日次LLM予算を共有するが、予算超過時も数値計算部分は必ず返す。毎日学習エンジンの自動予測ループとは独立したオンデマンド分析(詳細は本README「9. Knowledge Engine 4層構造 / Prediction Engine v2 / AIマッチ分析」「12. プロジェクト全体総点検」「13. 議論できるAIへの強化」参照) |
 | `POST /api/predict-match` | 【Stage B】注目カード(「⚽ 試合分析AI」の対戦カード一覧)の試合予測ロジックをサーバー側で計算するAPI。リクエストbody(JSON)に`homeLabel`・`awayLabel`・`homePlayers`・`awayPlayers`(各選手は能力値`attrs`・`overall`・`position`・`zones`を含む)を渡すと、予想スコア・AI確信度・支配率・勝因/敗因・試合の流れ・ターニングポイント・MVP・攻め方・想定スタメン・危険エリアをまとめて返す。フロントエンドは1.5秒以内に応答がない場合、または通信エラー時は、これまで通りブラウザ内で同じロジックを計算してシームレスに表示する(利用者からは違いが分からない設計)。将来、この関数の中身だけを機械学習モデルに差し替えれば、UIやAPIの形は一切変えずにAIの予測精度だけを向上できる |
-| `POST /api/discuss` | 【Stage C・Stage Eで拡張】「〜だと思う」「なぜ？」等の意見・考察を求める質問に、Planner(必要な情報+比較すべき観点を判定)→RAG(API-Football実データ+Knowledge Engineの蓄積知識を取得)→Reasoning Engine(仮説生成→根拠ランキング→自己チェック。利用者には非表示)→Memory Engine(前回の結論と比較・保存)→LLM推論(取得した事実+内部推論を根拠に考察)の順で処理し、①事実②統計③根拠④考察⑤結論⑥信頼度(理由付き)+フォローアップ質問を返すAPI。クラブに関する質問の場合、`meta.reasoning`に内部で検討した仮説一覧・選ばれた仮説・自己チェック結果・Memory Engineの記録結果が含まれる(デバッグ・検証用。回答文自体には仮説ラベルをそのまま出力しない)。リクエストbodyに`question`・`subject`(`{type:"club"または"player", labelJa, labelEn}`)・`playerHint`を渡す。単純な質問(選手データ・順位・試合結果など)はこのAPIを使わず、これまで通りフロントエンドのルールベースで即答するため、呼ばれるのは議論トリガーを検出したときだけ。`ANTHROPIC_API_KEY`未設定時は`ok:false`で正直な理由を返す。**2026年8月〜: クラブ・選手について初めて質問されたとき、Knowledge Engine Layer2(固定知識プロフィール)がまだ無ければオンデマンドで自動生成されるため(既定60日キャッシュ)、その初回だけ内部的にLLM呼び出しが1回増える(2回になる)** |
-| `POST /api/learning/run-daily?key=...` | 【Stage D・Stage Eで拡張】毎日学習エンジンを1回実行する(登録クラブのフォーム分析・Knowledge Engine経由での事実の記録・自社予測モデルの検証と改善・Hypothesis Engineによる状態仮説の検証)。`AUTO_COLLECT_SECRET`設定時は`key`が一致しないと403。`.github/workflows/daily-learning.yml`から毎日自動で呼び出される想定 |
+| `POST /api/discuss` | 【Stage C・Stage E・2026年8月「議論できるAI」強化フェーズで拡張】「〜だと思う」「なぜ？」等の意見・考察を求める質問に、Planner(必要な情報+比較すべき観点を判定)→RAG(API-Football実データ+Knowledge Engineの蓄積知識を取得)→Reasoning Engine(9観点の仮説生成→根拠ランキング→自己チェック。利用者には非表示)→Memory Engine(前回の結論と比較・保存)→LLM推論(取得した事実+内部推論を根拠に考察)の順で処理するAPI。**2026年8月〜: 回答の構成そのものを「検索AIの要約」から「議論の型」に作り替えた。返り値は`generalView`(①一般論)・`aiOpinion`(②AI独自の意見。前回の結論から変わった場合は必ずその旨に触れる)・`counterArgument`(③反対意見)・`finalConclusion`(④最終結論)・`futureOutlook`(⑤今後どうなるか)・`mostImportantOpinion`(⑥「私は○○が最も重要だと考えます。」という必須の一言)の6フィールド(旧`evidence`/`consideration`/`conclusion`から名称・構成ともに刷新)**。クラブに関する質問の場合、`meta.reasoning`に内部で検討した9つの仮説一覧(怪我・戦術/フォーメーション・移籍・直近フォーム・監督・ホームアウェイ差・過密日程・勢い・順位)・選ばれた仮説・自己チェック結果・Memory Engineの記録結果が含まれる(デバッグ・検証用。回答文自体には仮説ラベルをそのまま出力しない)。リクエストbodyに`question`・`subject`(`{type:"club"または"player", labelJa, labelEn}`)・`playerHint`を渡す。単純な質問(選手データ・順位・試合結果など)はこのAPIを使わず、これまで通りフロントエンドのルールベースで即答するため、呼ばれるのは議論トリガーを検出したときだけ。`ANTHROPIC_API_KEY`未設定時は`ok:false`で正直な理由を返す。**2026年8月〜: クラブ・選手について初めて質問されたとき、Knowledge Engine Layer2(固定知識プロフィール)がまだ無ければオンデマンドで自動生成されるため(既定60日キャッシュ)、その初回だけ内部的にLLM呼び出しが1回増える(2回になる)** |
+| `POST /api/learning/run-daily?key=...` | 【Stage D・Stage E・2026年8月「議論できるAI」強化フェーズで拡張】毎日学習エンジンを1回実行する(登録クラブのフォーム分析・Knowledge Engine経由での事実の記録・自社予測モデルの検証と改善・Hypothesis Engineによる状態仮説の検証)。**2026年8月〜: Failure Learning(外れた予測の原因分類)・監督交代/補強の検知・戦術/得点失点パターンのAI見解生成も、この実行の中で行われる(詳細は本README「13.」参照)**。`AUTO_COLLECT_SECRET`設定時は`key`が一致しないと403。`.github/workflows/daily-learning.yml`から毎日自動で呼び出される想定 |
 | `GET /api/knowledge/team-view-history?team=英語クラブ名&key=...` | 【2026年8月・NEW】Memory Engine強化。「AIは昨日何を考えていたか・今日何を考えているか・その理由」を確認できるエンドポイント。`today`(現在の見解)と`history`(過去の見解の変化履歴。各要素に`changeReason`=なぜ考えが変わったか、`supersededAt`=いつ置き換わったか)を返す。`AUTO_COLLECT_SECRET`設定時は`key`が一致しないと403 |
-| `GET /api/growth-log` | 【Stage D・Stage Eで拡張・2026年8月本番監査で拡張】直近の学習エンジン実行結果(今日Knowledge Engineに新規保存した知識件数・重複でスキップした件数・検証した試合数・自社予測モデルの的中率の変化・AI自身の予測仮説の的中/破棄件数)を返す。ホーム画面の「🧠 昨日学んだこと」ウィジェットが使用。未実行の場合は`ranYet:false`を正直に返す。**2026年8月〜: `learningSummary`(実際に採用された重み変更を「✓ホーム補正を弱めました/理由:…」の形式で日本語化したもの・直近5回分)、`hasEnoughDataForLearning`・`totalOwnPredictionsResolvedSoFar`・`minResolvedForRecalibration`(まだ重みが更新されていない場合に「検証済み◯件/必要◯件」を正直に見せるための進捗情報)を追加** |
+| `GET /api/growth-log` | 【Stage D・Stage E・2026年8月本番監査・「議論できるAI」強化フェーズで拡張】直近の学習エンジン実行結果(今日Knowledge Engineに新規保存した知識件数・重複でスキップした件数・検証した試合数・自社予測モデルの的中率の変化・AI自身の予測仮説の的中/破棄件数)を返す。ホーム画面の「📈 AIの成長レポート」ウィジェットが使用。未実行の場合は`ranYet:false`を正直に返す。**2026年8月〜: `learningSummary`(実際に採用された重み変更を「✓ホーム補正を弱めました/理由:…」の形式で日本語化したもの・直近5回分)、`hasEnoughDataForLearning`・`totalOwnPredictionsResolvedSoFar`・`minResolvedForRecalibration`(まだ重みが更新されていない場合に「検証済み◯件/必要◯件」を正直に見せるための進捗情報)を追加**。**2026年8月(議論できるAI強化)〜: `failureReasonsToday`/`topFailureReasonsRecent`(外れた予測の理由と、直近の頻出理由)、`otherFactsToday`/`coachChangesDetectedToday`/`transferFactsAddedToday`(監督交代・補強の実データ)、`engineTotals`(Knowledge/Prediction/Memory各エンジンの累計保存件数。軽量カウンターによるO(1)集計)を追加** |
 | `GET /api/debug-status?key=...` / `GET /debug.html` | 【開発者専用・更新】「コード上は実装されている」ではなく「本番で今、実際に動いているか」を確認するための自己診断ページ。Redis(Upstash)への実際のPING接続確認、API-Footballへの実際の接続確認(`/status`)、Learning Engineの最終実行結果、Knowledge Engine/Memory Engineの登録クラブ横断の件数集計(**2026年8月〜: `knowledgeEngine.byLayer`でLayer1〜4別の件数も確認可能**)、自社予測モデル(Prediction Engine)の正答率(**2026年8月〜: `predictionEngine.v2ExtendedFeaturesLearning`で拡張特徴量の学習が始まっているか、`weightsHistoryRecent`で直近の重み更新履歴も確認可能**)を1画面にまとめて表示する。**LLM(Anthropic)は、APIキーが設定されていれば実際にごく小さいテスト呼び出しを1回行い(コストはごく僅かだが発生する)、成功/失敗と、失敗時は実際のHTTPステータス・エラー内容をそのまま表示する**(以前は「キーが設定されているか」しか見ておらず、「キーはあるのに呼び出し自体は失敗し続けている」状態を検知できなかった)。一般利用者向けの機能ではないため、`AUTO_COLLECT_SECRET`を設定している場合は他の保護付きエンドポイントと同じ`?key=`方式で保護される(未設定の場合は開いたまま。既存のrun-daily/auto-collectと同じトレードオフ) |

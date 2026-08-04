@@ -356,6 +356,7 @@
   </div>
 
   <div class="card" id="growthLogCard" style="padding:14px 18px;">
+    <h2 style="margin:0 0 6px;">📈 AIの成長レポート</h2>
     <div id="growthLogSummary">🧠 昨日学んだことを読み込み中…</div>
     <div id="growthLogDetails" style="display:none; margin-top:10px;"></div>
   </div>
@@ -3660,7 +3661,12 @@ function renderMatchAnalysisResult(data, homeJa, awayJa) {
     </div>
     ${injuriesHtml}
     ${formationHtml}
+    ${data.tacticalCompatibility ? `
+    <div class="compare-comment" style="margin-top:8px;">
+      <strong>⚔️ 戦術相性:</strong> ${escapeHtml(data.tacticalCompatibility.text)}
+    </div>` : ""}
     ${keyPlayersHtmlBlock}
+    ${data.biggestHighlight ? `<p class="value-note" style="margin-top:8px;">✨ この試合最大の見どころ: <strong>${escapeHtml(data.biggestHighlight.text)}</strong></p>` : ""}
     <p style="margin-top:12px; font-weight:700;">🏁 ${escapeHtml(data.conclusion)}</p>
     ${notesHtml}
     <p class="value-note" style="margin-top:8px; opacity:.7;">${escapeHtml(data.note || "")}</p>
@@ -5072,18 +5078,27 @@ async function fetchDiscussApi(question, subject, playerHint) {
   }
 }
 
-// 議論エンジンの回答を、通常のチャット吹き出しと同じ見た目で組み立てる。
-// ①事実②統計は折りたたみ(<details>)にして、まず④考察⑤結論を読みやすく前面に出す。
-// ⑥信頼度は★の数と、その理由(なぜその信頼度なのか)を必ず併記する。
+// 2026年8月・「議論できるAI」強化フェーズ(ご要望⑤): 単なる事実の要約ではなく、
+// 「一般論→AI独自の意見→反対意見→最終結論→今後どうなるか」という議論の型を
+// そのまま見出し付きで表示する(検索AIっぽさを消し、「議論している」感を出す)。
+// 最後の「最も重要だと考える点」は、AI自身の一言としてひときわ目立たせる。
 function renderDiscussReplyHtml(resp) {
   const stars = "★".repeat(resp.confidence.stars) + "☆".repeat(5 - resp.confidence.stars);
   const factsHtml = resp.facts && resp.facts.length
     ? `<details class="discuss-facts"><summary>📊 根拠にした事実を見る(${resp.facts.length}件)</summary><ul>${resp.facts.map(f => `<li>${escapeHtml(f)}</li>`).join("")}</ul></details>`
     : "";
   let body = "";
-  if (resp.evidence) body += `<p class="value-note">💡 ${escapeHtml(resp.evidence)}</p>`;
-  body += `<p>${escapeHtml(resp.consideration || "(考察を生成できませんでした)")}</p>`;
-  if (resp.conclusion) body += `<p>${escapeHtml(resp.conclusion)}</p>`;
+  if (resp.meta && resp.meta.parsedOk === false) {
+    // LLMが指定フォーマットに従わなかった場合の保険(aiOpinionに生文が入っている)。
+    body += `<p>${escapeHtml(resp.aiOpinion || "(考察を生成できませんでした)")}</p>`;
+  } else {
+    if (resp.generalView) body += `<p class="value-note">🌍 一般論: ${escapeHtml(resp.generalView)}</p>`;
+    body += `<p>🤖 <strong>AI独自の意見:</strong> ${escapeHtml(resp.aiOpinion || "(考察を生成できませんでした)")}</p>`;
+    if (resp.counterArgument) body += `<p class="value-note">🔄 反対意見: ${escapeHtml(resp.counterArgument)}</p>`;
+    if (resp.finalConclusion) body += `<p><strong>結論:</strong> ${escapeHtml(resp.finalConclusion)}</p>`;
+    if (resp.futureOutlook) body += `<p>📈 今後: ${escapeHtml(resp.futureOutlook)}</p>`;
+    if (resp.mostImportantOpinion) body += `<p style="margin-top:8px; font-weight:700;">🎯 ${escapeHtml(resp.mostImportantOpinion)}</p>`;
+  }
   const confidenceHtml = `<div class="discuss-confidence">${stars} <span class="value-note">${escapeHtml(resp.confidence.reasonJa)}</span></div>`;
   const followupsHtml = resp.followUpQuestions && resp.followUpQuestions.length
     ? `<div class="followup-chip-row">${resp.followUpQuestions.map(q => `<button class="chat-followup-btn" data-q="${escapeHtml(q)}">・${escapeHtml(q)}</button>`).join("")}</div>`
@@ -5683,12 +5698,38 @@ async function renderGrowthLogWidget() {
     const hypothesisLine = (hypConfirmed + hypDiscarded) > 0
       ? `<div class="value-note" style="margin:4px 0;">🧪 AI自身が立てた予測仮説の検証: 的中して知識に採用 ${hypConfirmed}件 ・ 外れて破棄 ${hypDiscarded}件</div>`
       : `<div class="value-note" style="margin:4px 0;">🧪 AI自身が立てた予測仮説の検証: 今回は検証できた仮説がありませんでした(試合がまだ終了していない等)。</div>`;
+
+    // 2026年8月・「議論できるAI」強化フェーズ(ご要望⑦・AIの成長レポート):
+    // Failure Learning(ご要望①)で新しく記録されるようになった「外れた理由」と、
+    // Knowledge/Prediction/Memory各エンジンの累計件数を追加表示する。
+    const topReasons = log.topFailureReasonsRecent || [];
+    const failureReasonsHtml = topReasons.length
+      ? `<div class="value-note" style="margin:4px 0;">❌ 直近よく外れる理由: ${topReasons.map((r) => `${escapeHtml(r.labelJa)}(${r.count}件)`).join("・")}</div>`
+      : `<div class="value-note" style="margin:4px 0;">❌ 直近よく外れる理由: まだ十分な検証データがありません。</div>`;
+    const totals = log.engineTotals || { knowledgeItemsTotal: 0, memoryConclusionsTotal: 0, predictionsTotal: 0 };
+    const engineTotalsHtml = `
+      <div class="value-note" style="margin:8px 0 2px; display:flex; gap:14px; flex-wrap:wrap;">
+        <span>🧠 Knowledge累計: <strong>${totals.knowledgeItemsTotal}</strong>件</span>
+        <span>⚽ Prediction累計: <strong>${totals.predictionsTotal}</strong>件</span>
+        <span>💭 Memory累計: <strong>${totals.memoryConclusionsTotal}</strong>件</span>
+      </div>
+      <div class="value-note" style="opacity:.75;">※累計は保存された時点でカウントする「これまでの学習活動量」の目安です(知識の失効等では減りません)。</div>
+    `;
+    // 2026年8月・ご要望②(Knowledge Engineの毎日成長): 監督交代・補強はフォーム系
+    // (factsToday)とは別経路で保存されるため、別枠(otherFactsToday)で表示する。
+    const otherFacts = log.otherFactsToday || [];
+    const otherFactsHtml = otherFacts.length
+      ? `<p class="value-note" style="margin:8px 0 4px;">🧩 監督交代・補強のチェック(実データ・ローテーションで数クラブずつ巡回):</p>${otherFacts.map(buildGrowthFactRow).join("")}`
+      : `<p class="value-note" style="margin:8px 0 4px; opacity:.8;">🧩 監督交代・補強のチェック: 本日ローテーションで確認したクラブでは変化は見つかりませんでした。</p>`;
     detailsEl.innerHTML = `
       ${accLine}
       ${buildLearningSummarySection(log)}
       ${hypothesisLine}
+      ${failureReasonsHtml}
+      ${engineTotalsHtml}
       <p class="value-note" style="margin:8px 0 4px;">今日追加された事実(すべてAPI-Footballの実データから算出):</p>
       ${factsHtml}
+      ${otherFactsHtml}
       <p class="value-note" style="margin-top:8px; opacity:.8;">※「自社予測モデル」はホーム画面の「AI予測の実績」(API-Football自体の予測データ)とは別の、このアプリ独自の実験的な予測モデルです。この学習結果(重み)は「クラブ同士の試合を分析」機能の予測にも実際に使われます。※「今日追加した知識」はKnowledge Engine(事実/分析/意見を分離・重複排除・失効管理する知識ベース)に新規保存された件数です。</p>
     `;
     toggleBtn.addEventListener("click", () => {

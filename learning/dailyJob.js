@@ -53,15 +53,16 @@ const { createKnowledgeStore } = require("../knowledge/knowledgeStore");
 const { createMemoryStore } = require("../memory/memoryStore");
 const { createRelationshipIndex } = require("../knowledge/relationshipIndex");
 const { createClubProfileEngine } = require("../knowledge/clubProfileEngine");
+const { summarizeTransfers } = require("../rag/knowledgeSource");
 const {
   computeGoalRateFeatures, computeFatigueFeature,
   fetchInjuryCountFeature, fetchStandingsFeature, fetchHeadToHeadFeature,
-  inferLeagueIdFromFixtures, computeHomeAwaySplit,
+  inferLeagueIdFromFixtures, computeHomeAwaySplit, fetchCoachCareer,
 } = require("./features");
 const {
   EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, predictOutcomeV2,
   computeFactorImportance, backtestAccuracyV2, fitWeightsGradientDescent,
-  buildLearningSummary,
+  buildLearningSummary, classifyFailureReasons, summarizeFailureReasons,
 } = require("./predictionModel");
 
 // ---- 調整可能な上限(API-Football無料プランの1日100リクエスト枠を守るため) ----
@@ -79,6 +80,17 @@ const FORM_FACT_DELTA_THRESHOLD = 0.3; // このゲーム差分以上変化し�
 // 実際には安定しない/頭打ちになる設計上のバグ)。300件に拡大し、
 // 積み上がったデータが実際に学習の安定性・精度向上に寄与するようにする。
 const OWN_PRED_RECENT_KEEP = 300;
+// 2026年8月・「議論できるAI」強化フェーズ(ご要望②・Knowledge Engineの毎日成長):
+// 監督交代・補強の確認(/coachs, /transfers)を全11クラブ毎日行うと+22リクエスト/日
+// となり、既存の新規予測ロジック(最大約30リクエスト/日)と合わせてAPI-Football
+// 無料枠(1日100リクエスト)を圧迫するリスクがあるため、日付ベースでずらした
+// ローテーションで少数クラブずつ確認する(全クラブを数日かけて一巡する設計。
+// Layer2プロフィール生成の「必要なクラブだけ」方式と同じ、予算重視の考え方)。
+const COACH_TRANSFER_CHECK_CAP = 4;
+// 移籍情報は「直近何日以内の移籍か」を区切って事実化する(既存のRAG層
+// summarizeTransfersの既定と同じ180日ではなく、「今日追加した知識」欄が
+// 埋もれないよう30日に絞る)。
+const TRANSFER_FACT_WINDOW_DAYS = 30;
 
 const DEFAULT_WEIGHTS = { homeBase: 1.35, awayBase: 1.15, sensitivity: 0.18, version: 0, updatedAt: null };
 
@@ -139,7 +151,11 @@ function backtestAccuracy(records, weights) {
 // Knowledge Engine Layer4(振り返り)の本文を機械的に組み立てる。LLMは使わない
 // (試合結果と、予測時点で実際に使った特徴量・重みの数値だけから導出するため、
 // でっち上げの余地がない)。
-function buildReflectionText(record, weightsUsed) {
+// 2026年8月・Failure Learning(ご要望①): 外れた場合はclassifyFailureReasons()の
+// 出力(failureReasons)を必ず理由文に織り込む。「モデルが重視していた要素だけ
+// では説明できませんでした」という曖昧な表現から、「過去対戦を重視しすぎた」
+// 「怪我人を軽視した」のような具体的な原因の言語化に置き換える。
+function buildReflectionText(record, weightsUsed, failureReasons) {
   const outcomeLabelJa = (w) => (w === "home" ? "ホームチームの勝利" : w === "away" ? "アウェイチームの勝利" : "引き分け");
   const importance = record && record.features ? computeFactorImportance(record.features, weightsUsed || EXTENDED_DEFAULT_WEIGHTS) : [];
   const weighted = importance.filter((i) => i.stars > 0);
@@ -153,11 +169,16 @@ function buildReflectionText(record, weightsUsed) {
     return { why, improvement };
   }
 
+  const reasons = failureReasons || [];
   const why = `予想は${outcomeLabelJa(record ? record.predictedWinner : null)}でしたが、実際は${outcomeLabelJa(record ? record.actualWinner : null)}でした。` +
-    (weighted.length
+    (reasons.length
+      ? `外れた理由: ${reasons.map((r) => r.labelJa).join("、")}。`
+      : weighted.length
       ? `モデルが重視していた要素(${weighted.map((i) => i.labelJa).join("、")})だけでは、この結果を十分に説明できませんでした。`
       : `この予測の時点ではモデルがどの特徴量も強く重視していなかった(学習データがまだ少ない)ため、精度が低い状態でした。`);
-  const improvement = "スタメン発表・直前の怪我人情報・監督采配など、現在のモデルにまだ組み込まれていない要因が結果に影響した可能性があります。継続してデータを蓄積し、重みの再学習で改善を試みます。";
+  const improvement = reasons.length
+    ? `次回以降は、${reasons.map((r) => r.labelJa).join("・")}という傾向を踏まえて重みの再学習(fitWeightsGradientDescent)を行い、同じ理由で外れる頻度が下がるか検証します。`
+    : "スタメン発表・直前の怪我人情報・監督采配など、現在のモデルにまだ組み込まれていない要因が結果に影響した可能性があります。継続してデータを蓄積し、重みの再学習で改善を試みます。";
   return { why, improvement };
 }
 
@@ -182,6 +203,7 @@ async function runDailyLearning(deps) {
 
   const errors = [];
   const factsToday = [];
+  const failureReasonsToday = []; // Failure Learning(ご要望①): 今日外れた予測の理由一覧
   let matchesResolvedToday = 0;
   let newPredictionsLogged = 0;
   let hypothesesConfirmed = 0; // Hypothesis Engine: 検証の結果、当たっていた状態仮説の件数
@@ -285,14 +307,16 @@ async function runDailyLearning(deps) {
           "あなたはサッカークラブを毎日観察しているアナリストAIです。",
           "与えられた最新の実データだけを根拠に、このクラブについて今日のあなたの見解を1文(60文字以内)で述べてください。",
           "前回の見解(あれば)と比べて考えが変わった場合は、変わった理由も1文(60文字以内)で述べてください。",
-          '出力は次のJSON形式のみ: {"view": "...", "changeReason": "..."}(変化が無い、または前回の見解が無い場合はchangeReasonは空文字列でよい)',
+          "さらに、直近の得点・失点の数値傾向から読み取れる、このクラブの得点パターン・失点パターン・プレースタイルについてのあなたの見解を1文(70文字以内)で述べてください。",
+          "この見解はAPI-Footballの実データそのものではなく、あなた自身の分析であることが分かる書き方をしてください(数字を新しく作ってはいけません)。",
+          '出力は次のJSON形式のみ: {"view": "...", "changeReason": "...", "playstyleNote": "..."}(変化が無い、または前回の見解が無い場合はchangeReasonは空文字列でよい)',
         ].join("\n");
         const userPrompt = [
           `クラブ: ${team.nameJa}`,
           `今日の実データ:\n${factsBlock}`,
           previous ? `前回(${previous.computedAt})の見解: ${previous.statement}` : "前回の見解: (まだありません)",
         ].join("\n\n");
-        const { text } = await generateLLM({ systemPrompt, userPrompt, maxTokens: 200 });
+        const { text } = await generateLLM({ systemPrompt, userPrompt, maxTokens: 260 });
         const start = text.indexOf("{");
         const end = text.lastIndexOf("}");
         if (start === -1 || end === -1) throw new Error("LLM出力がJSON形式ではありませんでした");
@@ -313,12 +337,88 @@ async function runDailyLearning(deps) {
           statement: `【AIの現在の見解】${viewStatement}`, isAiGenerated: true,
           computedAt: runAt.toISOString(), source: "毎日学習エンジンが実データを根拠に生成したAIの主観的な見解",
         });
+
+        // ---- ご要望②: 戦術・プレースタイル・得点パターン・失点パターン ----
+        // API-Footballには「戦術」「プレースタイル」を表す実データが存在しない
+        // ため、実データ(得点・失点の数値傾向)を根拠にAIが分析した見解として
+        // 「AI見解」ラベル付きで保存する(取得できるものはAPI、取得できない
+        // ものはAIの分析として保存、というご指示への対応)。
+        const playstyleNote = String((parsed && parsed.playstyleNote) || "").slice(0, 200).trim();
+        if (playstyleNote) {
+          await knowledgeStore.saveKnowledgeItem({
+            teamEn: team.nameEn, teamJa: team.nameJa, category: "playstyleAnalysis", type: "opinion",
+            statement: `【AI見解・戦術/得点失点パターン】${playstyleNote}`, isAiGenerated: true,
+            computedAt: runAt.toISOString(),
+            source: "実データ(得点・失点の数値傾向)を根拠にしたAIの分析(API-Footballにこの項目自体は存在しません)",
+          });
+        }
       } catch (e) {
         errors.push(`daily_view_failed:${team.nameEn}:${e.code || e.message}`);
       }
     }
   } else {
     llmSkippedReasons.push("LLM_NOT_CONFIGURED");
+  }
+
+  // ---- ①-d Knowledge Engine: 監督交代・補強の影響を毎日確認する(ご要望②) ----
+  // 「監督交代による変化」「補強の影響」はいずれもAPI-Footballの実データ
+  // (/coachs, /transfers)で取得できるため、AIの推測ではなく事実として記録する。
+  // 全11クラブを毎日確認すると+22リクエスト/日となりAPI予算を圧迫するため、
+  // COACH_TRANSFER_CHECK_CAP件/日のローテーションで少しずつ全クラブを巡回する。
+  const coachTransferStartOffset = Math.abs((dateKey.split("-").join("") * 7) % REGISTERED_TEAMS.length) || 0;
+  const coachTransferRotated = REGISTERED_TEAMS.slice(coachTransferStartOffset).concat(REGISTERED_TEAMS.slice(0, coachTransferStartOffset));
+  let coachChangesDetectedToday = 0;
+  let transferFactsAddedToday = 0;
+  const otherFactsToday = []; // growthLogの表示専用(factsToday/既存の保存ループとは別経路で保存済みのため二重保存しない)
+  for (const team of coachTransferRotated.slice(0, COACH_TRANSFER_CHECK_CAP)) {
+    try {
+      const cached = teamFormCache.get(team.nameEn);
+      const teamId = cached ? cached.teamId : await resolveTeamId(team.nameEn);
+      if (!teamId) continue;
+
+      // 監督交代の検知: Memory Engineに「現在の監督名」を保持し、前回との差分で判定する
+      // (INITIAL=初回記録は「交代」とは扱わない。比較対象が無いため)。
+      try {
+        const coachInfo = await fetchCoachCareer(teamId, callApiFootball);
+        if (coachInfo.currentCoachName) {
+          const coachSaveResult = await memoryStore.saveConclusion(
+            `team:${team.nameEn}:coachName`,
+            { statement: coachInfo.currentCoachName, computedAt: runAt.toISOString(), reasoning: "毎日学習エンジンによる自動記録(API-Footballの実データ)" },
+            "監督交代を検知しました(API-Footballの実データ)。"
+          );
+          if (coachSaveResult.changed && coachSaveResult.reason === "CHANGED") {
+            coachChangesDetectedToday++;
+            const statement = `${team.nameJa}の監督が交代しました: ${coachSaveResult.previousStatement} → ${coachInfo.currentCoachName}。`;
+            await knowledgeStore.saveKnowledgeItem({
+              teamEn: team.nameEn, teamJa: team.nameJa, category: "coachChange", type: "fact",
+              statement, computedAt: runAt.toISOString(), source: "API-Footballの実データ(/coachs)",
+            });
+            otherFactsToday.push({ teamEn: team.nameEn, teamJa: team.nameJa, statement, category: "coachChange" });
+          }
+        }
+      } catch (e) { errors.push(`coach_check_failed:${team.nameEn}:${e.message}`); }
+
+      // 補強の影響: 直近30日以内の加入・退団をそのまま事実として記録する
+      // (完全に同一内容の事実は knowledgeStore の重複排除により二重登録されない)。
+      try {
+        const transfersData = await callApiFootball("/transfers", { team: teamId });
+        const sinceDate = new Date(runAt.getTime() - TRANSFER_FACT_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+        const recentTransfers = summarizeTransfers(transfersData && transfersData.response, teamId, 5, sinceDate);
+        for (const t of recentTransfers) {
+          const statement = `${team.nameJa}: ${t.playerName}が${t.counterpart || "不明"}${t.direction === "加入" ? "から加入" : "へ退団"}しました(${t.date ? t.date.slice(0, 10) : "日付不明"})。`;
+          const saveResult = await knowledgeStore.saveKnowledgeItem({
+            teamEn: team.nameEn, teamJa: team.nameJa, category: "transferImpact", type: "fact",
+            statement, computedAt: runAt.toISOString(), source: "API-Footballの実データ(/transfers)",
+          });
+          if (saveResult.saved) {
+            transferFactsAddedToday++;
+            otherFactsToday.push({ teamEn: team.nameEn, teamJa: team.nameJa, statement, category: "transferImpact" });
+          }
+        }
+      } catch (e) { errors.push(`transfer_check_failed:${team.nameEn}:${e.message}`); }
+    } catch (e) {
+      errors.push(`coach_transfer_check_failed:${team.nameEn}:${e.message}`);
+    }
   }
 
   // ---- ② 保留中の自社予測を解決(試合が終わっていれば的中/不的中を確定) ----
@@ -336,6 +436,13 @@ async function runDailyLearning(deps) {
       record.actualWinner = actualWinner;
       record.correct = actualWinner === record.predictedWinner;
       record.resolvedAt = runAt.toISOString();
+
+      // ---- Failure Learning(ご要望①): 外れた場合は「何故外れたのか」を分類して保存する ----
+      // 従来は正解/不正解のカウントだけで、原因は一切記録していなかった。
+      // 予測時点の特徴量(record.features)と重み(record.weightsSnapshot)だけを
+      // 根拠に機械的に分類する(LLM不使用・でっち上げ防止)。
+      const failureReasons = record.correct ? [] : classifyFailureReasons(record, record.weightsSnapshot);
+      record.failureReasons = failureReasons;
       await upstashSetJSON(`learn:ownpred:${fixtureIdStr}`, record);
       await upstashCmd(["LREM", "learn:ownpred:pending", "0", fixtureIdStr]).catch(() => {});
       await upstashCmd(["INCR", "learn:ownpred:resolved"]).catch(() => {});
@@ -369,7 +476,7 @@ async function runDailyLearning(deps) {
       // 必ず保存する(以前はハズレた仮説を保存していなかった=正直な弱点だった)。
       // LLMを使わず、実際に計算した特徴量・重みから機械的に導く(でっち上げ防止)。
       try {
-        const reflection = buildReflectionText(record, record.weightsSnapshot);
+        const reflection = buildReflectionText(record, record.weightsSnapshot, failureReasons);
         const outcomeLabelJa = (w) => (w === "home" ? "ホーム勝利" : w === "away" ? "アウェイ勝利" : "引き分け");
         const statement = [
           `【振り返り】${record.homeTeamEn} vs ${record.awayTeamEn}`,
@@ -379,10 +486,54 @@ async function runDailyLearning(deps) {
         ].join(" ");
         await knowledgeStore.saveKnowledgeItem({
           teamEn: record.originTeamEn || record.homeTeamEn, category: "matchReflection", type: "reflection",
-          statement, detail: { predicted: record.predictedWinner, actual: record.actualWinner, correct: record.correct, ...reflection },
+          statement, detail: { predicted: record.predictedWinner, actual: record.actualWinner, correct: record.correct, failureReasons, ...reflection },
           computedAt: runAt.toISOString(), source: "試合結果と予測時点の特徴量・重みから機械的に生成(LLM不使用)",
         });
         reflectionsSaved++;
+
+        // ---- Failure Learning(ご要望①続き): 外れた理由を単独のKnowledge Engine
+        // 項目(analysis)としても保存する。これにより議論モードの根拠プール
+        // (evidencePool.js→ke.analyses)からも参照でき、「次回の予測へ反映」の
+        // 一部として、同じクラブについて話す際にAIが過去の予測ミスの傾向を
+        // 踏まえられるようになる(数値としては、この失敗パターンはfeatures/weights
+        // 経由で勾配降下法による重み再学習にも既に反映されている。§④のv2重み更新参照)。
+        if (!record.correct && failureReasons.length) {
+          failureReasonsToday.push(...failureReasons.map((r) => ({ ...r, teamEn: record.originTeamEn || record.homeTeamEn })));
+          try {
+            await knowledgeStore.saveKnowledgeItem({
+              teamEn: record.originTeamEn || record.homeTeamEn, category: "predictionFailureReason", type: "analysis",
+              statement: `【予測が外れた理由】${record.homeTeamEn} vs ${record.awayTeamEn}: ${failureReasons.map((r) => r.labelJa).join("、")}。${failureReasons[0].detail}`,
+              detail: { fixtureId: fixtureIdStr, failureReasons },
+              computedAt: runAt.toISOString(), source: "予測時点の特徴量・重みから機械的に分類(LLM不使用)",
+            });
+          } catch (e) { errors.push(`failure_reason_save_failed:${fixtureIdStr}:${e.message}`); }
+        }
+
+        // ---- Memory Engine(ご要望④続き): 「試合予測」自体を、前回の予測・結果・
+        // 外れた理由・学んだこと・次回改善点まで含めて記憶する。
+        // memoryStore.saveConclusion()は「前回の内容と異なれば、前回の内容を
+        // memory:history:*へ退避してから今回の内容で上書きする」という既存の
+        // 変化検知の仕組みをそのまま持っているため、対戦カードが変わるたびに
+        // 自動的に「前回の予測」が履歴として保存されていく(新しい仕組みを
+        // 増やさず、既存のMemory Engineの仕組みを再利用しただけ)。
+        try {
+          const predictionMemoryStatement = [
+            `${record.homeTeamEn} vs ${record.awayTeamEn}: 予測は${outcomeLabelJa(record.predictedWinner)}`,
+            `結果は${outcomeLabelJa(record.actualWinner)}(${record.correct ? "的中" : "不的中"})`,
+            failureReasons.length ? `外れた理由: ${failureReasons.map((r) => r.labelJa).join("、")}` : null,
+            `学んだこと: ${reflection.why}`,
+            `次回改善点: ${reflection.improvement}`,
+          ].filter(Boolean).join(" / ");
+          await memoryStore.saveConclusion(
+            `team:${record.originTeamEn || record.homeTeamEn}:predictionMemory`,
+            {
+              statement: predictionMemoryStatement, confidence: record.correct ? 1 : 0,
+              reasoning: "毎日学習エンジンによる自動記録(試合結果と予測時点の特徴量・重みから機械的に生成)",
+              computedAt: runAt.toISOString(),
+            },
+            null
+          );
+        } catch (e) { errors.push(`prediction_memory_failed:${fixtureIdStr}:${e.message}`); }
       } catch (e) { errors.push(`reflection_failed:${fixtureIdStr}:${e.message}`); }
     } catch (e) {
       errors.push(`resolve_failed:${fixtureIdStr}:${e.message}`);
@@ -591,6 +742,9 @@ async function runDailyLearning(deps) {
       errors.push(`knowledge_save_failed:${f.teamEn}:${e.message}`);
     }
   }
+  // ①-d(監督交代・補強)は既に個別に保存済みなので、ここでは「今日追加した知識」の
+  // 合計件数にだけ加算する(二重保存はしない)。
+  knowledgeItemsSavedToday += transferFactsAddedToday + coachChangesDetectedToday;
 
   // ---- 「昨日より知識が増えていることが分かるようにする」ための集計 ----
   // 全登録クラブ横断で、今日新しく覚えた知識・更新された知識・古くなった
@@ -607,17 +761,32 @@ async function runDailyLearning(deps) {
     } catch (e) { /* ベストエフォート */ }
   }
 
+  // ---- Failure Learning(ご要望①): 直近の外れた理由を頻度順に集計する ----
+  // 「今日」だけでなく直近の傾向も分かるよう、learn:ownpred:recent(既に
+  // failureReasonsを保持している解決済みレコード)から機械的に集計する。
+  let topFailureReasonsRecent = [];
+  try {
+    const recentForFailuresRaw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "0", "-1"]).catch(() => [])) || [];
+    const recentForFailures = recentForFailuresRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
+    topFailureReasonsRecent = summarizeFailureReasons(recentForFailures, 5);
+  } catch (e) { /* ベストエフォート */ }
+
   const growthLog = {
     date: dateKey,
     ranAt: runAt.toISOString(),
     teamsAnalyzed: REGISTERED_TEAMS.length,
     factsAddedToday: factsToday.length,
     facts: factsToday,
+    // ②(ご要望②・Knowledge Engineの毎日成長): 監督交代・補強はfactsToday(フォーム系)
+    // とは別経路で保存済みのため、表示専用の配列として別フィールドで返す。
+    otherFactsToday, coachChangesDetectedToday, transferFactsAddedToday,
     knowledgeItemsSavedToday, knowledgeItemsDuplicateToday,
     matchesResolvedToday,
     newPredictionsLogged,
     hypothesesConfirmed, hypothesesDiscarded,
     reflectionsSaved, // Layer4: 当たり/外れ問わず保存した振り返りの件数
+    failureReasonsToday, // Failure Learning: 今日外れた予測それぞれの理由(配列)
+    topFailureReasonsRecent, // Failure Learning: 直近の解決済み予測全体での頻出理由(頻度順)
     profilesGenerated, // Layer2: 今日新しく生成した固定知識(クラブプロフィール)の件数
     aiViewsChanged, aiViewsUnchanged, // Layer3: AIの見解が変わった/変わらなかったクラブ数
     llmSkippedReasons, // Layer2/3がLLM未設定でスキップされた場合の理由(空配列なら正常実行)
@@ -654,17 +823,35 @@ async function getGrowthLog(deps) {
   const totalResolvedRaw = await upstashCmd(["GET", "learn:ownpred:resolved"]).catch(() => null);
   const totalResolved = parseInt(totalResolvedRaw, 10) || 0;
   const hasEnoughDataForLearning = totalResolved >= MIN_RESOLVED_FOR_RECALIBRATION;
+
+  // ---- 「AIの成長レポート」ウィジェット(ご要望⑦)向け: Knowledge/Prediction/
+  // Memory各エンジンの累計件数。ホーム画面が読み込まれるたびに登録クラブ全件を
+  // ループするのは重すぎるため(/debug.htmlの開発者向け集計とは別に)、
+  // knowledgeStore.js/memoryStore.jsが保存の都度INCRしている軽量カウンターを
+  // そのまま読むだけ(O(1))。失効しても減らない「累計保存件数」である点は
+  // 呼び出し側(index.html)で正直にラベルする。
+  const [knowledgeTotalCounterRaw, memoryTotalCounterRaw, predictionTotalCounterRaw] = await Promise.all([
+    upstashCmd(["GET", "knowledge:totalItemsSavedCounter"]).catch(() => null),
+    upstashCmd(["GET", "memory:totalConclusionsSavedCounter"]).catch(() => null),
+    upstashCmd(["GET", "learn:ownpred:total"]).catch(() => null),
+  ]);
+  const engineTotals = {
+    knowledgeItemsTotal: parseInt(knowledgeTotalCounterRaw, 10) || 0,
+    memoryConclusionsTotal: parseInt(memoryTotalCounterRaw, 10) || 0,
+    predictionsTotal: parseInt(predictionTotalCounterRaw, 10) || 0,
+  };
+
   if (!latest) {
     return {
       configured: true, ranYet: false, message: "学習エンジンはまだ一度も実行されていません。",
       learningSummary, hasEnoughDataForLearning, totalOwnPredictionsResolvedSoFar: totalResolved,
-      minResolvedForRecalibration: MIN_RESOLVED_FOR_RECALIBRATION,
+      minResolvedForRecalibration: MIN_RESOLVED_FOR_RECALIBRATION, engineTotals,
     };
   }
   return {
     configured: true, ranYet: true, ...latest,
     learningSummary, hasEnoughDataForLearning, totalOwnPredictionsResolvedSoFar: totalResolved,
-    minResolvedForRecalibration: MIN_RESOLVED_FOR_RECALIBRATION,
+    minResolvedForRecalibration: MIN_RESOLVED_FOR_RECALIBRATION, engineTotals,
   };
 }
 

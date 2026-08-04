@@ -59,6 +59,34 @@ function buildEvidencePool(knowledge, teamEn) {
     pool.push({ category: "coach", type: "fact", teamEn, statement: `現在の監督: ${knowledge.coachName}。` });
   }
 
+  // 2026年8月・「議論できるAI」強化フェーズ: Reasoning Engineが最低5つ以上の
+  // 仮説を比較検討できるよう、疲労・ホームアウェイ差・勢い・順位を新しい
+  // evidenceカテゴリとして追加する(いずれも実データのみ・推測は含まない)。
+  if (knowledge.fatigue && knowledge.fatigue.matchesLast7Days >= 3) {
+    pool.push({ category: "fatigue", type: "fact", teamEn, statement: `直近7日間で${knowledge.fatigue.matchesLast7Days}試合をこなしており、過密日程の可能性がある。` });
+  }
+
+  if (knowledge.homeAwaySplit) {
+    const { home, away } = knowledge.homeAwaySplit;
+    if (home.sampleSize >= 2 && away.sampleSize >= 2 && home.winRate !== null && away.winRate !== null && Math.abs(home.winRate - away.winRate) >= 0.2) {
+      pool.push({
+        category: "homeAway", type: "fact", teamEn,
+        statement: `直近${home.sampleSize}試合のホーム勝率${Math.round(home.winRate * 100)}%に対し、直近${away.sampleSize}試合のアウェイ勝率は${Math.round(away.winRate * 100)}%と、${home.winRate > away.winRate ? "ホームでの強さ" : "アウェイでの粘り強さ"}が目立つ。`,
+      });
+    }
+  }
+
+  if (knowledge.streak) {
+    pool.push({ category: "streak", type: "fact", teamEn, statement: `直近${knowledge.streak.count}試合連続で「${knowledge.streak.result}」が続いている。` });
+  }
+
+  if (knowledge.standings && knowledge.standings.position !== null) {
+    pool.push({
+      category: "standings", type: "fact", teamEn,
+      statement: `現在の順位は${knowledge.standings.position}位(勝点${knowledge.standings.points ?? "不明"}、${knowledge.standings.played ?? "不明"}試合消化)。`,
+    });
+  }
+
   // 毎日学習エンジン(dailyJob.js)がKnowledge Engine経由で蓄積した「事実」
   // (直近フォームの変化など)。既にKnowledge Engineの重複排除・失効管理を
   // 経ているため、そのまま evidence として扱える。
