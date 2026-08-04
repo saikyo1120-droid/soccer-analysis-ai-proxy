@@ -60,6 +60,9 @@ const { buildMatchFeatures } = require("./featureEngine");
 const { createApiBudget, DEFAULT_DAILY_BUDGET, DEFAULT_USER_RESERVE } = require("./apiBudget");
 // 2026年8月・優先順位⑫: 「何でも保存する」のをやめ、AI自身が学ぶ価値を判断する
 const { assessImportance, summarizeImportance } = require("./importanceEngine");
+// 2026年8月・「知識量を大幅に増やす」フェーズ: UEFA上位100クラブの日次収集
+const { collectUniverse } = require("./universeCollector");
+const { createClubDossier } = require("../knowledge/clubDossier");
 const { buildDailySnapshot, saveDailyMetrics } = require("./dailyMetrics");
 const {
   computeGoalRateFeatures, computeFatigueFeature,
@@ -290,6 +293,27 @@ function mergeGrowthLogs(previous, current) {
     // 優先順位⑫: 同日に複数回実行された場合、重要度の内訳は合算し、
     // 「今日いちばん学ぶ価値があったこと」は重要な方を残す。
     importanceSummary: mergeImportanceSummaries(previous.importanceSummary, current.importanceSummary),
+    // 宇宙収集は輪番のため、同日の再実行では対象が同じ=最大値を採用する。
+    // 変化の一覧は内容で重複排除する。
+    universe: (() => {
+      const p = previous.universe; const c = current.universe;
+      if (!p) return c || null;
+      if (!c) return p;
+      const seen = new Set();
+      const changes = [...(p.changesDetected || []), ...(c.changesDetected || [])]
+        .filter((x) => { const k = `${x.club}|${x.changeJa}`; if (seen.has(k)) return false; seen.add(k); return true; })
+        .slice(0, 20);
+      return {
+        coreClubsPlanned: Math.max(p.coreClubsPlanned || 0, c.coreClubsPlanned || 0),
+        coreClubsUpdated: Math.max(p.coreClubsUpdated || 0, c.coreClubsUpdated || 0),
+        squadsUpdated: Math.max(p.squadsUpdated || 0, c.squadsUpdated || 0),
+        playersUpdated: Math.max(p.playersUpdated || 0, c.playersUpdated || 0),
+        xgClubsUpdated: Math.max(p.xgClubsUpdated || 0, c.xgClubsUpdated || 0),
+        standingsLeaguesUpdated: Math.max(p.standingsLeaguesUpdated || 0, c.standingsLeaguesUpdated || 0),
+        changesDetected: changes,
+        skipped: capList([...(p.skipped || []), ...(c.skipped || [])]),
+      };
+    })(),
     errors: capList([...(previous.errors || []), ...(current.errors || [])]),
   };
 }
@@ -1252,6 +1276,24 @@ async function runDailyLearning(deps) {
     }
   }
 
+  // ---- ③-b UEFA上位100クラブの知識収集(2026年8月・知識拡大フェーズ) ----
+  // ご指示①②③: 上位100クラブとその選手の実データを、更新頻度の階層つきで
+  // 毎日収集し、クラブ調査ファイル(kb:club:*)へ構造化して保存する。
+  // 自社予測の記録・検証(②③)より後に置くのは、監査で判明した
+  // 「学習の中核が予算切れで飢える」事故を繰り返さないため。
+  let universeStats = null;
+  try {
+    const clubDossier = createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON });
+    universeStats = await collectUniverse({
+      callApiFootball, apiBudget, clubDossier, knowledgeStore,
+      knowledgeGraph, thoughtTimeline, computeFormScore,
+      recordLearned: saveWithImportance,
+    }, runAt, dateKey);
+    if (universeStats.errors && universeStats.errors.length) errors.push(...universeStats.errors);
+  } catch (e) {
+    errors.push(`universe_collection_failed:${e.message}`);
+  }
+
   // ---- ④ 十分な検証データが溜まっていれば、モデルの重みを再調整する ----
   const totalResolvedRaw = await upstashCmd(["GET", "learn:ownpred:resolved"]).catch(() => null);
   const totalCorrectRaw = await upstashCmd(["GET", "learn:ownpred:correct"]).catch(() => null);
@@ -1573,6 +1615,17 @@ async function runDailyLearning(deps) {
     // 「今日は知識が34件増えました」だけでは中身の重みが分からなかったため、
     // 重要度別の内訳と、その日いちばん学ぶ価値があった出来事を添える。
     importanceSummary: summarizeImportance(learnedWithImportance),
+    // 知識拡大フェーズ: 上位100クラブの収集状況(何を更新し、何を見送ったか)
+    universe: universeStats ? {
+      coreClubsPlanned: universeStats.coreClubsPlanned,
+      coreClubsUpdated: universeStats.coreClubsUpdated,
+      squadsUpdated: universeStats.squadsUpdated,
+      playersUpdated: universeStats.playersUpdated,
+      xgClubsUpdated: universeStats.xgClubsUpdated,
+      standingsLeaguesUpdated: universeStats.standingsLeaguesUpdated,
+      changesDetected: (universeStats.changesDetected || []).slice(0, 20),
+      skipped: universeStats.skipped || [],
+    } : null,
     // 1回の実行ぶんでも、エラーが大量に出た日にログが肥大化しないよう上限を設ける
     errors: capList(errors),
   };

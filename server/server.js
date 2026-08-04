@@ -76,7 +76,7 @@ const {
 // リーグの知識(順位表・得点/アシストランキング)をクラブの質問から引くために使う
 const _LEAGUE_CFG = require("./learning/leagueConfig");
 const {
-  EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, predictOutcomeV2,
+  EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, computeFeatureAvailability, predictOutcomeV2,
   computeMatchProbabilities, mostLikelyScoreline, computeFactorImportance,
 } = require("./learning/predictionModel");
 // 選手個人の実データ統計(2026年8月・知識拡張フェーズ)。
@@ -1825,6 +1825,14 @@ const { createThoughtTimeline } = require("./memory/thoughtTimeline");
 const thoughtTimeline = createThoughtTimeline({
   upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
 });
+// ---- 2026年8月・知識拡大フェーズ: クラブ調査ファイル(UEFA上位100の構造化知識) ----
+// 日次収集(universeCollector)が書き、予測・議論・マッチ分析が読む。
+// これにより「APIが今この瞬間失敗した=データ不足」ではなく、
+// 「直近の実測値で補い、いつのデータかを明示する」動きになる。
+const { createClubDossier } = require("./knowledge/clubDossier");
+const clubDossier = createClubDossier({
+  upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
+});
 
 const learningDeps = {
   // 2026年8月・欠陥Aの修正: 日次ジョブ(バッチ)の呼び出しであることを明示し、
@@ -2055,11 +2063,80 @@ async function handleMatchAnalysis(query, clientIp) {
     ])
     : [{ xgNet: null }, { xgNet: null }];
   if (!canSpendXg) dataNotes.push("本日のAPIリクエストの残りが少ないため、xG(チャンスの質)の取得は見送りました。");
-  const built = buildMatchFeatures(
-    { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXgInfo, topScorer: homeTopScorerInfo },
-    { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXgInfo, topScorer: awayTopScorerInfo },
-    h2h
-  );
+  // ---- 2026年8月・知識拡大フェーズ(ご指示⑤「データ不足を極力無くす」) ----
+  //   これまでは「今この瞬間のAPI呼び出しが失敗した=データ不足」だった。
+  //   日次収集が蓄えたクラブ調査ファイル(kb:club:*)に直近の実測値があれば
+  //   それで補い、**いつ取得したデータかを必ず明示**する。
+  //   鮮度の上限: 怪我・フォームは72時間、順位・xG・得点王は7日。
+  //   それより古いものは使わない(古い実測で新しい試合を語るのは不正確なため)。
+  const dossierFill = async (side, sideJa, src) => {
+    const d = await clubDossier.getDossier(side.nameEn).catch(() => null);
+    if (!d || !d.sections) return src;
+    const ageHours = (sec) => {
+      const t = sec && sec.computedAt ? new Date(sec.computedAt).getTime() : NaN;
+      return Number.isFinite(t) ? Math.round((Date.now() - t) / 3600000) : null;
+    };
+    const out = { ...src };
+    const fills = [];
+    // 怪我(72時間以内の実測があれば)
+    const injSec = d.sections.injuries;
+    const injAge = ageHours(injSec);
+    if ((src.injuries.error || !Number.isFinite(src.injuries.injuryCount)) && injSec && injAge !== null && injAge <= 72) {
+      out.injuries = { injuryCount: injSec.injuryCount, injuredPlayers: injSec.injuredPlayers || [], suspendedPlayers: injSec.suspendedPlayers || [] };
+      fills.push(`負傷者情報(${injAge}時間前に取得)`);
+    }
+    // 順位(7日以内)
+    const stSec = d.sections.standings;
+    const stAge = ageHours(stSec);
+    if ((!src.standings || src.standings.position === null || src.standings.position === undefined) && stSec && stAge !== null && stAge <= 168) {
+      out.standings = { position: stSec.position, points: stSec.points, played: stSec.played, goalsForAvg: stSec.goalsForAvg, goalsAgainstAvg: stSec.goalsAgainstAvg };
+      fills.push(`順位(${Math.round(stAge / 24)}日前に取得)`);
+    }
+    // xG(7日以内)
+    const xgSec = d.sections.xg;
+    const xgAge = ageHours(xgSec);
+    if ((!src.xg || src.xg.xgNet === null || src.xg.xgNet === undefined) && xgSec && xgAge !== null && xgAge <= 168 && xgSec.xgNet !== null) {
+      out.xg = { xgNet: xgSec.xgNet };
+      fills.push(`xG(${Math.round(xgAge / 24)}日前に取得)`);
+    }
+    // フォーム(直近試合の取得に失敗した場合のみ・72時間以内)
+    const formSec = d.sections.form;
+    const formAge = ageHours(formSec);
+    if ((!src.form || !Array.isArray(src.form.fixtures) || !src.form.fixtures.length) && formSec && formAge !== null && formAge <= 72) {
+      out.form = {
+        currentFormScore: formSec.currentFormScore, avgGoalsFor: formSec.avgGoalsFor,
+        avgGoalsAgainst: formSec.avgGoalsAgainst, matchesLast7Days: formSec.matchesLast7Days,
+        fixtures: [],
+      };
+      // ホーム/アウェイ勝率は fixtures から計算できないため、実測値を直接持ち込む
+      out.venueRates = { homeWinRate: formSec.homeWinRate ?? null, awayWinRate: formSec.awayWinRate ?? null };
+      fills.push(`直近フォーム(${formAge}時間前に取得)`);
+    }
+    if (fills.length) {
+      dataNotes.push(`${sideJa}の${fills.join("・")}は、毎日の学習で事前に蓄積した実測値を使用しています。`);
+    }
+    return out;
+  };
+  const homeSrcRaw = { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXgInfo, topScorer: homeTopScorerInfo };
+  const awaySrcRaw = { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXgInfo, topScorer: awayTopScorerInfo };
+  const [homeSrc, awaySrc] = await Promise.all([
+    dossierFill(home, home.nameJa, homeSrcRaw),
+    dossierFill(away, away.nameJa, awaySrcRaw),
+  ]);
+  const built = buildMatchFeatures(homeSrc, awaySrc, h2h);
+  // 調査ファイル由来のホーム/アウェイ勝率を反映(fixturesが無い場合の補完)。
+  // ctxを直したら、特徴量と供給判定も必ず作り直す(直さないと0のままになる)。
+  let venueFilled = false;
+  if (homeSrc.venueRates && built.homeCtx.homeVenueWinRate === null && homeSrc.venueRates.homeWinRate !== null) {
+    built.homeCtx.homeVenueWinRate = homeSrc.venueRates.homeWinRate; venueFilled = true;
+  }
+  if (awaySrc.venueRates && built.awayCtx.awayVenueWinRate === null && awaySrc.venueRates.awayWinRate !== null) {
+    built.awayCtx.awayVenueWinRate = awaySrc.venueRates.awayWinRate; venueFilled = true;
+  }
+  if (venueFilled) {
+    built.features = computeMatchFeatures(built.homeCtx, built.awayCtx, h2h);
+    built.supplied = computeFeatureAvailability(built.homeCtx, built.awayCtx, h2h);
+  }
   const homeCtx = built.homeCtx;
   const awayCtx = built.awayCtx;
   const features = built.features;
@@ -3106,6 +3183,44 @@ async function handleDiscuss(body, clientIp) {
       //   蓄積された知識はそれを補う形でORする。
       const poolCategories = new Set((evidencePool || []).map((e) => e && e.category).filter(Boolean));
       const fetched = new Set(knowledge.fetchedTypes || []);
+
+      // ---- 2026年8月・知識拡大フェーズ(ご指示④⑤) ----
+      //   毎日の収集で蓄えたクラブ調査ファイルを、議論の根拠に必ず使う。
+      //   取得時刻を明示し、鮮度の上限を超えたものは使わない。
+      let dossierData = null;
+      try {
+        dossierData = await clubDossier.getDossier(subject.labelEn);
+        if (dossierData && dossierData.sections) {
+          const secs = dossierData.sections;
+          const ageH = (sec) => {
+            const t = sec && sec.computedAt ? new Date(sec.computedAt).getTime() : NaN;
+            return Number.isFinite(t) ? Math.round((Date.now() - t) / 3600000) : null;
+          };
+          const fresh = (sec, limitH) => { const a = ageH(sec); return sec && a !== null && a <= limitH; };
+          // UEFAランキング(静的スナップショットである旨を必ず添える)
+          if (dossierData.uefaRankSnapshot) {
+            facts.push(`UEFAクラブランキング: 約${dossierData.uefaRankSnapshot}位(2025年時点の係数に基づくスナップショット。最新の公式順位ではありません)`);
+          }
+          if (fresh(secs.standings, 168) && secs.standings.position !== null) {
+            facts.push(`国内リーグ順位: ${secs.standings.position}位・勝点${secs.standings.points ?? "不明"}(${Math.round(ageH(secs.standings) / 24)}日前の実測)`);
+          }
+          if (fresh(secs.xg, 168) && secs.xg.xgNet !== null) {
+            facts.push(`xG(チャンスの質)の収支: ${secs.xg.xgNet > 0 ? "+" : ""}${secs.xg.xgNet}(直近試合の平均・${Math.round(ageH(secs.xg) / 24)}日前の実測)`);
+          }
+          if (fresh(secs.squad, 240) && secs.squad.count) {
+            facts.push(`登録選手数: ${secs.squad.count}人(名簿は約7日周期で更新)`);
+          }
+          if ((dossierData.lastChangesJa || []).length) {
+            const recent = dossierData.lastChangesJa.slice(0, 3);
+            recent.forEach((c) => facts.push(`[最近の変化 ${c.date}] ${c.changeJa}`));
+          }
+          knowledgeMeta.dossier = {
+            available: true,
+            sectionsStored: Object.keys(secs),
+            lastUpdatedJa: dossierData.updatedAt ? `${ageH({ computedAt: dossierData.updatedAt })}時間前` : null,
+          };
+        }
+      } catch (e) { /* 調査ファイルが無くても従来どおり動く */ }
       deliberationResult = deliberate({
         ranked: reasoningBundle.hypotheses,
         dataAvailability: {
@@ -3114,18 +3229,24 @@ async function handleDiscuss(body, clientIp) {
           goals: (knowledge.goalsForTrend || []).length > 0
             || poolCategories.has("recentFormTrend") || poolCategories.has("goalRate"),
           standings: !!knowledge.standings
-            || poolCategories.has("standings") || poolCategories.has("leagueStandings"),
+            || poolCategories.has("standings") || poolCategories.has("leagueStandings")
+            || !!(dossierData && dossierData.sections && dossierData.sections.standings
+              && dossierData.sections.standings.position !== null),
           // 「取得を試みて失敗しなかった」ことを条件にする。
           // 怪我人0人という結果と、取得失敗はまったく別のことなので区別する。
           injuries: (fetched.has("injuries") && !(knowledge.errors || []).includes("injuries_failed"))
             || poolCategories.has("injuries") || poolCategories.has("injury"),
-          // 過去対戦成績・xGはクラブ単体の質問では現在取得していない。
-          // 将来取得するようになったら、このカテゴリ名で自動的にtrueになる。
+          // 過去対戦成績はクラブ単体の質問では現在取得していない。
           headToHead: poolCategories.has("headToHead"),
-          xg: poolCategories.has("xg"),
+          // 知識拡大フェーズ: xGは調査ファイルの実測(7日以内)があれば「揃っている」
+          xg: poolCategories.has("xg") || !!(dossierData && dossierData.sections && dossierData.sections.xg
+            && dossierData.sections.xg.xgNet !== null
+            && (Date.now() - new Date(dossierData.sections.xg.computedAt || 0).getTime()) <= 168 * 3600000),
           coach: !!knowledge.coachName
             || poolCategories.has("coachChange") || poolCategories.has("coach") || poolCategories.has("managerHistory"),
-          venue: !!knowledge.homeAwaySplit || poolCategories.has("homeAway"),
+          venue: !!knowledge.homeAwaySplit || poolCategories.has("homeAway")
+            || !!(dossierData && dossierData.sections && dossierData.sections.form
+              && dossierData.sections.form.homeWinRate !== null),
         },
         // 第5次監査での修正: 質問に応じて「本当に必要なデータ」だけを点検する。
         //   従来は質問内容にかかわらず8種類すべてを必須としていたため、
@@ -3661,6 +3782,23 @@ const server = http.createServer(async (req, res) => {
           .finally(() => { dailyLearningRunning = false; });
         return;
       }
+      if (pathname === "/api/knowledge/coverage") {
+        // 知識拡大フェーズの「実際に何件入っているか」を実測で返す。
+        // 「実装しました」ではなく「実際に動いている」ことの証明用。
+        // 全クラブの読み出しはRedisアクセスが多いため5分キャッシュする。
+        const covCached = cacheGet("kb:coverage");
+        if (covCached) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify(covCached));
+          return;
+        }
+        const summary = await clubDossier.getCoverageSummary();
+        const body = { ok: true, generatedAt: new Date().toISOString(), ...summary };
+        cacheSet("kb:coverage", body, 5 * 60 * 1000);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
       if (pathname === "/api/growth-log") {
         // ホーム画面の「昨日学んだこと」ウィジェット用。Upstash未設定・未実行の
         // 場合も、架空の数字を返さず正直な状態を返す(既存のhandleAccuracyStats
@@ -3784,6 +3922,7 @@ module.exports = {
   // 2026年8月・優先順位⑲/⑳
   knowledgeGraph,
   thoughtTimeline,
+  clubDossier,
   clubProfileEngine,
   playerProfileEngine,
 };
