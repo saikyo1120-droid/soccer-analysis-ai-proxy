@@ -280,7 +280,7 @@ async function runDailyLearning(deps) {
   const {
     callApiFootball, resolveTeamId,
     upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON,
-    now, generateLLM,
+    now, generateLLM, getApiPlanInfo,
   } = deps;
   const nowFn = typeof now === "function" ? now : () => new Date();
   const runAt = nowFn();
@@ -294,9 +294,36 @@ async function runDailyLearning(deps) {
   // 2026年8月・優先順位⑦: APIリクエスト予算ガード。1日の上限に静かに突き当たって
   // 「エラーだらけで知識0件」になる事故(優先順位⑨のご指摘)を防ぐため、消費量を
   // 記録し、予算が尽きそうなときはオプション扱いの処理を理由つきで見送る。
+  // 2026年8月・優先順位⑪: 1日の上限は、次の優先順位で決める。
+  //   1. API-Footballのレスポンスヘッダーから自動判定した実際の契約プランの上限
+  //      (Pro加入後にAPI_DAILY_BUDGETを設定し忘れても自動的に追従する)
+  //   2. 環境変数 API_DAILY_BUDGET(自動判定より小さく抑えたい場合の手動指定)
+  //   3. 既定値100(無料プラン想定)
+  // 「自動判定より手動設定の方が大きい」場合は、実際には使えない量を使おうとして
+  // 大量のエラーになるため、安全側(小さい方)を採用する。
+  const detectedPlan = (typeof getApiPlanInfo === "function") ? getApiPlanInfo() : null;
+  const detectedLimit = detectedPlan && detectedPlan.detectedDailyLimit;
+  const manualLimit = Number(process.env.API_DAILY_BUDGET) || null;
+  let effectiveDailyBudget;
+  let budgetSourceJa;
+  if (detectedLimit && manualLimit) {
+    effectiveDailyBudget = Math.min(detectedLimit, manualLimit);
+    budgetSourceJa = detectedLimit <= manualLimit
+      ? `API-Footballから自動判定した実際の上限(${detectedLimit}件/日・${detectedPlan.planNameJa})を採用しました(API_DAILY_BUDGET=${manualLimit}は実際の上限を超えているため、安全のため自動判定値を使います)。`
+      : `手動設定のAPI_DAILY_BUDGET=${manualLimit}件/日を採用しました(実際の契約上限は${detectedLimit}件/日・${detectedPlan.planNameJa})。`;
+  } else if (detectedLimit) {
+    effectiveDailyBudget = detectedLimit;
+    budgetSourceJa = `API-Footballから自動判定した実際の上限(${detectedLimit}件/日・${detectedPlan.planNameJa})を採用しました。手動設定は不要です。`;
+  } else if (manualLimit) {
+    effectiveDailyBudget = manualLimit;
+    budgetSourceJa = `手動設定のAPI_DAILY_BUDGET=${manualLimit}件/日を採用しました(まだAPI-Footballを呼べていないため、実際の契約プランは自動判定できていません)。`;
+  } else {
+    effectiveDailyBudget = DEFAULT_DAILY_BUDGET;
+    budgetSourceJa = `既定値(${DEFAULT_DAILY_BUDGET}件/日・無料プラン想定)を採用しました。`;
+  }
   const apiBudget = createApiBudget({
     upstashEnabled, upstashGetJSON, upstashSetJSON,
-    dailyBudget: Number(process.env.API_DAILY_BUDGET) || DEFAULT_DAILY_BUDGET,
+    dailyBudget: effectiveDailyBudget,
     userReserve: Number(process.env.API_USER_RESERVE) || DEFAULT_USER_RESERVE,
   });
   await apiBudget.init(dateKey);
@@ -939,7 +966,8 @@ async function runDailyLearning(deps) {
     playerFieldsRetryableToday: playerResult.fieldsRetryableToday,
     playerUnavailableReasonsToday: playerResult.unavailableReasonsToday,
     // 2026年8月・優先順位⑦: APIリクエスト予算の使用状況(優先順位⑨の診断用)。
-    apiBudget: apiBudget.summary(),
+    // 優先順位⑪: どうやってその予算値を決めたか(自動判定/手動設定/既定値)も併記する。
+    apiBudget: { ...apiBudget.summary(), sourceJa: budgetSourceJa, detectedPlan: detectedPlan || null },
     matchesResolvedToday,
     newPredictionsLogged,
     hypothesesConfirmed, hypothesesDiscarded,

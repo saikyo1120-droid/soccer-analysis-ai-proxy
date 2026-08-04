@@ -206,7 +206,7 @@ async function getRunHistory(deps, days, todayDateKey) {
  * 推測は書かず、確認できないものは正直に "unknown" とその理由を返す。
  */
 function buildEngineStatuses(ctx) {
-  const { growthLog, runHistory, upstashEnabled, apiKeyConfigured, llmConfigured, engineTotals } = ctx || {};
+  const { growthLog, runHistory, upstashEnabled, apiKeyConfigured, llmConfigured, engineTotals, apiPlan, configuredCaps } = ctx || {};
   const log = growthLog || {};
   const totals = engineTotals || log.engineTotals || {};
   const s = [];
@@ -247,6 +247,28 @@ function buildEngineStatuses(ctx) {
     apiKeyConfigured ? "ok" : "error",
     apiKeyConfigured ? "APIキーが設定されています。" : "APIキーが未設定のため、実データを一切取得できません。",
     apiKeyConfigured ? null : "Renderの環境変数 API_FOOTBALL_KEY を設定してください。");
+
+  // 契約プラン(2026年8月・優先順位⑪)。
+  // API-Footballは「自動更新されない」仕様のため、期限が切れると通知なく無料プラン
+  // (1日100リクエスト)へ戻る。有料プラン向けの設定(EXTENDED_LEAGUE_CAP /
+  // PLAYER_UPDATE_CAP)を入れたまま無料へ戻ると、予算不足で更新が大量に見送られる。
+  // それを「原因不明の不調」ではなく「契約が切れた」とはっきり示すための判定。
+  if (apiPlan && apiPlan.detectedDailyLimit) {
+    const caps = configuredCaps || {};
+    const configuredForPaid = (Number(caps.playerUpdateCap) || 0) > 10 || (Number(caps.extendedLeagueCap) || 0) > 2;
+    if (apiPlan.detectedDailyLimit <= 100 && configuredForPaid) {
+      push("apiPlan", "API-Footballの契約プラン", "error",
+        `現在は${apiPlan.planNameJa}(1日${apiPlan.detectedDailyLimit}件)ですが、有料プラン向けの設定(1日${caps.playerUpdateCap || "?"}選手・拡張リーグ${caps.extendedLeagueCap || "?"}件)が入ったままです。有料プランの期限が切れて無料プランへ戻った可能性が高いです。`,
+        "API-Footballは自動更新されません。ダッシュボードのProfile→My Accessで契約状況を確認し、必要なら再契約してください。再契約すれば設定はそのままで自動的に元に戻ります。");
+    } else {
+      push("apiPlan", "API-Footballの契約プラン", "ok",
+        `${apiPlan.planNameJa}(1日${apiPlan.detectedDailyLimit}件)として自動判定しています。${apiPlan.detectedRemaining != null ? `本日の残り: ${apiPlan.detectedRemaining}件。` : ""}`,
+        "API-Footballは自動更新されない仕様です。期限が切れると通知なく無料プラン(1日100件)へ戻るため、更新日をカレンダー等に控えておくことをおすすめします。");
+    }
+  } else {
+    push("apiPlan", "API-Footballの契約プラン", "unknown",
+      (apiPlan && apiPlan.noteJa) || "まだ契約プランを自動判定できていません。");
+  }
 
   push("llm", "LLM(AIの考察生成)",
     llmConfigured ? "ok" : "warn",

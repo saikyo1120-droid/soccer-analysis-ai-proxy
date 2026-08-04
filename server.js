@@ -237,6 +237,52 @@ function rateLimited(ip) {
   return fresh.length > limit;
 }
 
+// ---- 2026年8月・優先順位⑪: 契約プランの自動判定 ----
+// API-Footballの公式ドキュメント("HOW RATELIMIT WORKS")に記載されている
+// レスポンスヘッダーから、そのAPIキーの実際の1日あたり上限と残量を読み取る。
+//   x-ratelimit-requests-limit     … 契約プランの1日あたり上限(無料=100, Pro=7500 等)
+//   x-ratelimit-requests-remaining … 本日の残り
+// RapidAPI経由の場合はヘッダー名が異なる(x-ratelimit-requests-limit は同じだが
+// 提供されないことがある)ため、取れなかった場合は正直にnullのままにする。
+let lastRateLimit = { dailyLimit: null, remaining: null, observedAt: null };
+function recordRateLimitHeaders(res) {
+  try {
+    if (!res || !res.headers || typeof res.headers.get !== "function") return;
+    const limit = parseInt(res.headers.get("x-ratelimit-requests-limit"), 10);
+    const remaining = parseInt(res.headers.get("x-ratelimit-requests-remaining"), 10);
+    if (Number.isFinite(limit) && limit > 0) {
+      lastRateLimit = {
+        dailyLimit: limit,
+        remaining: Number.isFinite(remaining) ? remaining : null,
+        observedAt: new Date().toISOString(),
+      };
+    }
+  } catch (e) { /* ヘッダーが読めなくても本処理は続行する(ベストエフォート) */ }
+}
+// 上限値から契約プラン名を推定する。API-Footballの公開価格表の数値に対応させる。
+// 一致しない場合は推測でプラン名をでっち上げず、正直に「不明」と返す。
+function planNameFromDailyLimit(limit) {
+  if (!Number.isFinite(limit)) return null;
+  if (limit <= 100) return "Free(無料)";
+  if (limit <= 7500) return "Pro($19/月)";
+  if (limit <= 75000) return "Ultra($29/月)";
+  if (limit <= 150000) return "Mega($39/月)";
+  return "Custom(カスタム)";
+}
+function getApiPlanInfo() {
+  const detected = lastRateLimit.dailyLimit;
+  return {
+    detectedDailyLimit: detected,
+    detectedRemaining: lastRateLimit.remaining,
+    observedAt: lastRateLimit.observedAt,
+    planNameJa: detected ? planNameFromDailyLimit(detected) : null,
+    // 自動判定できていない場合に、なぜできていないのかを正直に伝える
+    noteJa: detected
+      ? "API-Footballのレスポンスヘッダーから実際の契約プランを自動判定しました。"
+      : "まだAPI-Footballを1度も呼べていないため、契約プランを自動判定できていません(APIキー未設定、またはサーバー起動直後の可能性があります)。",
+  };
+}
+
 async function callApiFootball(endpoint, params) {
   if (!API_KEY) {
     const err = new Error("API_FOOTBALL_KEY が設定されていません(.envを確認してください)");
@@ -253,6 +299,12 @@ async function callApiFootball(endpoint, params) {
     : { "x-apisports-key": API_KEY };
 
   const res = await fetchWithTimeout(url.toString(), { headers }, API_FOOTBALL_TIMEOUT_MS);
+  // 2026年8月・優先順位⑪: API-Footballは全レスポンスに、そのAPIキーの
+  // 「1日の上限」と「本日の残り」をヘッダーで返してくる。これを読んでおけば、
+  // 契約プラン(無料100/日・Pro7500/日など)をアプリ自身が自動判定できるため、
+  // 利用者がAPI_DAILY_BUDGETを手で設定する必要が無くなる(設定し忘れ・
+  // 設定間違いによる予算超過事故を根本的に防げる)。
+  recordRateLimitHeaders(res);
   if (!res.ok) {
     const err = new Error(`API-Football HTTP ${res.status}`);
     err.code = "HTTP_ERROR";
@@ -1275,6 +1327,10 @@ const learningDeps = {
   // LLMを使う。未設定(APIキー無し)の環境でも安全に動く(dailyJob.js側で
   // generateLLMが無い場合は正直にスキップし、llmSkippedReasonsに記録する)。
   generateLLM,
+  // 2026年8月・優先順位⑪: 契約プランの1日あたり上限を自動判定するための関数。
+  // これを渡しておくと、日次ジョブがAPI_DAILY_BUDGETの手動設定に頼らず、
+  // 実際の契約プランに合わせて自動的に予算を決められる。
+  getApiPlanInfo,
 };
 
 // ---- Stage E: Knowledge Engine / Memory Engine / Knowledge Graph への依存注入 ----
@@ -1669,6 +1725,13 @@ async function handleLearningHealth(searchParams) {
     apiKeyConfigured: !!API_KEY,
     llmConfigured: !!process.env.ANTHROPIC_API_KEY,
     engineTotals: growthLog.engineTotals,
+    // 優先順位⑪: 契約プランと、現在の設定値。有料プラン向けの設定のまま
+    // 無料プランへ戻ってしまった場合を検出するために両方を渡す。
+    apiPlan: getApiPlanInfo(),
+    configuredCaps: {
+      playerUpdateCap: Number(process.env.PLAYER_UPDATE_CAP) || null,
+      extendedLeagueCap: Number(process.env.EXTENDED_LEAGUE_CAP) || null,
+    },
   });
 
   const errorCount = engines.filter((e) => e.status === "error").length;
@@ -1686,6 +1749,9 @@ async function handleLearningHealth(searchParams) {
       ok: true, generatedAt, overall, overallMessageJa,
       zeroKnowledge, zeroVerification, engines, runHistory,
       apiBudget: growthLog.apiBudget || null,
+      // 2026年8月・優先順位⑪: 現在の契約プランの自動判定結果。
+      // 「Proに加入したはずだが本当に反映されているか」をこの画面だけで確認できる。
+      apiPlan: getApiPlanInfo(),
     },
   };
 }
@@ -2665,6 +2731,8 @@ module.exports = {
   getGrowthLog,
   handleDebugStatus,
   handleLearningHealth,
+  getApiPlanInfo,
+  recordRateLimitHeaders,
   handleTeamViewHistory,
   handleMatchAnalysis,
   learningDeps,

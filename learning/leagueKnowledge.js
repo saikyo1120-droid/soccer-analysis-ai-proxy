@@ -31,7 +31,10 @@ const { MANDATORY_LEAGUES, EXTENDED_LEAGUES, leagueEntityKey, resolveLeagueId } 
 // API-Football無料プラン(1日100リクエスト)を守るため、必須5リーグ(15リクエスト
 // /日)は毎日確実に取得しつつ、拡張リーグはローテーションで少しずつ確認する
 // (5リーグを2件/日なら3日弱で一巡する)。
-const EXTENDED_LEAGUE_CHECK_CAP = 2;
+// 2026年8月・優先順位⑪: 有料プランへ移行したときにコードを書き換えずに
+// 拡張リーグも毎日すべて取得できるよう、環境変数で上書きできるようにした
+// (EXTENDED_LEAGUE_CAP=5 にすれば、ご要望の10リーグすべてが毎日更新になる)。
+const EXTENDED_LEAGUE_CHECK_CAP = Number(process.env.EXTENDED_LEAGUE_CAP) || 2;
 
 function seasonForDate(runAt) {
   const m = runAt.getUTCMonth() + 1; // 欧州シーズンは7月開始想定(既存のguessSeasonと同じ考え方)
