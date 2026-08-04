@@ -344,13 +344,54 @@ function recordRateLimitHeaders(res) {
     const limit = parseInt(res.headers.get("x-ratelimit-requests-limit"), 10);
     const remaining = parseInt(res.headers.get("x-ratelimit-requests-remaining"), 10);
     if (Number.isFinite(limit) && limit > 0) {
+      const isNew = lastRateLimit.dailyLimit !== limit;
       lastRateLimit = {
         dailyLimit: limit,
         remaining: Number.isFinite(remaining) ? remaining : null,
         observedAt: new Date().toISOString(),
       };
+      // ---- 2026年8月・本番の健康診断出力から発見した重大な問題への対応 ----
+      //   契約プランの自動判定はプロセス内のメモリにしか無かった。
+      //   Renderの無料プランは15分アクセスが無いとスリープするため、
+      //   **起動のたびに「プランが分からない」状態に戻り、予算が既定の
+      //   1日100件で始まってしまう**。日次学習は
+      //   クラブ→監督/移籍→リーグ→選手 の順に処理するため、
+      //   100件(うち20件は利用者用に確保)ではクラブと監督/移籍で尽き、
+      //   **リーグと選手には一度も到達しない**。
+      //   実際、本番の記録は3日連続で「0リーグ・0選手」でした。
+      //   一度分かったプランはUpstashへ保存し、次の起動時に読み直す。
+      if (isNew && UPSTASH_ENABLED) {
+        upstashSetJSON("learn:apiplan", {
+          dailyLimit: limit, observedAt: lastRateLimit.observedAt,
+        }).catch(() => {});
+      }
     }
   } catch (e) { /* ヘッダーが読めなくても本処理は続行する(ベストエフォート) */ }
+}
+
+// 保存済みのプラン判定を読み戻す(プロセス起動時に1回だけ)。
+// これが無いと、スリープ復帰のたびに予算が100件から始まってしまう。
+let planRestorePromise = null;
+async function restoreDetectedPlan() {
+  if (!UPSTASH_ENABLED) return null;
+  if (lastRateLimit.dailyLimit) return lastRateLimit.dailyLimit;
+  if (!planRestorePromise) {
+    planRestorePromise = (async () => {
+      try {
+        const stored = await upstashGetJSON("learn:apiplan");
+        if (stored && Number.isFinite(stored.dailyLimit) && stored.dailyLimit > 0 && !lastRateLimit.dailyLimit) {
+          lastRateLimit = {
+            dailyLimit: stored.dailyLimit,
+            remaining: null, // 残量は今日の実測でしか分からないので復元しない
+            observedAt: stored.observedAt || null,
+            restoredFromStorage: true,
+          };
+        }
+        return lastRateLimit.dailyLimit;
+      } catch (e) { return null; }
+    })();
+  }
+  return planRestorePromise;
 }
 // 上限値から契約プラン名を推定する。API-Footballの公開価格表の数値に対応させる。
 // 一致しない場合は推測でプラン名をでっち上げず、正直に「不明」と返す。
@@ -370,8 +411,12 @@ function getApiPlanInfo() {
     observedAt: lastRateLimit.observedAt,
     planNameJa: detected ? planNameFromDailyLimit(detected) : null,
     // 自動判定できていない場合に、なぜできていないのかを正直に伝える
+    // 復元した値なのか、今のプロセスで実際に観測した値なのかを区別して伝える
+    restoredFromStorage: !!lastRateLimit.restoredFromStorage,
     noteJa: detected
-      ? "API-Footballのレスポンスヘッダーから実際の契約プランを自動判定しました。"
+      ? (lastRateLimit.restoredFromStorage
+        ? `以前の実行で判定した契約プラン(1日${detected}件)を保存先から読み戻しています。次にAPIを呼んだ時点で最新の値へ更新されます。`
+        : "API-Footballのレスポンスヘッダーから実際の契約プランを自動判定しました。")
       : "まだAPI-Footballを1度も呼べていないため、契約プランを自動判定できていません(APIキー未設定、またはサーバー起動直後の可能性があります)。",
   };
 }
@@ -464,6 +509,10 @@ async function getApiBudget() {
   globalApiBudget = null;
   globalApiBudgetDate = today;
   const creating = (async () => {
+    // 保存済みのプラン判定があれば先に読み戻す(スリープ復帰対策)。
+    // これをしないと、起動直後の予算が既定の100件になり、
+    // 日次学習がリーグ・選手まで到達できない。
+    await restoreDetectedPlan().catch(() => null);
     const detected = getApiPlanInfo();
     const manual = Number(process.env.API_DAILY_BUDGET) || null;
     // 実際の契約プランの上限を優先し、手動設定がそれを超える場合は安全側を採る
