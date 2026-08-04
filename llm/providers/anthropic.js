@@ -27,13 +27,36 @@ const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5";
 const ANTHROPIC_API_BASE = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION = "2023-06-01";
 
+// 2026年8月・本番調査で発見された不具合の修正: fetch()にタイムアウトが無いと、
+// Anthropic APIの応答が万一止まった場合に日次学習ジョブ全体がフリーズしてしまう
+// (server.jsのfetchWithTimeoutと同じ理由・同じ対策)。LLM生成は他の外部API呼び出し
+// より時間がかかることがあるため、少し長めの30秒を上限とする(環境変数で上書き可能。
+// 自動テストでは短い値に設定して実際に何秒も待たずに動作検証する)。
+const ANTHROPIC_TIMEOUT_MS = parseInt(process.env.ANTHROPIC_TIMEOUT_MS, 10) || 30000;
+async function fetchWithTimeout(url, options = {}, timeoutMs = ANTHROPIC_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (e) {
+    if (e && e.name === "AbortError") {
+      const err = new Error(`Anthropic APIへのリクエストがタイムアウトしました(${timeoutMs}ms)`);
+      err.code = "TIMEOUT";
+      throw err;
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function generate({ systemPrompt, userPrompt, maxTokens }) {
   if (!ANTHROPIC_API_KEY) {
     const err = new Error("ANTHROPIC_API_KEY が設定されていません(.envを確認してください)");
     err.code = "NO_KEY";
     throw err;
   }
-  const res = await fetch(ANTHROPIC_API_BASE, {
+  const res = await fetchWithTimeout(ANTHROPIC_API_BASE, {
     method: "POST",
     headers: {
       "x-api-key": ANTHROPIC_API_KEY,

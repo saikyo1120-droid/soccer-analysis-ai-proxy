@@ -145,6 +145,36 @@ function cacheSet(key, data, ttlMs) {
   cache.set(key, { data, expires: Date.now() + ttlMs });
 }
 
+// 2026年8月・本番調査で発見された不具合の修正(GitHub Actionsの手動実行が
+// exit code 28(curlのタイムアウト)で7分前後失敗し続けた件): これまで
+// fetch()の呼び出しには一切タイムアウトを設定していなかったため、外部API
+// (サッカーデータAPI・Upstash・LLM)のどれか1つでも応答が返ってこない状態に
+// 陥ると、そのリクエストは永遠に(Node/Renderがプロセスを強制終了するまで)
+// 待ち続けてしまい、日次学習ジョブ全体がフリーズしてしまう構造的な弱点が
+// あった。resolveTeamIdの再試行ロジック自体は正しく動作していても、個々の
+// fetch呼び出しに時間の上限が無ければ「一時的な障害」を検知すること自体が
+// できない。すべてのfetch呼び出しに明示的なタイムアウトを設け、外部APIが
+// 応答しない場合は決められた時間で確実にエラーとして扱われるようにする
+// (エラーになれば、既存の再試行・キャッシュしない、というロジックが正しく
+// 機能する)。テスト・デバッグ用に環境変数で上限時間を上書きできるようにしておく
+// (自動テストでは短い値に設定し、実際に何秒も待たずにタイムアウト動作を検証する)。
+const API_FOOTBALL_TIMEOUT_MS = parseInt(process.env.API_FOOTBALL_TIMEOUT_MS, 10) || 20000;
+const UPSTASH_TIMEOUT_MS = parseInt(process.env.UPSTASH_TIMEOUT_MS, 10) || 15000;
+function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal })
+    .catch((e) => {
+      if (e && e.name === "AbortError") {
+        const err = new Error(`リクエストがタイムアウトしました(${timeoutMs}ms): ${typeof url === "string" ? url : url.toString()}`);
+        err.code = "TIMEOUT";
+        throw err;
+      }
+      throw e;
+    })
+    .finally(() => clearTimeout(timer));
+}
+
 // ---- Upstash Redis REST APIへの薄いラッパー ----
 // Upstashは「1コマンド1リクエスト」のシンプルなREST APIを提供している。ここでは
 // 汎用の「コマンド配列をそのままPOSTする」形式(例: ["SET","key","value"])を使う。
@@ -158,11 +188,11 @@ async function upstashCmd(commandArray) {
     err.code = "NO_UPSTASH";
     throw err;
   }
-  const res = await fetch(UPSTASH_URL, {
+  const res = await fetchWithTimeout(UPSTASH_URL, {
     method: "POST",
     headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
     body: JSON.stringify(commandArray),
-  });
+  }, UPSTASH_TIMEOUT_MS);
   const json = await res.json();
   if (json && json.error) {
     const err = new Error("Upstash error: " + json.error);
@@ -216,7 +246,7 @@ async function callApiFootball(endpoint, params) {
     ? { "X-RapidAPI-Key": API_KEY, "X-RapidAPI-Host": API_HOST }
     : { "x-apisports-key": API_KEY };
 
-  const res = await fetch(url.toString(), { headers });
+  const res = await fetchWithTimeout(url.toString(), { headers }, API_FOOTBALL_TIMEOUT_MS);
   if (!res.ok) {
     const err = new Error(`API-Football HTTP ${res.status}`);
     err.code = "HTTP_ERROR";
