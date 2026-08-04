@@ -206,6 +206,14 @@
   .live-stat-item .lbl { font-size: 11px; color: var(--text-muted); }
   .real-fixture-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
   .real-fixture-row:last-child { border-bottom: none; }
+  /* 2026年8月・優先順位⑩: 試合カードをAIマッチ分析と同じカードUIへ統一する。
+     分析を開いている間だけ枠線と背景を強調し、「今どの試合を見ているか」を
+     一目で分かるようにする(閉じている間は従来どおりの一覧の見た目を保つ)。 */
+  .fixture-card { border-radius: 10px; transition: background .15s ease, box-shadow .15s ease; }
+  .fixture-card.is-expanded { background: var(--surface, rgba(0,0,0,.02)); box-shadow: 0 0 0 1px var(--border) inset; padding: 4px 10px 10px; margin: 6px -10px; }
+  .fixture-card.is-expanded > .real-fixture-row { border-bottom: 1px solid var(--border); }
+  .fixture-analysis-slot { padding-top: 8px; }
+  .fixture-analysis-slot .card { margin-bottom: 10px; }
   .form-row { display: flex; gap: 10px; margin-bottom: 6px; }
   .form-chip { flex: 1; text-align: center; border: 1px solid var(--border); border-radius: 10px; padding: 8px 4px; }
   .form-chip .letter { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border-radius: 50%; font-size: 12px; font-weight: 700; color: #fff; margin-bottom: 4px; }
@@ -4355,12 +4363,15 @@ function fixtureRowHtml(f) {
   const badgeClass = group === "live" ? "is-live" : group === "finished" ? "is-finished" : group === "upcoming" ? "is-upcoming" : "is-other";
   const badge = `<span class="status-badge ${badgeClass}">${group === "live" ? '<span class="live-dot"></span>' : ""}${fixtureStatusLabel(f.status, group)}</span>`;
   return `
-    <div class="real-fixture-row${group === "live" ? " is-live" : ""}" data-fixture-card="${f.id}">
-      <div>
-        <div class="teams">⚽ ${f.home.name} ${scoreStr} ${f.away.name}</div>
-        <div class="sub">${badge} ${timeStr}${f.venue ? " ・ " + f.venue : ""}</div>
+    <div class="fixture-card" data-fixture-card="${f.id}">
+      <div class="real-fixture-row${group === "live" ? " is-live" : ""}">
+        <div>
+          <div class="teams">⚽ ${f.home.name} ${scoreStr} ${f.away.name}</div>
+          <div class="sub">${badge} ${timeStr}${f.venue ? " ・ " + f.venue : ""}</div>
+        </div>
+        <button class="match-analyze-btn real-fixture-analyze-btn" data-fixture-id="${f.id}">${group === "finished" ? "答え合わせを見る ▶" : "AI分析を見る ▶"}</button>
       </div>
-      <button class="match-analyze-btn real-fixture-analyze-btn" data-fixture-id="${f.id}">${group === "finished" ? "答え合わせを見る ▶" : "AI分析を見る ▶"}</button>
+      <div class="fixture-analysis-slot" id="fixtureAnalysis-${f.id}" style="display:none;"></div>
     </div>`;
 }
 // リーグ別にグループ化した上で、行の並び順（h4見出しは付けず、リーグヘッダーの
@@ -4524,7 +4535,9 @@ function renderFixturesListInto(listEl, fixtures, emptyMessageHtml) {
   listEl.innerHTML = sections.join("") + finishedHtml;
 
   listEl.querySelectorAll(".real-fixture-analyze-btn").forEach(btn => {
-    btn.addEventListener("click", () => renderRealFixtureAnalysis(btn.dataset.fixtureId));
+    // 2026年8月・優先順位⑩: 分析結果を画面下部の別領域ではなく、
+    // その試合カードの中に展開する(AIマッチ分析と同じカードUIに統一)。
+    btn.addEventListener("click", () => renderFixtureAnalysisInline(btn));
   });
   const finishedBtn = document.getElementById("fixturesFinishedToggleBtn");
   const finishedWrap = document.getElementById("fixturesFinishedWrap");
@@ -4983,6 +4996,51 @@ function buildFinishedAnalysisHtml(analysis, level) {
     </div>`;
 }
 let lastRealFixtureAnalysis = null; // re-rendered at the new detail level when the 超入門/標準/戦術 switch changes
+// 2026年8月・優先順位⑩「今日の試合カードはAIマッチ分析と同じ見やすいカードUIに
+// 統一してください」への対応。試合カードの中で開閉し、開いている間だけ分析を表示する。
+// キャッシュ(fetchRealFixtureAnalysis内)により、2回目以降の開閉は通信ゼロで即座に切り替わる。
+async function renderFixtureAnalysisInline(btn) {
+  const fixtureId = btn && btn.dataset ? btn.dataset.fixtureId : null;
+  if (!fixtureId) return;
+  const slot = document.getElementById(`fixtureAnalysis-${fixtureId}`);
+  if (!slot) { renderRealFixtureAnalysis(fixtureId); return; } // 従来の下部表示へフォールバック
+
+  const isOpen = slot.style.display !== "none";
+  const baseLabel = btn.dataset.baseLabel || btn.textContent;
+  if (!btn.dataset.baseLabel) btn.dataset.baseLabel = baseLabel;
+
+  const cardEl = slot.closest(".fixture-card");
+  if (isOpen) { // 開いていれば閉じる(通信は発生しない)
+    slot.style.display = "none";
+    btn.textContent = btn.dataset.baseLabel;
+    if (cardEl) cardEl.classList.remove("is-expanded");
+    return;
+  }
+
+  slot.style.display = "block";
+  btn.textContent = "▲ 閉じる";
+  if (cardEl) cardEl.classList.add("is-expanded");
+  if (slot.dataset.loaded === "1") return; // 既に読み込み済みなら再取得しない
+
+  slot.innerHTML = `<p class="value-note" style="margin:8px 0;">🔄 実データを取得中です…(サーバーが休止していた場合、初回は最大1分ほどかかることがあります)</p>`;
+  const analysis = await fetchRealFixtureAnalysis(fixtureId);
+  if (!analysis) {
+    // でっち上げず、正直に取得できなかったことを伝える(既存方針を踏襲)
+    slot.innerHTML = `<p class="value-note" style="margin:8px 0;">この試合の詳細データを取得できませんでした。時間をおいて再度お試しください。</p>`;
+    return;
+  }
+  const bodyHtml = analysis.phase === "finished" ? buildFinishedAnalysisHtml(analysis, state.level)
+    : analysis.phase === "live" ? buildLiveAnalysisHtml(analysis, state.level)
+    : buildUpcomingPreviewHtml(analysis, state.level);
+  // ご指示どおり「AIが今回最も重要だと判断した要因」を、結論より先に表示する。
+  slot.innerHTML = buildMostImportantFactorBanner(analysis) + bodyHtml;
+  slot.dataset.loaded = "1";
+  lastRealFixtureAnalysis = analysis;
+  if (analysis.fixture && analysis.fixture.home && analysis.fixture.away) {
+    trackRecentMatch("real:" + fixtureId, `${analysis.fixture.home.name} vs ${analysis.fixture.away.name}`);
+  }
+}
+
 async function renderRealFixtureAnalysis(fixtureId) {
   const wrapEl = document.getElementById("realFixtureAnalysisWrap");
   if (!wrapEl) return;
