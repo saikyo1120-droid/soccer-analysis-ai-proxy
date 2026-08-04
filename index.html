@@ -5781,6 +5781,12 @@ async function renderGrowthLogWidget() {
   const errorWarningHtml = todayErrors.length
     ? `<div class="value-note" style="margin-top:2px; color:#c0392b;">⚠️ 本日のデータ取得で${todayErrors.length}件のエラーが発生しました(詳細は「詳しく見る」)。件数が少ないのはこのエラーが原因の可能性があります。</div>`
     : "";
+  // 2026年8月・バグ修正: Renderのスリープ起床待ち等で同じ日に学習エンジンが
+  // 複数回実行されることがある(サーバー側では合算表示するよう修正済みだが、
+  // 「なぜ2回実行されたか」自体は正直に開示しておく)。
+  const runsTodayHtml = (log.runsToday && log.runsToday > 1)
+    ? `<div class="value-note" style="margin-top:2px;">ℹ️ 本日は学習エンジンが${log.runsToday}回実行されました(件数は合算して表示しています)。</div>`
+    : "";
 
   summaryEl.innerHTML = `
     🧠 <strong>昨日学んだこと</strong>
@@ -5788,6 +5794,7 @@ async function renderGrowthLogWidget() {
     <button class="more-details-btn" id="growthLogToggleBtn" type="button" style="margin-left:8px; display:inline-block; width:auto; padding:4px 10px;">詳しく見る ▼</button>
     <div class="value-note" style="margin-top:4px;">今日追加した知識: ${knowledgeSaved}件(重複でスキップ: ${knowledgeDup}件) ・ 検証した試合: ${log.matchesResolvedToday}件</div>
     ${errorWarningHtml}
+    ${runsTodayHtml}
   `;
 
   const toggleBtn = document.getElementById("growthLogToggleBtn");

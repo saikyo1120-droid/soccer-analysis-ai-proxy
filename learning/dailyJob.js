@@ -182,6 +182,58 @@ function buildReflectionText(record, weightsUsed, failureReasons) {
   return { why, improvement };
 }
 
+// 2026年8月・本番で実際に発生したバグの修正(「今日追加した知識0件」の根本原因):
+// Renderの無料プランはアクセスが無いとスリープし、起床に時間がかかる。
+// GitHub Actions側のワークフロー(.github/workflows/daily-learning.yml)は
+// 最初のリクエストがタイムアウトすると60秒待って自動的にもう一度呼び出す設計に
+// なっており、かつ1回目のリクエストがクライアント側(GitHub Actions)ではタイム
+// アウトしていても、Render側では処理が実際に最後まで完了していることがある。
+// この場合、同じ日に学習エンジンが実質2回実行されることになる。
+// 従来はrun-dailyを実行するたびにgrowthLog(learn:growthlog:*)をまるごと
+// 上書きしていたため、1回目の実行で実際に新しい知識が保存されていても、
+// 2回目の実行(内容は同じなので大半が「重複」と正しく判定される)の結果で
+// 上書きされ、「今日追加した知識0件」という誤解を招く表示になっていた
+// (Knowledge Engine自体の重複排除ロジックは正しく機能しており、データが
+// 壊れていたわけではない。「その日の実行の合計」ではなく「直近1回の実行結果」
+// を見せていた集計・表示側の設計ミス)。
+// 同じ日付の既存ログがあれば、件数を合算し、一覧は内容(statement)で重複排除
+// して連結し、モデルの状態を表す値(的中率・重み更新の有無等)だけは最新の
+// 実行の値を使う。
+function mergeGrowthLogs(previous, current) {
+  if (!previous || previous.date !== current.date) return { ...current, runsToday: 1, firstRanAt: current.ranAt };
+  const dedupeByStatement = (a, b) => {
+    const seen = new Set((a || []).map((f) => f && f.statement));
+    return [...(a || []), ...(b || []).filter((f) => !(f && seen.has(f.statement)))];
+  };
+  const mergedFacts = dedupeByStatement(previous.facts, current.facts);
+  const mergedOtherFacts = dedupeByStatement(previous.otherFactsToday, current.otherFactsToday);
+  const sum = (a, b) => (a || 0) + (b || 0);
+  return {
+    ...current, // 的中率・重み更新有無などの「状態」は最新の実行の値をそのまま使う
+    ranAt: current.ranAt,
+    firstRanAt: previous.firstRanAt || previous.ranAt,
+    runsToday: (previous.runsToday || 1) + 1,
+    facts: mergedFacts,
+    factsAddedToday: mergedFacts.length,
+    otherFactsToday: mergedOtherFacts,
+    coachChangesDetectedToday: sum(previous.coachChangesDetectedToday, current.coachChangesDetectedToday),
+    transferFactsAddedToday: sum(previous.transferFactsAddedToday, current.transferFactsAddedToday),
+    knowledgeItemsSavedToday: sum(previous.knowledgeItemsSavedToday, current.knowledgeItemsSavedToday),
+    knowledgeItemsDuplicateToday: sum(previous.knowledgeItemsDuplicateToday, current.knowledgeItemsDuplicateToday),
+    matchesResolvedToday: sum(previous.matchesResolvedToday, current.matchesResolvedToday),
+    newPredictionsLogged: sum(previous.newPredictionsLogged, current.newPredictionsLogged),
+    hypothesesConfirmed: sum(previous.hypothesesConfirmed, current.hypothesesConfirmed),
+    hypothesesDiscarded: sum(previous.hypothesesDiscarded, current.hypothesesDiscarded),
+    reflectionsSaved: sum(previous.reflectionsSaved, current.reflectionsSaved),
+    profilesGenerated: sum(previous.profilesGenerated, current.profilesGenerated),
+    aiViewsChanged: sum(previous.aiViewsChanged, current.aiViewsChanged),
+    aiViewsUnchanged: sum(previous.aiViewsUnchanged, current.aiViewsUnchanged),
+    failureReasonsToday: [...(previous.failureReasonsToday || []), ...(current.failureReasonsToday || [])],
+    llmSkippedReasons: Array.from(new Set([...(previous.llmSkippedReasons || []), ...(current.llmSkippedReasons || [])])),
+    errors: [...(previous.errors || []), ...(current.errors || [])],
+  };
+}
+
 async function runDailyLearning(deps) {
   const {
     callApiFootball, resolveTeamId,
@@ -797,10 +849,17 @@ async function runDailyLearning(deps) {
     knowledgeNewToday, knowledgeUpdatedToday, knowledgeStaleTotal, // 「昨日より知識が増えている」ことの可視化用
     errors,
   };
-  await upstashSetJSON(`learn:growthlog:${dateKey}`, growthLog);
-  await upstashSetJSON("learn:growthlog:latest", growthLog);
 
-  return { ok: true, ...growthLog };
+  // 同じ日付の既存ログがあれば合算する(上のmergeGrowthLogsのコメント参照)。
+  // これにより、Renderのスリープ起床待ち等で同じ日に複数回実行されても、
+  // 「今日追加した知識」が最後の実行結果だけで上書きされて0件に見えてしまう
+  // ことを防ぐ。
+  const existingToday = await upstashGetJSON(`learn:growthlog:${dateKey}`).catch(() => null);
+  const mergedGrowthLog = mergeGrowthLogs(existingToday, growthLog);
+  await upstashSetJSON(`learn:growthlog:${dateKey}`, mergedGrowthLog);
+  await upstashSetJSON("learn:growthlog:latest", mergedGrowthLog);
+
+  return { ok: true, ...mergedGrowthLog };
 }
 
 // 「昨日の学習」ウィジェット用に、実際に採用された重み変更の履歴を人が読める
@@ -881,6 +940,6 @@ module.exports = {
   runDailyLearning, getGrowthLog, getRecentFactsForTeam,
   computeFormScore, predictOutcome, backtestAccuracy, outcomeFromScore,
   DEFAULT_WEIGHTS, REGISTERED_TEAMS,
-  buildReflectionText,
+  buildReflectionText, mergeGrowthLogs,
   MIN_RESOLVED_FOR_RECALIBRATION, OWN_PRED_RECENT_KEEP,
 };

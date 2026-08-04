@@ -126,11 +126,19 @@ function resolveStaticRoot() {
 const STATIC_ROOT = resolveStaticRoot();
 
 // ---- ごく簡易なインメモリキャッシュ(TTL付き) ----
+// 2026年8月・本番で実際に発見されたバグの修正: 以前はキャッシュに「無い」場合も
+// cacheGetがnullを返していたため、resolveTeamId/resolvePlayerIdが「本当に
+// 見つからなかった」結果をcacheSet(key, null, ...)で意図的にキャッシュしても、
+// 呼び出し側の`if (cached !== null) return cached;`という判定では「キャッシュに
+// 無い(=null)」のか「キャッシュされた正しい結果がnullだった」のかを区別できず、
+// 負のキャッシュが実質的に一度も機能していなかった(常にAPIへ再フェッチしていた)。
+// 「エントリが無い」場合はundefinedを返すよう変更し、呼び出し側は`!== undefined`
+// で判定することで、null自体を正しくキャッシュできるようにする。
 const cache = new Map();
 function cacheGet(key) {
   const hit = cache.get(key);
-  if (!hit) return null;
-  if (Date.now() > hit.expires) { cache.delete(key); return null; }
+  if (!hit) return undefined;
+  if (Date.now() > hit.expires) { cache.delete(key); return undefined; }
   return hit.data;
 }
 function cacheSet(key, data, ttlMs) {
@@ -263,42 +271,79 @@ function searchTermVariants(name) {
 // on ANY club worldwide without having to pre-register that club's league ID
 // in SEARCH_LEAGUES — we just ask API-Football "which team is this" directly.
 // Cached for 30 days since a team's ID never changes.
+// 2026年8月・本番で実際に発生したバグの修正(team_not_found:Al-Nassr):
+// 従来はAPI-Football呼び出しが「本当に該当チームが無かった(空の検索結果)」
+// のか「一時的なネットワーク障害・API側のタイムアウトなどで例外が発生した」
+// のかを区別せず、どちらもtry/catchでまとめてnullにして24時間キャッシュして
+// いた。後者(一時的な障害)まで24時間「見つからなかった」ことにしてしまうと、
+// 次にそのクラブを扱おうとする処理(毎日学習エンジン・議論エンジン等)が
+// 丸1日ずっと失敗し続けることになる。この関数はその2つを明確に区別し、
+// 「本当に見つからなかった場合」だけを(それでも24時間ではなく、日をまたげば
+// 確実に再挑戦されるよう短めの)キャッシュ対象にし、「一時的な障害」の場合は
+// 1回だけ短い間隔を空けて自動再試行したうえで、それでも失敗すればキャッシュ
+// せずにnullを返す(次の呼び出しで再挑戦できるようにする)。
+const TEAM_NOT_FOUND_CACHE_MS = 3 * 60 * 60 * 1000; // 3時間(以前は24時間固定だった)
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+async function searchTeamsWithRetry(name, attempts = 2, delayMs = 400) {
+  let lastError = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const data = await callApiFootball("/teams", { search: name });
+      return { list: data.response || [], error: null };
+    } catch (e) {
+      lastError = e;
+      if (i < attempts - 1) await sleep(delayMs);
+    }
+  }
+  return { list: [], error: lastError };
+}
+
 async function resolveTeamId(teamNameEnglish) {
   const name = (teamNameEnglish || "").trim();
   if (!name) return null;
   const cacheKey = `team-id:${name.toLowerCase()}`;
   const cached = cacheGet(cacheKey);
-  if (cached !== null) return cached;
-  try {
-    let data = await callApiFootball("/teams", { search: name });
-    let list = data.response || [];
-    // 実際に確認された不具合(team_not_found:Al-Nassr): API-Football側の表記が
-    // ハイフンの有無で揺れている場合、検索文字列をそのまま渡すとヒットしない
-    // ことがある。ハイフンを空白に置き換えた表記・完全に取り除いた表記でも
-    // 追加で試す(既存の成功しているクラブの挙動には影響しない=最初の検索で
-    // ヒットすればそのまま使うだけ)。
-    if (!list.length && name.includes("-")) {
-      const variants = [name.replace(/-/g, " "), name.replace(/-/g, "")];
-      for (const variant of variants) {
-        const retryData = await callApiFootball("/teams", { search: variant });
-        list = retryData.response || [];
-        if (list.length) break;
-      }
+  if (cached !== undefined) return cached;
+
+  let list = [];
+  let hadTransientError = false;
+
+  const first = await searchTeamsWithRetry(name);
+  list = first.list;
+  if (!list.length && first.error) hadTransientError = true;
+
+  // 実際に確認された不具合(team_not_found:Al-Nassr): API-Football側の表記が
+  // ハイフンの有無で揺れている場合、検索文字列をそのまま渡すとヒットしない
+  // ことがある。ハイフンを空白に置き換えた表記・完全に取り除いた表記でも
+  // 追加で試す(既存の成功しているクラブの挙動には影響しない=最初の検索で
+  // ヒットすればそのまま使うだけ)。
+  if (!list.length && name.includes("-")) {
+    const variants = [name.replace(/-/g, " "), name.replace(/-/g, "")];
+    for (const variant of variants) {
+      const retry = await searchTeamsWithRetry(variant);
+      list = retry.list;
+      if (list.length) { hadTransientError = false; break; }
+      if (retry.error) hadTransientError = true;
     }
-    if (!list.length) { cacheSet(cacheKey, null, 24 * 60 * 60 * 1000); return null; }
-    const exact = list.find((r) => (r.team && r.team.name || "").toLowerCase() === name.toLowerCase());
-    const id = (exact || list[0]).team.id;
-    cacheSet(cacheKey, id, 30 * 24 * 60 * 60 * 1000);
-    return id;
-  } catch (e) {
+  }
+
+  if (!list.length) {
+    // 一時的な障害(例外)が原因で空だった場合は、キャッシュに残さず次回また
+    // 挑戦できるようにする(=でっち上げの「見つからなかった」を記録しない)。
+    if (!hadTransientError) cacheSet(cacheKey, null, TEAM_NOT_FOUND_CACHE_MS);
     return null;
   }
+  const exact = list.find((r) => (r.team && r.team.name || "").toLowerCase() === name.toLowerCase());
+  const id = (exact || list[0]).team.id;
+  cacheSet(cacheKey, id, 30 * 24 * 60 * 60 * 1000);
+  return id;
 }
 
 async function resolvePlayerId(name, teamHint, season, birthHint, teamEnglishHint) {
   const cacheKey = `resolve:${name}|${teamHint}|${season}|${birthHint || ""}|${teamEnglishHint || ""}`;
   const cached = cacheGet(cacheKey);
-  if (cached !== null) return cached;
+  if (cached !== undefined) return cached;
 
   let results = [];
 
