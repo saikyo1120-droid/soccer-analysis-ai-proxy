@@ -778,15 +778,33 @@ async function runDailyLearning(deps) {
         fetchStandingsFeature(leagueId, season, awayTeamId, callApiFootball),
         fetchHeadToHeadFeature(homeTeamId, awayTeamId, callApiFootball),
       ]);
+      // ---- 2026年8月・優先順位②: Proプラン移行に伴う特徴量の拡張 ----
+      // 追加のAPI呼び出しを一切増やさずに使える情報を、まず確実に取り込む。
+      //   ・ホーム/アウェイ別の成績 … 既に取得済みのfixtures(直近10試合)から算出
+      //   ・出場停止者数           … 既に取得済みの/injuriesのレスポンスから算出
+      //     (computeInjuryCountFeatureは以前からsuspendedPlayersを分離していたが、
+      //      予測モデルには渡されておらず、負傷者と一緒くたにされていた)
+      const homeSplit = computeHomeAwaySplit(homeForm.fixtures || [], homeTeamId);
+      const awaySplit = computeHomeAwaySplit(awayForm.fixtures || [], awayTeamId);
       const homeCtx = {
         formScore: homeFormScore, avgGoalsFor: homeForm.avgGoalsFor, avgGoalsAgainst: homeForm.avgGoalsAgainst,
         injuryCount: homeInjuries.injuryCount, pointsPerGame: homeStandings.played ? (homeStandings.points / homeStandings.played) : null,
         matchesLast7Days: homeForm.matchesLast7Days,
+        // ホームチームは「ホームでの勝率」で評価する(会場を区別しないformScoreとは別の情報)
+        homeVenueWinRate: homeSplit.home.winRate,
+        suspensionCount: (homeInjuries.suspendedPlayers || []).length,
+        xgNet: homeForm.xgNet ?? null,
+        topScorerGoals: homeForm.topScorerGoals ?? null,
       };
       const awayCtx = {
         formScore: awayFormScore, avgGoalsFor: awayForm.avgGoalsFor, avgGoalsAgainst: awayForm.avgGoalsAgainst,
         injuryCount: awayInjuries.injuryCount, pointsPerGame: awayStandings.played ? (awayStandings.points / awayStandings.played) : null,
         matchesLast7Days: awayForm.matchesLast7Days,
+        // アウェイチームは「アウェイでの勝率」で評価する
+        awayVenueWinRate: awaySplit.away.winRate,
+        suspensionCount: (awayInjuries.suspendedPlayers || []).length,
+        xgNet: awayForm.xgNet ?? null,
+        topScorerGoals: awayForm.topScorerGoals ?? null,
       };
       const features = computeMatchFeatures(homeCtx, awayCtx, h2h);
 

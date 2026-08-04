@@ -87,7 +87,13 @@ function computeInjuryCountFeature(injuriesResponse) {
     const name = r && r.player && r.player.name;
     if (!name || seen.has(name)) continue;
     const reason = (r.player && r.player.reason) || null;
-    const isSuspension = !!(reason && /suspend/i.test(reason));
+    // 2026年8月・優先順位②の実装中に発見した既存バグの修正:
+    // 従来は /suspend/i だったが、これは "Suspended" にはマッチする一方で
+    // "Suspension"(API-Footballが返す代表的な表記。例: "Red Card Suspension")
+    // には**マッチしない**(suspend の d と suspension の s が違うため)。
+    // その結果、出場停止の選手が「負傷者」として数えられていた。
+    // 出場停止は「確実に出られない」ため負傷とは意味が違い、予測にも影響する。
+    const isSuspension = !!(reason && /suspen(d|s)/i.test(reason));
     seen.set(name, { name, reason, type: isSuspension ? "suspension" : "injury" });
   }
   const players = [...seen.values()];

@@ -30,6 +30,13 @@ const EXTENDED_DEFAULT_WEIGHTS = {
   standingsSensitivity: 0, // 順位・勝点の差
   headToHeadSensitivity: 0, // 直接対戦成績の差
   fatigueSensitivity: 0, // 過密日程(疲労)の差
+  // ---- 2026年8月・優先順位②(Proプラン移行に伴う特徴量の拡張) ----
+  // 既存の重みと同じく、既定値は全て0。つまり追加した瞬間は予測結果が
+  // 一切変わらず(＝既存の挙動を壊さず)、実データで学習して初めて効き始める。
+  venueSensitivity: 0, // ホームでのホーム成績 と アウェイでのアウェイ成績 の差
+  suspensionSensitivity: 0, // 出場停止者数の差(怪我とは分けて評価する)
+  xgSensitivity: 0, // xG(期待得点)- xGA(期待失点)の差
+  topScorerSensitivity: 0, // 各チームの得点ランキング上位選手の得点数の差
   version: 0,
   updatedAt: null,
 };
@@ -41,6 +48,10 @@ const FEATURE_WEIGHT_MAP = {
   standingsDiff: "standingsSensitivity",
   headToHeadDiff: "headToHeadSensitivity",
   fatigueDiff: "fatigueSensitivity",
+  venueDiff: "venueSensitivity",
+  suspensionDiff: "suspensionSensitivity",
+  xgDiff: "xgSensitivity",
+  topScorerDiff: "topScorerSensitivity",
 };
 
 const FEATURE_LABELS_JA = {
@@ -50,6 +61,10 @@ const FEATURE_LABELS_JA = {
   standingsDiff: "順位・勝点",
   headToHeadDiff: "過去対戦成績",
   fatigueDiff: "過密日程(疲労)",
+  venueDiff: "ホーム/アウェイ別の成績",
+  suspensionDiff: "出場停止",
+  xgDiff: "xG(期待得点)の質",
+  topScorerDiff: "エースの得点力",
 };
 
 /**
@@ -68,6 +83,30 @@ function computeMatchFeatures(homeCtx, awayCtx, h2h) {
     standingsDiff: (homeCtx.pointsPerGame ?? 0) - (awayCtx.pointsPerGame ?? 0),
     headToHeadDiff: h2h ? (h2h.homeSideWins ?? 0) - (h2h.awaySideWins ?? 0) : 0,
     fatigueDiff: (awayCtx.matchesLast7Days ?? 0) - (homeCtx.matchesLast7Days ?? 0),
+    // ---- 2026年8月・優先順位②で追加した特徴量 ----
+    // どれも「値が取れなければ0(＝予測に影響しない)」とする。存在しない
+    // データを推測で埋めない(このプロジェクトの一貫した方針)。
+    //
+    // venueDiff: 「ホームチームがホームでどれだけ勝てているか」と
+    //   「アウェイチームがアウェイでどれだけ勝てているか」の差。
+    //   既存のformDiffは会場を区別しない全体の調子なので、別の情報になる。
+    venueDiff: (homeCtx.homeVenueWinRate ?? null) !== null && (awayCtx.awayVenueWinRate ?? null) !== null
+      ? (homeCtx.homeVenueWinRate - awayCtx.awayVenueWinRate)
+      : 0,
+    // suspensionDiff: 出場停止は「確実に出られない」ため、出場が不確実な
+    //   負傷者(injuryDiff)とは分けて学習させる。符号は相手 - 自分。
+    suspensionDiff: (awayCtx.suspensionCount ?? 0) - (homeCtx.suspensionCount ?? 0),
+    // xgDiff: xG(期待得点) - xGA(期待失点) の差。実際の得点(goalRateDiff)は
+    //   運に左右されるが、xGは「チャンスの質」を表すため、実力の指標として
+    //   より安定するとされる。取得できないリーグでは0のままになる。
+    xgDiff: (homeCtx.xgNet ?? null) !== null && (awayCtx.xgNet ?? null) !== null
+      ? (homeCtx.xgNet - awayCtx.xgNet)
+      : 0,
+    // topScorerDiff: 各チームのリーグ得点ランキング上位選手の得点数の差。
+    //   「エースがいるか」を数値化する(架空のキーマン診断はしない)。
+    topScorerDiff: (homeCtx.topScorerGoals ?? null) !== null && (awayCtx.topScorerGoals ?? null) !== null
+      ? (homeCtx.topScorerGoals - awayCtx.topScorerGoals)
+      : 0,
   };
 }
 
@@ -331,6 +370,14 @@ const FAILURE_REASON_LABELS_JA = {
   headToHeadDiff_underweighted: "過去対戦を軽視した",
   fatigueDiff_overweighted: "過密日程を重視しすぎた",
   fatigueDiff_underweighted: "過密日程を軽視した",
+  venueDiff_overweighted: "ホーム/アウェイ別の成績を重視しすぎた",
+  venueDiff_underweighted: "ホーム/アウェイ別の成績を軽視した",
+  suspensionDiff_overweighted: "出場停止者を重視しすぎた",
+  suspensionDiff_underweighted: "出場停止者を軽視した",
+  xgDiff_overweighted: "xG(期待得点)を重視しすぎた",
+  xgDiff_underweighted: "xG(期待得点)との差を見逃した",
+  topScorerDiff_overweighted: "エースの得点力を重視しすぎた",
+  topScorerDiff_underweighted: "エースの得点力を軽視した",
   unmodeled_factors: "セットプレー・スタメン発表・審判の判定など、現在のモデルが数値化していない要因の影響",
 };
 
@@ -413,6 +460,10 @@ const SUCCESS_REASON_LABELS_JA = {
   standingsDiff_worked: "順位・勝点の差を正しく評価できた",
   headToHeadDiff_worked: "過去対戦の傾向を正しく評価できた",
   fatigueDiff_worked: "過密日程(疲労)の影響を正しく評価できた",
+  venueDiff_worked: "ホーム/アウェイ別の成績を正しく評価できた",
+  suspensionDiff_worked: "出場停止者の影響を正しく評価できた",
+  xgDiff_worked: "xG(期待得点)の質を正しく評価できた",
+  topScorerDiff_worked: "エースの得点力を正しく評価できた",
   overall_judgement: "モデル全体の総合判断が当たった(単一の決定的な要因は特定できません)",
 };
 
