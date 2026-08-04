@@ -3661,10 +3661,42 @@ function renderMatchAnalysisResult(data, homeJa, awayJa) {
   `).join("") || `<p class="value-note">まだ強く学習された要素はありません(毎日学習エンジンの検証データが十分に蓄積されると、ここに表示されます)。</p>`;
   const notesHtml = (data.dataNotes || []).length ? `<p class="value-note" style="margin-top:8px; opacity:.8;">※ ${data.dataNotes.map(escapeHtml).join(" / ")}</p>` : "";
 
+  // 2026年8月・第6次監査で発見した「作ったのに一度も表示していなかった機能」の修正:
+  //   優先順位⑤・⑳の「前回はこう考えていたが、今回はこう考える。理由は…」は
+  //   サーバー側で組み立てて memoryComparison として返していたのに、
+  //   画面のどこからも参照しておらず、**利用者は一度も見たことがなかった**
+  //   (リクエストのたびにUpstashを1回読む費用だけ払っていた)。
+  //   変化があったときだけ出す、という当初の設計どおりに表示する。
+  // 2026年8月・第7次監査で発見した表示の誤りの修正:
+  //   ラベルが**逆**になっていた。LLMが自由に書いた文章には何の印も付かず、
+  //   実データから機械的に組み立てた文章の方に「(簡易版)」と付けていたため、
+  //   利用者から見ると「AIが書いた推測」と「実データから計算した事実」が
+  //   まったく区別できなかった(むしろ推測の方が本格的に見えた)。
+  //   AIが書いたものには必ず【AIの見解】と明示する。
+  const aiTag = (block) => (block && block.source === "ai_generated" ? "(AIの見解)" : "");
+
+  const mc = data.memoryComparison || null;
+  const memoryComparisonHtml = mc ? `
+    <div class="compare-comment" style="margin-top:10px; border-left:3px solid #6a8caf; padding-left:10px;">
+      <strong>🧠 前回この対戦を見たときとの違い:</strong> ${escapeHtml(mc.headlineJa || "")}
+      ${(mc.reasonsJa && mc.reasonsJa.length) ? `<ul style="margin:6px 0 0 1em; padding:0;">${mc.reasonsJa.map((r) => `<li class="value-note">${escapeHtml(r)}</li>`).join("")}</ul>` : ""}
+      ${mc.learnedJa ? `<p class="value-note" style="margin-top:4px; opacity:.85;">${escapeHtml(mc.learnedJa)}</p>` : ""}
+    </div>` : "";
+
   // 2026年8月・本番監査(⑦情報拡張)対応: 怪我人の実名・直近フォーメーション・
   // 注目選手(実データのみ・取得できない場合は正直に非表示)を追加表示する。
   function injuryLineHtml(side, label) {
-    if (!side || !side.count) return `<div class="value-note" style="margin:2px 0;">${escapeHtml(label)}: 負傷・出場停止者なし</div>`;
+    // 2026年8月・第5次監査で発見した表示の誤りの修正:
+    //   `!side.count` は count が null(=/injuries の取得に失敗して**人数が
+    //   分からない**状態)でも真になるため、取得に失敗したときに
+    //   「負傷・出場停止者なし」と断言してしまっていた。
+    //   同じ画面の下部には「負傷者情報の取得に失敗しました」という注記が出るので、
+    //   1つの回答の中で矛盾したことを述べている状態だった。
+    //   「0人だった」と「分からない」を必ず区別する。
+    if (!side || side.count === null || side.count === undefined) {
+      return `<div class="value-note" style="margin:2px 0;">${escapeHtml(label)}: 負傷・出場停止の情報を取得できませんでした</div>`;
+    }
+    if (!side.count) return `<div class="value-note" style="margin:2px 0;">${escapeHtml(label)}: 負傷・出場停止者なし</div>`;
     const names = [...side.injured, ...side.suspended].slice(0, 4).join("・");
     return `<div class="value-note" style="margin:2px 0;">${escapeHtml(label)}: ${side.count}名${names ? `(${escapeHtml(names)}等)` : ""}</div>`;
   }
@@ -3693,19 +3725,20 @@ function renderMatchAnalysisResult(data, homeJa, awayJa) {
     <h3 class="sim-subhead">📋 AIが重視した要素(重要度順)</h3>
     ${factorsHtml}
     <div class="compare-comment" style="margin-top:10px;">
-      <strong>🗣️ 試合展開予想${data.narrative.source === "ai_generated" ? "" : "(簡易版)"}:</strong> ${escapeHtml(data.narrative.text)}
+      <strong>🗣️ 試合展開予想${aiTag(data.narrative)}:</strong> ${escapeHtml(data.narrative.text)}
     </div>
     <div class="compare-comment" style="margin-top:8px;">
-      <strong>🔄 もし予想と違ったら:</strong> ${escapeHtml(data.reverseScenario.text)}
+      <strong>🔄 もし予想と違ったら${aiTag(data.reverseScenario)}:</strong> ${escapeHtml(data.reverseScenario.text)}
     </div>
     ${injuriesHtml}
     ${formationHtml}
-    ${data.tacticalCompatibility ? `
+    ${data.tacticalCompatibility && data.tacticalCompatibility.text ? `
     <div class="compare-comment" style="margin-top:8px;">
-      <strong>⚔️ 戦術相性:</strong> ${escapeHtml(data.tacticalCompatibility.text)}
+      <strong>⚔️ 戦術相性${aiTag(data.tacticalCompatibility)}:</strong> ${escapeHtml(data.tacticalCompatibility.text)}
     </div>` : ""}
     ${keyPlayersHtmlBlock}
-    ${data.biggestHighlight ? `<p class="value-note" style="margin-top:8px;">✨ この試合最大の見どころ: <strong>${escapeHtml(data.biggestHighlight.text)}</strong></p>` : ""}
+    ${data.biggestHighlight && data.biggestHighlight.text ? `<p class="value-note" style="margin-top:8px;">✨ この試合最大の見どころ${aiTag(data.biggestHighlight)}: <strong>${escapeHtml(data.biggestHighlight.text)}</strong></p>` : ""}
+    ${memoryComparisonHtml}
     <p style="margin-top:12px; font-weight:700;">🏁 ${escapeHtml(data.conclusion)}</p>
     ${notesHtml}
     <p class="value-note" style="margin-top:8px; opacity:.7;">${escapeHtml(data.note || "")}</p>
@@ -4288,7 +4321,14 @@ function playersForSide(matchup, side) {
   }).map(([key, p]) => ({ key, ...p }));
 }
 function teamAvg(players, attr) {
-  if (!players.length) return 62;
+  // 2026年8月・第7次監査で発見した欠陥の修正:
+  //   選手が0人のとき固定値62を返していたため、「◯◯は攻撃力で相手を
+  //   上回っており(平均62.0 対 62.0)」という、定数から作った(しかも両者同値の)
+  //   比較文が生成されていた。サーバー側では0人を弾くようにしたが、
+  //   こちら(ローカル計算のフォールバック)にも同じ定数が残っていたため、
+  //   結局同じ嘘が利用者に見えてしまう状態だった。
+  //   比較できないことは null で表す(呼び出し側で「比較不可」と表示する)。
+  if (!players.length) return null;
   return players.reduce((s, p) => s + (attr === "overall" ? p.overall : p.attrs[attr]), 0) / players.length;
 }
 function pickLikelyXI(players) {
@@ -5086,10 +5126,11 @@ function pickStandoutPlayer(players) {
 function buildTurningPointAndMvp(homeLabel, homeP, awayP, winnerLabel) {
   const winnerPlayers = winnerLabel === homeLabel ? homeP : awayP;
   const standout = pickStandoutPlayer(winnerPlayers) || pickStandoutPlayer(homeP.concat(awayP));
-  const minute = 8 + Math.floor(Math.random() * 82);
-  const half = minute <= 45 ? "前半" : "後半";
+  // 2026年8月・第7次監査で発見した欠陥の修正:
+  //   乱数から作った分数を「後半67分前後に…」と分析結果のように提示していた。
+  //   根拠がゼロの数字なので出さない(サーバー側と同じ修正)。
   const turningPoint = standout
-    ? `${half}${minute}分前後、${standout.nameJa}が試合の流れを引き寄せる場面を作ると予想されます。`
+    ? `${standout.nameJa}が試合の流れを引き寄せる場面を作れるかどうかが鍵になると予想されます(具体的な時間帯を予測できる根拠はありません)。`
     : `試合中盤にどちらかのチームがギアを上げるタイミングが訪れると予想されます。`;
   return { turningPoint, mvp: standout ? { key: standout.key, nameJa: standout.nameJa, emoji: standout.emoji, overall: standout.overall } : null };
 }
@@ -5191,6 +5232,9 @@ function toPredictPlayerPayload(p) {
   return { key: p.key, name: p.name, nameJa: p.nameJa, emoji: p.emoji, overall: p.overall, position: p.position, attrs: p.attrs, zones: p.zones || [] };
 }
 function computeMatchAnalysisLocally(homeLabel, awayLabel, homeP, awayP) {
+  // 2026年8月・第7次監査での追加: 片方でも登録選手が0人なら比較できない。
+  // 以前は固定値62で「62.0 対 62.0」という嘘の比較文を作っていた。
+  if (!homeP.length || !awayP.length) return null;
   const homeOverall = teamAvg(homeP, "overall"), awayOverall = teamAvg(awayP, "overall");
   const diff = homeOverall - awayOverall;
   const homeLambda = Math.max(0.4, 1.35 + diff / 28);
@@ -5267,6 +5311,12 @@ async function renderMatchAnalysis(matchupId) {
   // ターニングポイント/MVP・攻撃方向・危険エリア・予想布陣は、すべてこの1回の
   // API呼び出し(失敗時はローカル計算にフォールバック)で取得する。
   const data = await getMatchAnalysisData(m.homeLabel, m.awayLabel, homeP, awayP);
+  // 2026年8月・第7次監査での追加: 比較できるだけの登録選手がいない場合、
+  // 架空の平均値で比較文を作らず、正直にその旨だけを表示する。
+  if (!data) {
+    wrapEl.innerHTML = `<p class="value-note">この対戦は、どちらかのチームに登録選手データが無いため、能力値にもとづく分析ができませんでした(架空の数値で比較することはしません)。</p>`;
+    return;
+  }
   const { homeGoals, awayGoals, confidence, possessionHomePct: possClamp, styleText, winFactor, loseFactor,
     matchFlowSegments, turningPoint, mvp, attackDirection, homeXI, awayXI, homeFormation, awayFormation, dangerZones } = data;
 
@@ -5415,7 +5465,38 @@ function detectClubMention(q) {
   const fullMatches = clubs.filter(c => norm.indexOf(normalizeName(c)) !== -1);
   if (fullMatches.length) return fullMatches.sort((a, b) => b.length - a.length)[0];
   // 2) question uses a shortened nickname that's a token of the full name (e.g. "レアルはなぜ強い？")
-  const tokenMatches = clubs.filter(c => c.split(/[・\s]/).filter(Boolean).some(t => t.length >= 2 && norm.indexOf(normalizeName(t)) !== -1));
+  //
+  // ■ 2026年8月・第7次監査で発見した最重要欠陥の修正
+  //   従来はここで「登録クラブ名のいずれかのトークンが質問文に含まれていれば
+  //   そのクラブ」と判定していた。その結果、**登録されていない別のクラブについて
+  //   聞かれたのに、トークンを共有する登録クラブの実データで答えていた**。
+  //     「マンチェスター・ユナイテッドはなぜ弱くなった？」→ マンチェスター・シティ
+  //     「インテル・ミランは今季どう？」            → インテル・マイアミ
+  //     「レアル・ベティスはどう思う？」            → レアル・マドリード
+  //   しかも取得は成功するので自信度は★4〜5、根拠も「実データ」として提示され、
+  //   画面のどこにも「どのクラブとして答えたか」が出ない。
+  //   このプロジェクトで最悪の「でっち上げ」経路だった。
+  //
+  //   対策: トークン一致は、**質問文の中でそのトークンの直後に別のクラブ名らしい
+  //   カタカナ語が続いていない場合**に限る。「レアル」単独なら短縮形とみなすが、
+  //   「レアル・ベティス」のように続きがある場合は、その全体が登録クラブ名と
+  //   一致しない限り、知らないクラブとして扱う(nullを返し、一般質問として扱う)。
+  const tokenMatches = clubs.filter((c) => {
+    const tokens = c.split(/[・\s]/).filter(Boolean).filter((t) => t.length >= 2);
+    return tokens.some((t) => {
+      const nt = normalizeName(t);
+      let from = 0;
+      for (;;) {
+        const idx = norm.indexOf(nt, from);
+        if (idx === -1) return false;
+        // トークンの直後を見る。カタカナ・長音が続いていれば、それは
+        // 「別のクラブの名前の一部」である可能性が高いので短縮形とみなさない。
+        const after = norm.slice(idx + nt.length);
+        if (!/^[ァ-ヴーァ-ヶー・]/.test(after)) return true;
+        from = idx + 1;
+      }
+    });
+  });
   if (!tokenMatches.length) return null;
   if (tokenMatches.length === 1) return tokenMatches[0];
   // multiple clubs share a token (e.g. レアル・マドリード / レアル・ソシエダ both match "レアル") ->
@@ -5468,15 +5549,56 @@ function answerClubQuestion(clubName, question, level) {
 //   2) よく話題になる日本人選手の姓の簡易辞書(将来的に拡充可能。網羅はしていない
 //      ことをREADMEに明記する)。
 const KNOWN_JP_SURNAMES = ["久保建英", "久保", "三笘薫", "三笘", "遠藤航", "遠藤", "冨安健洋", "冨安", "堂安律", "堂安", "鎌田大地", "鎌田", "伊東純也", "伊東", "上田綺世", "上田", "南野拓実", "南野", "旗手怜央", "旗手", "板倉滉", "板倉", "浅野拓磨", "浅野", "中村敬斗", "中村", "谷口彰悟", "谷口", "毎熊晟矢", "毎熊"];
+// 2026年8月・第7次監査で発見した過検出の修正:
+//   「カタカナが2文字以上あれば選手名」という判定は広すぎた。日本語のサッカーの
+//   話題はほぼ必ずカタカナを含むため、
+//     「ハイプレスは本当に有効だと思う?」  → 選手名「ハイプレス」
+//     「プレミアリーグとラ・リーガ、どっちがレベル高い?」→ 選手名「プレミアリーグ」
+//   のように、一般的な質問がことごとく選手検索へ回されていた。1回の空振りに
+//   API-Footballへの検索が最大21〜42件走るため、API予算も無駄に焼いていた。
+//   さらに、本来用意されている「一般的なサッカーの知識で考察する」経路が
+//   ほとんど到達不能になっていた。
+//   明らかに選手名ではない語(戦術用語・リーグ名・大会名・ポジション名など)を
+//   除外する。網羅は目指さず、実際に問題になった種類を確実に弾く。
+const NON_PLAYER_KATAKANA = [
+  // 戦術・プレー用語
+  "ハイプレス", "プレス", "プレッシング", "ポゼッション", "カウンター", "ショートカウンター",
+  "ビルドアップ", "フォーメーション", "システム", "セットプレー", "コーナーキック",
+  "パス", "ドリブル", "クロス", "シュート", "オフサイド", "マンマーク", "ゾーン",
+  "ターンオーバー", "ローテーション", "スタメン", "ベンチ", "サブ",
+  // ポジション
+  "ゴールキーパー", "キーパー", "ディフェンダー", "センターバック", "サイドバック",
+  "ボランチ", "ミッドフィルダー", "フォワード", "ウイング", "ストライカー", "アンカー",
+  // リーグ・大会
+  "プレミアリーグ", "プレミア", "ラリーガ", "リーガ", "ブンデスリーガ", "ブンデス",
+  "セリエ", "リーグアン", "チャンピオンズリーグ", "チャンピオンズ", "ヨーロッパリーグ",
+  "ワールドカップ", "ユーロ", "アジアカップ", "リーグ", "カップ", "トーナメント",
+  // 一般語
+  "サッカー", "フットボール", "クラブ", "チーム", "サポーター", "ファン", "スタジアム",
+  "シーズン", "オフシーズン", "コンディション", "パフォーマンス", "データ", "スタッツ",
+  "レベル", "スタイル", "タイプ", "モチベーション", "メンタル", "フィジカル", "スピード",
+  "テクニック", "バランス", "コスト", "ランキング", "スカウト", "コーチ", "マネージャー",
+];
+function isLikelyPlayerName(token) {
+  const t = String(token || "");
+  if (t.length < 3) return false; // 2文字のカタカナだけで選手名と判断しない
+  return !NON_PLAYER_KATAKANA.some((w) => t === w || t.indexOf(w) !== -1 || w.indexOf(t) !== -1);
+}
 function guessUnregisteredPlayerName(q) {
   const kata = String(q || "").match(/[ァ-ヴー]{2,}/g);
-  if (kata && kata.length) return kata.slice().sort((a, b) => b.length - a.length)[0];
+  if (kata && kata.length) {
+    const candidates = kata.filter(isLikelyPlayerName).sort((a, b) => b.length - a.length);
+    if (candidates.length) return candidates[0];
+  }
   const jp = KNOWN_JP_SURNAMES.find((s) => q.indexOf(s) !== -1);
   return jp || null;
 }
 
 function getDailyFeaturedMatchup() {
-  const dateStr = new Date().toISOString().slice(0, 10);
+  // 第7次監査での修正: UTCの日付だと日本時間の午前9時に「今日の注目」が
+  // 切り替わっていた。利用者の端末の日付に合わせる。
+  const now = new Date();
+  const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
   const idx = hashString("matchup|" + dateStr) % MATCHUPS.length;
   return MATCHUPS[idx];
 }
@@ -5646,7 +5768,7 @@ async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn, forced
   } else {
     // 議論エンジンに接続できなかった/失敗した場合: 「考えたふり」はせず正直に状況を
     // 伝えた上で、参考情報として従来のデータ要約(キーワードベース)を添える。
-    const reason = (resp && resp.message) ? resp.message : "AIの考察機能に接続できませんでした(サーバーの起動直後で時間がかかっている可能性があります)。";
+    const reason = (resp && resp.message) ? resp.message : "AIの考察機能に接続できませんでした(サーバーの起動直後、通信の一時的な不調、またはAIのAPIキーが未設定の可能性があります)。";
     let fallback = "";
     if (subject.type === "club" && subject.labelJa) fallback = buildClubAnswer(subject.labelJa, dLevel);
     else if (subject.type === "player" && resolvedPlayer) {
@@ -6121,6 +6243,16 @@ async function renderAiAccuracyWidget() {
     return;
   }
 
+  // 2026年8月・第6次監査で発見した誤りの修正:
+  //   保存先(Upstash)の読み取りに失敗した場合も total/resolved が0で返るため、
+  //   何ヶ月も実績を積み上げた後の一時的な通信障害で
+  //   「記録を開始したばかりです」と表示されていた。
+  //   実績が無いのか、読み出せなかっただけなのかを必ず区別する。
+  if (stats.error) {
+    summaryEl.innerHTML = `🤖 <strong>AI予測の実績</strong>: いまは記録を読み出せませんでした(保存先との通信が一時的に不安定な可能性があります)。しばらくしてから再度お試しください。`;
+    return;
+  }
+
   if (!stats.resolved || stats.resolved === 0) {
     const pendingNote = stats.total > 0 ? `(現在${stats.total}件の予測を検証中)` : "";
     summaryEl.innerHTML = `🤖 <strong>AI予測の実績</strong>: 記録を開始したばかりです${pendingNote}。試合結果が出次第、正答率が表示されます。`;
@@ -6216,9 +6348,12 @@ async function renderGrowthLogWidget() {
 
   const accBefore = log.ownAccuracyBefore;
   const accAfter = log.ownAccuracyAfter;
-  const accChanged = accBefore !== null && accAfter !== null && accBefore !== accAfter;
+  // 2026年8月・第6次監査で発見した誤りの修正:
+  //   `!== null` は undefined を通してしまうため、これらのフィールドを持たない
+  //   古い記録では「的中率: undefined%」と表示されていた。数値かどうかで判定する。
+  const accChanged = Number.isFinite(accBefore) && Number.isFinite(accAfter) && accBefore !== accAfter;
   let accLine = "";
-  if (accBefore !== null && accAfter !== null) {
+  if (Number.isFinite(accBefore) && Number.isFinite(accAfter)) {
     const arrow = accChanged ? `${accBefore}% → ${accAfter}%(${accAfter > accBefore ? "+" : ""}${Math.round((accAfter - accBefore) * 10) / 10}%)` : `${accAfter}%(検証データが少なく、今回はモデル更新なし)`;
     accLine = `<div class="value-note" style="margin:4px 0;">📈 自社予測モデルの的中率(実験的): ${arrow}</div>`;
   } else {
@@ -6268,12 +6403,17 @@ async function renderGrowthLogWidget() {
   // 前日との差分から機械的に判定した結果を、最も目立つ位置に表示する。
   // 根拠が無いのに「成長した」とは言わない(判定不能なら正直にそう出す)。
   const growthCmp = log.growthComparison || null;
+  // 2026年8月・第6次監査で発見した表示の誤りの修正:
+  //   `${delta ?? "—"}件` は、「比較できなかった(null)」を数字の並びの中の
+  //   ダッシュとして描くため、ゼロと見分けがつかなかった。
+  //   比較できなかったことは、はっきり言葉で示す。
+  const fmtDelta = (v, unit) => (Number.isFinite(v) ? `${v > 0 ? "+" : ""}${v}${unit}` : "比較不可");
   const growthVerdictHtml = growthCmp
     ? `<div style="margin-top:6px; padding:8px 10px; border-radius:8px; background:${growthCmp.improved === true ? "rgba(30,132,73,.10)" : growthCmp.improved === false ? "rgba(192,57,43,.08)" : "rgba(0,0,0,.04)"};">
          <span style="font-weight:700; color:${growthCmp.improved === true ? "#1e8449" : growthCmp.improved === false ? "#c0392b" : "inherit"};">
            ${growthCmp.improved === true ? "📈" : growthCmp.improved === false ? "📉" : "➖"} ${escapeHtml(growthCmp.verdictJa || "")}
          </span>
-         ${growthCmp.hasBaseline ? `<div class="value-note" style="margin-top:3px; opacity:.85;">前日比 — 知識: ${growthCmp.knowledgeDelta ?? "—"}件 / 記憶: ${growthCmp.memoryDelta ?? "—"}件 / 的中率: ${growthCmp.accuracyDelta ?? "—"}pt</div>` : ""}
+         ${growthCmp.hasBaseline ? `<div class="value-note" style="margin-top:3px; opacity:.85;">${growthCmp.adjacentDays === false ? "比較した2日の差" : "前日比"} — 知識: ${fmtDelta(growthCmp.knowledgeDelta, "件")} / 記憶: ${fmtDelta(growthCmp.memoryDelta, "件")} / 的中率: ${fmtDelta(growthCmp.accuracyDelta, "pt")}</div>` : ""}
        </div>`
     : "";
   const zeroDiag = log.zeroKnowledgeDiagnosis || null;
@@ -6297,10 +6437,10 @@ async function renderGrowthLogWidget() {
     : "";
 
   summaryEl.innerHTML = `
-    🧠 <strong>昨日学んだこと</strong>
-    <span class="value-note">(${formatDateJa(log.date + "T00:00:00Z")}時点・登録${log.teamsAnalyzed}クラブ+${leaguesAnalyzed}リーグ+${playersAnalyzed}選手を分析)</span>
+    🧠 <strong>直近の学習で分かったこと</strong>
+    <span class="value-note">(${log.date ? formatDateJa(log.date + "T00:00:00Z") + "時点・" : ""}登録${log.teamsAnalyzed ?? 0}クラブ+${leaguesAnalyzed}リーグ+${playersAnalyzed}選手を分析)</span>
     <button class="more-details-btn" id="growthLogToggleBtn" type="button" style="margin-left:8px; display:inline-block; width:auto; padding:4px 10px;">詳しく見る ▼</button>
-    <div class="value-note" style="margin-top:4px;">今日追加した知識: ${knowledgeSaved}件(重複でスキップ: ${knowledgeDup}件) ・ 検証した試合: ${log.matchesResolvedToday}件</div>
+    <div class="value-note" style="margin-top:4px;">この日に追加した知識: ${knowledgeSaved}件(重複でスキップ: ${knowledgeDup}件) ・ 検証した試合: ${log.matchesResolvedToday ?? 0}件</div>
     ${growthVerdictHtml}
     ${zeroDiagHtml}
     ${zeroVerifyHtml}

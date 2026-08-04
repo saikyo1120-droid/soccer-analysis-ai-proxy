@@ -114,6 +114,28 @@ test("buildLearningSummary: 採用分だけを新しい順(直近が先頭)に�
     assert.strictEqual(log.totalOwnPredictionsResolvedSoFar, 30);
   });
 
+  await testAsync("getGrowthLog: 「AIの成長レポート」用にKnowledge/Prediction/Memory各エンジンの累計件数(engineTotals)を軽量カウンターから返す", async () => {
+    const counters = {
+      "knowledge:totalItemsSavedCounter": "42",
+      "memory:totalConclusionsSavedCounter": "7",
+      "learn:ownpred:total": "15",
+    };
+    const upstashCmd = async (cmd) => {
+      const [op, key] = cmd;
+      if (op === "LRANGE") return [];
+      if (op === "GET") return Object.prototype.hasOwnProperty.call(counters, key) ? counters[key] : null;
+      return null;
+    };
+    const log = await getGrowthLog({ upstashEnabled: true, upstashGetJSON: async () => null, upstashCmd });
+    assert.deepStrictEqual(log.engineTotals, { knowledgeItemsTotal: 42, memoryConclusionsTotal: 7, predictionsTotal: 15 }, `engineTotalsが軽量カウンターの値をそのまま返すはず, got: ${JSON.stringify(log.engineTotals)}`);
+  });
+
+  await testAsync("getGrowthLog: カウンターが未設定(まだ一度も保存されていない)場合は正直に0を返す(でっち上げない)", async () => {
+    const upstashCmd = async (cmd) => (cmd[0] === "LRANGE" ? [] : null);
+    const log = await getGrowthLog({ upstashEnabled: true, upstashGetJSON: async () => null, upstashCmd });
+    assert.deepStrictEqual(log.engineTotals, { knowledgeItemsTotal: 0, memoryConclusionsTotal: 0, predictionsTotal: 0 });
+  });
+
   console.log(failures === 0 ? "\nlearning summary widget tests PASSED." : `\n${failures} test(s) FAILED.`);
   process.exit(failures === 0 ? 0 : 1);
 })();

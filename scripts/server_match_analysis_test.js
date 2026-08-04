@@ -119,6 +119,8 @@ function get(port, urlPath) {
     ok(typeof b.narrative.text === "string" && b.narrative.text.length > 0, "試合展開予想が含まれる");
     ok(typeof b.reverseScenario.text === "string" && b.reverseScenario.text.length > 0, "逆転シナリオが含まれる");
     ok(typeof b.conclusion === "string" && b.conclusion.length > 0, "AI結論が含まれる");
+    ok(typeof b.tacticalCompatibility.text === "string" && b.tacticalCompatibility.text.includes("4-3-3") && b.tacticalCompatibility.text.includes("4-4-2"), "戦術相性(⑦)の見立てに両者のフォーメーションが含まれる, got " + b.tacticalCompatibility.text);
+    ok(typeof b.biggestHighlight.text === "string" && b.biggestHighlight.text.length > 0, "この試合最大の見どころ(⑩)が含まれる, got " + b.biggestHighlight.text);
     ok(b.injuries && b.injuries.home.count === 2, "怪我人の影響(人数)が含まれる, got " + JSON.stringify(b.injuries));
     ok(b.injuries.home.injured.includes("田中太郎"), "怪我人の実名(負傷)が含まれる");
     ok(b.injuries.home.suspended.includes("佐藤次郎"), "怪我人の実名(出場停止)が別枠で含まれる");
