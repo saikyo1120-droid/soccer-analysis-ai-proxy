@@ -135,6 +135,9 @@ const STATIC_ROOT = resolveStaticRoot();
 // 「エントリが無い」場合はundefinedを返すよう変更し、呼び出し側は`!== undefined`
 // で判定することで、null自体を正しくキャッシュできるようにする。
 const cache = new Map();
+// /api/learning/run-daily をfire-and-forget化(下記参照)したことに伴う、
+// 二重起動防止用のフラグ。
+let dailyLearningRunning = false;
 function cacheGet(key) {
   const hit = cache.get(key);
   if (!hit) return undefined;
@@ -2398,15 +2401,46 @@ const server = http.createServer(async (req, res) => {
         // AUTO_COLLECT_SECRETを流用して保護する(新しいシークレットを追加で
         // 設定する手間を増やさないため。定期実行はGitHub Actions等の外部
         // スケジューラからこのURLを1日1回呼び出す想定)。
+        //
+        // 2026年8月・本番調査で発見された不具合の修正: 以前はこのリクエストを
+        // 「学習ジョブが完全に終わるまで」応答を返さずに待たせていた。実際の
+        // 本番データ(11クラブ・複数選手ぶんの外部API呼び出し + LLM生成)では
+        // この処理全体が2分(GitHub Actions側のcurl --max-timeの上限)を超える
+        // ことがあり、fetchWithTimeout導入後も「個々の呼び出しは時間内に終わる
+        // が、件数が多いため合計では2分を超える」ケースでは、GitHub Actions
+        // 側がcurlの制限時間で待ちきれずexit code 28で失敗し続けていた
+        // (サーバー側は実際には処理を続けており、いずれ正常に完了・保存されて
+        // いた可能性が高い)。
+        // 対策として、リクエストを受けたら即座に「開始しました」と応答を返し、
+        // 実際の学習処理はレスポンスを待たずにバックグラウンドで継続する
+        // (fire-and-forget)方式に変更した。これにより、処理に何分かかっても
+        // HTTPクライアント側のタイムアウトの影響を受けなくなる。デバッグ用途で
+        // 完了を待ちたい場合は ?sync=1 を付けると従来通り同期的に完了を待つ。
         const requiredSecret = process.env.AUTO_COLLECT_SECRET || "";
         if (requiredSecret && parsed.searchParams.get("key") !== requiredSecret) {
           res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
           res.end(JSON.stringify({ ok: false, error: "invalid or missing key" }));
           return;
         }
-        const result = await runDailyLearning(learningDeps);
-        res.writeHead(result.ok === false ? 200 : 200, { "Content-Type": "application/json; charset=utf-8" });
-        res.end(JSON.stringify(result));
+        if (parsed.searchParams.get("sync") === "1") {
+          const result = await runDailyLearning(learningDeps);
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify(result));
+          return;
+        }
+        if (dailyLearningRunning) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: true, alreadyRunning: true, message: "学習ジョブは既に実行中です(二重起動を防ぐためスキップしました)。数分後に/api/growth-logで結果を確認してください。" }));
+          return;
+        }
+        dailyLearningRunning = true;
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: true, started: true, message: "学習ジョブをバックグラウンドで開始しました。数分後に/api/growth-logで結果を確認してください。" }));
+        runDailyLearning(learningDeps)
+          .catch((e) => {
+            console.error("[run-daily background error]", e && e.stack || e);
+          })
+          .finally(() => { dailyLearningRunning = false; });
         return;
       }
       if (pathname === "/api/growth-log") {
