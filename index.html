@@ -5615,6 +5615,115 @@ function getDailyFeaturedMatchup() {
 // クラブの日本語表記(PLAYERSデータの club/clubBase() が返す値)から、RAG検索に
 // 必要な英語クラブ名を引くための対応表。実際の試合(API-Football)を登録クラブへ
 // 結びつけるREAL_FIXTURE_CLUB_EN_TO_JA(英→日)の向きを逆にしたもの。
+// ============================================================
+// 2026年8月・知識拡張フェーズ(ご指示①): UEFAクラブランキングTOP100の対応表。
+// server/learning/clubUniverse.js のCLUB_UNIVERSE(日本語名→英語名)から生成。
+// ローカルに選手データが無いクラブでも、サーバー側で毎日蓄積している
+// 調査ファイル(clubDossier)の知識を使って議論できるようにするための入口。
+// ============================================================
+const UNIVERSE_CLUB_JA_TO_EN = {
+  "レアル・マドリード": "Real Madrid",
+  "マンチェスター・シティ": "Manchester City",
+  "バイエルン・ミュンヘン": "Bayern Munich",
+  "パリ・サンジェルマン": "Paris Saint Germain",
+  "リヴァプール": "Liverpool",
+  "インテル": "Inter",
+  "ボルシア・ドルトムント": "Borussia Dortmund",
+  "RBライプツィヒ": "RB Leipzig",
+  "FCバルセロナ": "Barcelona",
+  "バイヤー・レバークーゼン": "Bayer Leverkusen",
+  "アトレティコ・マドリード": "Atletico Madrid",
+  "アーセナル": "Arsenal",
+  "ユヴェントス": "Juventus",
+  "ベンフィカ": "Benfica",
+  "アタランタ": "Atalanta",
+  "ACミラン": "AC Milan",
+  "ASローマ": "AS Roma",
+  "FCポルト": "Porto",
+  "スポルティングCP": "Sporting CP",
+  "ナポリ": "Napoli",
+  "チェルシー": "Chelsea",
+  "マンチェスター・ユナイテッド": "Manchester United",
+  "PSVアイントホーフェン": "PSV Eindhoven",
+  "アヤックス": "Ajax",
+  "フェイエノールト": "Feyenoord",
+  "クラブ・ブルッヘ": "Club Brugge",
+  "トッテナム": "Tottenham",
+  "ラツィオ": "Lazio",
+  "セビージャ": "Sevilla",
+  "ビジャレアル": "Villarreal",
+  "アイントラハト・フランクフルト": "Eintracht Frankfurt",
+  "シャフタール・ドネツク": "Shakhtar Donetsk",
+  "スポルティング・ブラガ": "Sporting Braga",
+  "フィオレンティーナ": "Fiorentina",
+  "レンジャーズ": "Rangers",
+  "セルティック": "Celtic",
+  "レッドブル・ザルツブルク": "Red Bull Salzburg",
+  "オリンピアコス": "Olympiakos Piraeus",
+  "リール": "Lille",
+  "マルセイユ": "Marseille",
+  "ウェストハム": "West Ham",
+  "リヨン": "Lyon",
+  "モナコ": "Monaco",
+  "ガラタサライ": "Galatasaray",
+  "フェネルバフチェ": "Fenerbahce",
+  "レアル・ソシエダ": "Real Sociedad",
+  "レアル・ベティス": "Real Betis",
+  "アストン・ヴィラ": "Aston Villa",
+  "ニューカッスル": "Newcastle",
+  "ブライトン": "Brighton",
+  "スラヴィア・プラハ": "Slavia Praha",
+  "スパルタ・プラハ": "Sparta Praha",
+  "ディナモ・ザグレブ": "Dinamo Zagreb",
+  "ヤングボーイズ": "Young Boys",
+  "FCコペンハーゲン": "FC Copenhagen",
+  "レッドスター・ベオグラード": "Red Star Belgrade",
+  "バーゼル": "Basel",
+  "ユニオン・サン=ジロワーズ": "Union St. Gilloise",
+  "ヘント": "Gent",
+  "アンデルレヒト": "Anderlecht",
+  "PAOK": "PAOK",
+  "フェレンツヴァーロシュ": "Ferencvarosi TC",
+  "モルデ": "Molde",
+  "ボデ/グリムト": "Bodo/Glimt",
+  "ニース": "Nice",
+  "レンヌ": "Rennes",
+  "トゥールーズ": "Toulouse",
+  "SCフライブルク": "SC Freiburg",
+  "ホッフェンハイム": "1899 Hoffenheim",
+  "ウニオン・ベルリン": "Union Berlin",
+  "VfLヴォルフスブルク": "VfL Wolfsburg",
+  "ボローニャ": "Bologna",
+  "トリノ": "Torino",
+  "アスレティック・ビルバオ": "Athletic Club",
+  "バレンシア": "Valencia",
+  "ジローナ": "Girona",
+  "ベシクタシュ": "Besiktas",
+  "トラブゾンスポル": "Trabzonspor",
+  "AZアルクマール": "AZ Alkmaar",
+  "トゥエンテ": "Twente",
+  "ヴィトーリア・ギマランイス": "Vitoria Guimaraes",
+  "スロヴァン・ブラチスラヴァ": "Slovan Bratislava",
+  "レギア・ワルシャワ": "Legia Warszawa",
+  "ヴィクトリア・プルゼニ": "Viktoria Plzen",
+  "カラバフ": "Qarabag",
+  "シュトゥルム・グラーツ": "Sturm Graz",
+  "LASK": "LASK",
+  "ラピド・ウィーン": "Rapid Vienna",
+  "ミッティラン": "FC Midtjylland",
+  "マルメFF": "Malmo FF",
+  "ルドゴレツ": "Ludogorets",
+  "パルチザン・ベオグラード": "FK Partizan",
+  "APOEL": "APOEL",
+  "シェリフ・ティラスポリ": "Sheriff",
+  "マッカビ・テルアビブ": "Maccabi Tel Aviv",
+  "マッカビ・ハイファ": "Maccabi Haifa",
+  "ヘンク": "Genk",
+  "ロイヤル・アントワープ": "Royal Antwerp",
+  "スタンダール・リエージュ": "Standard Liege",
+  "セルヴェット": "Servette",
+};
+
 const CLUB_JA_TO_EN = {
   "バイエルン・ミュンヘン": "Bayern Munich",
   "アーセナルFC": "Arsenal",
@@ -5693,6 +5802,20 @@ function buildDiscussSubject(q, contextPlayer, forcedPlayerName) {
       subject: { type: "player", labelJa: p.nameJa },
       playerHint: { name: p.name, teamEn: CLUB_JA_TO_EN[clubBase(p)] || "", birth: p.birth || "" },
       resolvedPlayer: p,
+    };
+  }
+  // 2026年8月・知識拡張フェーズ(ご指示④): ローカル登録クラブ(CLUB_JA_TO_EN)にも
+  // 選手データにも該当しない場合、UEFA TOP100の対応表を最長一致で照合する。
+  // 一致すればsubject.type="club"としてサーバーへ渡し、サーバー側が毎日蓄積している
+  // 調査ファイル(clubDossier)の実測知識で議論する。登録クラブ・選手の既存判定より
+  // 後に置くことで、これまでの挙動は一切変えない。
+  const universeHit = Object.keys(UNIVERSE_CLUB_JA_TO_EN)
+    .filter((ja) => q && q.includes(ja))
+    .sort((a, b) => b.length - a.length)[0];
+  if (universeHit) {
+    return {
+      subject: { type: "club", labelJa: universeHit, labelEn: UNIVERSE_CLUB_JA_TO_EN[universeHit] },
+      playerHint: null, resolvedPlayer: null,
     };
   }
   // 2026年8月・優先順位①: ローカル未登録の選手でも、質問文から選手名らしき語を
