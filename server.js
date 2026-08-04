@@ -283,6 +283,30 @@ function getApiPlanInfo() {
   };
 }
 
+// ---- 2026年8月: 日次学習ジョブの多重起動を防ぐロック ----
+// プロセス内フラグ(dailyLearningRunning)は再デプロイ・スリープ復帰で失われるため、
+// Upstash上に期限つきのロックを置いてプロセスをまたいで保護する。
+// SET key value NX EX <秒> は「まだ無いときだけ書き込む」ため、
+// これが失敗した=直近に別の実行が始まっている、と判断できる。
+const DAILY_RUN_LOCK_SECONDS = Number(process.env.DAILY_RUN_LOCK_SECONDS) || 600; // 既定10分
+async function tryAcquireDailyRunLock() {
+  if (!UPSTASH_ENABLED) {
+    // Upstashが無い環境では、従来どおりプロセス内フラグだけで保護する
+    // (できないことを黙って「できたこと」にしない)。
+    return { acquired: true, skipped: true, reasonJa: "Upstash未設定のため、プロセスをまたいだ多重起動の防止はできません。" };
+  }
+  try {
+    const key = `learn:runlock:${new Date().toISOString().slice(0, 10)}`;
+    const result = await upstashCmd(["SET", key, new Date().toISOString(), "NX", "EX", String(DAILY_RUN_LOCK_SECONDS)]);
+    // Upstashは取得成功で "OK"、既に存在して書き込まなかった場合は null を返す
+    return { acquired: result === "OK" || result === true, skipped: false };
+  } catch (e) {
+    // ロックの取得可否が判断できない場合は、学習が一切動かなくなる方が困るため
+    // 実行を許可する(安全側=可用性優先)。
+    return { acquired: true, skipped: true, reasonJa: `実行ロックを確認できませんでした(${e.message})。` };
+  }
+}
+
 async function callApiFootball(endpoint, params) {
   if (!API_KEY) {
     const err = new Error("API_FOOTBALL_KEY が設定されていません(.envを確認してください)");
@@ -2616,6 +2640,34 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ ok: false, error: "invalid or missing key" }));
           return;
         }
+        // 2026年8月・本番調査(優先順位⑨の健康診断)で発見した不具合の修正:
+        // 本番のgrowthLogに「本日13回実行」と記録されており、API-Footballの
+        // 使用量が想定(80〜100)の8倍(801)に膨らんでいた。
+        //
+        // 原因: GitHub Actions側のcurlが --retry 2 とフォールバックの再呼び出しを
+        // 行うため、1回のワークフローで最大4回このエンドポイントを叩く。
+        // Renderの無料プランは15分アクセスが無いとスリープするため、初回の
+        // 呼び出しはコールドスタート待ちでタイムアウトしやすく、そのたびに
+        // curlが再送する。サーバー側は既に処理を始めているので、再送のぶんだけ
+        // 学習ジョブが多重に起動していた。
+        //
+        // 既存の dailyLearningRunning はプロセス内メモリのフラグのため、
+        // 再デプロイやスリープ復帰で新しいプロセスになると効かない。そこで
+        // Upstash上に「実行ロック」を置き、プロセスをまたいで多重起動を防ぐ。
+        // 一定時間(既定10分)で自動的に期限切れになるため、途中で落ちても
+        // 翌回以降がブロックされ続けることはない。意図的に再実行したい場合は
+        // ?force=1 を付ける(デバッグ用の逃げ道)。
+        const runLockOk = (parsed.searchParams.get("force") === "1")
+          ? { acquired: true, skipped: false }
+          : await tryAcquireDailyRunLock();
+        if (!runLockOk.acquired) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({
+            ok: true, started: false, alreadyRunning: true, reason: "RUN_LOCK_HELD",
+            message: `直近${DAILY_RUN_LOCK_SECONDS / 60}分以内に学習ジョブが開始されているため、二重起動を防ぐためスキップしました(API-Footballのリクエストを無駄に消費しないための保護です)。意図的に再実行したい場合は ?force=1 を付けてください。`,
+          }));
+          return;
+        }
         if (parsed.searchParams.get("sync") === "1") {
           const result = await runDailyLearning(learningDeps);
           res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
@@ -2731,6 +2783,7 @@ module.exports = {
   getGrowthLog,
   handleDebugStatus,
   handleLearningHealth,
+  tryAcquireDailyRunLock,
   getApiPlanInfo,
   recordRateLimitHeaders,
   handleTeamViewHistory,
