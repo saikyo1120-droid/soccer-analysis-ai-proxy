@@ -57,6 +57,7 @@ const { summarizeTransfers } = require("../rag/knowledgeSource");
 const { collectLeagueKnowledge } = require("./leagueKnowledge");
 const { collectPlayerKnowledge, PLAYER_UPDATE_CAP_DEFAULT } = require("./playerDailyUpdate");
 const { createApiBudget, DEFAULT_DAILY_BUDGET, DEFAULT_USER_RESERVE } = require("./apiBudget");
+const { buildDailySnapshot, saveDailyMetrics } = require("./dailyMetrics");
 const {
   computeGoalRateFeatures, computeFatigueFeature,
   fetchInjuryCountFeature, fetchStandingsFeature, fetchHeadToHeadFeature,
@@ -66,6 +67,7 @@ const {
   EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, predictOutcomeV2,
   computeFactorImportance, backtestAccuracyV2, fitWeightsGradientDescent,
   buildLearningSummary, classifyFailureReasons, summarizeFailureReasons,
+  classifySuccessReasons, summarizeSuccessReasons,
 } = require("./predictionModel");
 
 // ---- 調整可能な上限(API-Football無料プランの1日100リクエスト枠を守るため) ----
@@ -271,6 +273,7 @@ function mergeGrowthLogs(previous, current) {
     aiViewsChanged: sum(previous.aiViewsChanged, current.aiViewsChanged),
     aiViewsUnchanged: sum(previous.aiViewsUnchanged, current.aiViewsUnchanged),
     failureReasonsToday: [...(previous.failureReasonsToday || []), ...(current.failureReasonsToday || [])],
+    successReasonsToday: [...(previous.successReasonsToday || []), ...(current.successReasonsToday || [])],
     llmSkippedReasons: Array.from(new Set([...(previous.llmSkippedReasons || []), ...(current.llmSkippedReasons || [])])),
     errors: [...(previous.errors || []), ...(current.errors || [])],
   };
@@ -285,6 +288,8 @@ async function runDailyLearning(deps) {
   const nowFn = typeof now === "function" ? now : () => new Date();
   const runAt = nowFn();
   const dateKey = runAt.toISOString().slice(0, 10); // YYYY-MM-DD
+  // 2026年8月・完全自動Learning Cycle ⑧「Learning Time」: 学習にかかった実時間を計測する。
+  const learningStartedAtMs = Date.now();
 
   if (!upstashEnabled) {
     return { ok: false, reason: "NO_UPSTASH", message: "Upstash未設定のため学習エンジンは記録できません(.envのUPSTASH_REDIS_REST_URL/TOKENを確認してください)。" };
@@ -334,6 +339,7 @@ async function runDailyLearning(deps) {
   const errors = [];
   const factsToday = [];
   const failureReasonsToday = []; // Failure Learning(ご要望①): 今日外れた予測の理由一覧
+  const successReasonsToday = []; // 2026年8月・完全自動Learning Cycle ⑧: 今日当たった予測の理由一覧
   let matchesResolvedToday = 0;
   let newPredictionsLogged = 0;
   let hypothesesConfirmed = 0; // Hypothesis Engine: 検証の結果、当たっていた状態仮説の件数
@@ -608,6 +614,11 @@ async function runDailyLearning(deps) {
       // 根拠に機械的に分類する(LLM不使用・でっち上げ防止)。
       const failureReasons = record.correct ? [] : classifyFailureReasons(record, record.weightsSnapshot);
       record.failureReasons = failureReasons;
+      // 2026年8月・完全自動Learning Cycle ⑧: 当たった時も「なぜ当たったのか」を
+      // 分析する(従来は外れた時しか言語化していなかった)。失敗分析と完全に
+      // 対称な条件でのみ判定し、決め手が無ければ正直にそう返す。
+      const successReasons = record.correct ? classifySuccessReasons(record, record.weightsSnapshot) : [];
+      record.successReasons = successReasons;
       await upstashSetJSON(`learn:ownpred:${fixtureIdStr}`, record);
       await upstashCmd(["LREM", "learn:ownpred:pending", "0", fixtureIdStr]).catch(() => {});
       await upstashCmd(["INCR", "learn:ownpred:resolved"]).catch(() => {});
@@ -662,6 +673,17 @@ async function runDailyLearning(deps) {
         // 一部として、同じクラブについて話す際にAIが過去の予測ミスの傾向を
         // 踏まえられるようになる(数値としては、この失敗パターンはfeatures/weights
         // 経由で勾配降下法による重み再学習にも既に反映されている。§④のv2重み更新参照)。
+        if (record.correct && successReasons.length) {
+          successReasonsToday.push(...successReasons.map((r) => ({ ...r, teamEn: record.originTeamEn || record.homeTeamEn })));
+          try {
+            await knowledgeStore.saveKnowledgeItem({
+              teamEn: record.originTeamEn || record.homeTeamEn, category: "predictionSuccessReason", type: "analysis",
+              statement: `【予測が当たった理由】${record.homeTeamEn} vs ${record.awayTeamEn}: ${successReasons.map((r) => r.labelJa).join("、")}。${successReasons[0].detail}`,
+              detail: { fixtureId: fixtureIdStr, successReasons },
+              computedAt: runAt.toISOString(), source: "予測時点の特徴量・重みから機械的に分類(LLM不使用)",
+            });
+          } catch (e) { errors.push(`success_reason_save_failed:${fixtureIdStr}:${e.message}`); }
+        }
         if (!record.correct && failureReasons.length) {
           failureReasonsToday.push(...failureReasons.map((r) => ({ ...r, teamEn: record.originTeamEn || record.homeTeamEn })));
           try {
@@ -932,10 +954,12 @@ async function runDailyLearning(deps) {
   // 「今日」だけでなく直近の傾向も分かるよう、learn:ownpred:recent(既に
   // failureReasonsを保持している解決済みレコード)から機械的に集計する。
   let topFailureReasonsRecent = [];
+  let topSuccessReasonsRecent = []; // 2026年8月: 最近うまくいっている判断基準
   try {
     const recentForFailuresRaw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "0", "-1"]).catch(() => [])) || [];
     const recentForFailures = recentForFailuresRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
     topFailureReasonsRecent = summarizeFailureReasons(recentForFailures, 5);
+    topSuccessReasonsRecent = summarizeSuccessReasons(recentForFailures, 5);
   } catch (e) { /* ベストエフォート */ }
 
   const growthLog = {
@@ -974,6 +998,8 @@ async function runDailyLearning(deps) {
     reflectionsSaved, // Layer4: 当たり/外れ問わず保存した振り返りの件数
     failureReasonsToday, // Failure Learning: 今日外れた予測それぞれの理由(配列)
     topFailureReasonsRecent, // Failure Learning: 直近の解決済み予測全体での頻出理由(頻度順)
+    successReasonsToday, // 2026年8月: 今日当たった予測それぞれの理由(配列)
+    topSuccessReasonsRecent, // 2026年8月: 最近うまくいっている判断基準(頻度順)
     profilesGenerated, // Layer2: 今日新しく生成した固定知識(クラブプロフィール)の件数
     aiViewsChanged, aiViewsUnchanged, // Layer3: AIの見解が変わった/変わらなかったクラブ数
     llmSkippedReasons, // Layer2/3がLLM未設定でスキップされた場合の理由(空配列なら正常実行)
@@ -997,6 +1023,14 @@ async function runDailyLearning(deps) {
   const mergedGrowthLog = mergeGrowthLogs(existingToday, growthLog);
   await upstashSetJSON(`learn:growthlog:${dateKey}`, mergedGrowthLog);
   await upstashSetJSON("learn:growthlog:latest", mergedGrowthLog);
+
+  // 2026年8月・完全自動Learning Cycle ⑧「毎日賢くなっていることを証明する」:
+  // 日をまたいで比較できる軽量な指標だけを別キーに保存する。growthLogは項目が
+  // 多く増減が読み取りにくいため、比較専用のスナップショットを分けている。
+  const metricsSnapshot = buildDailySnapshot(mergedGrowthLog, {
+    learningDurationMs: Date.now() - learningStartedAtMs,
+  });
+  await saveDailyMetrics({ upstashEnabled, upstashSetJSON }, metricsSnapshot);
 
   return { ok: true, ...mergedGrowthLog };
 }

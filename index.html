@@ -6164,6 +6164,18 @@ async function renderGrowthLogWidget() {
   // のどちらなのかを、サーバー側の診断結果(zeroKnowledgeDiagnosis)に基づいて
   // はっきり書き分ける。これまでは「0件」としか出ないため、正常に動いていても
   // 利用者には「本当に学習しているの?」と見えてしまっていた。
+  // 2026年8月・完全自動Learning Cycle ⑧「毎日賢くなっていることを証明してください」:
+  // 前日との差分から機械的に判定した結果を、最も目立つ位置に表示する。
+  // 根拠が無いのに「成長した」とは言わない(判定不能なら正直にそう出す)。
+  const growthCmp = log.growthComparison || null;
+  const growthVerdictHtml = growthCmp
+    ? `<div style="margin-top:6px; padding:8px 10px; border-radius:8px; background:${growthCmp.improved === true ? "rgba(30,132,73,.10)" : growthCmp.improved === false ? "rgba(192,57,43,.08)" : "rgba(0,0,0,.04)"};">
+         <span style="font-weight:700; color:${growthCmp.improved === true ? "#1e8449" : growthCmp.improved === false ? "#c0392b" : "inherit"};">
+           ${growthCmp.improved === true ? "📈" : growthCmp.improved === false ? "📉" : "➖"} ${escapeHtml(growthCmp.verdictJa || "")}
+         </span>
+         ${growthCmp.hasBaseline ? `<div class="value-note" style="margin-top:3px; opacity:.85;">前日比 — 知識: ${growthCmp.knowledgeDelta ?? "—"}件 / 記憶: ${growthCmp.memoryDelta ?? "—"}件 / 的中率: ${growthCmp.accuracyDelta ?? "—"}pt</div>` : ""}
+       </div>`
+    : "";
   const zeroDiag = log.zeroKnowledgeDiagnosis || null;
   const zeroVerifyDiag = log.zeroVerificationDiagnosis || null;
   const severityStyle = { ok: "color:#1e8449;", warn: "color:#b9770e;", error: "color:#c0392b;" };
@@ -6189,6 +6201,7 @@ async function renderGrowthLogWidget() {
     <span class="value-note">(${formatDateJa(log.date + "T00:00:00Z")}時点・登録${log.teamsAnalyzed}クラブ+${leaguesAnalyzed}リーグ+${playersAnalyzed}選手を分析)</span>
     <button class="more-details-btn" id="growthLogToggleBtn" type="button" style="margin-left:8px; display:inline-block; width:auto; padding:4px 10px;">詳しく見る ▼</button>
     <div class="value-note" style="margin-top:4px;">今日追加した知識: ${knowledgeSaved}件(重複でスキップ: ${knowledgeDup}件) ・ 検証した試合: ${log.matchesResolvedToday}件</div>
+    ${growthVerdictHtml}
     ${zeroDiagHtml}
     ${zeroVerifyHtml}
     ${errorWarningHtml}
@@ -6276,6 +6289,35 @@ async function renderGrowthLogWidget() {
         : ""}
     `;
 
+    // 2026年8月・完全自動Learning Cycle ⑧「成功した理由も分析」:
+    // 従来は「外した理由」しか出していなかったが、当たった理由も同じ形式で表示する。
+    const topSuccess = log.topSuccessReasonsRecent || [];
+    const successToday = log.successReasonsToday || [];
+    const successReasonsHtml = (topSuccess.length || successToday.length)
+      ? `<p class="value-note" style="margin:8px 0 4px;">✅ 直近うまくいっている判断基準${successToday.length ? `(本日${successToday.length}件の的中を分析)` : ""}:</p>
+         ${topSuccess.length
+           ? `<ul style="margin:0 0 4px 8px; padding-left:18px; font-size:12px;">${topSuccess.slice(0, 3).map((r) => `<li>${escapeHtml(r.labelJa || "")}(${r.count}回)</li>`).join("")}</ul>`
+           : `<p class="value-note" style="margin:4px 0 4px 8px; opacity:.8;">まだ集計できるだけの的中データがありません。</p>`}`
+      : `<p class="value-note" style="margin:8px 0 4px; opacity:.8;">✅ 当たった理由の分析: まだ検証できた試合がありません(試合終了後に自動で分析します)。</p>`;
+
+    // 2026年8月・完全自動Learning Cycle ⑦「学習状況を見える化してください」:
+    // ご要望の項目(取得した試合数・選手数・クラブ数・追加/更新知識件数・
+    // 各Engineの更新状況)を1か所にまとめて数値で表示する。
+    const learningStatsHtml = `
+      <p class="value-note" style="margin:10px 0 4px;">📊 本日の学習サマリー(数値):</p>
+      <div class="value-note" style="margin:0 0 4px 8px; display:flex; gap:10px 16px; flex-wrap:wrap; font-size:12px;">
+        <span>クラブ: <strong>${log.teamsAnalyzed ?? 0}</strong></span>
+        <span>リーグ: <strong>${log.leaguesAnalyzedToday ?? 0}</strong></span>
+        <span>選手: <strong>${log.playersCheckedToday ?? 0}</strong></span>
+        <span>検証した試合: <strong>${log.matchesResolvedToday ?? 0}</strong></span>
+        <span>新規予測: <strong>${log.newPredictionsLogged ?? 0}</strong></span>
+        <span>追加知識: <strong>${log.knowledgeItemsSavedToday ?? 0}</strong></span>
+        <span>変化なし: <strong>${log.knowledgeItemsDuplicateToday ?? 0}</strong></span>
+        <span>振り返り保存: <strong>${log.reflectionsSaved ?? 0}</strong></span>
+        <span>仮説検証: <strong>${(log.hypothesesConfirmed ?? 0) + (log.hypothesesDiscarded ?? 0)}</strong></span>
+        <span>重み更新: <strong>${(log.weightsUpdated || log.weightsUpdatedV2) ? "あり" : "なし"}</strong></span>
+      </div>`;
+
     // 2026年8月・優先順位⑦: APIリクエスト予算の使用状況。「知識0件」の原因が
     // 予算切れなのかどうかを、利用者自身が確認できるようにする。
     const budget = log.apiBudget || null;
@@ -6309,6 +6351,8 @@ async function renderGrowthLogWidget() {
       ${otherFactsHtml}
       ${leagueFactsHtml}
       ${playerFactsHtml}
+      ${successReasonsHtml}
+      ${learningStatsHtml}
       ${budgetHtml}
       <p class="value-note" style="margin-top:8px; opacity:.8;">※「自社予測モデル」はホーム画面の「AI予測の実績」(API-Football自体の予測データ)とは別の、このアプリ独自の実験的な予測モデルです。この学習結果(重み)は「クラブ同士の試合を分析」機能の予測にも実際に使われます。※「今日追加した知識」はKnowledge Engine(事実/分析/意見を分離・重複排除・失効管理する知識ベース)に新規保存された件数です。</p>
     `;

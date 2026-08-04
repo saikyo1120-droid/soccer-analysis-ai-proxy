@@ -395,6 +395,92 @@ function classifyFailureReasons(record, weightsUsed) {
   return reasons.slice(0, 3);
 }
 
+// ---- 2026年8月・完全自動Learning Cycle ⑧「成功した理由も分析」 ----
+// これまでは「外した理由」しか言語化しておらず、当たった時は数を数えるだけだった。
+// 人間のアナリストは当たった時も「なぜ当たったのか」を確認して自分の判断基準を
+// 強化するため、同じことをAIにもさせる。
+//
+// でっち上げ防止: 失敗分析と完全に対称な条件だけで判定する。
+//   「その特徴量が予測した方向に効いていて(重みが一定以上)、実際の結果も
+//     その方向だった」場合のみ「正しく評価できた要因」とみなす。
+// 該当が1つも無い場合は、無理に理由を作らず「単一の決定的な要因は特定できない
+// (モデル全体の総合判断が当たった)」と正直に返す。
+const SUCCESS_REASON_LABELS_JA = {
+  home_bonus_worked: "ホームアドバンテージを正しく評価できた",
+  formDiff_worked: "直近フォームの差を正しく評価できた",
+  goalRateDiff_worked: "得点力・失点率の差を正しく評価できた",
+  injuryDiff_worked: "怪我人の影響を正しく評価できた",
+  standingsDiff_worked: "順位・勝点の差を正しく評価できた",
+  headToHeadDiff_worked: "過去対戦の傾向を正しく評価できた",
+  fatigueDiff_worked: "過密日程(疲労)の影響を正しく評価できた",
+  overall_judgement: "モデル全体の総合判断が当たった(単一の決定的な要因は特定できません)",
+};
+
+/**
+ * 的中した予測について「なぜ当たったのか」を分類する。
+ * @param {object} record - resolved済みのlearn:ownpredレコード
+ * @param {object} weightsUsed - 予測時点の重み
+ * @returns {Array<{id, labelJa, detail}>} 外れていれば空配列
+ */
+function classifySuccessReasons(record, weightsUsed) {
+  if (!record || record.correct !== true || !record.actualWinner || !record.predictedWinner) return [];
+  const weights = weightsUsed || record.weightsSnapshot || EXTENDED_DEFAULT_WEIGHTS;
+  const actualSign = OUTCOME_SIGN[record.actualWinner] ?? 0;
+  const outcomeLabelJa = (w) => (w === "home" ? "ホーム勝利" : w === "away" ? "アウェイ勝利" : "引き分け");
+  const reasons = [];
+
+  const homeBiasMag = (weights.homeBase ?? 0) - (weights.awayBase ?? 0);
+  if (actualSign > 0 && homeBiasMag >= 0.3) {
+    reasons.push({
+      id: "home_bonus_worked",
+      labelJa: SUCCESS_REASON_LABELS_JA.home_bonus_worked,
+      detail: `ホームアドバンテージ(基礎値の差+${homeBiasMag.toFixed(2)})を見込んでホーム優位と予想し、実際に${outcomeLabelJa(record.actualWinner)}になりました。`,
+    });
+  }
+
+  const features = record.features;
+  if (features && typeof features === "object") {
+    for (const [fKey, wKey] of Object.entries(FEATURE_WEIGHT_MAP)) {
+      const fVal = features[fKey] || 0;
+      const wVal = weights[wKey] || 0;
+      const contributionSign = Math.sign(fVal * wVal);
+      const labelJa = FEATURE_LABELS_JA[fKey];
+      // 失敗分析の「重視しすぎた」と対称: 予測方向に効いていて、結果もその方向だった
+      if (contributionSign !== 0 && contributionSign === actualSign && Math.abs(wVal) >= 0.05) {
+        reasons.push({
+          id: `${fKey}_worked`,
+          labelJa: SUCCESS_REASON_LABELS_JA[`${fKey}_worked`] || `${labelJa}を正しく評価できた`,
+          detail: `${labelJa}の差(${fVal.toFixed(2)})を根拠に予想し、実際の結果(${outcomeLabelJa(record.actualWinner)})もその方向でした。`,
+        });
+      }
+    }
+  }
+
+  if (!reasons.length) {
+    reasons.push({
+      id: "overall_judgement",
+      labelJa: SUCCESS_REASON_LABELS_JA.overall_judgement,
+      detail: "個々の要素では決め手を特定できませんでしたが、複数要素を総合した予測が結果と一致しました。",
+    });
+  }
+  return reasons.slice(0, 3);
+}
+
+// 成功理由も失敗理由と同じ形式で頻度集計する(「最近うまくいっている判断基準」)。
+function summarizeSuccessReasons(records, limit) {
+  const counts = new Map();
+  for (const r of records || []) {
+    if (!r || r.correct !== true || !Array.isArray(r.successReasons)) continue;
+    for (const reason of r.successReasons) {
+      if (!reason || !reason.id) continue;
+      const cur = counts.get(reason.id) || { id: reason.id, labelJa: reason.labelJa, count: 0 };
+      cur.count++;
+      counts.set(reason.id, cur);
+    }
+  }
+  return [...counts.values()].sort((a, b) => b.count - a.count).slice(0, limit || 5);
+}
+
 // 直近の解決済み予測(learn:ownpred:recentなど)の failureReasons を横断集計し、
 // 「最近よく外れる原因」を頻度順に返す(AIの成長レポート・議論モードの根拠に使う)。
 function summarizeFailureReasons(records, limit) {
@@ -432,4 +518,7 @@ module.exports = {
   buildLearningSummary,
   classifyFailureReasons,
   summarizeFailureReasons,
+  classifySuccessReasons,
+  summarizeSuccessReasons,
+  SUCCESS_REASON_LABELS_JA,
 };

@@ -51,6 +51,8 @@ const { runDailyLearning, getGrowthLog, getRecentFactsForTeam, computeFormScore 
 // 2026年8月・優先順位⑨: 「今日追加した知識0件」が正常な0件(前回から変化なし)
 // なのか、異常な0件(未実行・キー未設定・予算切れ等)なのかを実データから判定する。
 const { diagnoseZeroKnowledge, diagnoseZeroVerification, getRunHistory, buildEngineStatuses } = require("./learning/healthCheck");
+// 2026年8月・完全自動Learning Cycle ⑧: 「本当に昨日より賢くなったのか」を数値で示す。
+const { getMetricsTrend } = require("./learning/dailyMetrics");
 // /debug診断ページが「毎日学習エンジンが対象にしている全クラブ」を横断して
 // Knowledge Engine / Memory Engineの件数を集計するために使う一覧(新機能ではなく
 // 既存のクラブ一覧を読み取り専用で再利用するだけ)。
@@ -1740,6 +1742,7 @@ async function handleLearningHealth(searchParams) {
   const todayDateKey = new Date().toISOString().slice(0, 10);
   const runHistory = await getRunHistory(learningDeps, days, todayDateKey).catch(() => ({ available: false, reasonJa: "実行履歴の読み出しに失敗しました。", days: [] }));
 
+  const metricsTrend = await getMetricsTrend(learningDeps, 7, todayDateKey).catch(() => null);
   const zeroKnowledge = diagnoseZeroKnowledge(growthLog);
   const zeroVerification = diagnoseZeroVerification(growthLog);
   const engines = buildEngineStatuses({
@@ -1772,6 +1775,9 @@ async function handleLearningHealth(searchParams) {
     body: {
       ok: true, generatedAt, overall, overallMessageJa,
       zeroKnowledge, zeroVerification, engines, runHistory,
+      // 2026年8月: 「昨日より賢くなったか」を数値の差分で示す(⑧のご要望)。
+      growthComparison: metricsTrend ? metricsTrend.comparison : null,
+      metricsAvailable: !!(metricsTrend && metricsTrend.available),
       apiBudget: growthLog.apiBudget || null,
       // 2026年8月・優先順位⑪: 現在の契約プランの自動判定結果。
       // 「Proに加入したはずだが本当に反映されているか」をこの画面だけで確認できる。
@@ -2711,9 +2717,25 @@ const server = http.createServer(async (req, res) => {
         try {
           result.zeroKnowledgeDiagnosis = diagnoseZeroKnowledge(result);
           result.zeroVerificationDiagnosis = diagnoseZeroVerification(result);
+          // 2026年8月・完全自動Learning Cycle ⑧: 「昨日より賢くなったか」の判定も
+          // ホーム画面のウィジェットへ渡す(前日との実データの差分に基づく)。
+          const trend = await getMetricsTrend(learningDeps, 3, new Date().toISOString().slice(0, 10)).catch(() => null);
+          result.growthComparison = trend ? trend.comparison : null;
         } catch (e) { /* 診断は付加情報なので、失敗しても本体は返す */ }
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(result));
+        return;
+      }
+      if (pathname === "/api/learning/metrics") {
+        // 2026年8月・完全自動Learning Cycle ⑧「毎日賢くなっていることを証明してください」。
+        // Prediction Accuracy / Knowledge Count / Memory Count / Failure Learning /
+        // Weight Update / Learning Time を日ごとに記録したものを、前日との差分つきで返す。
+        const days = Math.max(2, Math.min(60, parseInt(parsed.searchParams.get("days") || "14", 10) || 14));
+        const todayDateKey = new Date().toISOString().slice(0, 10);
+        const trend = await getMetricsTrend(learningDeps, days, todayDateKey)
+          .catch((e) => ({ available: false, reasonJa: `指標の読み出しに失敗しました(${e.message})。`, days: [] }));
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: true, generatedAt: new Date().toISOString(), ...trend }));
         return;
       }
       if (pathname === "/api/learning/health") {
