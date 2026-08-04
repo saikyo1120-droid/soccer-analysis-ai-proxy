@@ -3192,6 +3192,14 @@ function buildDialogueExtras(topicType, ctx, level) {
   return html;
 }
 
+// 2026年8月・「議論できるAIへの強化」フェーズ(優先順位①): answerPlayerQuestion/
+// answerClubQuestionは「よくある聞き方」を無料・即答するためのルールベース層。
+// ここでパターンに一致しない=このAIが答えられない、ではなく、実データ+LLMの
+// 議論エンジン(/api/discuss、既にPlanner/RAG/Reasoning Engineで実装済み)に
+// エスカレーションするための合図として、このシンボルを返す(利用者には絶対に
+// 表示しない。呼び出し側が必ず判定してrunDiscussFlowへ回す)。
+const NO_RULE_MATCH = Symbol("NO_RULE_MATCH");
+
 function answerPlayerQuestion(player, question, level) {
   const q = (question || "").trim();
   if (!q) return "質問を入力してください。";
@@ -3211,7 +3219,7 @@ function answerPlayerQuestion(player, question, level) {
   if (/タイトル|優勝|実績/.test(q)) return player.titles.length ? `${player.name}の主なタイトルは${player.titles.join("、")}です。` : `このツールに登録されているタイトル実績は現時点でありません(未収録の可能性があります)。`;
   if (/どんな選手|どういう選手|の特徴|人物像|プロフィール/.test(q)) return player.summary[level] || player.summary.standard;
   if (other) return buildComparisonAnswer(player, other);
-  return `この聞き方にはまだうまくお答えできませんでした。「弱点は？」「なぜ評価が高い？」「どんな戦術に合う？」「(他の選手名)との違いは？」「初心者にもわかるように説明して」のような質問なら、登録データから回答を組み立てられます。`;
+  return NO_RULE_MATCH;
 }
 
 // deterministic pseudo-random generator for unregistered player names
@@ -4097,7 +4105,18 @@ async function sendChatMessage(player, presetText) {
     return;
   }
 
-  const answer = beginnerize(answerPlayerQuestion(player, text, state.level));
+  const ruleAnswer = answerPlayerQuestion(player, text, state.level);
+  // 2026年8月・優先順位①: ルールベースのパターンに一致しなかった場合、以前は
+  // 「うまくお答えできませんでした」で終わっていた。この選手カードの文脈が
+  // 分かっているため、その選手を主題としてAIの議論エンジン(実データ+LLM)へ
+  // エスカレーションし、常に実質的な回答を返す。
+  if (ruleAnswer === NO_RULE_MATCH) {
+    if (input) input.value = "";
+    renderChatUI(player);
+    await runDiscussFlow(text, dLevel, player, (msg) => chatHistories[key].push(msg), () => renderChatUI(player));
+    return;
+  }
+  const answer = beginnerize(ruleAnswer);
   const other = detectMentionedPlayer(text, player.key);
   const isComparison = !!(other && /違い|比較|どっちが|どちらが|vs|対/.test(text));
   const topicType = isComparison ? "comparison" : "player";
@@ -4960,6 +4979,40 @@ function buildClubAnswer(clubName, level) {
   else if (level === "expert") text += `平均${ATTR_LABELS[Object.entries(avgAttrs).sort((a, b) => b[1] - a[1])[0][0]]}の高さが、この戦術評価の主因になっています。`;
   return text;
 }
+
+// 2026年8月・「議論できるAIへの強化」フェーズ(優先順位①): buildClubAnswer()は
+// 「登録選手の能力値」という静的データだけを根拠にした汎用サマリーで、質問の
+// 角度(なぜ強い/なぜ弱くなった/補強すべきか/監督采配は等)を区別しない。
+// 「素朴に概要を知りたい」聞き方はこの無料の即答で十分だが、それ以外(直近の
+// 調子・怪我・補強・監督評価など)は実データの裏付けが無いと不正確・的外れに
+// なりやすいため、正直さを優先してNO_RULE_MATCHを返し、呼び出し側で実データ+
+// LLMの議論エンジン(/api/discuss)にエスカレーションさせる。
+function answerClubQuestion(clubName, question, level) {
+  const q = String(question || "").trim();
+  if (!q || /^(どんなクラブ|クラブ概要|概要|教えて|about)[?？!。]*$/.test(q) || /どんなクラブ|クラブ概要|概要を?教えて/.test(q)) {
+    return buildClubAnswer(clubName, level);
+  }
+  return NO_RULE_MATCH;
+}
+
+// 2026年8月・「議論できるAIへの強化」フェーズ(優先順位①): ローカルのPLAYERS
+// (登録選手カード用の静的データ)に無い選手についての質問は、これまで
+// 「検出すらできない」ため必ず失敗していた。しかしサーバー側のhandlePlayerSeasonStats
+// は選手名さえあればAPI-Footballへ実際に検索をかけられる(ローカル登録に依存しない)
+// ため、質問文から「選手名らしき語」を推測できれば、未登録選手でも実データに基づく
+// 回答が可能になる。完全な固有表現抽出ではなく、以下2つの現実的なヒューリスティックに
+// 限定する(過検出でおかしな検索をしないよう、あえて範囲を絞っている):
+//   1) カタカナの連続2文字以上 ― 海外選手名の大半はカタカナ表記されるため。
+//   2) よく話題になる日本人選手の姓の簡易辞書(将来的に拡充可能。網羅はしていない
+//      ことをREADMEに明記する)。
+const KNOWN_JP_SURNAMES = ["久保建英", "久保", "三笘薫", "三笘", "遠藤航", "遠藤", "冨安健洋", "冨安", "堂安律", "堂安", "鎌田大地", "鎌田", "伊東純也", "伊東", "上田綺世", "上田", "南野拓実", "南野", "旗手怜央", "旗手", "板倉滉", "板倉", "浅野拓磨", "浅野", "中村敬斗", "中村", "谷口彰悟", "谷口", "毎熊晟矢", "毎熊"];
+function guessUnregisteredPlayerName(q) {
+  const kata = String(q || "").match(/[ァ-ヴー]{2,}/g);
+  if (kata && kata.length) return kata.slice().sort((a, b) => b.length - a.length)[0];
+  const jp = KNOWN_JP_SURNAMES.find((s) => q.indexOf(s) !== -1);
+  return jp || null;
+}
+
 function getDailyFeaturedMatchup() {
   const dateStr = new Date().toISOString().slice(0, 10);
   const idx = hashString("matchup|" + dateStr) % MATCHUPS.length;
@@ -5037,7 +5090,7 @@ function isDiscussionTrigger(q) {
 // 質問文(と、分かっていれば「今表示中の選手」)から、議論エンジンのRAGが使う
 // 「主題」を決める。クラブが見つかればクラブ優先、次に選手、どちらもなければ
 // 主題なし(その場合はRAGを呼ばず、LLMの一般知識のみで考察する)。
-function buildDiscussSubject(q, contextPlayer) {
+function buildDiscussSubject(q, contextPlayer, forcedPlayerName) {
   if (contextPlayer) {
     return {
       subject: { type: "player", labelJa: contextPlayer.nameJa },
@@ -5057,6 +5110,13 @@ function buildDiscussSubject(q, contextPlayer) {
       playerHint: { name: p.name, teamEn: CLUB_JA_TO_EN[clubBase(p)] || "", birth: p.birth || "" },
       resolvedPlayer: p,
     };
+  }
+  // 2026年8月・優先順位①: ローカル未登録の選手でも、質問文から選手名らしき語を
+  // 推測できていれば(guessUnregisteredPlayerName)、サーバー側のAPI-Football実検索に
+  // 委ねる形でsubject.type="player"として扱う(resolvedPlayerはローカルカードが
+  // 無いためnullのまま)。
+  if (forcedPlayerName) {
+    return { subject: { type: "player", labelJa: forcedPlayerName }, playerHint: { name: forcedPlayerName, teamEn: "", birth: "" }, resolvedPlayer: null };
   }
   return { subject: { type: null }, playerHint: null, resolvedPlayer: null };
 }
@@ -5109,8 +5169,8 @@ function renderDiscussReplyHtml(resp) {
 // hero chat・選手個別チャット共通の議論モードフロー。
 // pushFn: 新しいメッセージオブジェクトを履歴配列に積む関数
 // renderFn: 履歴を再描画する関数
-async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn) {
-  const { subject, playerHint, resolvedPlayer } = buildDiscussSubject(q, contextPlayer);
+async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn, forcedPlayerName) {
+  const { subject, playerHint, resolvedPlayer } = buildDiscussSubject(q, contextPlayer, forcedPlayerName);
   const pendingMsg = { role: "ai", text: `<p class="value-note">🧠 AIが考えています…(実データを確認し、考察を組み立てています)</p>`, extras: "" };
   pushFn(pendingMsg);
   renderFn();
@@ -5127,7 +5187,10 @@ async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn) {
     const reason = (resp && resp.message) ? resp.message : "AIの考察機能に接続できませんでした(サーバーの起動直後で時間がかかっている可能性があります)。";
     let fallback = "";
     if (subject.type === "club" && subject.labelJa) fallback = buildClubAnswer(subject.labelJa, dLevel);
-    else if (subject.type === "player" && resolvedPlayer) fallback = answerPlayerQuestion(resolvedPlayer, q, dLevel);
+    else if (subject.type === "player" && resolvedPlayer) {
+      const ruleAnswer = answerPlayerQuestion(resolvedPlayer, q, dLevel);
+      fallback = (ruleAnswer === NO_RULE_MATCH) ? (resolvedPlayer.summary[dLevel] || resolvedPlayer.summary.standard) : ruleAnswer;
+    }
     pendingMsg.text = `<p class="value-note">⚠️ ${escapeHtml(reason)}</p>` +
       (fallback ? `<p>${escapeHtml(fallback)}</p><p class="value-note">(↑参考として、登録データに基づく要約を表示しています。AIによる考察ではありません)</p>` : "");
   }
@@ -5150,7 +5213,15 @@ async function heroAskAI(question) {
     return;
   }
 
-  const matchIntent = /(今日|本日).*(試合|見るべき|おすすめ)|見るべき試合|おすすめの試合|どの試合を見る/.test(q);
+  // 2026年8月・「議論できるAIへの強化」フェーズ(優先順位①・最重要): 以前はここで
+  // マッチしなければ「うまく認識できませんでした」と即座に諦めていた。しかし
+  // /api/discuss(Planner→RAG→Reasoning Engine→LLM)は既にクラブ・選手・一般論の
+  // どのケースでも実データに基づいた本物の考察を返せる設計になっている。そのため
+  // 「無料で一瞬で正確に答えられる、よくある聞き方」だけをこの下のルールベースで
+  // 即答し、パターンに一致しないものは(失敗として諦めるのではなく)必ずAIの
+  // 議論エンジンへエスカレーションする形に変更した。これにより「答えられません」を
+  // 実質ゼロに近づける。
+  const matchIntent = /(今日|本日).*(試合|見るべき|おすすめ)|見るべき試合|おすすめの試合|どの試合を見る|試合.*(どっち|勝つ|予想|展開|見どころ)|どっち.*勝つ|勝つのはどっち/.test(q);
   const comparisonKeyword = /(どっち|どちら|vs|VS|対|比較|違い)/.test(q);
   const mentioned = findAllMentionedPlayers(q, 2);
   let reply;
@@ -5175,22 +5246,39 @@ async function heroAskAI(question) {
     document.getElementById("playerSearchInput").value = mentioned[0].nameJa;
     renderPlayerCard(mentioned[0], state.level);
     scrollToEl("playerCardWrap");
-    reply = `${mentioned[0].nameJa}について、下にAI分析カードを表示しました。${answerPlayerQuestion(mentioned[0], q, state.level)}`;
+    const ruleAnswer = answerPlayerQuestion(mentioned[0], q, state.level);
+    if (ruleAnswer === NO_RULE_MATCH) {
+      await runDiscussFlow(q, dLevel, mentioned[0], (msg) => heroChatHistory.push(msg), renderHeroChatUI);
+      return;
+    }
+    reply = `${mentioned[0].nameJa}について、下にAI分析カードを表示しました。${ruleAnswer}`;
     topicType = "player"; topicCtx = mentioned[0];
   } else {
     const clubName = detectClubMention(q);
     if (clubName) {
-      reply = buildClubAnswer(clubName, state.level);
+      const ruleAnswer = answerClubQuestion(clubName, q, state.level);
+      if (ruleAnswer === NO_RULE_MATCH) {
+        await runDiscussFlow(q, dLevel, null, (msg) => heroChatHistory.push(msg), renderHeroChatUI);
+        return;
+      }
+      reply = ruleAnswer;
       topicType = "club"; topicCtx = clubName;
     } else if (matchIntent) {
       switchToMatchMode();
       const m = getDailyFeaturedMatchup();
       renderMatchAnalysis(m.id);
       scrollToEl("matchAnalysisWrap");
-      reply = `本日のAIおすすめカードは「${m.homeLabel} vs ${m.awayLabel}」です。下に分析を表示しました。📡「本日の実際の試合」に実データがある場合は、そちらも合わせてチェックしてみてください。`;
+      reply = `具体的な対戦カードが分からなかったため、本日のAIおすすめカード「${m.homeLabel} vs ${m.awayLabel}」を表示しました。下に分析を表示しています。特定の対戦を知りたい場合は「(クラブ名)と(クラブ名)どっちが勝つ？」のようにクラブ名を含めて聞いてください。📡「本日の実際の試合」に実データがある場合は、そちらも合わせてチェックしてみてください。`;
       topicType = "match"; topicCtx = m;
     } else {
-      reply = `うまく認識できませんでした。「(選手名)はどんな選手？」「(クラブ名)はなぜ強い？」「今日見るべき試合は？」「(選手A)と(選手B)どっち？」のような聞き方だと、登録データからAIが答えを組み立てられます。`;
+      // クラブ名・登録選手名のどちらも検出できなかった場合。これまではここで
+      // 諦めていたが、未登録選手名らしき語(カタカナ表記など)を推測できれば
+      // それを手がかりにサーバーのAPI-Football実検索へ委ね、それも無理なら
+      // 「主題なし」の一般知識考察としてAIの議論エンジンへ渡す(常に何らかの
+      // 実質的な回答を試みる)。
+      const guessedName = guessUnregisteredPlayerName(q);
+      await runDiscussFlow(q, dLevel, null, (msg) => heroChatHistory.push(msg), renderHeroChatUI, guessedName || undefined);
+      return;
     }
   }
   const extras = buildDialogueExtras(topicType, topicCtx, dLevel);
@@ -5683,11 +5771,23 @@ async function renderGrowthLogWidget() {
   const hypConfirmed = log.hypothesesConfirmed ?? 0;
   const hypDiscarded = log.hypothesesDiscarded ?? 0;
 
+  // 2026年8月・優先順位⑨(Learning Engine総点検): 「今日追加した知識0件」が
+  // 表示された時、それが「本当に変化が無かった」のか「実はAPI-Football等への
+  // データ取得でエラーが起きて処理が止まっていた」のか、これまでは区別できな
+  // かった(dailyJob.js側は各処理をerrors配列に記録していたが、フロント側で
+  // 一切表示していなかった)。エラーが1件でもあれば、詳細を開かなくても分かる
+  // よう要約行に警告を出す。
+  const todayErrors = log.errors || [];
+  const errorWarningHtml = todayErrors.length
+    ? `<div class="value-note" style="margin-top:2px; color:#c0392b;">⚠️ 本日のデータ取得で${todayErrors.length}件のエラーが発生しました(詳細は「詳しく見る」)。件数が少ないのはこのエラーが原因の可能性があります。</div>`
+    : "";
+
   summaryEl.innerHTML = `
     🧠 <strong>昨日学んだこと</strong>
     <span class="value-note">(${formatDateJa(log.date + "T00:00:00Z")}時点・登録${log.teamsAnalyzed}クラブを分析)</span>
     <button class="more-details-btn" id="growthLogToggleBtn" type="button" style="margin-left:8px; display:inline-block; width:auto; padding:4px 10px;">詳しく見る ▼</button>
     <div class="value-note" style="margin-top:4px;">今日追加した知識: ${knowledgeSaved}件(重複でスキップ: ${knowledgeDup}件) ・ 検証した試合: ${log.matchesResolvedToday}件</div>
+    ${errorWarningHtml}
   `;
 
   const toggleBtn = document.getElementById("growthLogToggleBtn");
@@ -5721,12 +5821,27 @@ async function renderGrowthLogWidget() {
     const otherFactsHtml = otherFacts.length
       ? `<p class="value-note" style="margin:8px 0 4px;">🧩 監督交代・補強のチェック(実データ・ローテーションで数クラブずつ巡回):</p>${otherFacts.map(buildGrowthFactRow).join("")}`
       : `<p class="value-note" style="margin:8px 0 4px; opacity:.8;">🧩 監督交代・補強のチェック: 本日ローテーションで確認したクラブでは変化は見つかりませんでした。</p>`;
+    // 2026年8月・優先順位⑨: dailyJob.js側は以前からteam/fixtureごとの失敗理由を
+    // errors配列に記録していた(例: "coach_check_failed:Bayern Munich:..."）が、
+    // このウィジェットには一切表示されていなかった。「本当に学習しているの?」と
+    // 利用者が不安にならないよう、正直にエラー内容を開示する(技術的な文字列
+    // そのままだが、隠すよりずっと良い)。
+    const errorsHtml = todayErrors.length
+      ? `<div style="margin:8px 0 4px; padding:8px 10px; background:rgba(192,57,43,.08); border-radius:8px;">
+           <p class="value-note" style="color:#c0392b; font-weight:600; margin:0 0 4px;">⚠️ 本日発生したエラー(${todayErrors.length}件・開発者向けの技術的な詳細):</p>
+           <ul style="margin:0; padding-left:18px; font-size:12px; color:#c0392b; opacity:.85;">
+             ${todayErrors.slice(0, 10).map((e) => `<li>${escapeHtml(String(e))}</li>`).join("")}
+           </ul>
+           ${todayErrors.length > 10 ? `<p class="value-note" style="margin:4px 0 0;">…他${todayErrors.length - 10}件</p>` : ""}
+         </div>`
+      : "";
     detailsEl.innerHTML = `
       ${accLine}
       ${buildLearningSummarySection(log)}
       ${hypothesisLine}
       ${failureReasonsHtml}
       ${engineTotalsHtml}
+      ${errorsHtml}
       <p class="value-note" style="margin:8px 0 4px;">今日追加された事実(すべてAPI-Footballの実データから算出):</p>
       ${factsHtml}
       ${otherFactsHtml}
