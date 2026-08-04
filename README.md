@@ -1573,11 +1573,127 @@ try/catchで囲み、失敗しても`errors`配列に記録して次へ進む」
 
 #### 残課題
 
-- 「⑤今日の試合検索機能」はまだ未着手です(優先順位⑤として次回対応予定)。
+- 「⑤今日の試合検索機能」は次のセクション(19)で対応済みです。
 - 試合中データの自動更新(現在は「開き直すと最新化される」方式)を、
   ページを開いたままでも一定間隔で自動的に再取得するポーリング方式に
   発展させる余地がありますが、API利用枠(無料/有料プランの上限)への影響を
   慎重に見極めたいため、今回はあえて「開き直し方式」に留めています。
+
+### 19. 2026年8月・優先順位⑤(今日の試合検索機能)
+
+「本日の実際の試合」カードに検索窓(`#fixtureSearchInput`)を追加しました。
+ご要望どおり「レアル」のように日本語で打つだけで対象の試合が絞り込まれ、
+クラブ名・リーグ名・国名・監督名のいずれからも検索できます。
+
+#### クラブ名/リーグ名/国名検索(即時・追加通信なし)
+
+すでに取得済みの「本日の試合」データに対して、入力するたびにクライアント側で
+即座に絞り込みます(追加のAPI呼び出しは発生しません)。API-Footballが返す
+クラブ名・リーグ名・国名は基本的に英語(現地語)表記のため、日本語入力でも
+ヒットするよう`FIXTURE_SEARCH_ALIASES`という日本語→英語の別名テーブルを新設
+しました(欧州5大リーグ・主要クラブ・主要国を最低限カバー)。「レアル」→
+`real madrid`、「プレミアリーグ」→`premier league`のように、別名に部分一致
+した場合はその英語キーワードでも試合データを照合します。
+
+既存の`REAL_FIXTURE_CLUB_EN_TO_JA`(登録選手データと結びつけるための厳密一致
+テーブル、優先順位③で使用)とは目的が異なるため、あえて別のテーブルとして
+新設しています(厳密一致である必要が無く、自由に別名を増やせるようにする
+ため)。
+
+#### 監督名検索(バックエンドへのデバウンス問い合わせ)
+
+監督名は「本日の試合」一覧そのものには含まれていません。今日の試合に登場する
+全チーム(最大160チーム分)の監督データを毎回先読みするとAPI予算(月間上限
+あり)を圧迫するため、そうはせず、新設した`GET /api/coach-search?name=`が
+API-Football自身のサーバー側名前検索(`/coachs?search=`)をオンデマンドで
+呼び出す方式にしました。フロントエンド側は入力から500ms待って(デバウンス)
+から呼び出し、返ってきた監督の現所属チーム名を、通常検索でヒットしなかった
+試合に対して追加でマージ表示します(`mergeCoachMatchedFixtures`)。検索語が
+その間に変わっていた場合は、古い結果を捨てて反映しないようトークンで管理して
+います。
+
+一致する試合が1件も無い場合は、架空の試合をでっち上げず「見つかりませんでした」
+と正直に表示します(既存の一貫した設計方針を踏襲)。
+
+#### テスト
+
+`scripts/fixture_search_test.js`(新規、14テスト)で以下を確認しています。
+
+- `fixtureMatchesQuery`が英語表記への直接の部分一致、日本語別名テーブル経由の
+  一致(「レアル」「プレミアリーグ」「イタリア」等)、どちらにも一致しない
+  場合は正直にfalseを返すこと(でっち上げてヒットさせない)
+- `filterFixturesByQuery`で試合一覧全体を正しく絞り込めること
+- `mergeCoachMatchedFixtures`が監督の所属チーム名から追加の試合を正しく
+  マージし、重複を除外し、一致が無い/未定義の場合も例外を投げないこと
+- `FIXTURE_SEARCH_ALIASES`が欧州5大リーグの日本語名を最低限カバーしていること
+
+`scripts/server_coach_search_test.js`(新規)で`GET /api/coach-search`が、
+1文字クエリではAPIを呼ばないこと(予算保護)、現所属チームを正しく解決する
+こと、該当なしや退任済み(現所属が不明)の監督を正しく除外することを確認して
+います。API-Footballの`/coachs`レスポンス形状は、既存の`server/learning/
+features.js`の`computeCoachCareer`ですでに確認済みの実スキーマ(監督ごとに
+フラットな`{name, photo, career:[...]}`。ネストされた`coach`キーは無い)に
+合わせています。
+
+`scripts/pw_fixture_search_check.js`(新規)で、実際のブラウザ上で日本語
+「レアル」検索・日本語「プレミアリーグ」検索・監督名検索(デバウンス後の
+バックエンド問い合わせ)・検索クリア・該当なし時の正直な表示、すべてを
+実際のserver.js(+モックAPI-Football)を通して確認しました。
+
+既存の全自動テスト(51本の非ブラウザテスト+主要なPlaywrightチェック)も
+あわせて再実行し、全て無変更で通過することを確認しています。
+
+なお、今回のテストの過程で2件の**既存の不具合**(私の変更とは無関係な、
+以前から存在していたもの)を発見し、あわせて修正しました。
+
+- `scripts/pw_growth_log_check.js`: 優先順位①でGitHub Actionsのタイムアウト
+  対策として日次学習エンドポイントをfire-and-forget化した際、このテストの
+  事前準備コードが更新されておらず、`factsAddedToday`等の結果を同期的に
+  受け取れなくなっていました。デバッグ用に残してある`?sync=1`(旧来の同期
+  動作)を使うよう修正しました。
+- `scripts/pw_discuss_mode_check.js`: テストが用意するLLM応答のモック文章の
+  見出し(`###根拠###`/`###考察###`/`###結論###`)が、実際のプロンプト
+  (`buildDiscussPrompt`)が指定する見出し(`###一般論###`/`###AI独自の意見###`
+  等)と一致しておらず、`parseDiscussLlmOutput`がどの見出しも解析できずに
+  `followUpQuestions`が常に空配列になっていました。モックの見出しを実際の
+  プロンプト仕様に合わせて修正しました。
+
+#### 修正・追加したファイル
+
+- `index.html`: 検索窓(`#fixtureSearchInput`)の追加、
+  `FIXTURE_SEARCH_ALIASES`/`fixtureMatchesQuery`/`filterFixturesByQuery`/
+  `mergeCoachMatchedFixtures`/`fetchCoachSearch`/`renderFixturesListInto`/
+  `applyFixtureSearch`の新設、`renderRealFixturesIfAvailable`の拡張
+- `server/server.js`: `handleCoachSearch`の新設、
+  `GET /api/coach-search`ルートの追加
+- `scripts/fixture_search_test.js`(新規)
+- `scripts/server_coach_search_test.js`(新規)
+- `scripts/pw_fixture_search_check.js`(新規)
+- `scripts/pw_growth_log_check.js`(事前準備を`?sync=1`に修正、既存の不具合)
+- `scripts/pw_discuss_mode_check.js`(モックLLM応答の見出しを修正、既存の不具合)
+
+#### 残課題
+
+- 監督名検索は現状「見つかった監督の現所属チーム」だけを手がかりにしており、
+  同姓同名の監督が複数いる場合は区別できません(API-Football側の検索結果を
+  そのまま使っているため)。実運用で問題になるケースが出てくれば、生年月日や
+  国籍などの追加情報での絞り込みを検討する余地があります。
+- 検索は「本日取得済みの試合データ」に対してのみ行われます(明日以降の試合を
+  横断して検索する機能ではありません)。これは優先順位⑤のご要望(「今日ある
+  試合を検索できます」)の範囲内の実装です。
+- 以下のPlaywrightチェックは、今回の変更とは無関係な既存の理由で実行できません
+  でした(いずれも私の変更前から同じ状態だったことを確認済みです)。
+  - `scripts/pw_check.js` / `scripts/pw_check3_live_api.js`: 本番URL
+    (`https://soccer-analysis-ai-proxy.onrender.com`)への実通信を前提とした
+    古い形式のチェックで、このサンドボックス環境(外部インターネットに出られ
+    ない)では構造的に実行不可能です。より新しいチェック(`page.route()`で
+    ローカルサーバーへリダイレクトする方式、例:`pw_fixture_search_check.js`
+    や`pw_discuss_mode_check.js`)に役割は引き継がれています。
+  - `scripts/pw_check5_offseason_frontend.js` / `scripts/pw_check6_coldstart.js`:
+    以前のデバッグセッションで作成された一時ディレクトリ(`/tmp/local_test_site`
+    等)を前提としており、現在の環境には存在しません。
+  - `scripts/pw_check4_screenshot_saka.js`: スクリーンショット撮影時の要素の
+    表示待ちでタイムアウトすることがある、環境依存のチェックです。
 
 ## エンドポイント一覧
 
@@ -1587,6 +1703,7 @@ try/catchで囲み、失敗しても`errors`配列に記録して次へ進む」
 | `GET /api/player-season-stats?name=選手名&team=クラブ名` | 選手の今シーズン実データ(出場数・ゴール・アシスト・平均レーティング。**2026年8月〜: キーパス・パス成功率・ドリブル成功率・守備指標・デュエル勝率も追加**) |
 | `GET /api/fixtures/today?leagues=39,140,78` | 指定リーグの本日の実際の試合一覧 |
 | `GET /api/fixtures/analysis?id=試合ID` | 特定の試合の事前/事後分析(試合前はAI予測を記録、試合後は予測を検証) |
+| `GET /api/coach-search?name=監督名` | **2026年8月〜:** 「今日の試合検索」の監督名検索用。API-Football自身のサーバー側名前検索を使い、現所属チーム名を返す |
 | `GET /api/accuracy-stats` | AI予測の本物の実績(記録数・的中数・正答率)。Upstash未設定時は`configured:false`を返す |
 | `GET /api/predictions/auto-collect?key=...` | 誰も見ていなくても予測の記録・確定を進める(定期cron向け)。`AUTO_COLLECT_SECRET`設定時は`key`が一致しないと403 |
 | `GET /api/match-analysis?home=クラブ名&away=クラブ名` | 【2026年8月・NEW、同月の総点検・「議論できるAI」強化フェーズで拡張】「AIマッチ分析」カード。任意の登録クラブ2つ(日本語名/英語名どちらも可)について、Prediction Engine v2(実データの特徴量+学習済みの重み+ポワソン分布)でAI勝率内訳・★付き重要度ランキング・試合展開予想(LLM。未設定/予算超過時は決定論的な文章に自動フォールバック)・逆シナリオ・予想スコア付き結論を返す。**2026年8月(総点検)〜: `injuries`(怪我人・出場停止の実名)・`formation`(直近実試合のフォーメーション)・`keyPlayers`(今季得点ランキング上位選手)を追加。また、結論文がスコアと矛盾する不具合(例:「1-1で勝利」)と、ホーム/アウェイが異なるリーグ所属の場合に順位・得点ランキングが誤ったリーグで検索される不具合を修正**。**2026年8月(議論できるAI強化)〜: 11項目のうち残っていた`tacticalCompatibility`(⑦戦術相性の明示的な見立て。フォーメーション同士の噛み合わせを機械的に判定するdeterministicフォールバック+LLM見解)・`biggestHighlight`(⑩この試合最大の見どころ)を追加。④「鍵になる時間帯」のみ未実装(理由・代替案は本README「13.」参照)**。`POST /api/discuss`と同じIPごとの日次LLM予算を共有するが、予算超過時も数値計算部分は必ず返す。毎日学習エンジンの自動予測ループとは独立したオンデマンド分析(詳細は本README「9. Knowledge Engine 4層構造 / Prediction Engine v2 / AIマッチ分析」「12. プロジェクト全体総点検」「13. 議論できるAIへの強化」参照) |

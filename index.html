@@ -382,6 +382,10 @@
   <div class="card" id="realFixturesCard" style="display:none; border:1.5px solid var(--series-3);">
     <h2>📡 本日の実際の試合</h2>
     <p class="value-note" style="margin-bottom:10px;">有料API(API-Football)から取得した、本日の実際の試合日程です。「🔴 試合中」「⏰ これから」「✅ 終了」に整理して表示します。試合前は注目ポイントのAIプレビュー(90分ストーリー予想つき)、試合終了後は実際の選手評価・タイムラインをもとにした振り返りを見られます。</p>
+    <div style="margin-bottom:10px;">
+      <input type="text" id="fixtureSearchInput" placeholder="例: レアル / プレミアリーグ / イングランド / 監督名" style="width:100%; box-sizing:border-box; padding:9px 12px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary); font-size:14px;">
+      <p class="value-note" id="fixtureSearchHint" style="margin:6px 0 0; display:none;"></p>
+    </div>
     <div id="realFixturesList"></div>
   </div>
   <div id="realFixtureAnalysisWrap"></div>
@@ -4378,18 +4382,107 @@ function fixturesByLeagueHtml(fixtures) {
       ${g.fixtures.map(fixtureRowHtml).join("")}
     </div>`).join("");
 }
-// 2026年8月・優先順位②④: 今日の試合を「試合中→これから→終了」の順で3段に
-// 整理して表示する(試合中が最も「今」見る価値が高いため先頭、終了は振り返り
-// 用途なので折りたたみ、が基本方針)。各段の中はさらにリーグ別に分ける。
-async function renderRealFixturesIfAvailable() {
-  const cardEl = document.getElementById("realFixturesCard");
-  const listEl = document.getElementById("realFixturesList");
-  if (!cardEl || !listEl) return;
-  const data = await fetchRealFixturesToday();
-  if (!data) { cardEl.style.display = "none"; return; }
+// 2026年8月・優先順位⑤: 「今日の試合検索」用の日本語→英語 検索別名テーブル。
+// API-Footballが返すクラブ名・リーグ名・国名は基本的に英語(現地語)表記のため、
+// 日本語で「レアル」「プレミアリーグ」等と打っても検索にヒットするよう、部分一致
+// で使う別名を用意する。REAL_FIXTURE_CLUB_EN_TO_JAは「登録選手データと結びつける
+// ための厳密一致テーブル」で用途が異なるため、検索専用に別途持つ(厳密一致であ
+// る必要が無いぶん自由に増やせる)。最低限、欧州5大リーグ+主要クラブ+主要国を
+// カバーする(優先順位⑥で5大リーグを継続的な学習対象にする方針とも整合させる)。
+const FIXTURE_SEARCH_ALIASES = [
+  { ja: "レアルマドリード", en: ["real madrid"] },
+  { ja: "レアル", en: ["real madrid"] },
+  { ja: "バルセロナ", en: ["barcelona"] },
+  { ja: "バルサ", en: ["barcelona"] },
+  { ja: "マンチェスターユナイテッド", en: ["manchester united"] },
+  { ja: "マンユナイテッド", en: ["manchester united"] },
+  { ja: "マンU", en: ["manchester united"] },
+  { ja: "マンチェスターシティ", en: ["manchester city"] },
+  { ja: "マンC", en: ["manchester city"] },
+  { ja: "リバプール", en: ["liverpool"] },
+  { ja: "アーセナル", en: ["arsenal"] },
+  { ja: "チェルシー", en: ["chelsea"] },
+  { ja: "トッテナム", en: ["tottenham"] },
+  { ja: "バイエルン", en: ["bayern"] },
+  { ja: "ドルトムント", en: ["dortmund"] },
+  { ja: "ユベントス", en: ["juventus"] },
+  { ja: "ユーベ", en: ["juventus"] },
+  { ja: "ミラン", en: ["milan"] },
+  { ja: "インテル", en: ["inter"] },
+  { ja: "ナポリ", en: ["napoli"] },
+  { ja: "ローマ", en: ["roma"] },
+  { ja: "パリサンジェルマン", en: ["paris saint germain", "paris sg"] },
+  { ja: "PSG", en: ["paris saint germain", "paris sg"] },
+  { ja: "プレミアリーグ", en: ["premier league"] },
+  { ja: "プレミア", en: ["premier league"] },
+  { ja: "ラリーガ", en: ["la liga"] },
+  { ja: "リーガ", en: ["la liga"] },
+  { ja: "ブンデスリーガ", en: ["bundesliga"] },
+  { ja: "ブンデス", en: ["bundesliga"] },
+  { ja: "セリエA", en: ["serie a"] },
+  { ja: "セリエ", en: ["serie a"] },
+  { ja: "リーグアン", en: ["ligue 1"] },
+  { ja: "イングランド", en: ["england"] },
+  { ja: "スペイン", en: ["spain"] },
+  { ja: "ドイツ", en: ["germany"] },
+  { ja: "イタリア", en: ["italy"] },
+  { ja: "フランス", en: ["france"] },
+  { ja: "ブラジル", en: ["brazil"] },
+  { ja: "アルゼンチン", en: ["argentina"] },
+  { ja: "アメリカ", en: ["usa"] },
+  { ja: "日本", en: ["japan"] },
+  { ja: "韓国", en: ["south korea", "korea"] },
+  { ja: "サウジアラビア", en: ["saudi arabia"] },
+];
+// クラブ名・リーグ名・国名(英語表記+上のJA別名テーブル)に対して検索クエリが
+// 部分一致するかを判定する。監督名は今日の試合一覧そのものには含まれていない
+// (全チーム分を毎回取得するとAPI予算を圧迫するため)ため、この関数の対象外
+// ―― 監督名検索はfetchCoachSearch/mergeCoachMatchedFixturesで別途扱う。
+function fixtureMatchesQuery(f, rawQuery) {
+  const q = (rawQuery || "").trim().toLowerCase();
+  if (!q) return true;
+  const haystacks = [f.home && f.home.name, f.away && f.away.name, f.league, f.country].filter(Boolean).map((s) => s.toLowerCase());
+  if (haystacks.some((h) => h.indexOf(q) !== -1)) return true;
+  const matchedAliases = FIXTURE_SEARCH_ALIASES.filter((a) => a.ja.toLowerCase().indexOf(q) !== -1);
+  return matchedAliases.some((a) => a.en.some((enKw) => haystacks.some((h) => h.indexOf(enKw) !== -1)));
+}
+function filterFixturesByQuery(fixtures, rawQuery) {
+  return (fixtures || []).filter((f) => fixtureMatchesQuery(f, rawQuery));
+}
+// 監督名検索(/api/coach-search)でヒットした監督の「現所属チーム名」のリストを
+// もとに、通常のクラブ名/リーグ名/国名検索だけではヒットしなかった試合を追加する。
+function mergeCoachMatchedFixtures(fixtures, alreadyFiltered, coachTeamNames) {
+  if (!coachTeamNames || !coachTeamNames.length) return alreadyFiltered;
+  const already = new Set(alreadyFiltered.map((f) => f.id));
+  const teamNamesLower = coachTeamNames.filter(Boolean).map((n) => n.toLowerCase());
+  const extra = (fixtures || []).filter((f) => {
+    if (already.has(f.id)) return false;
+    const homeName = ((f.home && f.home.name) || "").toLowerCase();
+    const awayName = ((f.away && f.away.name) || "").toLowerCase();
+    return teamNamesLower.some((n) => n && ((homeName && (homeName.indexOf(n) !== -1 || n.indexOf(homeName) !== -1)) || (awayName && (awayName.indexOf(n) !== -1 || n.indexOf(awayName) !== -1))));
+  });
+  return alreadyFiltered.concat(extra);
+}
+// 監督名でのチーム検索。全チームの監督データを毎回取得するとAPI予算を圧迫する
+// ため、API-Football自身のサーバー側名前検索(/coachs?search=)をオンデマンドで
+// (デバウンスして)呼び出す方式にしてある(バックエンド側はhandleCoachSearch)。
+async function fetchCoachSearch(name) {
+  try {
+    const url = `${API_PROXY_BASE}/coach-search?name=${encodeURIComponent(name)}`;
+    const data = await fetchJsonWithTimeout(url, backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+    return (data && data.found && data.coaches) ? data.coaches : [];
+  } catch (e) { return []; }
+}
 
+let lastFixturesToday = []; // 検索フィルタの元になる、フィルタ前の本日の試合一覧
+let fixtureSearchDebounceTimer = null;
+let fixtureSearchRequestToken = 0;
+
+// フィルタ済みのfixtures配列から、既存の「試合中→これから→終了」3段組みの
+// HTMLを組み立ててlistElに反映する(初期表示・検索結果表示の両方で使う共通処理)。
+function renderFixturesListInto(listEl, fixtures, emptyMessageHtml) {
   const byGroup = { live: [], upcoming: [], finished: [], other: [] };
-  data.fixtures.forEach(f => byGroup[classifyFixtureStatus(f.status)].push(f));
+  fixtures.forEach(f => byGroup[classifyFixtureStatus(f.status)].push(f));
 
   const sections = [];
   if (byGroup.live.length) {
@@ -4422,11 +4515,10 @@ async function renderRealFixturesIfAvailable() {
       </div>`;
   }
   if (!sections.length && !finishedHtml) {
-    // ライブラリ的には200 okだが、fixturesが空(今日は世界的に試合が無い日、
-    // あるいはAPI側の返答が偶然空)の場合。架空の試合をでっち上げず、正直に
-    // 「今日は無い」旨を伝えて終わる(既存の"graceful degradation"方針を踏襲)。
-    listEl.innerHTML = `<p class="value-note">本日はAPI-Footballで確認できる試合がありませんでした。</p>`;
-    cardEl.style.display = "block";
+    // 架空の試合をでっち上げず、正直に「無い」旨を伝えて終わる(既存の
+    // "graceful degradation"方針を踏襲)。検索で0件の場合はemptyMessageHtmlで
+    // 呼び出し側から専用の文言を渡す。
+    listEl.innerHTML = emptyMessageHtml || `<p class="value-note">本日はAPI-Footballで確認できる試合がありませんでした。</p>`;
     return;
   }
   listEl.innerHTML = sections.join("") + finishedHtml;
@@ -4443,7 +4535,70 @@ async function renderRealFixturesIfAvailable() {
       finishedBtn.textContent = isHidden ? "▲ 閉じる" : `▼ 終了した試合を表示(${byGroup.finished.length}試合)`;
     });
   }
+}
+
+// 2026年8月・優先順位⑤: 検索窓の入力に応じて一覧を絞り込む。クラブ名/リーグ名/
+// 国名は取得済みデータへの即時のクライアント側フィルタ(追加の通信なし)、
+// 監督名だけはバックエンドへの問い合わせが必要なため、デバウンスした上で
+// 非同期に追加マージする(結果が古い検索語のものにならないようトークンで管理)。
+async function applyFixtureSearch() {
+  const listEl = document.getElementById("realFixturesList");
+  const hintEl = document.getElementById("fixtureSearchHint");
+  const inputEl = document.getElementById("fixtureSearchInput");
+  if (!listEl || !inputEl) return;
+  const q = inputEl.value.trim();
+  const myToken = ++fixtureSearchRequestToken;
+
+  if (!q) {
+    if (hintEl) { hintEl.style.display = "none"; hintEl.textContent = ""; }
+    renderFixturesListInto(listEl, lastFixturesToday);
+    return;
+  }
+
+  const filtered = filterFixturesByQuery(lastFixturesToday, q);
+  if (hintEl) { hintEl.style.display = "none"; hintEl.textContent = ""; }
+  renderFixturesListInto(listEl, filtered, filtered.length ? undefined : `<p class="value-note">「${escapeHtml(q)}」に一致する試合が見つかりませんでした。監督名でも検索中です…</p>`);
+
+  if (fixtureSearchDebounceTimer) clearTimeout(fixtureSearchDebounceTimer);
+  if (q.length < 2) return; // 1文字だけの監督名検索はノイズが多すぎるため行わない
+  fixtureSearchDebounceTimer = setTimeout(async () => {
+    const coaches = await fetchCoachSearch(q);
+    if (myToken !== fixtureSearchRequestToken) return; // 検索語が変わっていたら古い結果は破棄する
+    const coachTeamNames = coaches.map(c => c.team).filter(Boolean);
+    const merged = mergeCoachMatchedFixtures(lastFixturesToday, filtered, coachTeamNames);
+    if (merged.length > filtered.length) {
+      if (hintEl) {
+        hintEl.style.display = "block";
+        hintEl.textContent = `⚽ 監督「${coaches.map(c => c.name).filter(Boolean).join("・")}」の所属チームの試合も含めて表示しています。`;
+      }
+      renderFixturesListInto(listEl, merged);
+    } else if (!filtered.length && hintEl) {
+      hintEl.style.display = "block";
+      hintEl.textContent = `「${q}」に一致する試合・監督が見つかりませんでした。`;
+    }
+  }, 500);
+}
+
+// 2026年8月・優先順位②④⑤: 今日の試合を「試合中→これから→終了」の順で3段に
+// 整理して表示する(試合中が最も「今」見る価値が高いため先頭、終了は振り返り
+// 用途なので折りたたみ、が基本方針)。各段の中はさらにリーグ別に分ける。
+// 検索窓(クラブ名/リーグ名/国名/監督名)での絞り込みにも対応する。
+async function renderRealFixturesIfAvailable() {
+  const cardEl = document.getElementById("realFixturesCard");
+  const listEl = document.getElementById("realFixturesList");
+  if (!cardEl || !listEl) return;
+  const data = await fetchRealFixturesToday();
+  if (!data) { cardEl.style.display = "none"; return; }
+
+  lastFixturesToday = data.fixtures;
+  renderFixturesListInto(listEl, lastFixturesToday);
   cardEl.style.display = "block";
+
+  const searchInput = document.getElementById("fixtureSearchInput");
+  if (searchInput && !searchInput.dataset.fixtureSearchWired) {
+    searchInput.dataset.fixtureSearchWired = "1";
+    searchInput.addEventListener("input", () => applyFixtureSearch());
+  }
 }
 
 async function fetchRealFixtureAnalysis(fixtureId) {

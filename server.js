@@ -750,6 +750,48 @@ async function handleFixturesToday(query) {
   }
 }
 
+// 2026年8月・優先順位⑤: 「今日の試合検索」で監督名からもチームを検索できる
+// ようにするための軽量エンドポイント。今日の試合一覧に登場する全チーム(最大
+// 160チーム分)の監督データを毎回先読みするとAPI予算(月間上限あり)を圧迫する
+// ため、そうはせず、API-Football自身のサーバー側名前検索(/coachs?search=)を
+// クエリが変わるたびオンデマンドで(フロントエンド側でデバウンスした上で)呼ぶ。
+// 現所属チームが分かった監督だけを返し、実際にそのチームが今日の試合に含まれる
+// かどうかの突き合わせはフロントエンド(mergeCoachMatchedFixtures)側で行う。
+async function handleCoachSearch(query) {
+  const name = String(query.get("name") || "").trim();
+  if (!name || name.length < 2) return { status: 200, body: { found: false, coaches: [] } };
+
+  const cacheKey = `coach-search:${name.toLowerCase()}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== undefined) return { status: 200, body: cached };
+
+  try {
+    const data = await callApiFootball("/coachs", { search: name });
+    const list = data.response || [];
+    // API-Footballの/coachsは監督ごとにフラットな{name, photo, career:[...]}を返す
+    // (server/learning/features.jsのcomputeCoachCareerで既に確認済みの実際のスキーマ。
+    // ネストされた"coach"キーは無い)。career配列の中でendが無いエントリが在任中=現所属。
+    const coaches = list
+      .map((c) => {
+        const career = Array.isArray(c.career) ? c.career : [];
+        const current = career.find((entry) => entry && entry.team && !entry.end) || null;
+        return {
+          name: c.name || null,
+          photo: c.photo || null,
+          team: current && current.team ? current.team.name : null,
+        };
+      })
+      .filter((c) => c.name && c.team); // 現所属が不明な監督は今日の試合検索には使えないため除外する
+    const payload = { found: coaches.length > 0, coaches };
+    cacheSet(cacheKey, payload, 60 * 60 * 1000); // 監督の異動は頻繁ではないため1時間キャッシュ
+    return { status: 200, body: payload };
+  } catch (e) {
+    const payload = { found: false, reason: e.code || "error", error: e.message, coaches: [] };
+    cacheSet(cacheKey, payload, 5 * 60 * 1000);
+    return { status: 200, body: payload };
+  }
+}
+
 // Statuses API-Football uses to mark a fixture as fully finished (as opposed to
 // not-yet-started, in-play, postponed, cancelled, etc.).
 const FINISHED_STATUSES = new Set(["FT", "AET", "PEN"]);
@@ -2343,6 +2385,12 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(body));
         return;
       }
+      if (pathname === "/api/coach-search") {
+        const { status, body } = await handleCoachSearch(parsed.searchParams);
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
       if (pathname === "/api/accuracy-stats") {
         const { status, body } = await handleAccuracyStats();
         res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -2530,6 +2578,7 @@ module.exports = {
   handlePlayerSeasonStats,
   handleFixturesToday,
   handleFixtureAnalysis,
+  handleCoachSearch,
   handleAccuracyStats,
   handleAutoCollectPredictions,
   handlePredictMatch,
