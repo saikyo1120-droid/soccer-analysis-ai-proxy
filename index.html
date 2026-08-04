@@ -5727,14 +5727,23 @@ async function fetchDiscussApi(question, subject, playerHint) {
 // そのまま見出し付きで表示する(検索AIっぽさを消し、「議論している」感を出す)。
 // 最後の「最も重要だと考える点」は、AI自身の一言としてひときわ目立たせる。
 function renderDiscussReplyHtml(resp) {
+  // 2026年8月・100問検証で発見した欠陥の修正:
+  //   AIの回答を6つの観点へ整えられなかった場合、これまでは「AI独自の意見」欄に
+  //   全文が入り、残りの見出しが空のまま並んでいた。なぜ空なのかがどこにも
+  //   書かれていなかったため、利用者には壊れているようにしか見えなかった。
+  const formatNoteHtml = resp.formatNoteJa
+    ? `<p class="value-note" style="margin-bottom:6px; opacity:.9;">※ ${escapeHtml(resp.formatNoteJa)}</p>`
+    : "";
   const stars = "★".repeat(resp.confidence.stars) + "☆".repeat(5 - resp.confidence.stars);
   const factsHtml = resp.facts && resp.facts.length
     ? `<details class="discuss-facts"><summary>📊 根拠にした事実を見る(${resp.facts.length}件)</summary><ul>${resp.facts.map(f => `<li>${escapeHtml(f)}</li>`).join("")}</ul></details>`
     : "";
-  let body = "";
+  let body = formatNoteHtml;
   if (resp.meta && resp.meta.parsedOk === false) {
-    // LLMが指定フォーマットに従わなかった場合の保険(aiOpinionに生文が入っている)。
-    body += `<p>${escapeHtml(resp.aiOpinion || "(考察を生成できませんでした)")}</p>`;
+    // LLMが指定フォーマットに従わなかった場合の保険(aiOpinionに文章だけが入っている)。
+    // 2026年8月・100問検証での修正: なぜいつもの6項目が出ないのかを
+    // 上の formatNoteHtml で必ず説明する(黙って1項目だけ出さない)。
+    if (resp.aiOpinion) body += `<p>${escapeHtml(resp.aiOpinion)}</p>`;
   } else {
     if (resp.generalView) body += `<p class="value-note">🌍 一般論: ${escapeHtml(resp.generalView)}</p>`;
     body += `<p>🤖 <strong>AI独自の意見:</strong> ${escapeHtml(resp.aiOpinion || "(考察を生成できませんでした)")}</p>`;
@@ -5743,11 +5752,35 @@ function renderDiscussReplyHtml(resp) {
     if (resp.futureOutlook) body += `<p>📈 今後: ${escapeHtml(resp.futureOutlook)}</p>`;
     if (resp.mostImportantOpinion) body += `<p style="margin-top:8px; font-weight:700;">🎯 ${escapeHtml(resp.mostImportantOpinion)}</p>`;
   }
+  // 2026年8月・優先順位⑳: 「以前と比べて考え方が変わった理由」。
+  // AI自身の記録から機械的に組み立てた文なので、内容は必ず記録どおり。
+  // 変化が無ければ何も出さない(ノイズを増やさない)。
+  const tc = resp.meta && resp.meta.thoughtChange;
+  const thoughtChangeHtml = (tc && tc.narrativeJa)
+    ? `<div class="compare-comment" style="margin-top:8px; border-left:3px solid #8e44ad; padding-left:10px;">
+         <strong>🧠 私の考えが変わった理由:</strong> ${escapeHtml(tc.narrativeJa)}
+       </div>`
+    : "";
+  // 優先順位⑳: 考えの移り変わりを時系列でも見せる(折りたたみ)
+  const tl = resp.meta && resp.meta.thoughtTimeline;
+  const timelineHtml = (tl && tl.steps && tl.steps.length >= 2)
+    ? `<details class="discuss-facts"><summary>🕒 このクラブについての考えの移り変わり(${tl.totalRecorded}件)</summary><ul>${
+      tl.steps.map((st) => `<li><strong>${escapeHtml(st.kindLabelJa)}</strong>(${escapeHtml(String(st.at).slice(0, 10))}): ${escapeHtml(st.statementJa)}${st.causeJa ? `<br><span class="value-note">${escapeHtml(st.causeJa)}</span>` : ""}</li>`).join("")
+    }</ul>${tl.omittedCount ? `<p class="value-note">※ 古い${tl.omittedCount}件は省略しています。</p>` : ""}</details>`
+    : "";
+  // 優先順位⑲: 関係として整理された知識(事実の羅列との違いが分かる形で見せる)
+  const kg = resp.meta && resp.meta.knowledgeGraph;
+  const graphHtml = (kg && kg.linesJa && kg.linesJa.length)
+    ? `<details class="discuss-facts"><summary>🕸️ 関係として整理した知識(${kg.edgeCount}件)</summary><ul>${
+      kg.linesJa.map((l) => `<li>${escapeHtml(l)}</li>`).join("")
+    }</ul>${kg.truncated ? `<p class="value-note">※ 関連が多いため一部のみ表示しています。</p>` : ""}</details>`
+    : "";
+
   const confidenceHtml = `<div class="discuss-confidence">${stars} <span class="value-note">${escapeHtml(resp.confidence.reasonJa)}</span></div>`;
   const followupsHtml = resp.followUpQuestions && resp.followUpQuestions.length
     ? `<div class="followup-chip-row">${resp.followUpQuestions.map(q => `<button class="chat-followup-btn" data-q="${escapeHtml(q)}">・${escapeHtml(q)}</button>`).join("")}</div>`
     : "";
-  return { text: body, extras: `${confidenceHtml}${factsHtml}${followupsHtml}` };
+  return { text: body + thoughtChangeHtml, extras: `${confidenceHtml}${graphHtml}${timelineHtml}${factsHtml}${followupsHtml}` };
 }
 
 // hero chat・選手個別チャット共通の議論モードフロー。
@@ -6408,6 +6441,24 @@ async function renderGrowthLogWidget() {
   //   ダッシュとして描くため、ゼロと見分けがつかなかった。
   //   比較できなかったことは、はっきり言葉で示す。
   const fmtDelta = (v, unit) => (Number.isFinite(v) ? `${v > 0 ? "+" : ""}${v}${unit}` : "比較不可");
+
+  // 2026年8月・優先順位⑫: 「今日は知識が34件増えました」だけでは中身の重みが
+  // 分からない。AI自身が「これは学ぶ価値がある」と判断したものと、
+  // **なぜそう判断したのか**を、いちばん目立つ位置に出す。
+  // これが「昨日より賢くなったことを利用者が実感できる」ことの中核。
+  const imp = log.importanceSummary || null;
+  const IMP_ICON = { critical: "🔴", high: "🟠", medium: "🟡", low: "⚪", routine: "⚪" };
+  const importanceHtml = (imp && imp.highlights && imp.highlights.length)
+    ? `<div class="value-note" style="margin-top:6px; padding:8px; border-left:3px solid #d35400; background:rgba(211,84,0,.06); border-radius:4px;">
+         <strong>💡 今日いちばん学ぶ価値があったこと</strong>
+         <ul style="margin:6px 0 0 1em; padding:0;">
+           ${imp.highlights.map((h) => `<li style="margin-bottom:4px;">${IMP_ICON[h.level] || "⚪"} <strong>${escapeHtml(h.labelJa)}</strong>${h.teamJa ? `(${escapeHtml(h.teamJa)})` : ""}: ${escapeHtml(h.statement)}<br><span style="opacity:.85;">▸ AIがこれを学ぶべきと判断した理由: ${escapeHtml(h.reasonJa)}</span></li>`).join("")}
+         </ul>
+         <div style="margin-top:4px; opacity:.85;">${escapeHtml(imp.summaryJa || "")}</div>
+       </div>`
+    : (imp && imp.summaryJa
+      ? `<div class="value-note" style="margin-top:6px; opacity:.85;">💡 ${escapeHtml(imp.summaryJa)}</div>`
+      : "");
   const growthVerdictHtml = growthCmp
     ? `<div style="margin-top:6px; padding:8px 10px; border-radius:8px; background:${growthCmp.improved === true ? "rgba(30,132,73,.10)" : growthCmp.improved === false ? "rgba(192,57,43,.08)" : "rgba(0,0,0,.04)"};">
          <span style="font-weight:700; color:${growthCmp.improved === true ? "#1e8449" : growthCmp.improved === false ? "#c0392b" : "inherit"};">
@@ -6441,6 +6492,7 @@ async function renderGrowthLogWidget() {
     <span class="value-note">(${log.date ? formatDateJa(log.date + "T00:00:00Z") + "時点・" : ""}登録${log.teamsAnalyzed ?? 0}クラブ+${leaguesAnalyzed}リーグ+${playersAnalyzed}選手を分析)</span>
     <button class="more-details-btn" id="growthLogToggleBtn" type="button" style="margin-left:8px; display:inline-block; width:auto; padding:4px 10px;">詳しく見る ▼</button>
     <div class="value-note" style="margin-top:4px;">この日に追加した知識: ${knowledgeSaved}件(重複でスキップ: ${knowledgeDup}件) ・ 検証した試合: ${log.matchesResolvedToday ?? 0}件</div>
+    ${importanceHtml}
     ${growthVerdictHtml}
     ${zeroDiagHtml}
     ${zeroVerifyHtml}
