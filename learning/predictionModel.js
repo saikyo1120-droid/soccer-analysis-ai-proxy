@@ -454,6 +454,109 @@ function classifyFailureReasons(record, weightsUsed) {
   return reasons.slice(0, 3);
 }
 
+// ---- 2026年8月・優先順位③「Failure Learningを本格化してください」 ----
+// ご要望原文: 「ホーム補正が強すぎた/怪我を軽視した/スタメン変更を見逃した/
+// フォーメーション相性を考慮しなかった/監督交代を考慮しなかった/xGとの差を
+// 見逃した など、必ず原因を分析してください」。
+//
+// classifyFailureReasons は「モデルが持っている特徴量の重み」からしか原因を
+// 出せないため、モデルに入っていない事情(監督交代・スタメン変更など)は
+// 永久に "unmodeled_factors"(数値化していない要因)としか言えなかった。
+// そこで、予測時点に記録しておいた文脈(predictionContext)と、試合後に判明した
+// 事実(resolvedContext)を突き合わせて、モデルの外側の原因を特定する関数を追加する。
+//
+// でっち上げ防止の原則(重要):
+//   ・「予測時点で分かっていたこと」と「試合後に判明したこと」が
+//     実際に食い違っている場合にだけ理由を立てる。
+//   ・文脈が記録されていない(古いレコード等)場合は、無理に推測せず何も返さない。
+const CONTEXTUAL_FAILURE_LABELS_JA = {
+  xg_goal_gap_missed: "xG(チャンスの質)との食い違いを見逃した",
+  coach_change_ignored: "監督交代を考慮できなかった",
+  formation_change_missed: "フォーメーション変更を見逃した",
+  lineup_disruption_missed: "スタメンの大幅な入れ替わりを見逃した",
+};
+
+/**
+ * モデルの外側にある原因を、予測時点の文脈と試合後の事実の差から特定する。
+ * @param {object} record - resolved済みのlearn:ownpredレコード
+ * @param {object} resolved - 試合後に判明した文脈
+ *   { homeCoachName, awayCoachName, homeFormation, awayFormation, homeLineupNames, awayLineupNames }
+ * @returns {Array<{id, labelJa, detail}>} 当たっていた場合・文脈が無い場合は空配列
+ */
+function classifyContextualFailureReasons(record, resolved) {
+  if (!record || record.correct !== false) return [];
+  const reasons = [];
+  const ctx = record.predictionContext || null;
+  const after = resolved || null;
+
+  // ① xGとの食い違い(モデル内の特徴量だけで判定できるので、文脈が無くても使える)
+  //    実際の得点力(goalRateDiff)とxG(xgDiff)が逆を向いていたのに、
+  //    得点力の方を信じて外した場合。「最近よく点が入っていたのは幸運で、
+  //    チャンスの質は伴っていなかった」という典型的な読み違い。
+  const f = record.features || {};
+  const goalSign = Math.sign(f.goalRateDiff || 0);
+  const xgSign = Math.sign(f.xgDiff || 0);
+  const predSign = record.predictedWinner === "home" ? 1 : record.predictedWinner === "away" ? -1 : 0;
+  if (goalSign !== 0 && xgSign !== 0 && goalSign !== xgSign && predSign === goalSign) {
+    reasons.push({
+      id: "xg_goal_gap_missed",
+      labelJa: CONTEXTUAL_FAILURE_LABELS_JA.xg_goal_gap_missed,
+      detail: `実際の得点力の差(${(f.goalRateDiff || 0).toFixed(2)})とxG(チャンスの質)の差(${(f.xgDiff || 0).toFixed(2)})が逆を向いていましたが、実際の得点の方を信じて予想し、外れました。得点が続いていたのは一時的な幸運だった可能性があります。`,
+    });
+  }
+
+  if (!ctx || !after) return reasons.slice(0, 3);
+
+  // ② 監督交代: 予測時点の監督名と、試合時点の監督名が違う
+  for (const side of ["home", "away"]) {
+    const before = ctx[`${side}CoachName`];
+    const now = after[`${side}CoachName`];
+    if (before && now && before !== now) {
+      reasons.push({
+        id: "coach_change_ignored",
+        labelJa: CONTEXTUAL_FAILURE_LABELS_JA.coach_change_ignored,
+        detail: `${side === "home" ? "ホーム" : "アウェイ"}チームの監督が予測時点の「${before}」から試合時点では「${now}」に代わっていました。監督交代直後はチームの戦い方が大きく変わることがありますが、予測モデルはこれを数値として扱えていません。`,
+      });
+      break; // 同じ理由を両チーム分並べない
+    }
+  }
+
+  // ③ フォーメーション変更: 予測時点に想定していた布陣と、実際の布陣が違う
+  for (const side of ["home", "away"]) {
+    const before = ctx[`${side}Formation`];
+    const now = after[`${side}Formation`];
+    if (before && now && before !== now) {
+      reasons.push({
+        id: "formation_change_missed",
+        labelJa: CONTEXTUAL_FAILURE_LABELS_JA.formation_change_missed,
+        detail: `${side === "home" ? "ホーム" : "アウェイ"}チームの布陣が、直近の${before}から実際の試合では${now}に変わっていました。`,
+      });
+      break;
+    }
+  }
+
+  // ④ スタメンの大幅な入れ替わり: 予測時点の主力と実際の先発の重なりが少ない
+  for (const side of ["home", "away"]) {
+    const before = ctx[`${side}LineupNames`];
+    const now = after[`${side}LineupNames`];
+    if (Array.isArray(before) && Array.isArray(now) && before.length >= 5 && now.length >= 5) {
+      const nowSet = new Set(now);
+      const kept = before.filter((n) => nowSet.has(n)).length;
+      const changed = before.length - kept;
+      if (changed >= Math.ceil(before.length / 2)) {
+        reasons.push({
+          id: "lineup_disruption_missed",
+          labelJa: CONTEXTUAL_FAILURE_LABELS_JA.lineup_disruption_missed,
+          detail: `${side === "home" ? "ホーム" : "アウェイ"}チームの先発が、直近の試合から${changed}人入れ替わっていました(${before.length}人中)。主力を温存するターンオーバーは結果を大きく変えることがあります。`,
+        });
+        break;
+      }
+    }
+  }
+
+  return reasons.slice(0, 3);
+}
+
 // ---- 2026年8月・完全自動Learning Cycle ⑧「成功した理由も分析」 ----
 // これまでは「外した理由」しか言語化しておらず、当たった時は数を数えるだけだった。
 // 人間のアナリストは当たった時も「なぜ当たったのか」を確認して自分の判断基準を
@@ -583,5 +686,7 @@ module.exports = {
   summarizeFailureReasons,
   classifySuccessReasons,
   summarizeSuccessReasons,
+  classifyContextualFailureReasons,
+  CONTEXTUAL_FAILURE_LABELS_JA,
   SUCCESS_REASON_LABELS_JA,
 };

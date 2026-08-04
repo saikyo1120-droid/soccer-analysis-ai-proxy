@@ -68,7 +68,7 @@ const {
   EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, predictOutcomeV2,
   computeFactorImportance, backtestAccuracyV2, fitWeightsGradientDescent,
   buildLearningSummary, classifyFailureReasons, summarizeFailureReasons,
-  classifySuccessReasons, summarizeSuccessReasons,
+  classifySuccessReasons, summarizeSuccessReasons, classifyContextualFailureReasons,
 } = require("./predictionModel");
 
 // ---- 調整可能な上限(API-Football無料プランの1日100リクエスト枠を守るため) ----
@@ -623,6 +623,42 @@ async function runDailyLearning(deps) {
       // 対称な条件でのみ判定し、決め手が無ければ正直にそう返す。
       const successReasons = record.correct ? classifySuccessReasons(record, record.weightsSnapshot) : [];
       record.successReasons = successReasons;
+
+      // ---- 2026年8月・優先順位③: モデルの外側にある原因を特定する ----
+      // 監督交代・フォーメーション変更・スタメンの大幅入れ替えは、予測モデルの
+      // 特徴量に入っていないため classifyFailureReasons では永久に
+      // 「数値化していない要因」としか言えなかった。外れた試合に限って
+      // /fixtures/lineups を1回だけ取得し、予測時点の文脈と突き合わせる
+      // (当たった試合では取得しない=API予算の節約)。
+      let contextualFailureReasons = [];
+      if (!record.correct) {
+        let resolvedContext = null;
+        const canSpendLineup = apiBudget ? apiBudget.tryReserve(1, "外れた試合のスタメン照合").allowed : true;
+        if (canSpendLineup) {
+          try {
+            const lu = await callApiFootball("/fixtures/lineups", { fixture: fixtureIdStr });
+            const rows = (lu && lu.response) || [];
+            const homeRow = rows[0] || null;
+            const awayRow = rows[1] || null;
+            const names = (row) => (row && Array.isArray(row.startXI))
+              ? row.startXI.map((p) => (p && p.player && p.player.name) || null).filter(Boolean)
+              : null;
+            resolvedContext = {
+              homeCoachName: (homeRow && homeRow.coach && homeRow.coach.name) || null,
+              awayCoachName: (awayRow && awayRow.coach && awayRow.coach.name) || null,
+              homeFormation: (homeRow && homeRow.formation) || null,
+              awayFormation: (awayRow && awayRow.formation) || null,
+              homeLineupNames: names(homeRow),
+              awayLineupNames: names(awayRow),
+            };
+          } catch (e) {
+            errors.push(`lineup_fetch_failed:${fixtureIdStr}:${e.code || e.message}`);
+          }
+        }
+        contextualFailureReasons = classifyContextualFailureReasons(record, resolvedContext);
+        record.contextualFailureReasons = contextualFailureReasons;
+        record.resolvedContext = resolvedContext;
+      }
       await upstashSetJSON(`learn:ownpred:${fixtureIdStr}`, record);
       await upstashCmd(["LREM", "learn:ownpred:pending", "0", fixtureIdStr]).catch(() => {});
       await upstashCmd(["INCR", "learn:ownpred:resolved"]).catch(() => {});
@@ -687,6 +723,18 @@ async function runDailyLearning(deps) {
               computedAt: runAt.toISOString(), source: "予測時点の特徴量・重みから機械的に分類(LLM不使用)",
             });
           } catch (e) { errors.push(`success_reason_save_failed:${fixtureIdStr}:${e.message}`); }
+        }
+        if (!record.correct && contextualFailureReasons.length) {
+          failureReasonsToday.push(...contextualFailureReasons.map((r) => ({ ...r, teamEn: record.originTeamEn || record.homeTeamEn })));
+          try {
+            await knowledgeStore.saveKnowledgeItem({
+              teamEn: record.originTeamEn || record.homeTeamEn, category: "predictionContextualFailure", type: "analysis",
+              statement: `【予測が外れた理由(モデル外の要因)】${record.homeTeamEn} vs ${record.awayTeamEn}: ${contextualFailureReasons.map((r) => r.labelJa).join("、")}。${contextualFailureReasons[0].detail}`,
+              detail: { fixtureId: fixtureIdStr, contextualFailureReasons },
+              computedAt: runAt.toISOString(),
+              source: "予測時点に記録した文脈と、試合後に判明した事実(/fixtures/lineups)の突き合わせ",
+            });
+          } catch (e) { errors.push(`contextual_failure_save_failed:${fixtureIdStr}:${e.message}`); }
         }
         if (!record.correct && failureReasons.length) {
           failureReasonsToday.push(...failureReasons.map((r) => ({ ...r, teamEn: record.originTeamEn || record.homeTeamEn })));
@@ -788,6 +836,19 @@ async function runDailyLearning(deps) {
       //   ・出場停止者数           … 既に取得済みの/injuriesのレスポンスから算出
       //     (computeInjuryCountFeatureは以前からsuspendedPlayersを分離していたが、
       //      予測モデルには渡されておらず、負傷者と一緒くたにされていた)
+      // 2026年8月・優先順位③: 監督名は①-dで既にMemory Engineへ保存済みなので、
+      // それを読み出すだけ(追加のAPI呼び出しは発生しない)。試合後にもう一度
+      // 照合することで「監督交代を考慮できなかった」を検出できるようにする。
+      const readCoachName = async (teamEn) => {
+        if (!teamEn) return null;
+        try {
+          const c = await memoryStore.getLastConclusion(`team:${teamEn}:coachName`);
+          return (c && c.statement) || null;
+        } catch (e) { return null; }
+      };
+      const homeCoachNameAtPrediction = await readCoachName(isHome ? team.nameEn : opponentName);
+      const opponentCoachNameAtPrediction = await readCoachName(isHome ? opponentName : team.nameEn);
+
       const homeSplit = computeHomeAwaySplit(homeForm.fixtures || [], homeTeamId);
       const awaySplit = computeHomeAwaySplit(awayForm.fixtures || [], awayTeamId);
 
@@ -864,6 +925,17 @@ async function runDailyLearning(deps) {
         kickoff: fx.fixture.date, loggedAt: runAt.toISOString(),
         resolved: false, actualWinner: null, correct: null, resolvedAt: null,
         originTeamEn: team.nameEn, stateHypothesis,
+        // 2026年8月・優先順位③: モデルの外側にある原因(監督交代・スタメン変更等)を
+        // 試合後に特定できるよう、予測時点の文脈を保存しておく。
+        // ここでは追加のAPI呼び出しを増やさず、既に取得済みの情報だけを記録する
+        // (フォーメーション・スタメンは解決時に/fixtures/lineupsで照合する)。
+        predictionContext: {
+          homeCoachName: (isHome ? homeCoachNameAtPrediction : opponentCoachNameAtPrediction) || null,
+          awayCoachName: (isHome ? opponentCoachNameAtPrediction : homeCoachNameAtPrediction) || null,
+          homeFormation: null, awayFormation: null,
+          homeLineupNames: null, awayLineupNames: null,
+          capturedAt: runAt.toISOString(),
+        },
       };
       await upstashSetJSON(`learn:ownpred:${fixtureId}`, record);
       await upstashCmd(["RPUSH", "learn:ownpred:pending", String(fixtureId)]).catch(() => {});
