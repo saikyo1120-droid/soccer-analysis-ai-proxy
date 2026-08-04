@@ -604,7 +604,21 @@ async function runDailyLearning(deps) {
       if (!record || record.resolved) { await upstashCmd(["LREM", "learn:ownpred:pending", "0", fixtureIdStr]).catch(() => {}); continue; }
       const data = await callApiFootball("/fixtures", { id: fixtureIdStr });
       const fx = (data && data.response && data.response[0]) || null;
-      if (!fx || !fx.fixture || fx.fixture.status.short !== "FT") continue; // まだ終わっていない
+      // 2026年8月・総点検で発見した重大な欠陥の修正:
+      // 従来は「FT(終了)以外は continue」だったため、延期(PST)・中止(CANC)・
+      // 放棄(ABD)になった試合のIDが保留キューから**永久に削除されなかった**。
+      // このキューは先頭10件しか見ないため、そうしたIDが10件たまると
+      // 以降どの予測も検証されなくなり(matchesResolvedTodayが永久に0)、
+      // 毎日10回ぶんのAPIリクエストを無駄に消費し続ける状態だった。
+      const shortStatus = fx && fx.fixture && fx.fixture.status ? fx.fixture.status.short : null;
+      const UNRESOLVABLE_STATUSES = ["PST", "CANC", "ABD", "AWD", "WO"]; // 延期・中止・放棄・裁定勝ち・不戦勝
+      if (UNRESOLVABLE_STATUSES.includes(shortStatus)) {
+        // この試合は結果が出ないので、検証対象から外して先頭詰まりを解消する
+        await upstashCmd(["LREM", "learn:ownpred:pending", "0", fixtureIdStr]).catch(() => {});
+        errors.push(`prediction_unresolvable:${fixtureIdStr}:${shortStatus}`);
+        continue;
+      }
+      if (!fx || !fx.fixture || shortStatus !== "FT") continue; // まだ終わっていない
       const actualWinner = outcomeFromScore(fx.goals.home, fx.goals.away);
       if (!actualWinner) continue;
       record.resolved = true;
@@ -1150,7 +1164,27 @@ async function runDailyLearning(deps) {
   // 2026年8月・完全自動Learning Cycle ⑧「毎日賢くなっていることを証明する」:
   // 日をまたいで比較できる軽量な指標だけを別キーに保存する。growthLogは項目が
   // 多く増減が読み取りにくいため、比較専用のスナップショットを分けている。
-  const metricsSnapshot = buildDailySnapshot(mergedGrowthLog, {
+  // 2026年8月・総点検で発見した重大な欠陥の修正:
+  // engineTotals は getGrowthLog() 側でしか組み立てられておらず、
+  // runDailyLearning() が返す growthLog には含まれていなかった。そのため
+  // buildDailySnapshot が読む knowledgeTotal / memoryTotal / predictionsTotal が
+  // **毎日0のまま保存され**、「昨日より賢くなったか」の判定が永久に
+  // 「変化がありませんでした」になっていた(このプロジェクトの最重要目標が
+  // 数値で証明できない状態だった)。ここで実際の累計を読み出して同梱する。
+  let engineTotalsForMetrics = { knowledgeItemsTotal: 0, memoryConclusionsTotal: 0, predictionsTotal: 0 };
+  try {
+    const [kRaw, mRaw, pRaw] = await Promise.all([
+      upstashCmd(["GET", "knowledge:totalItemsSavedCounter"]).catch(() => null),
+      upstashCmd(["GET", "memory:totalConclusionsSavedCounter"]).catch(() => null),
+      upstashCmd(["GET", "learn:ownpred:total"]).catch(() => null),
+    ]);
+    engineTotalsForMetrics = {
+      knowledgeItemsTotal: parseInt(kRaw, 10) || 0,
+      memoryConclusionsTotal: parseInt(mRaw, 10) || 0,
+      predictionsTotal: parseInt(pRaw, 10) || 0,
+    };
+  } catch (e) { /* ベストエフォート */ }
+  const metricsSnapshot = buildDailySnapshot({ ...mergedGrowthLog, engineTotals: engineTotalsForMetrics }, {
     learningDurationMs: Date.now() - learningStartedAtMs,
   });
   await saveDailyMetrics({ upstashEnabled, upstashSetJSON }, metricsSnapshot);

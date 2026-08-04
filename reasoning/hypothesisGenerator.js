@@ -29,11 +29,20 @@
  * 実データとして既に扱っている(README「議論できるAIへの強化」参照)。
  */
 
+// 2026年8月・総点検で発見した重大な欠陥の修正:
+// relevantCategories が、dailyJob.js が実際にKnowledge Engineへ保存している
+// category 文字列(recentFormTrend / coachChange / transferImpact /
+// matchReflection / predictionFailureReason / predictionSuccessReason /
+// dailyAiView / playstyleAnalysis / predictionHypothesis /
+// predictionContextualFailure)と一致していなかった。
+// そのため**毎日蓄積してきた知識が推論に一度も使われず、全仮説のスコアが常に0**
+// になっていた(Knowledge Engineが事実上「書き込み専用」だった)。
+// 実際に保存されているcategoryを各観点へ割り当てて結線する。
 const HYPOTHESIS_FACTORS = [
   {
     id: "defense_injury",
     label: "怪我・出場停止(守備陣・主力の状態)が原因という仮説",
-    relevantCategories: ["injuries"],
+    relevantCategories: ["injuries", "injury", "predictionContextualFailure"],
     buildStatement: (teamJa, matched) =>
       matched.length
         ? `${teamJa}の状態は、負傷・出場停止による選手の入れ替わりが影響している可能性がある。`
@@ -42,7 +51,7 @@ const HYPOTHESIS_FACTORS = [
   {
     id: "tactics_formation",
     label: "戦術・フォーメーションの変化が原因という仮説",
-    relevantCategories: ["formation", "clubProfile"],
+    relevantCategories: ["formation", "clubProfile", "playstyleAnalysis"],
     buildStatement: (teamJa, matched) =>
       matched.length
         ? `${teamJa}の結果は、フォーメーションや戦術的な方針(ビルドアップ・プレス・保持率等)が影響している可能性がある。`
@@ -51,7 +60,7 @@ const HYPOTHESIS_FACTORS = [
   {
     id: "squad_transfers",
     label: "移籍による戦力変化が原因という仮説",
-    relevantCategories: ["transfers"],
+    relevantCategories: ["transfers", "transferImpact"],
     buildStatement: (teamJa, matched) =>
       matched.length
         ? `${teamJa}の状態は、直近の移籍(加入・退団)による戦力変化が影響している可能性がある。`
@@ -60,7 +69,7 @@ const HYPOTHESIS_FACTORS = [
   {
     id: "recent_form",
     label: "直近フォーム(得失点差の推移)が原因という仮説",
-    relevantCategories: ["recentForm"],
+    relevantCategories: ["recentForm", "recentFormTrend", "matchReflection"],
     buildStatement: (teamJa, matched) =>
       matched.length
         ? `${teamJa}の直近の試合結果の推移そのものが、現在の評価に直接影響している可能性がある。`
@@ -69,7 +78,7 @@ const HYPOTHESIS_FACTORS = [
   {
     id: "coach",
     label: "監督(采配・就任時期)が原因という仮説",
-    relevantCategories: ["coach"],
+    relevantCategories: ["coach", "coachChange"],
     buildStatement: (teamJa, matched) =>
       matched.length
         ? `${teamJa}の状態は、現在の監督の采配方針が影響している可能性がある。`
@@ -78,7 +87,7 @@ const HYPOTHESIS_FACTORS = [
   {
     id: "home_away",
     label: "ホーム/アウェイの違いが原因という仮説",
-    relevantCategories: ["homeAway"],
+    relevantCategories: ["homeAway", "leagueStandings"],
     buildStatement: (teamJa, matched) =>
       matched.length
         ? `${teamJa}はホームとアウェイで成績差が大きく、開催地が結果に影響している可能性がある。`
@@ -96,7 +105,7 @@ const HYPOTHESIS_FACTORS = [
   {
     id: "momentum",
     label: "勢い・メンタル面(連続結果)が原因という仮説",
-    relevantCategories: ["streak"],
+    relevantCategories: ["streak", "predictionFailureReason", "predictionSuccessReason"],
     buildStatement: (teamJa, matched) =>
       matched.length
         ? `${teamJa}は結果が連続しており、勢い(またはその逆の重圧)がメンタル面に影響している可能性がある。`
@@ -105,7 +114,7 @@ const HYPOTHESIS_FACTORS = [
   {
     id: "standings",
     label: "リーグ順位・置かれた状況が原因という仮説",
-    relevantCategories: ["standings"],
+    relevantCategories: ["standings", "dailyAiView", "predictionHypothesis"],
     buildStatement: (teamJa, matched) =>
       matched.length
         ? `${teamJa}の現在のリーグ順位が、モチベーションや戦い方の選択に影響している可能性がある。`

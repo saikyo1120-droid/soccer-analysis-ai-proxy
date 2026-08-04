@@ -121,8 +121,13 @@ function computeStandingsFeature(standingsResponse, teamId) {
         position: row.rank ?? null,
         points: row.points ?? null,
         played: played ?? null,
-        goalsForAvg: played ? Math.round((goalsFor / played) * 100) / 100 : null,
-        goalsAgainstAvg: played ? Math.round((goalsAgainst / played) * 100) / 100 : null,
+        // 2026年8月・総点検で発見した欠陥の修正: row.all.goals が欠けている
+        // (一部リーグ・シーズンで起こりうる)場合、従来は undefined/played で
+        // **NaN** になり、それが特徴量として下流へ流れていた。
+        // 数値でなければ正直に null にする(0にもしない。0は「無得点」という
+        // 別の意味を持ってしまうため)。
+        goalsForAvg: (played && Number.isFinite(goalsFor)) ? Math.round((goalsFor / played) * 100) / 100 : null,
+        goalsAgainstAvg: (played && Number.isFinite(goalsAgainst)) ? Math.round((goalsAgainst / played) * 100) / 100 : null,
       };
     }
   }
@@ -310,6 +315,11 @@ function pickTeamTopScorer(topscorersResponse, teamId) {
 function computeXgFromFixtureStats(statsResponse, teamId) {
   const list = statsResponse || [];
   const mine = list.find((t) => t && t.team && t.team.id === teamId);
+  // 2026年8月・総点検で発見した欠陥の修正: 対象チームが統計に含まれていない場合、
+  // 従来は「teamIdと違うチーム」を無条件に相手とみなしていたため、
+  // **まったく無関係なチームのxGを自チームのxGA(被期待失点)として拾って**いた。
+  // 自チームが見つからないなら、相手も特定できない(両方nullを返す)。
+  if (!mine) return { xg: null, xga: null };
   const opponent = list.find((t) => t && t.team && t.team.id !== teamId);
   const pick = (block) => {
     if (!block || !Array.isArray(block.statistics)) return null;

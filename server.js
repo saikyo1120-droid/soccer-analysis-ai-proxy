@@ -43,6 +43,8 @@ const { createMemoryStore } = require("./memory/memoryStore");
 const { createClubProfileEngine } = require("./knowledge/clubProfileEngine");
 const { buildEvidencePool } = require("./reasoning/evidencePool");
 const { assembleReasoning, formatReasoningForPrompt } = require("./reasoning/reasoningEngine");
+// 2026年8月・優先順位④: 6段階の熟考(必要データ取得→仮説生成→仮説比較→反対意見→根拠評価→最終結論)。
+const { deliberate } = require("./reasoning/deliberation");
 
 // 毎日学習エンジン(Learning Engine)。実体は server/learning/dailyJob.js。
 // 依存(callApiFootball/resolveTeamId/Upstashアクセス関数)は、このファイル自身が
@@ -2305,6 +2307,7 @@ async function handleDiscuss(body, clientIp) {
   // 場合にのみ組み立てる(選手・一般質問は構造化された根拠プールを持たないため
   // 対象外。将来的に拡張する余地があることをREADMEで開示する)。
   let reasoningBundle = null;
+  let deliberationResult = null; // 優先順位④: 6段階の熟考の結果
   let memorySubjectKey = null;
   let previousConclusion = null;
 
@@ -2325,6 +2328,33 @@ async function handleDiscuss(body, clientIp) {
         hypothesesConsidered: reasoningBundle.hypotheses.map((h) => ({ label: h.label, score: h.score, evidenceCount: h.evidence.length })),
         selectedLabel: reasoningBundle.selected ? reasoningBundle.selected.label : null,
         selfCheck: reasoningBundle.selfCheck,
+      };
+      knowledgeMeta.deliberation = null; // 下で6段階の結果を入れる
+      // ---- 2026年8月・優先順位④: 6段階の熟考を実行する ----
+      // どのデータが揃っていて何が欠けているかを、実際に取得できた知識から判定する
+      // (推測しない: 該当カテゴリの根拠が1件でもあれば「揃っている」とみなす)。
+      const poolCategories = new Set((evidencePool || []).map((e) => e && e.category).filter(Boolean));
+      deliberationResult = deliberate({
+        ranked: reasoningBundle.hypotheses,
+        dataAvailability: {
+          form: poolCategories.has("recentFormTrend") || poolCategories.has("recentForm"),
+          goals: poolCategories.has("recentFormTrend") || poolCategories.has("dailyAiView"),
+          standings: poolCategories.has("standings") || poolCategories.has("leagueStandings"),
+          injuries: poolCategories.has("injuries") || poolCategories.has("injury"),
+          headToHead: poolCategories.has("matchReflection"),
+          xg: poolCategories.has("leagueTopScorers"),
+          coach: poolCategories.has("coachChange") || poolCategories.has("coach"),
+          venue: poolCategories.has("homeAway") || poolCategories.has("leagueStandings"),
+        },
+        previousConclusion,
+      });
+      knowledgeMeta.deliberation = {
+        stages: deliberationResult.stages,
+        finalConclusionJa: deliberationResult.finalConclusionJa,
+        counterArgumentJa: deliberationResult.counterArgumentJa,
+        confidence: deliberationResult.confidence,
+        factorBreakdown: deliberationResult.factorBreakdown,
+        changedFromPrevious: deliberationResult.changedFromPrevious,
       };
 
       memorySubjectKey = `team:${subject.labelEn}:leadingFactor`;
@@ -2390,7 +2420,15 @@ async function handleDiscuss(body, clientIp) {
     confidence = { stars: 2, reasonJa: "特定の実データによる裏付けができないため、確信度は控えめにしています。" };
   }
 
-  const reasoningPromptBlock = reasoningBundle ? formatReasoningForPrompt(reasoningBundle, previousConclusion) : "";
+  let reasoningPromptBlock = reasoningBundle ? formatReasoningForPrompt(reasoningBundle, previousConclusion) : "";
+  // 優先順位④: 6段階の検討結果をLLMへ渡し、「私は○○が最も重要だと考えます」で
+  // 締めることを明示的に指示する(テンプレート化を避けるため、根拠の状況に
+  // 応じて内容が毎回変わる内部メモをそのまま添える)。
+  if (deliberationResult) {
+    reasoningPromptBlock += `\n\n${deliberationResult.promptNote}\n` +
+      `【必ず守ること】最後は必ず「${deliberationResult.stages.step6_finalConclusion.headlineJa}」という趣旨の一文で締めてください。` +
+      `根拠が不足している場合は、無理に断定せず不足していることを正直に述べてください。`;
+  }
   const userPrompt = [
     `利用者の質問: 「${question}」`,
     "",

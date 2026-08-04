@@ -82,6 +82,12 @@ function compareHypotheses(ranked) {
 /** 段階4: 反対意見 — 採用しなかった仮説から、最も有力な反論を立てる。 */
 function buildCounterArgument(comparison) {
   const c = comparison || {};
+  // 総点検で発見した欠陥の修正: 採用した見方自体に根拠が無い場合にまで
+  // 「反対意見が無いこと自体が根拠の強さを示す」と述べており、
+  // **データが1件も無い状態を強みであるかのように見せてしまっていた**。
+  if (!c.top || !(c.top.score > 0)) {
+    return { hasCounter: false, statementJa: "そもそも実データが不足しているため、賛成・反対のどちらの材料も十分にありません。" };
+  }
   if (!c.second || !(c.second.score > 0)) {
     return { hasCounter: false, statementJa: "実データ上、この見方に有力に対抗する材料は見つかりませんでした(反対意見が無いこと自体が根拠の強さを示します)。" };
   }
@@ -160,7 +166,13 @@ function evaluateEvidence(comparison, dataAvailability, ranked) {
  */
 function buildFinalConclusion(comparison, evaluation, previousConclusion) {
   const top = comparison && comparison.top;
-  if (!top) {
+  // 2026年8月・総点検で発見した欠陥の修正:
+  // 仮説オブジェクト自体は存在するがスコアが0(＝根拠が1件も無い)場合にも
+  // 「私は○○が最も重要だと考えます」と断定してしまっていた。
+  // これはこのモジュール自身が冒頭で宣言している「根拠が1件も無い観点を
+  // 『最も重要』とは言わない」という原則に反するため、スコア0は保留扱いにする。
+  const hasEvidence = !!top && (top.score || 0) > 0;
+  if (!hasEvidence) {
     return {
       headlineJa: "私は、現時点では確かなことを申し上げられないと考えます。",
       bodyJa: "実データから支持できる見方が見つからなかったためです。データが揃い次第、改めて分析します。",
