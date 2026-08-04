@@ -1776,6 +1776,17 @@ async function handleLearningHealth(searchParams) {
       // 2026年8月・優先順位⑪: 現在の契約プランの自動判定結果。
       // 「Proに加入したはずだが本当に反映されているか」をこの画面だけで確認できる。
       apiPlan: getApiPlanInfo(),
+      // 2026年8月: 「Renderの環境変数をちゃんと設定できたのか」を、
+      // Renderの管理画面を開かなくてもこの画面だけで確認できるようにする。
+      // 環境変数は一度設定すれば再デプロイしても保持されるため、設定作業は1回だけ。
+      settings: {
+        extendedLeagueCap: Number(process.env.EXTENDED_LEAGUE_CAP) || null,
+        playerUpdateCap: Number(process.env.PLAYER_UPDATE_CAP) || null,
+        apiDailyBudgetManual: Number(process.env.API_DAILY_BUDGET) || null,
+        noteJa: (Number(process.env.EXTENDED_LEAGUE_CAP) && Number(process.env.PLAYER_UPDATE_CAP))
+          ? `有料プラン向けの設定が反映されています(拡張リーグ${process.env.EXTENDED_LEAGUE_CAP}件/日・選手${process.env.PLAYER_UPDATE_CAP}名/日)。追加の設定作業は不要です。`
+          : "Render側の環境変数 EXTENDED_LEAGUE_CAP / PLAYER_UPDATE_CAP がまだ設定されていません(未設定の場合は無料プラン向けの既定値、拡張リーグ2件・選手3名で動作します)。設定は1回だけで、以後は再デプロイしても保持されます。",
+      },
     },
   };
 }

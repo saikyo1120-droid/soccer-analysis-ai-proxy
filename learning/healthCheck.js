@@ -188,16 +188,47 @@ async function getRunHistory(deps, days, todayDateKey) {
       });
     }
   }
-  const ranDays = out.filter((d) => d.ran).length;
+  // 2026年8月・本番での誤検出の修正:
+  //   「直近14日間のうち3日しか実行されていません」と警告が出たが、実際には
+  //   API-Footballのアカウント作成が7/31で、それ以前はそもそも実行しようが
+  //   なかっただけだった(＝故障ではない)。記録が1件も無い時期まで「動いて
+  //   いない日」として数えるのは、利用者を不必要に不安にさせる誤検出になる。
+  //   そこで「最初に実行記録がある日」より前は集計から除外し、運用が始まって
+  //   からの期間だけで判定する(推測で埋めるのではなく、対象外として明示する)。
+  const out2 = out.slice();
+  let firstRanIndex = -1;
+  for (let i = out2.length - 1; i >= 0; i--) {
+    if (out2[i].ran) { firstRanIndex = i; break; }
+  }
+  for (let i = 0; i < out2.length; i++) {
+    if (firstRanIndex === -1 || i > firstRanIndex) out2[i].beforeStart = true;
+  }
+  const trackedDays = out2.filter((d) => !d.beforeStart);
+  const ranDays = out2.filter((d) => d.ran).length;
+  const missingTracked = trackedDays.filter((d) => !d.ran);
+  const excludedCount = out2.length - trackedDays.length;
+  const excludedNote = excludedCount > 0
+    ? `(このうち${excludedCount}日は運用開始前のため対象外としています)`
+    : "";
+
+  let everyDayJa;
+  if (firstRanIndex === -1) {
+    everyDayJa = `直近${n}日間に実行記録が1件もありません。GitHub Actionsのスケジュールが動いていない可能性があります。`;
+  } else if (missingTracked.length === 0) {
+    everyDayJa = `運用開始以降の${trackedDays.length}日間、毎日欠かさず実行されています${excludedNote}。`;
+  } else {
+    everyDayJa = `運用開始以降の${trackedDays.length}日間のうち${trackedDays.length - missingTracked.length}日で実行されています(${missingTracked.map((d) => d.date).join("・")}は実行記録がありません)${excludedNote}。実行記録が無い日は、GitHub Actionsのスケジュールが動いていなかった可能性があります。`;
+  }
+
   return {
     available: true,
-    days: out,
+    days: out2,
     ranDays,
     totalDays: n,
-    // 「毎日動いている」ことをひと目で言い切れる形にする
-    everyDayJa: ranDays === n
-      ? `直近${n}日間、毎日欠かさず実行されています。`
-      : `直近${n}日間のうち${ranDays}日で実行されています(${n - ranDays}日は実行記録がありません)。実行記録が無い日は、GitHub Actionsのスケジュールが動いていなかった可能性があります。`,
+    // 運用が始まってからの日数と、そのうち実行できていない日(誤検出を避けた指標)
+    trackedDays: trackedDays.length,
+    missingDays: missingTracked.map((d) => d.date),
+    everyDayJa,
   };
 }
 
@@ -214,11 +245,13 @@ function buildEngineStatuses(ctx) {
 
   // 1. GitHub Actions / 2. cron(同じスケジュール実行の話なのでまとめて判定する)
   if (runHistory && runHistory.available) {
-    if (runHistory.ranDays === runHistory.totalDays) {
-      push("githubActions", "GitHub Actions / cron(毎日の起動)", "ok", runHistory.everyDayJa);
-    } else if (runHistory.ranDays === 0) {
+    // 「運用開始前」の期間は判定から除外する(2026年8月・誤検出の修正)。
+    const missing = runHistory.missingDays || [];
+    if (runHistory.ranDays === 0) {
       push("githubActions", "GitHub Actions / cron(毎日の起動)", "error", runHistory.everyDayJa,
         "GitHubリポジトリのActionsタブで daily-learning.yml が有効か、直近の実行が失敗していないかを確認してください。");
+    } else if (missing.length === 0) {
+      push("githubActions", "GitHub Actions / cron(毎日の起動)", "ok", runHistory.everyDayJa);
     } else {
       push("githubActions", "GitHub Actions / cron(毎日の起動)", "warn", runHistory.everyDayJa,
         "実行記録が無い日があります。GitHub Actionsは長期間コミットが無いリポジトリでは自動的に無効化されることがあります。");
