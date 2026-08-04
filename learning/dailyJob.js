@@ -55,6 +55,8 @@ const { createRelationshipIndex } = require("../knowledge/relationshipIndex");
 const { createClubProfileEngine } = require("../knowledge/clubProfileEngine");
 const { summarizeTransfers } = require("../rag/knowledgeSource");
 const { collectLeagueKnowledge } = require("./leagueKnowledge");
+const { collectPlayerKnowledge, PLAYER_UPDATE_CAP_DEFAULT } = require("./playerDailyUpdate");
+const { createApiBudget, DEFAULT_DAILY_BUDGET, DEFAULT_USER_RESERVE } = require("./apiBudget");
 const {
   computeGoalRateFeatures, computeFatigueFeature,
   fetchInjuryCountFeature, fetchStandingsFeature, fetchHeadToHeadFeature,
@@ -209,7 +211,22 @@ function mergeGrowthLogs(previous, current) {
   const mergedFacts = dedupeByStatement(previous.facts, current.facts);
   const mergedOtherFacts = dedupeByStatement(previous.otherFactsToday, current.otherFactsToday);
   const mergedLeagueFacts = dedupeByStatement(previous.leagueFactsToday, current.leagueFactsToday);
+  const mergedPlayerFacts = dedupeByStatement(previous.playerFactsToday, current.playerFactsToday);
   const sum = (a, b) => (a || 0) + (b || 0);
+  // 優先順位⑦: 「更新できなかった理由」は、同じ選手・同じ項目の重複を除いて合算する
+  // (同日に複数回実行しても同じ理由が並ぶだけなので)。
+  const mergedUnavailable = (() => {
+    const out = [];
+    const seen = new Set();
+    for (const row of [...(previous.playerUnavailableReasonsToday || []), ...(current.playerUnavailableReasonsToday || [])]) {
+      if (!row) continue;
+      const k = `${row.playerJa}|${row.fieldJa}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(row);
+    }
+    return out;
+  })();
   return {
     ...current, // 的中率・重み更新有無などの「状態」は最新の実行の値をそのまま使う
     ranAt: current.ranAt,
@@ -233,6 +250,18 @@ function mergeGrowthLogs(previous, current) {
     leagueFactsAddedToday: mergedLeagueFacts.length,
     leagueFactsDuplicateToday: sum(previous.leagueFactsDuplicateToday, current.leagueFactsDuplicateToday),
     leagueFactsToday: mergedLeagueFacts,
+    // 2026年8月・優先順位⑦: 選手の日次更新。対象選手は日付ベースのローテーションで
+    // 決まるため、同日の再実行では顔ぶれが変わらない(=最大値を採用する)。
+    // 事実の件数・項目数は、リーグと同じく重複排除したうえで数える。
+    playersCheckedToday: Math.max(previous.playersCheckedToday || 0, current.playersCheckedToday || 0),
+    playersUpdatedToday: Math.max(previous.playersUpdatedToday || 0, current.playersUpdatedToday || 0),
+    playerFactsAddedToday: mergedPlayerFacts.length,
+    playerFactsDuplicateToday: sum(previous.playerFactsDuplicateToday, current.playerFactsDuplicateToday),
+    playerFactsToday: mergedPlayerFacts,
+    playerFieldsUpdatedToday: Math.max(previous.playerFieldsUpdatedToday || 0, current.playerFieldsUpdatedToday || 0),
+    playerFieldsPermanentlyUnavailable: Math.max(previous.playerFieldsPermanentlyUnavailable || 0, current.playerFieldsPermanentlyUnavailable || 0),
+    playerFieldsRetryableToday: Math.max(previous.playerFieldsRetryableToday || 0, current.playerFieldsRetryableToday || 0),
+    playerUnavailableReasonsToday: mergedUnavailable,
     matchesResolvedToday: sum(previous.matchesResolvedToday, current.matchesResolvedToday),
     newPredictionsLogged: sum(previous.newPredictionsLogged, current.newPredictionsLogged),
     hypothesesConfirmed: sum(previous.hypothesesConfirmed, current.hypothesesConfirmed),
@@ -262,6 +291,15 @@ async function runDailyLearning(deps) {
   }
 
   const knowledgeStore = createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON });
+  // 2026年8月・優先順位⑦: APIリクエスト予算ガード。1日の上限に静かに突き当たって
+  // 「エラーだらけで知識0件」になる事故(優先順位⑨のご指摘)を防ぐため、消費量を
+  // 記録し、予算が尽きそうなときはオプション扱いの処理を理由つきで見送る。
+  const apiBudget = createApiBudget({
+    upstashEnabled, upstashGetJSON, upstashSetJSON,
+    dailyBudget: Number(process.env.API_DAILY_BUDGET) || DEFAULT_DAILY_BUDGET,
+    userReserve: Number(process.env.API_USER_RESERVE) || DEFAULT_USER_RESERVE,
+  });
+  await apiBudget.init(dateKey);
   const memoryStore = createMemoryStore({ upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON });
   const relationshipIndex = createRelationshipIndex({ upstashEnabled, upstashGetJSON, upstashSetJSON });
   const clubProfileEngine = createClubProfileEngine({ generateLLM, knowledgeStore, setRelation: relationshipIndex.setRelation });
@@ -497,6 +535,28 @@ async function runDailyLearning(deps) {
     if (leagueResult.errors && leagueResult.errors.length) errors.push(...leagueResult.errors);
   } catch (e) {
     errors.push(`league_knowledge_failed:${e.message}`);
+  }
+
+  // ---- ①-f 選手情報の日次更新(2026年8月・優先順位⑦) ----
+  // 「聞かれた時だけ取得」から「毎日更新」へ。16項目それぞれについて、
+  // 取得できた値、または取得できなかった理由を必ず記録する
+  // (詳細は server/learning/playerDailyUpdate.js のコメント参照)。
+  let playerResult = {
+    playersCheckedToday: 0, playersUpdatedToday: 0, playerFactsSavedToday: 0,
+    playerFactsDuplicateToday: 0, playerFactsToday: [], fieldsUpdatedToday: 0,
+    fieldsPermanentlyUnavailable: 0, fieldsRetryableToday: 0,
+    unavailableReasonsToday: [], errors: [],
+  };
+  try {
+    playerResult = await collectPlayerKnowledge({
+      callApiFootball, knowledgeStore, upstashEnabled, upstashGetJSON, upstashSetJSON,
+      apiBudget,
+      playerUpdateCap: Number(process.env.PLAYER_UPDATE_CAP) || PLAYER_UPDATE_CAP_DEFAULT,
+      searchLeagues: (process.env.SEARCH_LEAGUES || "").split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean),
+    }, runAt, dateKey);
+    if (playerResult.errors && playerResult.errors.length) errors.push(...playerResult.errors);
+  } catch (e) {
+    errors.push(`player_daily_update_failed:${e.message}`);
   }
 
   // ---- ② 保留中の自社予測を解決(試合が終わっていれば的中/不的中を確定) ----
@@ -823,8 +883,8 @@ async function runDailyLearning(deps) {
   // ①-d(監督交代・補強)、①-e(リーグ単位の順位表・ランキング)は既に個別に
   // 保存済みなので、ここでは「今日追加した知識」の合計件数にだけ加算する
   // (二重保存はしない)。
-  knowledgeItemsSavedToday += transferFactsAddedToday + coachChangesDetectedToday + leagueResult.leagueFactsSavedToday;
-  knowledgeItemsDuplicateToday += leagueResult.leagueFactsDuplicateToday;
+  knowledgeItemsSavedToday += transferFactsAddedToday + coachChangesDetectedToday + leagueResult.leagueFactsSavedToday + playerResult.playerFactsSavedToday;
+  knowledgeItemsDuplicateToday += leagueResult.leagueFactsDuplicateToday + playerResult.playerFactsDuplicateToday;
 
   // ---- 「昨日より知識が増えていることが分かるようにする」ための集計 ----
   // 全登録クラブ横断で、今日新しく覚えた知識・更新された知識・古くなった
@@ -868,6 +928,18 @@ async function runDailyLearning(deps) {
     leagueFactsAddedToday: leagueResult.leagueFactsSavedToday,
     leagueFactsDuplicateToday: leagueResult.leagueFactsDuplicateToday,
     leagueFactsToday: leagueResult.leagueFactsToday,
+    // 2026年8月・優先順位⑦: 選手情報の日次更新。「更新できなかった項目の理由」まで含めて返す。
+    playersCheckedToday: playerResult.playersCheckedToday,
+    playersUpdatedToday: playerResult.playersUpdatedToday,
+    playerFactsAddedToday: playerResult.playerFactsSavedToday,
+    playerFactsDuplicateToday: playerResult.playerFactsDuplicateToday,
+    playerFactsToday: playerResult.playerFactsToday,
+    playerFieldsUpdatedToday: playerResult.fieldsUpdatedToday,
+    playerFieldsPermanentlyUnavailable: playerResult.fieldsPermanentlyUnavailable,
+    playerFieldsRetryableToday: playerResult.fieldsRetryableToday,
+    playerUnavailableReasonsToday: playerResult.unavailableReasonsToday,
+    // 2026年8月・優先順位⑦: APIリクエスト予算の使用状況(優先順位⑨の診断用)。
+    apiBudget: apiBudget.summary(),
     matchesResolvedToday,
     newPredictionsLogged,
     hypothesesConfirmed, hypothesesDiscarded,
@@ -889,6 +961,10 @@ async function runDailyLearning(deps) {
   // これにより、Renderのスリープ起床待ち等で同じ日に複数回実行されても、
   // 「今日追加した知識」が最後の実行結果だけで上書きされて0件に見えてしまう
   // ことを防ぐ。
+  // 2026年8月・優先順位⑦: 今回の実行で使ったAPIリクエスト数を確定保存する
+  // (同じ日に複数回実行されても、1日の合計として正しく積み上がるようにするため)。
+  await apiBudget.flush();
+
   const existingToday = await upstashGetJSON(`learn:growthlog:${dateKey}`).catch(() => null);
   const mergedGrowthLog = mergeGrowthLogs(existingToday, growthLog);
   await upstashSetJSON(`learn:growthlog:${dateKey}`, mergedGrowthLog);

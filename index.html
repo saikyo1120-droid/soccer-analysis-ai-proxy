@@ -6155,10 +6155,12 @@ async function renderGrowthLogWidget() {
   // フィールドが無いため、undefinedのまま架空の0件表示にならないよう ?? で
   // 正直にフォールバックする。
   const leaguesAnalyzed = log.leaguesAnalyzedToday ?? 0;
+  // 2026年8月・優先順位⑦: 選手の日次更新も分析対象として表示する。
+  const playersAnalyzed = log.playersCheckedToday ?? 0;
 
   summaryEl.innerHTML = `
     🧠 <strong>昨日学んだこと</strong>
-    <span class="value-note">(${formatDateJa(log.date + "T00:00:00Z")}時点・登録${log.teamsAnalyzed}クラブ+${leaguesAnalyzed}リーグを分析)</span>
+    <span class="value-note">(${formatDateJa(log.date + "T00:00:00Z")}時点・登録${log.teamsAnalyzed}クラブ+${leaguesAnalyzed}リーグ+${playersAnalyzed}選手を分析)</span>
     <button class="more-details-btn" id="growthLogToggleBtn" type="button" style="margin-left:8px; display:inline-block; width:auto; padding:4px 10px;">詳しく見る ▼</button>
     <div class="value-note" style="margin-top:4px;">今日追加した知識: ${knowledgeSaved}件(重複でスキップ: ${knowledgeDup}件) ・ 検証した試合: ${log.matchesResolvedToday}件</div>
     ${errorWarningHtml}
@@ -6208,6 +6210,51 @@ async function renderGrowthLogWidget() {
         ? leagueFacts.map(buildGrowthFactRow).join("")
         : `<p class="value-note" style="margin:4px 0 4px 8px; opacity:.8;">本日は前回確認時から順位表・ランキングに変化が無かったため、新しい事実の追加はありませんでした(架空の変化は作りません)。</p>`}
     `;
+    // 2026年8月・優先順位⑦: 選手情報の日次更新。ご要望の中心は「更新できなかった
+    // 項目は理由を残してください」なので、更新できた件数だけでなく、
+    // 「なぜ取れなかったのか」を恒久的な制約と一時的な失敗に分けて開示する。
+    const playerFacts = log.playerFactsToday || [];
+    const playersChecked = log.playersCheckedToday ?? 0;
+    const fieldsUpdated = log.playerFieldsUpdatedToday ?? 0;
+    const unavailableRows = log.playerUnavailableReasonsToday || [];
+    const permanentRows = unavailableRows.filter((r) => r && r.permanent);
+    const retryableRows = unavailableRows.filter((r) => r && !r.permanent);
+    const buildReasonRow = (r) => `<li><strong>${escapeHtml(r.playerJa || "")}</strong> の「${escapeHtml(r.fieldJa || "")}」: ${escapeHtml(r.reason || "")}</li>`;
+    // 恒久的に取得できない項目は、選手ごとに同じ理由が並ぶため、項目単位でまとめる
+    const permanentByField = {};
+    permanentRows.forEach((r) => {
+      if (!permanentByField[r.fieldJa]) permanentByField[r.fieldJa] = { fieldJa: r.fieldJa, reason: r.reason, players: [] };
+      permanentByField[r.fieldJa].players.push(r.playerJa);
+    });
+    const permanentList = Object.values(permanentByField);
+    const playerFactsHtml = `
+      <p class="value-note" style="margin:8px 0 4px;">👤 選手情報の日次更新(本日${playersChecked}名をローテーションで確認・${fieldsUpdated}項目を更新):</p>
+      ${playerFacts.length
+        ? playerFacts.map((f) => `<p class="value-note" style="margin:4px 0 4px 8px;">・${escapeHtml(f.statement || "")}</p>`).join("")
+        : `<p class="value-note" style="margin:4px 0 4px 8px; opacity:.8;">本日確認した選手は、前回確認時からデータに変化がありませんでした(架空の変化は作りません)。</p>`}
+      ${permanentList.length
+        ? `<details style="margin:6px 0 4px 8px;"><summary class="value-note" style="cursor:pointer;">ℹ️ 現在のデータソースでは更新できない項目(${permanentList.length}種類)と、その理由を見る</summary>
+             <ul style="margin:4px 0 0; padding-left:18px; font-size:12px; opacity:.85;">
+               ${permanentList.map((g) => `<li><strong>${escapeHtml(g.fieldJa)}</strong>(対象: ${escapeHtml(g.players.join("、"))}): ${escapeHtml(g.reason)}</li>`).join("")}
+             </ul></details>`
+        : ""}
+      ${retryableRows.length
+        ? `<details style="margin:6px 0 4px 8px;"><summary class="value-note" style="cursor:pointer;">🔁 今日は取得できなかったが明日再試行する項目(${retryableRows.length}件)を見る</summary>
+             <ul style="margin:4px 0 0; padding-left:18px; font-size:12px; opacity:.85;">
+               ${retryableRows.slice(0, 20).map(buildReasonRow).join("")}
+             </ul>
+             ${retryableRows.length > 20 ? `<p class="value-note" style="margin:4px 0 0;">…他${retryableRows.length - 20}件</p>` : ""}
+           </details>`
+        : ""}
+    `;
+
+    // 2026年8月・優先順位⑦: APIリクエスト予算の使用状況。「知識0件」の原因が
+    // 予算切れなのかどうかを、利用者自身が確認できるようにする。
+    const budget = log.apiBudget || null;
+    const budgetHtml = budget
+      ? `<p class="value-note" style="margin:8px 0 4px; opacity:.85;">📊 本日のAPIリクエスト使用量: <strong>${budget.totalSpent}</strong> / ${budget.dailyBudget}件(うち${budget.userReserve}件は利用者の操作用に確保)。日次学習に使える残り: ${budget.remainingForJob}件。${budget.remainingForJob === 0 ? "<span style=\"color:#c0392b;\">本日は予算を使い切ったため、一部の更新を見送りました。</span>" : ""}</p>`
+      : "";
+
     // 2026年8月・優先順位⑨: dailyJob.js側は以前からteam/fixtureごとの失敗理由を
     // errors配列に記録していた(例: "coach_check_failed:Bayern Munich:..."）が、
     // このウィジェットには一切表示されていなかった。「本当に学習しているの?」と
@@ -6233,6 +6280,8 @@ async function renderGrowthLogWidget() {
       ${factsHtml}
       ${otherFactsHtml}
       ${leagueFactsHtml}
+      ${playerFactsHtml}
+      ${budgetHtml}
       <p class="value-note" style="margin-top:8px; opacity:.8;">※「自社予測モデル」はホーム画面の「AI予測の実績」(API-Football自体の予測データ)とは別の、このアプリ独自の実験的な予測モデルです。この学習結果(重み)は「クラブ同士の試合を分析」機能の予測にも実際に使われます。※「今日追加した知識」はKnowledge Engine(事実/分析/意見を分離・重複排除・失効管理する知識ベース)に新規保存された件数です。</p>
     `;
     toggleBtn.addEventListener("click", () => {
