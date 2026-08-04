@@ -753,6 +753,9 @@ async function handleFixturesToday(query) {
 // Statuses API-Football uses to mark a fixture as fully finished (as opposed to
 // not-yet-started, in-play, postponed, cancelled, etc.).
 const FINISHED_STATUSES = new Set(["FT", "AET", "PEN"]);
+// 2026年8月・優先順位④: 試合中(ライブ)のステータス一覧。フロントエンド
+// (index.html)のFIXTURE_LIVE_STATUSESと意味を揃えてある。
+const LIVE_STATUSES = new Set(["1H", "HT", "2H", "ET", "BT", "P", "SUSP", "INT", "LIVE"]);
 
 // Real "before the match" / "after the match" analysis for a specific fixture,
 // requested on demand (only when the user clicks to analyze that one match) —
@@ -792,15 +795,15 @@ async function handleFixtureAnalysis(query) {
       },
     };
 
-    if (!FINISHED_STATUSES.has(statusShort)) {
-      // Not finished yet (includes not-started, in-play, postponed, etc.) — no
-      // real post-match data exists yet, so there is nothing more to fetch from
-      // API-Football here. The frontend builds the pre-match preview itself
-      // (using our own registered player database for either club, if we have
-      // one registered) since there's no reliable real "predicted lineup" feed.
-      // We DO, however, log AI-Football's real prediction percentages here so
-      // that once this match finishes we can honestly verify whether the AI's
-      // prediction was correct (see "AI予測の「本物の記録」システム" above).
+    if (!FINISHED_STATUSES.has(statusShort) && !LIVE_STATUSES.has(statusShort)) {
+      // Not started yet (also covers postponed/cancelled/etc.) — no real
+      // in-match or post-match data exists yet, so there is nothing more to
+      // fetch from API-Football here. The frontend builds the pre-match preview
+      // itself (using our own registered player database for either club, if we
+      // have one registered) since there's no reliable real "predicted lineup"
+      // feed. We DO, however, log AI-Football's real prediction percentages here
+      // so that once this match finishes we can honestly verify whether the
+      // AI's prediction was correct (see "AI予測の「本物の記録」システム" above).
       const aiPrediction = await getOrLogPrediction(entry.fixture.id, {
         league: entry.league ? entry.league.name : null,
         homeName: entry.teams.home.name,
@@ -824,8 +827,12 @@ async function handleFixtureAnalysis(query) {
       return { status: 200, body: payload };
     }
 
-    // Finished match: pull REAL per-player match ratings/stats and the real goal/
-    // card timeline. This is genuine professional match data, not a simulation.
+    // 試合中・終了後のどちらも、選手の実評価・実際のイベント(得点・カード等)を
+    // 取得する処理は共通(API-Footballは試合中でも部分的な実データを返す)。
+    // 2026年8月・優先順位④: 以前は「終了」扱いの場合のみこの実データ取得を行い、
+    // 試合中は「これから」と同じ(予想のみ)扱いだった。これを改め、試合中は
+    // その時点までの実際の得点・イベント・出場選手の評価を見られるようにする。
+    const isFinished = FINISHED_STATUSES.has(statusShort);
     const [playersData, eventsData] = await Promise.all([
       callApiFootball("/fixtures/players", { fixture: id }).catch(() => ({ response: [] })),
       callApiFootball("/fixtures/events", { fixture: id }).catch(() => ({ response: [] })),
@@ -867,6 +874,22 @@ async function handleFixtureAnalysis(query) {
       type: e.type,
       detail: e.detail,
     }));
+
+    if (!isFinished) {
+      // 試合中: あくまで「今まさに分かっている実データ」であり、最終結果では
+      // ないため、AI予測の答え合わせ(resolvePrediction)はまだ行わない。
+      // 状況が刻々と変わるため、キャッシュも60秒と短くする。
+      const payload = {
+        ...base,
+        phase: "live",
+        homePlayers,
+        awayPlayers,
+        events,
+        elapsed: entry.fixture.status ? entry.fixture.status.elapsed : null,
+      };
+      cacheSet(cacheKey, payload, 60 * 1000);
+      return { status: 200, body: payload };
+    }
 
     // If we logged a real prediction for this fixture while it was still upcoming,
     // resolve it now against the real final score (honest win/draw/loss check).

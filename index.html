@@ -235,6 +235,24 @@
   .fixture-league-group:last-child { margin-bottom: 0; }
   .fixture-league-header { display:flex; align-items:baseline; gap:8px; font-size: 13.5px; font-weight: 700; margin: 0 0 4px; padding-bottom: 4px; border-bottom: 2px solid var(--baseline); }
   .fixture-league-header .fixture-league-country { font-size: 11.5px; font-weight: 500; color: var(--text-muted); }
+  /* 2026年8月・優先順位④: 試合の「開始前/試合中/終了」を一目で分かるようにする */
+  .fixture-status-group { margin-bottom: 16px; }
+  .fixture-status-group:last-child { margin-bottom: 0; }
+  .fixture-status-heading { display:flex; align-items:center; gap:8px; font-size: 14px; font-weight: 700; margin: 0 0 8px; }
+  .status-badge { display:inline-flex; align-items:center; gap:4px; font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+  .status-badge.is-live { background: var(--critical); color: #fff; }
+  .status-badge.is-live .live-dot { width:6px; height:6px; border-radius:50%; background:#fff; display:inline-block; animation: livePulse 1.4s ease-in-out infinite; }
+  .status-badge.is-upcoming { background: var(--surface-2); color: var(--text-secondary); border: 1px solid var(--border); }
+  .status-badge.is-finished { background: var(--good); color: #fff; opacity: 0.85; }
+  .status-badge.is-other { background: var(--surface-2); color: var(--text-muted); border: 1px solid var(--border); }
+  @keyframes livePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .real-fixture-row.is-live { background: var(--series-away-wash); border-radius: 8px; padding-left: 8px; padding-right: 8px; margin: 0 -8px; border-bottom-color: transparent; }
+  /* 優先順位③: 90分ストーリー予想 */
+  .story-phase { display:flex; gap:12px; padding: 10px 0; border-bottom: 1px dashed var(--border); }
+  .story-phase:last-child { border-bottom: none; }
+  .story-phase-time { flex-shrink:0; width: 64px; font-size: 12px; font-weight: 700; color: var(--text-secondary); padding-top: 1px; }
+  .story-phase-body { flex: 1; font-size: 13.5px; line-height: 1.6; }
+  .story-phase-body strong { color: var(--text-primary); }
   .match-timeline-track { position: relative; height: 40px; background: var(--surface-2); border-radius: 8px; margin: 12px 0 22px; }
   .match-timeline-marker { position: absolute; top: 50%; transform: translate(-50%, -50%); font-size: 16px; cursor: default; }
   .match-timeline-endlabel { position: absolute; top: 100%; margin-top: 3px; font-size: 10.5px; color: var(--text-muted); }
@@ -361,6 +379,13 @@
     <div id="growthLogDetails" style="display:none; margin-top:10px;"></div>
   </div>
 
+  <div class="card" id="realFixturesCard" style="display:none; border:1.5px solid var(--series-3);">
+    <h2>📡 本日の実際の試合</h2>
+    <p class="value-note" style="margin-bottom:10px;">有料API(API-Football)から取得した、本日の実際の試合日程です。「🔴 試合中」「⏰ これから」「✅ 終了」に整理して表示します。試合前は注目ポイントのAIプレビュー(90分ストーリー予想つき)、試合終了後は実際の選手評価・タイムラインをもとにした振り返りを見られます。</p>
+    <div id="realFixturesList"></div>
+  </div>
+  <div id="realFixtureAnalysisWrap"></div>
+
   <div class="card" id="aiMatchAnalysisCard">
     <h2>🧠 AIマッチ分析(クラブ対戦シミュレーション)</h2>
     <p class="value-note" style="margin-bottom:12px;">登録クラブ同士を選ぶと、実データ(直近フォーム・得失点・怪我人数・順位・過去対戦・過密日程)をもとに、AIが勝率・重視した要素・試合展開・予想スコアまで読み解きます。単なる勝敗ではなく「AIがどう試合を読んだか」を見られる分析です。</p>
@@ -417,15 +442,9 @@
   </div>
 
   <div id="matchSection">
-    <div class="card" id="realFixturesCard" style="display:none;">
-      <h2>📡 本日の実際の試合</h2>
-      <p class="value-note" style="margin-bottom:10px;">有料API(API-Football)から取得した、本日の実際の試合日程です。試合前は注目ポイントのAIプレビュー、試合終了後は実際の選手評価・タイムラインをもとにした振り返りを見られます。</p>
-      <div id="realFixturesList"></div>
-    </div>
-    <div id="realFixtureAnalysisWrap"></div>
     <div class="card">
       <h2>⚽ 注目の試合カード</h2>
-      <p class="value-note" style="margin-bottom:10px;">実際の「今日の試合日程」を取得できる無料APIが未接続のため、登録選手のデータを活用できる注目カードをAIが選んでいます(実際に今日開催されるとは限りません)。気になるカードの「分析する」を押すと、AIが選手データをもとにしたプレビューを生成します。</p>
+      <p class="value-note" style="margin-bottom:10px;">登録選手のデータを活用できる注目カードをAIが選んでいます(実際に今日開催されるとは限らない、シミュレーション用の組み合わせです)。本日の実際の試合はホーム画面上部の「📡 本日の実際の試合」カードをご覧ください。気になるカードの「分析する」を押すと、AIが選手データをもとにしたプレビューを生成します。</p>
       <div id="matchList"></div>
     </div>
     <div id="matchAnalysisWrap"></div>
@@ -4301,31 +4320,51 @@ function renderMatchList() {
 // If the proxy isn't running / has no key / has no fixtures today, the card
 // simply stays hidden and the curated list below is the only thing shown —
 // same graceful-degradation pattern as every other live-data source here.
+// 2026年8月・優先順位④: 「開始前/試合中/終了」を判定する。API-Footballの
+// status.shortはこれだけの種類があるため(参照: 公式ドキュメント)、3つの
+// バケツに正しく分類する。想定外の値が来ても「その他」として落ちるだけで
+// 表示自体は壊れないようにする(でっち上げの状態を表示しない)。
+const FIXTURE_LIVE_STATUSES = new Set(["1H", "HT", "2H", "ET", "BT", "P", "SUSP", "INT", "LIVE"]);
+const FIXTURE_FINISHED_STATUSES = new Set(["FT", "AET", "PEN", "AWD", "WO"]);
+const FIXTURE_NOTSTARTED_STATUSES = new Set(["TBD", "NS"]);
+function classifyFixtureStatus(status) {
+  if (FIXTURE_LIVE_STATUSES.has(status)) return "live";
+  if (FIXTURE_FINISHED_STATUSES.has(status)) return "finished";
+  if (FIXTURE_NOTSTARTED_STATUSES.has(status)) return "upcoming";
+  return "other"; // 延期(PST)・中止(CANC)・放棄(ABD)等
+}
+function fixtureStatusLabel(status, group) {
+  if (group === "live") {
+    if (status === "HT") return "🔴 HT(ハーフタイム)";
+    return `🔴 LIVE ${status ? status.replace("1H", "前半").replace("2H", "後半") : ""}`;
+  }
+  if (group === "finished") return "✅ 終了";
+  if (group === "upcoming") return "⏰ これから";
+  const otherLabels = { PST: "延期", CANC: "中止", ABD: "中断(打ち切り)", SUSP: "中断中" };
+  return otherLabels[status] || `ℹ️ ${status || "不明"}`;
+}
 function fixtureRowHtml(f) {
+  const group = classifyFixtureStatus(f.status);
   const dt = new Date(f.date);
   const timeStr = isNaN(dt.getTime()) ? "" : dt.toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
   const scoreStr = f.score && (f.score.home !== null && f.score.home !== undefined) ? `${f.score.home} - ${f.score.away}` : "vs";
+  const badgeClass = group === "live" ? "is-live" : group === "finished" ? "is-finished" : group === "upcoming" ? "is-upcoming" : "is-other";
+  const badge = `<span class="status-badge ${badgeClass}">${group === "live" ? '<span class="live-dot"></span>' : ""}${fixtureStatusLabel(f.status, group)}</span>`;
   return `
-    <div class="real-fixture-row">
+    <div class="real-fixture-row${group === "live" ? " is-live" : ""}">
       <div>
         <div class="teams">⚽ ${f.home.name} ${scoreStr} ${f.away.name}</div>
-        <div class="sub">${timeStr}${f.venue ? " ・ " + f.venue : ""}</div>
+        <div class="sub">${badge} ${timeStr}${f.venue ? " ・ " + f.venue : ""}</div>
       </div>
       <button class="match-analyze-btn real-fixture-analyze-btn" data-fixture-id="${f.id}">分析する ▶</button>
     </div>`;
 }
-// Groups today's fixtures by league/country so it's immediately obvious which
-// competition each match belongs to, instead of one long undifferentiated list.
-async function renderRealFixturesIfAvailable() {
-  const cardEl = document.getElementById("realFixturesCard");
-  const listEl = document.getElementById("realFixturesList");
-  if (!cardEl || !listEl) return;
-  const data = await fetchRealFixturesToday();
-  if (!data) { cardEl.style.display = "none"; return; }
-
+// リーグ別にグループ化した上で、行の並び順（h4見出しは付けず、リーグヘッダーの
+// 直後に並べる）で表示する内部ヘルパー。
+function fixturesByLeagueHtml(fixtures) {
   const groups = [];
   const groupIndex = {};
-  data.fixtures.forEach(f => {
+  fixtures.forEach(f => {
     const groupKey = `${f.league || "その他"}|${f.country || ""}`;
     if (!(groupKey in groupIndex)) {
       groupIndex[groupKey] = groups.length;
@@ -4333,16 +4372,77 @@ async function renderRealFixturesIfAvailable() {
     }
     groups[groupIndex[groupKey]].fixtures.push(f);
   });
-
-  listEl.innerHTML = groups.map(g => `
+  return groups.map(g => `
     <div class="fixture-league-group">
       <h3 class="fixture-league-header">🏆 ${g.league}${g.country ? `<span class="fixture-league-country">(${g.country})</span>` : ""}</h3>
       ${g.fixtures.map(fixtureRowHtml).join("")}
     </div>`).join("");
+}
+// 2026年8月・優先順位②④: 今日の試合を「試合中→これから→終了」の順で3段に
+// 整理して表示する(試合中が最も「今」見る価値が高いため先頭、終了は振り返り
+// 用途なので折りたたみ、が基本方針)。各段の中はさらにリーグ別に分ける。
+async function renderRealFixturesIfAvailable() {
+  const cardEl = document.getElementById("realFixturesCard");
+  const listEl = document.getElementById("realFixturesList");
+  if (!cardEl || !listEl) return;
+  const data = await fetchRealFixturesToday();
+  if (!data) { cardEl.style.display = "none"; return; }
+
+  const byGroup = { live: [], upcoming: [], finished: [], other: [] };
+  data.fixtures.forEach(f => byGroup[classifyFixtureStatus(f.status)].push(f));
+
+  const sections = [];
+  if (byGroup.live.length) {
+    sections.push(`
+      <div class="fixture-status-group">
+        <h3 class="fixture-status-heading">🔴 試合中(${byGroup.live.length}試合)</h3>
+        ${fixturesByLeagueHtml(byGroup.live)}
+      </div>`);
+  }
+  if (byGroup.upcoming.length) {
+    sections.push(`
+      <div class="fixture-status-group">
+        <h3 class="fixture-status-heading">⏰ これから(${byGroup.upcoming.length}試合)</h3>
+        ${fixturesByLeagueHtml(byGroup.upcoming)}
+      </div>`);
+  }
+  if (byGroup.other.length) {
+    sections.push(`
+      <div class="fixture-status-group">
+        <h3 class="fixture-status-heading">ℹ️ その他(延期・中止など、${byGroup.other.length}試合)</h3>
+        ${fixturesByLeagueHtml(byGroup.other)}
+      </div>`);
+  }
+  let finishedHtml = "";
+  if (byGroup.finished.length) {
+    finishedHtml = `
+      <button class="more-details-btn" id="fixturesFinishedToggleBtn" type="button">▼ 終了した試合を表示(${byGroup.finished.length}試合)</button>
+      <div id="fixturesFinishedWrap" class="fixture-status-group" style="display:none; margin-top:10px;">
+        ${fixturesByLeagueHtml(byGroup.finished)}
+      </div>`;
+  }
+  if (!sections.length && !finishedHtml) {
+    // ライブラリ的には200 okだが、fixturesが空(今日は世界的に試合が無い日、
+    // あるいはAPI側の返答が偶然空)の場合。架空の試合をでっち上げず、正直に
+    // 「今日は無い」旨を伝えて終わる(既存の"graceful degradation"方針を踏襲)。
+    listEl.innerHTML = `<p class="value-note">本日はAPI-Footballで確認できる試合がありませんでした。</p>`;
+    cardEl.style.display = "block";
+    return;
+  }
+  listEl.innerHTML = sections.join("") + finishedHtml;
 
   listEl.querySelectorAll(".real-fixture-analyze-btn").forEach(btn => {
     btn.addEventListener("click", () => renderRealFixtureAnalysis(btn.dataset.fixtureId));
   });
+  const finishedBtn = document.getElementById("fixturesFinishedToggleBtn");
+  const finishedWrap = document.getElementById("fixturesFinishedWrap");
+  if (finishedBtn && finishedWrap) {
+    finishedBtn.addEventListener("click", () => {
+      const isHidden = finishedWrap.style.display === "none";
+      finishedWrap.style.display = isHidden ? "block" : "none";
+      finishedBtn.textContent = isHidden ? "▲ 閉じる" : `▼ 終了した試合を表示(${byGroup.finished.length}試合)`;
+    });
+  }
   cardEl.style.display = "block";
 }
 
@@ -4397,6 +4497,73 @@ function strengthBarHtml(label, homePct, homeText, awayText) {
     </div>`;
 }
 
+// 2026年8月・優先順位③: 「90分ストーリー予想」。
+// 注意: 実際に何分に誰が得点する、といった架空の出来事をでっち上げるのではなく、
+// あくまで登録選手の実データ(能力値)から読み取れる「起こりやすい傾向」を
+// 序盤/中盤/終盤の3フェーズに分けて言語化する。数字の裏付けが無い断定は避け、
+// 「〜が鍵になりそうです」「〜の展開になりやすいと考えられます」という
+// 確率的な言い回しに徹する(既存のAI予測全体を貫く"でっち上げない"方針を踏襲)。
+function pickPlayerByAttr(players, attr) {
+  if (!players || !players.length) return null;
+  return players.slice().sort((a, b) => (b.attrs[attr] || 0) - (a.attrs[attr] || 0))[0];
+}
+function build90MinStoryHtml(f, homeP, awayP, level) {
+  if (!homeP.length && !awayP.length) return ""; // データが無いクラブについては、ここでも何も語らない(正直さ優先)
+  const homeOverall = homeP.length ? teamAvg(homeP, "overall") : null;
+  const awayOverall = awayP.length ? teamAvg(awayP, "overall") : null;
+  const bothSides = homeP.length > 0 && awayP.length > 0;
+  const diff = bothSides ? homeOverall - awayOverall : 0;
+  const favoredIsHome = diff >= 0;
+  const favoredName = bothSides ? (favoredIsHome ? f.home.name : f.away.name) : (homeP.length ? f.home.name : f.away.name);
+  const underdogName = bothSides ? (favoredIsHome ? f.away.name : f.home.name) : (homeP.length ? f.away.name : f.home.name);
+  const favoredPlayers = bothSides ? (favoredIsHome ? homeP : awayP) : (homeP.length ? homeP : awayP);
+  const closeMatch = bothSides && Math.abs(diff) < 2.5;
+
+  // 序盤: スピードのある選手がいれば「早い時間帯からの仕掛け」に触れる
+  const speedster = pickPlayerByAttr(favoredPlayers, "speed");
+  const openingBeats = [];
+  if (bothSides) {
+    openingBeats.push(closeMatch
+      ? `両クラブの登録選手データが拮抗しているため、立ち上がりは互いに様子見の展開になりやすいと考えられます。`
+      : `序盤から${favoredName}がボールを握る時間が長くなりやすいと分析されます(登録選手データの総合力差より)。`);
+  } else {
+    openingBeats.push(`${favoredName}については登録選手データがあるため傾向を読み取れますが、${underdogName}は現時点で未登録のため相対的な立ち上がりの優劣までは判断できません。`);
+  }
+  if (speedster) openingBeats.push(`特に${speedster.nameJa}のようなスピードタイプの選手が絡む速い攻撃が、早い時間帯のポイントになりそうです。`);
+
+  // 中盤: パス・戦術眼の高い選手(ゲームメイク役)に触れる
+  const playmaker = pickPlayerByAttr(favoredPlayers, "passing");
+  const midBeats = [];
+  if (closeMatch) {
+    midBeats.push(`中盤は一進一退が続きやすく、どちらか一方が一方的に押し込む展開にはなりにくいと予想されます。`);
+  } else {
+    midBeats.push(`試合が動くとすれば中盤から終盤にかけての可能性が高く、${favoredName}側がリズムを掴めるかが鍵になりそうです。`);
+  }
+  if (playmaker && playmaker !== speedster) midBeats.push(`${playmaker.nameJa}を経由した組み立てから、決定機が生まれるかに注目です。`);
+
+  // 終盤: シュート・フィジカルの高い選手(終盤の決定力・体力勝負)に触れる
+  const finisher = pickPlayerByAttr(favoredPlayers, "shooting");
+  const closingBeats = [];
+  closingBeats.push(`終盤は運動量が落ちてくる時間帯のため、集中力を切らさなかった側が試合を決めやすくなります。`);
+  if (finisher) closingBeats.push(`${finisher.nameJa}のような決定力の高い選手にとっては、疲労が出てくる終盤こそチャンスが増える時間帯と言えそうです。`);
+  if (closeMatch) closingBeats.push(`拮抗した内容が予想されるだけに、最後は個の力やセットプレー1本が結果を分ける可能性があります。`);
+
+  const confidenceNote = bothSides
+    ? `※このストーリー予想はAI確信度${Math.round(50 + Math.min(38, Math.abs(diff) * 2.6))}%の展開予想の"読み解き"であり、実際の試合展開を保証するものではありません。`
+    : `※登録データが片方のクラブのみのため、参考程度の展開予想です。`;
+
+  return `
+    <div style="margin-top:14px;">
+      <strong>📖 90分ストーリー予想</strong>
+      <div style="margin-top:6px;">
+        <div class="story-phase"><div class="story-phase-time">0〜30分<br>(序盤)</div><div class="story-phase-body">${openingBeats.join(" ")}</div></div>
+        <div class="story-phase"><div class="story-phase-time">30〜70分<br>(中盤)</div><div class="story-phase-body">${midBeats.join(" ")}</div></div>
+        <div class="story-phase"><div class="story-phase-time">70〜90分+<br>(終盤)</div><div class="story-phase-body">${closingBeats.join(" ")}</div></div>
+      </div>
+      <p class="value-note" style="margin-top:6px;">${confidenceNote}</p>
+    </div>`;
+}
+
 function buildUpcomingPreviewHtml(analysis, level) {
   const f = analysis.fixture;
   const homeJa = mapEnglishClubToRegistered(f.home.name);
@@ -4424,14 +4591,16 @@ function buildUpcomingPreviewHtml(analysis, level) {
       <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:8px;">
         <div style="flex:1; min-width:220px;"><strong>${f.home.name} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(homeP, 3)}</div></div>
         <div style="flex:1; min-width:220px;"><strong>${f.away.name} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(awayP, 3)}</div></div>
-      </div>`;
+      </div>
+      ${build90MinStoryHtml(f, homeP, awayP, level)}`;
   } else if (homeP.length || awayP.length) {
     const side = homeP.length ? f.home.name : f.away.name;
     const otherSide = homeP.length ? f.away.name : f.home.name;
     const players = homeP.length ? homeP : awayP;
     predictionHtml = `
       <p class="value-note">🤖 <strong>AIの展開予想:</strong> ${side}には登録選手データがあるため、そちらの注目選手を中心にプレビューします(${otherSide}は現時点で未登録のクラブのため、選手個別の分析はまだ提供できません)。</p>
-      <div style="margin-top:6px;"><strong>${side} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(players, 3)}</div></div>`;
+      <div style="margin-top:6px;"><strong>${side} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(players, 3)}</div></div>
+      ${build90MinStoryHtml(f, homeP, awayP, level)}`;
   } else {
     predictionHtml = `<p class="value-note">🤖 <strong>AIの展開予想:</strong> 現時点では${f.home.name}・${f.away.name}どちらも登録選手データがないため、選手個別の予想は提供できません(実際の試合結果や選手データが揃い次第、対応クラブを拡大予定です)。試合が終了すると、実データに基づいた選手評価と振り返りをこの場所で見られます。</p>`;
   }
@@ -4553,6 +4722,42 @@ function buildDecisivePointsText(analysis, level) {
   }
   return parts.join("");
 }
+// 2026年8月・優先順位④: 試合中(ライブ)の実データ表示。終了後の「振り返り」
+// (buildFinishedAnalysisHtml)と共通のパーツ(タイムライン・選手評価)を使うが、
+// あくまで「現時点まで」の実データであり、勝敗はまだ確定していないため、
+// 「何が勝敗を分けたか」のような結論めいた文章や最終MOTM判定は出さない
+// (試合が終わっていないのに結論を語る=でっち上げに繋がるため)。
+function buildLiveAnalysisHtml(analysis, level) {
+  const f = analysis.fixture;
+  const { homeAvg, awayAvg } = computeTeamRatingAvgs(analysis);
+  const ratingBarHtml = (homeAvg !== null && awayAvg !== null)
+    ? `<div class="rating-bar-wrap">${strengthBarHtml("現時点の選手評価", 50 + (homeAvg - awayAvg) * 15, homeAvg.toFixed(2), awayAvg.toFixed(2))}</div>`
+    : "";
+  const scoreStr = f.score && f.score.home !== null ? `${f.score.home} - ${f.score.away}` : "- - -";
+  const elapsedStr = analysis.elapsed !== null && analysis.elapsed !== undefined ? `${analysis.elapsed}分経過` : "";
+  return `
+    <div class="card" style="border:1.5px solid var(--critical);">
+      <h2><span class="status-badge is-live" style="margin-right:6px;"><span class="live-dot"></span>LIVE</span>${f.home.name} ${scoreStr} ${f.away.name}</h2>
+      <p class="value-note">${f.league || ""}${f.venue ? " ・ " + f.venue : ""}${elapsedStr ? " ・ " + elapsedStr : ""}(API-Footballの実データに基づく、試合中の途中経過です。まだ結果は確定していません)</p>
+      <div style="margin-top:8px;">${eventsTimelineVisualHtml(analysis.events, f.home.name)}</div>
+      ${ratingBarHtml}
+      <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:10px;">
+        <div style="flex:1; min-width:240px;">
+          <strong>${f.home.name} 現在の選手評価</strong>
+          <div style="margin-top:6px;">${analysis.homePlayers.map(playerRatingRowHtml).join("") || `<p class="value-note">まだ評価データがありません。</p>`}</div>
+        </div>
+        <div style="flex:1; min-width:240px;">
+          <strong>${f.away.name} 現在の選手評価</strong>
+          <div style="margin-top:6px;">${analysis.awayPlayers.map(playerRatingRowHtml).join("") || `<p class="value-note">まだ評価データがありません。</p>`}</div>
+        </div>
+      </div>
+      <div style="margin-top:10px;">
+        <strong>ここまでの試合の流れ</strong>
+        <div style="margin-top:6px;">${eventsTimelineHtml(analysis.events, f.home.name)}</div>
+      </div>
+      <p class="value-note" style="margin-top:8px;">🔄 この画面を開き直すと、最新の状況(最大1分前まで)に更新されます。</p>
+    </div>`;
+}
 function buildFinishedAnalysisHtml(analysis, level) {
   const f = analysis.fixture;
   const { homeAvg, awayAvg } = computeTeamRatingAvgs(analysis);
@@ -4590,7 +4795,9 @@ async function renderRealFixtureAnalysis(fixtureId) {
   const analysis = await fetchRealFixtureAnalysis(fixtureId);
   if (!analysis) { wrapEl.innerHTML = `<div class="card"><p class="value-note">この試合の詳細データを取得できませんでした。時間をおいて再度お試しください。</p></div>`; lastRealFixtureAnalysis = null; return; }
   lastRealFixtureAnalysis = analysis;
-  wrapEl.innerHTML = analysis.phase === "finished" ? buildFinishedAnalysisHtml(analysis, state.level) : buildUpcomingPreviewHtml(analysis, state.level);
+  wrapEl.innerHTML = analysis.phase === "finished" ? buildFinishedAnalysisHtml(analysis, state.level)
+    : analysis.phase === "live" ? buildLiveAnalysisHtml(analysis, state.level)
+    : buildUpcomingPreviewHtml(analysis, state.level);
   if (analysis.fixture && analysis.fixture.home && analysis.fixture.away) trackRecentMatch("real:" + fixtureId, `${analysis.fixture.home.name} vs ${analysis.fixture.away.name}`);
   wrapEl.scrollIntoView({ behavior: "smooth", block: "start" });
 }
@@ -5449,8 +5656,8 @@ renderAll = function () {
   if (lastRealFixtureAnalysis) {
     const wrapEl = document.getElementById("realFixtureAnalysisWrap");
     if (wrapEl) {
-      wrapEl.innerHTML = lastRealFixtureAnalysis.phase === "finished"
-        ? buildFinishedAnalysisHtml(lastRealFixtureAnalysis, state.level)
+      wrapEl.innerHTML = lastRealFixtureAnalysis.phase === "finished" ? buildFinishedAnalysisHtml(lastRealFixtureAnalysis, state.level)
+        : lastRealFixtureAnalysis.phase === "live" ? buildLiveAnalysisHtml(lastRealFixtureAnalysis, state.level)
         : buildUpcomingPreviewHtml(lastRealFixtureAnalysis, state.level);
     }
   }
