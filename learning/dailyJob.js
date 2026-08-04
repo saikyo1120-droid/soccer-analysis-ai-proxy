@@ -62,6 +62,7 @@ const {
   computeGoalRateFeatures, computeFatigueFeature,
   fetchInjuryCountFeature, fetchStandingsFeature, fetchHeadToHeadFeature,
   inferLeagueIdFromFixtures, computeHomeAwaySplit, fetchCoachCareer,
+  fetchTeamXgAverage, fetchTeamTopScorer,
 } = require("./features");
 const {
   EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, predictOutcomeV2,
@@ -351,7 +352,10 @@ async function runDailyLearning(deps) {
   const llmSkippedReasons = [];
 
   // ---- ① 登録クラブの実結果から「事実」を抽出(Layer1)+ v2特徴量の下地を計算 ----
-  const teamFormCache = new Map(); // nameEn -> { teamId, currentFormScore, sampleSize, avgGoalsFor, avgGoalsAgainst, matchesLast7Days, fixtures }
+  const teamFormCache = new Map();
+  // 2026年8月・優先順位②: 同じリーグ・同じチームの得点ランキング取得を
+  // 1回の実行内で重複させないためのキャッシュ(APIリクエストの節約)。
+  const teamTopScorerCache = new Map(); // nameEn -> { teamId, currentFormScore, sampleSize, avgGoalsFor, avgGoalsAgainst, matchesLast7Days, fixtures }
   for (const team of REGISTERED_TEAMS) {
     try {
       const teamId = await resolveTeamId(team.nameEn);
@@ -786,6 +790,35 @@ async function runDailyLearning(deps) {
       //      予測モデルには渡されておらず、負傷者と一緒くたにされていた)
       const homeSplit = computeHomeAwaySplit(homeForm.fixtures || [], homeTeamId);
       const awaySplit = computeHomeAwaySplit(awayForm.fixtures || [], awayTeamId);
+
+      // ---- xG(期待得点)とエースの得点力を取得する(2026年8月・優先順位②) ----
+      // xGは1試合につき1リクエスト必要なため、必ず予算ガードを通す
+      // (Proプランでも無制限ではないので、直近XG_SAMPLE_FIXTURES試合に絞る)。
+      // 取得できなかった場合はnullのままにして、予測に影響させない
+      // (0を入れると「チャンスの質が最低」と誤解釈されてしまうため)。
+      const XG_SAMPLE_FIXTURES = Number(process.env.XG_SAMPLE_FIXTURES) || 5;
+      const canSpendXg = () => (apiBudget ? apiBudget.tryReserve(1, "xGの取得").allowed : true);
+      const [homeXg, awayXg, homeTop, awayTop] = await Promise.all([
+        fetchTeamXgAverage(homeForm.fixtures || [], homeTeamId, callApiFootball, { limit: XG_SAMPLE_FIXTURES, canSpend: canSpendXg }),
+        fetchTeamXgAverage(awayForm.fixtures || [], awayTeamId, callApiFootball, { limit: XG_SAMPLE_FIXTURES, canSpend: canSpendXg }),
+        // 得点ランキングは優先順位⑥のリーグ日次取得と同じエンドポイントなので、
+        // 同じ実行内で複数回呼ばれてもキャッシュ(teamTopScorerCache)で1回に抑える。
+        (async () => {
+          const key = `${leagueId}:${homeTeamId}`;
+          if (teamTopScorerCache.has(key)) return teamTopScorerCache.get(key);
+          const r = await fetchTeamTopScorer(leagueId, season, homeTeamId, callApiFootball);
+          teamTopScorerCache.set(key, r);
+          return r;
+        })(),
+        (async () => {
+          const key = `${leagueId}:${awayTeamId}`;
+          if (teamTopScorerCache.has(key)) return teamTopScorerCache.get(key);
+          const r = await fetchTeamTopScorer(leagueId, season, awayTeamId, callApiFootball);
+          teamTopScorerCache.set(key, r);
+          return r;
+        })(),
+      ]);
+      if (homeXg && homeXg.reasonJa && !homeXg.sampleSize) errors.push(`xg_unavailable:${homeForm.teamId}:${homeXg.reasonJa}`);
       const homeCtx = {
         formScore: homeFormScore, avgGoalsFor: homeForm.avgGoalsFor, avgGoalsAgainst: homeForm.avgGoalsAgainst,
         injuryCount: homeInjuries.injuryCount, pointsPerGame: homeStandings.played ? (homeStandings.points / homeStandings.played) : null,
@@ -793,8 +826,8 @@ async function runDailyLearning(deps) {
         // ホームチームは「ホームでの勝率」で評価する(会場を区別しないformScoreとは別の情報)
         homeVenueWinRate: homeSplit.home.winRate,
         suspensionCount: (homeInjuries.suspendedPlayers || []).length,
-        xgNet: homeForm.xgNet ?? null,
-        topScorerGoals: homeForm.topScorerGoals ?? null,
+        xgNet: homeXg.xgNet ?? null,
+        topScorerGoals: (homeTop && homeTop.player) ? homeTop.player.goals : null,
       };
       const awayCtx = {
         formScore: awayFormScore, avgGoalsFor: awayForm.avgGoalsFor, avgGoalsAgainst: awayForm.avgGoalsAgainst,
@@ -803,8 +836,8 @@ async function runDailyLearning(deps) {
         // アウェイチームは「アウェイでの勝率」で評価する
         awayVenueWinRate: awaySplit.away.winRate,
         suspensionCount: (awayInjuries.suspendedPlayers || []).length,
-        xgNet: awayForm.xgNet ?? null,
-        topScorerGoals: awayForm.topScorerGoals ?? null,
+        xgNet: awayXg.xgNet ?? null,
+        topScorerGoals: (awayTop && awayTop.player) ? awayTop.player.goals : null,
       };
       const features = computeMatchFeatures(homeCtx, awayCtx, h2h);
 

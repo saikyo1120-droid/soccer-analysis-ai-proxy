@@ -2414,16 +2414,61 @@ Prediction Engineへ統合してください」。
   失敗/成功理由ラベルの追加、`computeMatchFeatures`の拡張
 - `server/learning/features.js`: 出場停止判定の正規表現バグ修正
 - `server/learning/dailyJob.js`: `venueDiff`/`suspensionDiff`への実データ供給
-- `scripts/prediction_features_v3_test.js`(新規)
+- `server/learning/features.js`: `computeXgFromFixtureStats`/`fetchTeamXgAverage`の新設
+- `server/learning/predictionModel.js`: `LEARNABLE_KEYS`への4キー追加(重大な実装漏れの修正)、
+  重み名の日本語ラベル追加
+- `server/learning/dailyJob.js`: xG・エースの得点力の実データ供給(予算ガード付き)
+- `scripts/prediction_features_v3_test.js`・
+  `scripts/prediction_weight_learning_simulation_test.js`(新規)
+
+#### xG・エースの得点力の実データ供給(②の完了)
+
+`server/learning/features.js`に`computeXgFromFixtureStats`/`fetchTeamXgAverage`を
+新設し、`/fixtures/statistics`の`expected_goals`からxG・xGAを取得して直近
+`XG_SAMPLE_FIXTURES`試合(既定5)の平均を求めます。**1試合につき1リクエスト
+かかるため、必ずAPI予算ガードを通します**(予算が尽きたら取得を見送り、
+「明日再試行します」と理由を残します)。
+
+xGを提供していないリーグ・シーズンでは**必ずnullのまま**にします。0を入れると
+「チャンスの質が最低」と誤解釈されて予測を歪めるためです。表記ゆれ
+(`expected goals` / `Expected_Goals`)にも対応し、値が文字列・空・数値でない
+場合もnullとして扱います(NaNを作らない)。
+
+エースの得点力は、既存の`fetchTeamTopScorer`(優先順位⑥と同じ
+`/players/topscorers`)を利用し、同じ実行内での重複取得を`teamTopScorerCache`で
+1回に抑えます。
+
+#### ★実装中に発見した重大な実装漏れ(シミュレーションで検出)
+
+**新しく追加した4つの重みが`LEARNABLE_KEYS`配列に入っておらず、勾配降下法の
+学習対象から外れていました。** つまり重みが永遠に0のままで、
+**追加した4つの特徴量が一生使われない**状態でした。
+
+これはユニットテストでは検出できません(特徴量の計算も予測も正しく動くため)。
+ご指定いただいた「重みが0から動くかを多日間シミュレーションで検証」を実際に
+書いたことで初めて発覚しました。修正後、4つすべてが0から動くことを確認しています。
+
+#### 重み学習シミュレーションの結果(実測値)
+
+`scripts/prediction_weight_learning_simulation_test.js`(新規、16テスト)より:
+
+```
+学習前: venueSensitivity=0        / 的中率 50%
+学習後: venueSensitivity=1.0000   / 的中率 50% → 100%
+        xgSensitivity:          0 → 1.0000
+        suspensionSensitivity:  0 → 1.0000
+        topScorerSensitivity:   0 → 1.0000
+多日間: 的中率 1日目 50% → 2日目 100% → 3日目 100%
+        venueSensitivity 0 → 1.0000 → 1.0000(前日の学習が引き継がれる)
+安全ゲート: 情報の無いデータ 35% → 35%(改善しないので採用されない)
+```
+
+「重みが0から動けば良い」わけではないため、**動いた場合は的中率が本当に改善して
+いることまで**検証しています。また、結果と無関係な(情報が無い)特徴量の重みは
+動かないこと=ノイズを学習しすぎないことも確認しています。
 
 #### 残課題
 
-- `xgDiff`と`topScorerDiff`は、モデル側の受け入れ準備(特徴量・重み・失敗分析・
-  表示)は完了していますが、**実データの供給経路はまだ結線していません**
-  (現在は常に0=予測に影響しない状態)。xGは`/fixtures/statistics`を試合ごとに
-  呼ぶ必要があり、1チームあたり10リクエスト前後かかるため、API予算ガードと
-  組み合わせた設計を次の段階で行います。得点ランキングは優先順位⑥で既に
-  リーグ単位で取得しているため、そのキャッシュを再利用する形が有力です。
 - スタメン・フォーメーションは`fetchLatestFormation`で取得できますが、
   「フォーメーション相性」を数値化する妥当な方法(例: 4-3-3 対 5-3-2 の
   有利不利)には根拠となる実データが必要で、推測でスコア化するのは

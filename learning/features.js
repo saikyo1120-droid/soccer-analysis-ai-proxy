@@ -301,6 +301,66 @@ function pickTeamTopScorer(topscorersResponse, teamId) {
   };
 }
 
+// ---- 2026年8月・優先順位②: xG(期待得点)の取得 ----
+// API-Footballの /fixtures/statistics は、1試合ぶんの両チームの統計を返す。
+// その中の type: "expected_goals" が xG。値は文字列("1.52")のこともあり、
+// リーグや年度によっては**そもそも提供されない**(その場合はnull)。
+// 提供されない場合に0や推測値を入れると「チャンスの質が最低」と誤解釈される
+// ため、必ずnullのままにして予測へ影響させない(このプロジェクトの一貫方針)。
+function computeXgFromFixtureStats(statsResponse, teamId) {
+  const list = statsResponse || [];
+  const mine = list.find((t) => t && t.team && t.team.id === teamId);
+  const opponent = list.find((t) => t && t.team && t.team.id !== teamId);
+  const pick = (block) => {
+    if (!block || !Array.isArray(block.statistics)) return null;
+    const row = block.statistics.find((st) => st && typeof st.type === "string" && /expected[_ ]?goals/i.test(st.type));
+    if (!row || row.value === null || row.value === undefined || row.value === "") return null;
+    const n = typeof row.value === "string" ? parseFloat(row.value) : Number(row.value);
+    return Number.isFinite(n) ? n : null;
+  };
+  return { xg: pick(mine), xga: pick(opponent) };
+}
+
+/**
+ * 直近の終了した試合から、そのチームの平均xG・平均xGAを求める。
+ * 1試合あたり1リクエストかかるため、必ず件数上限と予算ガードを通す。
+ * @param {function} canSpend - () => boolean。予算が無ければfalseを返す関数(任意)。
+ */
+async function fetchTeamXgAverage(fixtures, teamId, callApiFootball, opts) {
+  const o = opts || {};
+  const limit = Number.isFinite(o.limit) ? o.limit : 5;
+  const canSpend = typeof o.canSpend === "function" ? o.canSpend : () => true;
+  const finished = [...(fixtures || [])]
+    .filter((f) => f && f.fixture && f.fixture.id && f.goals && f.goals.home !== null && f.goals.home !== undefined)
+    .sort((a, b) => new Date(b.fixture.date) - new Date(a.fixture.date))
+    .slice(0, limit);
+  if (!finished.length) return { xgFor: null, xgAgainst: null, xgNet: null, sampleSize: 0, reasonJa: "終了した試合が見つからないため、xGを算出できませんでした。" };
+
+  const xgs = [];
+  const xgas = [];
+  let skippedForBudget = 0;
+  for (const f of finished) {
+    if (!canSpend()) { skippedForBudget++; continue; }
+    try {
+      const data = await callApiFootball("/fixtures/statistics", { fixture: f.fixture.id });
+      const { xg, xga } = computeXgFromFixtureStats(data && data.response, teamId);
+      if (xg !== null) xgs.push(xg);
+      if (xga !== null) xgas.push(xga);
+    } catch (e) { /* 1試合取れなくても他で平均できるので続行する */ }
+  }
+  const avg = (arr) => (arr.length ? Math.round((arr.reduce((a, b) => a + b, 0) / arr.length) * 100) / 100 : null);
+  const xgFor = avg(xgs);
+  const xgAgainst = avg(xgas);
+  return {
+    xgFor, xgAgainst,
+    xgNet: (xgFor !== null && xgAgainst !== null) ? Math.round((xgFor - xgAgainst) * 100) / 100 : null,
+    sampleSize: xgs.length,
+    reasonJa: xgs.length ? null
+      : (skippedForBudget ? "APIリクエスト予算が不足したため、xGの取得を見送りました(明日の実行で再試行します)。"
+        : "このリーグ・シーズンではAPI-FootballがxG(expected_goals)を提供していないため、取得できませんでした。"),
+  };
+}
+
 async function fetchTeamTopScorer(leagueId, season, teamId, callApiFootball) {
   if (!leagueId) return { player: null, error: "no_league_id" };
   try {
@@ -315,6 +375,8 @@ async function fetchTeamTopScorer(leagueId, season, teamId, callApiFootball) {
 }
 
 module.exports = {
+  computeXgFromFixtureStats,
+  fetchTeamXgAverage,
   computeGoalRateFeatures,
   computeFatigueFeature,
   computeInjuryCountFeature,

@@ -227,7 +227,15 @@ function computeNegativeLogLikelihood(records, weights) {
   return total / usable.length;
 }
 
-const LEARNABLE_KEYS = ["sensitivity", "goalRateSensitivity", "injurySensitivity", "standingsSensitivity", "headToHeadSensitivity", "fatigueSensitivity"];
+// 2026年8月・優先順位②の実装中に、重みの学習シミュレーションで発見した重大な
+// 実装漏れの修正: 新しく追加した特徴量の重みをこの配列に入れ忘れていたため、
+// 勾配降下法の対象外となり「永遠に0のまま=その特徴量が一生使われない」状態に
+// なっていた。特徴量を追加するときは、必ずこの配列にも追加すること。
+const LEARNABLE_KEYS = [
+  "sensitivity", "goalRateSensitivity", "injurySensitivity",
+  "standingsSensitivity", "headToHeadSensitivity", "fatigueSensitivity",
+  "venueSensitivity", "suspensionSensitivity", "xgSensitivity", "topScorerSensitivity",
+];
 
 // 数値微分(有限差分法)による勾配降下法。各パラメータをごくわずかに動かして
 // 損失(NLL)がどう変化するかを直接測るシンプルな方法(データ件数が少ない
@@ -276,6 +284,10 @@ const WEIGHT_LABELS_JA = {
   standingsSensitivity: "順位・勝点の重要度",
   headToHeadSensitivity: "過去対戦成績の重要度",
   fatigueSensitivity: "過密日程(疲労)の影響の重要度",
+  venueSensitivity: "ホーム/アウェイ別の成績の重要度",
+  suspensionSensitivity: "出場停止の影響の重要度",
+  xgSensitivity: "xG(期待得点)の重要度",
+  topScorerSensitivity: "エースの得点力の重要度",
 };
 const WEIGHT_CHANGE_THRESHOLD = 0.005; // これ未満の変化は「実質変化なし」として無視する
 
