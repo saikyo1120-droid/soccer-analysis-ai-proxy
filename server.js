@@ -51,6 +51,8 @@ const { runDailyLearning, getGrowthLog, getRecentFactsForTeam, computeFormScore 
 // 2026年8月・優先順位⑨: 「今日追加した知識0件」が正常な0件(前回から変化なし)
 // なのか、異常な0件(未実行・キー未設定・予算切れ等)なのかを実データから判定する。
 const { diagnoseZeroKnowledge, diagnoseZeroVerification, getRunHistory, buildEngineStatuses } = require("./learning/healthCheck");
+// 2026年8月・優先順位⑤: 予測評価が「変わった時だけ」Memory Engineへ記録する。
+const { recordPredictionEvaluation, buildComparisonForResponse } = require("./memory/predictionMemory");
 // 2026年8月・完全自動Learning Cycle ⑧: 「本当に昨日より賢くなったのか」を数値で示す。
 const { getMetricsTrend } = require("./learning/dailyMetrics");
 // /debug診断ページが「毎日学習エンジンが対象にしている全クラブ」を横断して
@@ -1684,6 +1686,21 @@ async function handleMatchAnalysis(query, clientIp) {
     away: awayTopScorerInfo.player ? { ...awayTopScorerInfo.player, note: "今シーズンの得点ランキング上位選手(実データ)" } : null,
   };
 
+  // ---- 2026年8月・優先順位⑤: Memory Engineを試合予測にも使う ----
+  // ご指示どおり「評価が変わった時だけ」記録し、「必要な時だけ」比較を表示する。
+  // 比較の生成は読み出し1回+計算のみ(LLMも書き込みも無い)ため、
+  // レスポンス速度に影響しない。記録の方は結果を待たない(fire-and-forget)。
+  const evaluationForMemory = {
+    predictedWinner, homeWinPct: winProbability.homeWinPct,
+    features, computedAt: new Date().toISOString(),
+  };
+  let memoryComparison = null;
+  try {
+    memoryComparison = await buildComparisonForResponse({ memoryStore }, home.nameEn, away.nameEn, evaluationForMemory);
+  } catch (e) { /* 付加情報なので失敗しても予測は返す */ }
+  recordPredictionEvaluation({ memoryStore }, home.nameEn, away.nameEn, evaluationForMemory)
+    .catch(() => { /* ベストエフォート */ });
+
   return {
     status: 200,
     body: {
@@ -1693,6 +1710,8 @@ async function handleMatchAnalysis(query, clientIp) {
       predictedScoreline,
       keyFactors,
       mostImportantFactor: topFactor ? topFactor.labelJa : "(まだ強く学習された要素はありません)",
+      // 優先順位⑤: 前回から評価が変わった時だけ入る(変化が無ければnull)。
+      memoryComparison,
       narrative, reverseScenario, conclusion,
       // 2026年8月・「議論できるAI」強化フェーズ(ご要望⑥): ⑦戦術相性の明示的な
       // 見立てと、⑩この試合最大の見どころ。11項目のうち、④鍵になる時間帯だけは
