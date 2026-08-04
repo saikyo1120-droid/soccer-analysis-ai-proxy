@@ -58,8 +58,21 @@ function stableHash(input) {
   return crypto.createHash("sha1").update(input).digest("hex").slice(0, 16);
 }
 
+// 2026年8月・優先順位⑥(主要リーグのKnowledge Engine日次蓄積): これまで
+// Knowledge Engineは「クラブ単位(teamEn)」の知識しか扱えなかった。リーグ単位の
+// 知識(順位表・得点/アシストランキング)を蓄積するため、item.teamEnが無い場合は
+// item.leagueEnを主体として扱えるよう一般化する。既存のクラブ単位の挙動
+// (item.teamEnがある場合)は完全に維持し、リーグ単位は"league:"接頭辞を付けた
+// 別名前空間のキーにすることで、クラブ名とリーグ名が万一衝突しても安全にする。
+function entityKeyFor(item) {
+  if (item && item.teamEn) return item.teamEn;
+  if (item && item.leagueEn) return `league:${item.leagueEn}`;
+  return null;
+}
+
 function computeItemHash(item) {
-  const normalized = `${item.teamEn}|${item.category}|${item.type}|${(item.statement || "").trim()}`;
+  const entity = entityKeyFor(item);
+  const normalized = `${entity}|${item.category}|${item.type}|${(item.statement || "").trim()}`;
   return stableHash(normalized);
 }
 
@@ -74,11 +87,14 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
   /**
    * @param {object} item - { teamEn, category, type: "fact"|"analysis"|"opinion",
    *   statement, computedAt(ISO), expiresRelevanceDays?, source }
+   *   teamEnの代わりにleagueEnを渡すと、クラブ単位ではなくリーグ単位の知識として
+   *   保存できる(2026年8月・優先順位⑥。いずれか一方は必須)。
    * @returns {{ saved: boolean, reason?: string, hash: string }}
    */
   async function saveKnowledgeItem(item) {
     if (!upstashEnabled) return { saved: false, reason: "NO_UPSTASH", hash: null };
-    if (!item || !item.teamEn || !item.type || !item.statement) return { saved: false, reason: "INVALID_ITEM", hash: null };
+    const entity = item && entityKeyFor(item);
+    if (!item || !entity || !item.type || !item.statement) return { saved: false, reason: "INVALID_ITEM", hash: null };
     if (!["fact", "analysis", "opinion", "profile", "reflection"].includes(item.type)) return { saved: false, reason: "INVALID_TYPE", hash: null };
 
     const hash = computeItemHash(item);
@@ -93,8 +109,8 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
 
     const record = { ...item, hash, firstSeenAt: item.computedAt, lastSeenAt: item.computedAt };
     await upstashSetJSON(`knowledge:item:${hash}`, record);
-    await upstashCmd(["RPUSH", `knowledge:byTeam:${item.teamEn}`, hash]).catch(() => {});
-    await upstashCmd(["LTRIM", `knowledge:byTeam:${item.teamEn}`, String(-MAX_ITEMS_PER_TEAM), "-1"]).catch(() => {});
+    await upstashCmd(["RPUSH", `knowledge:byTeam:${entity}`, hash]).catch(() => {});
+    await upstashCmd(["LTRIM", `knowledge:byTeam:${entity}`, String(-MAX_ITEMS_PER_TEAM), "-1"]).catch(() => {});
     // 2026年8月・「AIの成長レポート」ウィジェット(ご要望⑦)対応: 登録クラブ
     // 全件をループして数えるgetActiveKnowledge()はホーム画面が読み込まれる
     // たびに呼ぶには重すぎる(Upstash読み取りが多すぎる)ため、軽量な累計
@@ -104,16 +120,13 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
     return { saved: true, hash };
   }
 
-  /**
-   * このクラブについて現在「有効」な知識(失効していないもの)を、事実/分析/意見に
-   * 分けて返す。失効した知識は除外される(=削除はされないが、以後のRAG・推論には
-   * もう使われない、という設計)。
-   */
-  async function getActiveKnowledge(teamEn, nowMs) {
+  // teamEn/leagueEnどちらの名前空間でも共通で使う内部ヘルパー(重複を避けるため
+  // getActiveKnowledge/getActiveKnowledgeForLeagueの両方から呼ばれる)。
+  async function getActiveKnowledgeByEntity(entity, nowMs) {
     const empty = { facts: [], analyses: [], opinions: [], profiles: [], reflections: [], totalStored: 0, totalActive: 0 };
-    if (!upstashEnabled || !teamEn) return empty;
+    if (!upstashEnabled || !entity) return empty;
     const now = nowMs || Date.now();
-    const hashes = (await upstashCmd(["LRANGE", `knowledge:byTeam:${teamEn}`, "0", "-1"]).catch(() => [])) || [];
+    const hashes = (await upstashCmd(["LRANGE", `knowledge:byTeam:${entity}`, "0", "-1"]).catch(() => [])) || [];
     const items = [];
     for (const h of hashes) {
       const record = await upstashGetJSON(`knowledge:item:${h}`);
@@ -132,16 +145,25 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
   }
 
   /**
-   * 「昨日より知識が増えていることが分かるようにする」ためのヘルパー。
-   * firstSeenAtが指定の日付(YYYY-MM-DD)と一致するアイテムを「新しく覚えた
-   * 知識」、lastSeenAt(≠firstSeenAt)がその日付のアイテムを「更新された知識」
-   * として分類する。isExpiredで除外された「古くなった知識」の件数も返す。
+   * このクラブについて現在「有効」な知識(失効していないもの)を、事実/分析/意見に
+   * 分けて返す。失効した知識は除外される(=削除はされないが、以後のRAG・推論には
+   * もう使われない、という設計)。
    */
-  async function getKnowledgeDiffForTeam(teamEn, dateKey, nowMs) {
+  async function getActiveKnowledge(teamEn, nowMs) {
+    return getActiveKnowledgeByEntity(teamEn || null, nowMs);
+  }
+
+  // 2026年8月・優先順位⑥: getActiveKnowledgeのリーグ版(クラブ名の代わりに
+  // リーグの英語名を渡す)。
+  async function getActiveKnowledgeForLeague(leagueEn, nowMs) {
+    return getActiveKnowledgeByEntity(leagueEn ? `league:${leagueEn}` : null, nowMs);
+  }
+
+  async function getKnowledgeDiffByEntity(entity, dateKey, nowMs) {
     const empty = { newItems: [], updatedItems: [], staleCount: 0 };
-    if (!upstashEnabled || !teamEn || !dateKey) return empty;
+    if (!upstashEnabled || !entity || !dateKey) return empty;
     const now = nowMs || Date.now();
-    const hashes = (await upstashCmd(["LRANGE", `knowledge:byTeam:${teamEn}`, "0", "-1"]).catch(() => [])) || [];
+    const hashes = (await upstashCmd(["LRANGE", `knowledge:byTeam:${entity}`, "0", "-1"]).catch(() => [])) || [];
     const items = [];
     for (const h of hashes) {
       const record = await upstashGetJSON(`knowledge:item:${h}`);
@@ -157,7 +179,25 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
     return { newItems, updatedItems, staleCount };
   }
 
-  return { saveKnowledgeItem, getActiveKnowledge, getKnowledgeDiffForTeam };
+  /**
+   * 「昨日より知識が増えていることが分かるようにする」ためのヘルパー。
+   * firstSeenAtが指定の日付(YYYY-MM-DD)と一致するアイテムを「新しく覚えた
+   * 知識」、lastSeenAt(≠firstSeenAt)がその日付のアイテムを「更新された知識」
+   * として分類する。isExpiredで除外された「古くなった知識」の件数も返す。
+   */
+  async function getKnowledgeDiffForTeam(teamEn, dateKey, nowMs) {
+    return getKnowledgeDiffByEntity(teamEn || null, dateKey, nowMs);
+  }
+
+  // 2026年8月・優先順位⑥: getKnowledgeDiffForTeamのリーグ版。
+  async function getKnowledgeDiffForLeague(leagueEn, dateKey, nowMs) {
+    return getKnowledgeDiffByEntity(leagueEn ? `league:${leagueEn}` : null, dateKey, nowMs);
+  }
+
+  return {
+    saveKnowledgeItem, getActiveKnowledge, getKnowledgeDiffForTeam,
+    getActiveKnowledgeForLeague, getKnowledgeDiffForLeague,
+  };
 }
 
 module.exports = { createKnowledgeStore, computeItemHash, isExpired, DEFAULT_EXPIRY_DAYS };

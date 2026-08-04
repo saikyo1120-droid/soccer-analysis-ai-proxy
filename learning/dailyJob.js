@@ -54,6 +54,7 @@ const { createMemoryStore } = require("../memory/memoryStore");
 const { createRelationshipIndex } = require("../knowledge/relationshipIndex");
 const { createClubProfileEngine } = require("../knowledge/clubProfileEngine");
 const { summarizeTransfers } = require("../rag/knowledgeSource");
+const { collectLeagueKnowledge } = require("./leagueKnowledge");
 const {
   computeGoalRateFeatures, computeFatigueFeature,
   fetchInjuryCountFeature, fetchStandingsFeature, fetchHeadToHeadFeature,
@@ -207,6 +208,7 @@ function mergeGrowthLogs(previous, current) {
   };
   const mergedFacts = dedupeByStatement(previous.facts, current.facts);
   const mergedOtherFacts = dedupeByStatement(previous.otherFactsToday, current.otherFactsToday);
+  const mergedLeagueFacts = dedupeByStatement(previous.leagueFactsToday, current.leagueFactsToday);
   const sum = (a, b) => (a || 0) + (b || 0);
   return {
     ...current, // 的中率・重み更新有無などの「状態」は最新の実行の値をそのまま使う
@@ -220,6 +222,17 @@ function mergeGrowthLogs(previous, current) {
     transferFactsAddedToday: sum(previous.transferFactsAddedToday, current.transferFactsAddedToday),
     knowledgeItemsSavedToday: sum(previous.knowledgeItemsSavedToday, current.knowledgeItemsSavedToday),
     knowledgeItemsDuplicateToday: sum(previous.knowledgeItemsDuplicateToday, current.knowledgeItemsDuplicateToday),
+    // 2026年8月・優先順位⑥: リーグ単位の日次蓄積も、同日複数回実行された場合は
+    // 合算する(既存のcoachChangesDetectedToday等と同じ方針)。
+    // 日付ベースのローテーションのため、同日に複数回実行しても対象リーグの
+    // 顔ぶれは変わらない(=足し算すると二重計上になる)。実際に処理できた
+    // リーグ数として、実行間の最大値を採用する。
+    leaguesAnalyzedToday: Math.max(previous.leaguesAnalyzedToday || 0, current.leaguesAnalyzedToday || 0),
+    mandatoryLeaguesAnalyzedToday: Math.max(previous.mandatoryLeaguesAnalyzedToday || 0, current.mandatoryLeaguesAnalyzedToday || 0),
+    extendedLeaguesAnalyzedToday: Math.max(previous.extendedLeaguesAnalyzedToday || 0, current.extendedLeaguesAnalyzedToday || 0),
+    leagueFactsAddedToday: mergedLeagueFacts.length,
+    leagueFactsDuplicateToday: sum(previous.leagueFactsDuplicateToday, current.leagueFactsDuplicateToday),
+    leagueFactsToday: mergedLeagueFacts,
     matchesResolvedToday: sum(previous.matchesResolvedToday, current.matchesResolvedToday),
     newPredictionsLogged: sum(previous.newPredictionsLogged, current.newPredictionsLogged),
     hypothesesConfirmed: sum(previous.hypothesesConfirmed, current.hypothesesConfirmed),
@@ -471,6 +484,19 @@ async function runDailyLearning(deps) {
     } catch (e) {
       errors.push(`coach_transfer_check_failed:${team.nameEn}:${e.message}`);
     }
+  }
+
+  // ---- ①-e 主要リーグのKnowledge Engine日次蓄積(2026年8月・優先順位⑥) ----
+  // 登録クラブ単位(REGISTERED_TEAMS)とは別に、リーグ単位で順位表・得点/
+  // アシストランキングを毎日取得し蓄積する。欧州5大リーグは毎日必ず、それ
+  // 以外のご要望にあった5リーグはローテーションで確認する(詳細は
+  // server/learning/leagueKnowledge.jsのコメント参照)。
+  let leagueResult = { leaguesProcessed: 0, mandatoryLeaguesProcessed: 0, extendedLeaguesProcessed: 0, leagueFactsSavedToday: 0, leagueFactsDuplicateToday: 0, leagueFactsToday: [], errors: [] };
+  try {
+    leagueResult = await collectLeagueKnowledge({ callApiFootball, knowledgeStore, upstashEnabled, upstashGetJSON, upstashSetJSON }, runAt, dateKey);
+    if (leagueResult.errors && leagueResult.errors.length) errors.push(...leagueResult.errors);
+  } catch (e) {
+    errors.push(`league_knowledge_failed:${e.message}`);
   }
 
   // ---- ② 保留中の自社予測を解決(試合が終わっていれば的中/不的中を確定) ----
@@ -794,9 +820,11 @@ async function runDailyLearning(deps) {
       errors.push(`knowledge_save_failed:${f.teamEn}:${e.message}`);
     }
   }
-  // ①-d(監督交代・補強)は既に個別に保存済みなので、ここでは「今日追加した知識」の
-  // 合計件数にだけ加算する(二重保存はしない)。
-  knowledgeItemsSavedToday += transferFactsAddedToday + coachChangesDetectedToday;
+  // ①-d(監督交代・補強)、①-e(リーグ単位の順位表・ランキング)は既に個別に
+  // 保存済みなので、ここでは「今日追加した知識」の合計件数にだけ加算する
+  // (二重保存はしない)。
+  knowledgeItemsSavedToday += transferFactsAddedToday + coachChangesDetectedToday + leagueResult.leagueFactsSavedToday;
+  knowledgeItemsDuplicateToday += leagueResult.leagueFactsDuplicateToday;
 
   // ---- 「昨日より知識が増えていることが分かるようにする」ための集計 ----
   // 全登録クラブ横断で、今日新しく覚えた知識・更新された知識・古くなった
@@ -833,6 +861,13 @@ async function runDailyLearning(deps) {
     // とは別経路で保存済みのため、表示専用の配列として別フィールドで返す。
     otherFactsToday, coachChangesDetectedToday, transferFactsAddedToday,
     knowledgeItemsSavedToday, knowledgeItemsDuplicateToday,
+    // 2026年8月・優先順位⑥: リーグ単位(順位表・得点/アシストランキング)の日次蓄積。
+    leaguesAnalyzedToday: leagueResult.leaguesProcessed,
+    mandatoryLeaguesAnalyzedToday: leagueResult.mandatoryLeaguesProcessed,
+    extendedLeaguesAnalyzedToday: leagueResult.extendedLeaguesProcessed,
+    leagueFactsAddedToday: leagueResult.leagueFactsSavedToday,
+    leagueFactsDuplicateToday: leagueResult.leagueFactsDuplicateToday,
+    leagueFactsToday: leagueResult.leagueFactsToday,
     matchesResolvedToday,
     newPredictionsLogged,
     hypothesesConfirmed, hypothesesDiscarded,
