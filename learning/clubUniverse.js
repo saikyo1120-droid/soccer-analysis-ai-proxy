@@ -178,9 +178,11 @@ function clubsForSquadSync(dateKey) {
  * 「今日どのクラブのxGを更新するか」。tier Aのみ7日周期
  * (1クラブあたり/fixtures/statisticsを5回呼ぶ高価な処理のため)。
  */
-function clubsForXgUpdate(dateKey) {
+function clubsForXgUpdate(dateKey, periodDays) {
   const day = dayNumberOf(dateKey);
-  return CLUB_UNIVERSE.filter((c) => tierOf(c) === "A" && (c.rank % 7) === (day % 7));
+  // 自己改善ループ: 周期はAI自身が3〜14日の安全範囲で調整できる(既定7日)。
+  const p = Number.isFinite(periodDays) ? Math.max(3, Math.min(14, periodDays)) : 7;
+  return CLUB_UNIVERSE.filter((c) => tierOf(c) === "A" && (c.rank % p) === (day % p));
 }
 
 /**

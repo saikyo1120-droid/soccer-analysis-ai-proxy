@@ -86,8 +86,24 @@ const { scorePrediction, buildDailyAccuracy, saveDailyAccuracy, getAccuracyTrend
 const {
   flushIntelDaily, getIntelTrend, computeHypothesisStats, buildEngineGrowth,
   buildKnowledgeContributionRanking, buildAccuracyDiagnosis, buildSelfAssessment,
+  collectAnswerabilityFromBuffer, processAnswerability,
   INTEL_KEY_PREFIX, INTEL_REPORT_KEY_PREFIX,
 } = require("./intelligenceMetrics");
+// ---- 2026年8月・精度証明ラウンド ----
+// ② 較正に基づく自信の自動補正(実測のズレで翌日の表示勝率を補正)
+const { buildCalibrationMap } = require("./calibrationCorrection");
+// ⑤ オッズ比較・ROI(市場という最も厳しい採点者との毎日比較)
+const { extractMatchWinnerOdds, impliedProbsPct, scoreRoiForRecord, emptyRoiDaily, saveDailyRoi, getRoiTrend, ROI_KEY_PREFIX } = require("./roiTracker");
+// ① RAG強化(似たクラブ索引・似た試合の検索)
+const { clubVectorFromDossier, clubTraitsFromDossier, buildClubSimilarityIndex, findSimilarResolvedMatches, summarizeSimilarMatchesJa, saveClubSimilarityIndex, SIMILAR_CLUBS_KEY } = require("./similarityIndex");
+// 自己改善ループ: 診断→提案→安全な実行→効果測定→履歴
+const {
+  loadTuneConfig, saveTuneConfig, appendHistory,
+  buildSelfDiagnosis, buildImprovementProposals, applyProposals, evaluateDueChanges,
+  TUNABLE_KNOBS, EVAL_AFTER_DAYS,
+} = require("./selfImprovement");
+const { computeMarketProbs } = require("./accuracyTracker");
+const { CLUB_UNIVERSE } = require("./clubUniverse");
 // ① 学習によって「予測がどう変わったか」の記録
 const { computePredictionShift } = require("./predictionShift");
 // ⑩ AIが自分で「次に何を学ぶか」を決める
@@ -357,6 +373,8 @@ function mergeGrowthLogs(previous, current) {
     // 「その日最後に計算できた値」を残す(後の実行がまだ計算していなくても
     // 前の実行の実測を消さない)。
     intelligence: current.intelligence || previous.intelligence || null,
+    // 成長可視化ラウンド: カテゴリ別の学習内訳(その日最後に保存できた累計値)
+    knowledgeByCategoryToday: current.knowledgeByCategoryToday || previous.knowledgeByCategoryToday || null,
     errors: capList([...(previous.errors || []), ...(current.errors || [])]),
   };
 }
@@ -598,6 +616,7 @@ async function runDailyLearning(deps) {
   let newPredictionsLogged = 0;
   let hypothesesConfirmed = 0; // Hypothesis Engine: 検証の結果、当たっていた状態仮説の件数
   let hypothesesDiscarded = 0; // Hypothesis Engine: 検証の結果、外れて破棄した状態仮説の件数
+  const roiAggToday = emptyRoiDaily(); // 精度証明ラウンド⑤: 本日のROI集計(オッズつきの答え合わせ)
   let reflectionsSaved = 0; // Layer4: 当たり/外れ問わず「振り返り」を保存した件数
   let profilesGenerated = 0; // Layer2: 新しく生成した固定知識(クラブプロフィール)の件数
   let aiViewsChanged = 0; // Layer3: 前日から見解が変わったクラブの件数
@@ -1049,6 +1068,20 @@ async function runDailyLearning(deps) {
       await upstashCmd(["LTRIM", "learn:ownpred:recent", String(-OWN_PRED_RECENT_KEEP), "-1"]).catch(() => {});
       matchesResolvedToday++;
 
+      // ---- 精度証明ラウンド⑤: ROI採点(オッズが記録されている試合のみ) ----
+      // 「AIの予想勝敗に毎回1単位を賭けたら」という仮想収支で市場と比較する。
+      // オッズの無い試合は正直に集計外として件数だけ数える(でっち上げない)。
+      const roiScore = scoreRoiForRecord(record);
+      if (roiScore) {
+        roiAggToday.bets++;
+        roiAggToday.staked++;
+        roiAggToday.profitSum = Math.round((roiAggToday.profitSum + roiScore.profit) * 10000) / 10000;
+        if (roiScore.win) roiAggToday.wins++;
+        if (Number.isFinite(record.marketEdgePt)) { roiAggToday.edgeSumPt = Math.round((roiAggToday.edgeSumPt + record.marketEdgePt) * 10) / 10; roiAggToday.edgeN++; }
+      } else {
+        roiAggToday.oddsMissing++;
+      }
+
       // ---- Hypothesis Engine: 予測を立てた時点の「状態仮説」を実際の結果で検証する ----
       // ご要望の「AI自身が毎日仮説を立てる→次の試合で検証→当たれば知識として採用、
       // 外れたら破棄」をこの自社予測モデルの枠組みで実装したもの。
@@ -1225,6 +1258,19 @@ async function runDailyLearning(deps) {
   let featureEffectivenessToday = null; // ご指示⑧: 特徴量ごとの有効性の実測
   let predictionShiftToday = null; // ご指示①: 学習で予測がどう変わったか
   let agendaAppliedToday = null; // ご指示⑩: 前回の学習計画を今日の収集に反映した内容
+  // 自己改善ループ③: AIが自分で調整した設定(安全な上下限つき)を読み、
+  // 今日の収集(xG周期・選手詳細上限・優先クラブ数)へ実際に反映する。
+  const selfTuneConfig = await loadTuneConfig({ upstashEnabled, upstashGetJSON });
+
+  // 精度証明ラウンド: 直近の解決済み予測(似た試合の検索と重み学習で共有し、
+  // 同一実行内で learn:ownpred:recent を二度読みしない。第8次監査の方針を維持)
+  let recentRecordsShared = null;
+  async function loadRecentRecordsOnce() {
+    if (recentRecordsShared) return recentRecordsShared;
+    const raw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "0", "-1"]).catch(() => [])) || [];
+    recentRecordsShared = raw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
+    return recentRecordsShared;
+  }
 
   // ---- ③ 登録クラブの直近の試合について、新しく自社予測を立てる ----
   // 日付ベースでどのクラブから調べ始めるかをずらし、特定のクラブだけ毎回
@@ -1369,13 +1415,44 @@ async function runDailyLearning(deps) {
         ? `${team.nameJa}(直近フォームスコア${(cached && cached.currentFormScore) ?? "不明"})と対戦相手の差(最も影響した要素: ${topFactor ? topFactor.labelJa : "フォーム"})から、${favoredSide}が優位という仮説`
         : `${team.nameJa}と対戦相手は拮抗しており、互角(引き分けに近い)という仮説`;
 
+      // ---- 精度証明ラウンド⑤: オッズの記録(市場比較・ROIの材料) ----
+      // 取得できなければ正直にnull(架空のオッズは作らない。ROI集計から除外される)。
+      let matchOdds = null, marketImplied = null, marketEdgePt = null;
+      try {
+        const oddsData = await callApiFootball("/odds", { fixture: fixtureId });
+        matchOdds = extractMatchWinnerOdds(oddsData);
+        if (matchOdds) {
+          marketImplied = impliedProbsPct(matchOdds);
+          const probsForEdge = computeMarketProbs(homeLambda, awayLambda);
+          if (probsForEdge && marketImplied) {
+            const ourPct = predictedWinner === "home" ? probsForEdge.homeWin * 100 : predictedWinner === "away" ? probsForEdge.awayWin * 100 : probsForEdge.draw * 100;
+            const mktPct = predictedWinner === "home" ? marketImplied.homePct : predictedWinner === "away" ? marketImplied.awayPct : marketImplied.drawPct;
+            marketEdgePt = Math.round((ourPct - mktPct) * 10) / 10;
+          }
+        }
+      } catch (e) { /* オッズはベストエフォート(予算切れ・提供なし等) */ }
+
+      // ---- 精度証明ラウンド①: 「似た試合」の検索(答え合わせ済みの実結果から) ----
+      // 特徴量の距離で似た過去試合を探し、予測記録に添える(でっち上げ無しの実測)。
+      let similarPast = [];
+      try {
+        const recentForSimilarity = await loadRecentRecordsOnce();
+        similarPast = findSimilarResolvedMatches(features, recentForSimilarity, 3);
+      } catch (e) { /* 似た試合が無くても予測自体は記録する */ }
+
       const record = {
         fixtureId, homeTeamEn: isHome ? team.nameEn : opponentName, awayTeamEn: isHome ? opponentName : team.nameEn,
+        // 自己改善ループ①: リーグ別の精度診断のためにリーグ名も記録する
+        league: (fx.league && fx.league.name) ? fx.league.name : null,
         homeFormScore, awayFormScore, predictedWinner, // v1互換フィールド(既存のバックテスト・テストとの互換性のため維持)
         homeLambda, awayLambda, features, weightsSnapshot: weights, factorImportance: importance,
         kickoff: fx.fixture.date, loggedAt: runAt.toISOString(),
         resolved: false, actualWinner: null, correct: null, resolvedAt: null,
         originTeamEn: team.nameEn, stateHypothesis,
+        // 精度証明ラウンド: オッズ(市場比較・ROI用)と「似た試合」(RAG強化)
+        odds: matchOdds, marketImplied, marketEdgePt,
+        similarPast: similarPast.length ? similarPast : null,
+        similarPastJa: summarizeSimilarMatchesJa(similarPast),
         // 2026年8月・ご指示⑨: 最終スコア予想(ポアソン分布の最頻値)も記録し、
         // 試合後にスコア一致まで採点できるようにする。
         predictedScoreline: mostLikelyScoreline(homeLambda, awayLambda),
@@ -1428,12 +1505,13 @@ async function runDailyLearning(deps) {
     let priorityClubs = [];
     try {
       const latestAgenda = await loadLatestAgenda({ upstashEnabled, upstashGetJSON });
-      priorityClubs = priorityClubsOf(latestAgenda);
+      // 自己改善ループ③: 優先クラブ数の上限はAI自身が調整(3〜10の安全範囲)
+      priorityClubs = priorityClubsOf(latestAgenda).slice(0, selfTuneConfig.priorityClubsMax);
       if (priorityClubs.length) {
         agendaAppliedToday = {
           generatedAt: latestAgenda.generatedAt || null,
           priorityClubs,
-          noteJa: `前回の学習計画に基づき、${priorityClubs.length}クラブ(苦手と実測されたクラブ)を今日の収集で優先しました。`,
+          noteJa: `前回の学習計画に基づき、${priorityClubs.length}クラブ(苦手と実測されたクラブ)を今日の収集で優先しました(優先枠の上限${selfTuneConfig.priorityClubsMax}はAIの自己改善ループが管理)。`,
         };
       }
     } catch (e) { /* 計画が無ければ通常の輪番のみ */ }
@@ -1442,6 +1520,8 @@ async function runDailyLearning(deps) {
       knowledgeGraph, thoughtTimeline, computeFormScore,
       recordLearned: saveWithImportance,
       priorityClubs,
+      // 自己改善ループ③: AIが調整した収集設定(xG周期・選手詳細上限)を反映
+      tune: { xgRotationDays: selfTuneConfig.xgRotationDays, playerDetailCap: selfTuneConfig.playerDetailCap },
       // 第8次監査: 同日再実行ガード(kb:universe:ran:<date>)の読み書きに使う
       upstashCmd, upstashGetJSON, upstashSetJSON,
     }, runAt, dateKey);
@@ -1503,12 +1583,11 @@ async function runDailyLearning(deps) {
   //   メトリクスまで丸ごと失われ、外からは「その日はジョブが動かなかった」と
   //   しか見えなくなる(健康診断も「GitHub Actionsが動いていない可能性」と
   //   誤った原因を表示する)。学習に失敗しても、その日の知識は必ず残す。
-  let recentRecordsShared = null; // 第8次監査: 二度読み防止のため、後段の失敗集計と共有する
+  // 第8次監査: 二度読み防止 — recentRecordsSharedは上の予測ステージ(似た試合の
+  // 検索)と共有(loadRecentRecordsOnce)。既に読み込み済みならそれを再利用する。
   if (totalResolved >= MIN_RESOLVED_FOR_RECALIBRATION) {
     try {
-      const recentRaw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "0", "-1"]).catch(() => [])) || [];
-      const recentRecords = recentRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
-      recentRecordsShared = recentRecords;
+      const recentRecords = await loadRecentRecordsOnce();
       const storedWeights = await upstashGetJSON("learn:weights");
       const currentWeights = { ...EXTENDED_DEFAULT_WEIGHTS, ...DEFAULT_WEIGHTS, ...(storedWeights || {}) };
 
@@ -1756,10 +1835,8 @@ async function runDailyLearning(deps) {
   try {
     // 第8次監査(Medium)の修正: learn:ownpred:recent(最大300件×数KB)を同一実行内で
     // 二度全件読みしていた。重み学習の段(④)で読んだ結果を再利用する。
-    const recentForFailures = recentRecordsShared || (
-      ((await upstashCmd(["LRANGE", "learn:ownpred:recent", "0", "-1"]).catch(() => [])) || [])
-        .map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean)
-    );
+    // 精度証明ラウンドで一本化: 共有ローダー(既に読み込み済みなら再利用)を使う
+    const recentForFailures = await loadRecentRecordsOnce();
     topFailureReasonsRecent = summarizeFailureReasons(recentForFailures, 5);
     topSuccessReasonsRecent = summarizeSuccessReasons(recentForFailures, 5);
     // ---- 2026年8月・ご指示⑩: 次に何を学ぶかをAI自身が決める ----
@@ -1931,9 +2008,41 @@ async function runDailyLearning(deps) {
   // ここで行い、利用者の質問時には一切行わない。最終方針⑥)。
   try {
     const intelDeps = { upstashEnabled, upstashGetJSON, upstashSetJSON };
+    // 成長可視化ラウンド⑥: 「答えられるようになった」台帳の更新。
+    // フラッシュでバッファが消える前に、対象ごとの最高星を回収してから処理する。
+    const answerabilitySubjects = collectAnswerabilityFromBuffer();
+    await processAnswerability({ ...intelDeps, upstashCmd }, answerabilitySubjects, runAt.toISOString());
     // ③⑤ 考察の質・RAG使用率: メモリ集計をその日のキーへ保存
     await flushIntelDaily(intelDeps, dateKey);
     await upstashCmd(["EXPIRE", `${INTEL_KEY_PREFIX}${dateKey}`, String(120 * 86400)]).catch(() => {});
+
+    // 成長可視化ラウンド①②: 「今日なにを覚えたか」のカテゴリ別集計を保存し、
+    // growthLogにも同梱する(何のカテゴリを何件採用・何件重複除外したか)。
+    let knowledgeByCategoryToday = null;
+    try {
+      const catFlush = await knowledgeStore.flushCategoryCounters(dateKey);
+      knowledgeByCategoryToday = catFlush.categories && Object.keys(catFlush.categories).length ? catFlush.categories : null;
+      await upstashCmd(["EXPIRE", `learn:knowledge:categories:${dateKey}`, String(120 * 86400)]).catch(() => {});
+    } catch (e) { /* ベストエフォート */ }
+
+    // ---- 精度証明ラウンド⑤: 本日のROIを保存(オッズつきの答え合わせがあった日のみ加算) ----
+    if (roiAggToday.bets || roiAggToday.oddsMissing) {
+      await saveDailyRoi(intelDeps, dateKey, roiAggToday);
+      await upstashCmd(["EXPIRE", `${ROI_KEY_PREFIX}${dateKey}`, String(120 * 86400)]).catch(() => {});
+    }
+
+    // ---- 精度証明ラウンド①: 「似たクラブ」索引を毎晩再構築(実測ベクトルの距離) ----
+    // 質問時はこの1キーを読むだけになる(重い計算は全部ここ=夜間バッチ)。
+    try {
+      const dossierForSim = createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON });
+      const clubsForSim = [];
+      for (const c of CLUB_UNIVERSE) {
+        const d = await dossierForSim.getDossier(c.nameEn).catch(() => null);
+        if (d) clubsForSim.push({ teamEn: c.nameEn, teamJa: c.nameJa, vector: clubVectorFromDossier(d), traits: clubTraitsFromDossier(d) });
+      }
+      const simIndex = buildClubSimilarityIndex(clubsForSim, runAt.toISOString());
+      await saveClubSimilarityIndex(intelDeps, simIndex);
+    } catch (e) { errors.push(`similarity_index_failed:${e.message}`); }
 
     // 測定材料を読み出す(すべて保存済みの実測値)
     const yesterdayKey = new Date(new Date(`${dateKey}T00:00:00Z`).getTime() - 86400000).toISOString().slice(0, 10);
@@ -1967,15 +2076,98 @@ async function runDailyLearning(deps) {
       weightsUpdated: !!(weightsUpdated || weightsUpdatedV2),
     });
 
+    // ---- 精度証明ラウンド②: 較正マップ(自信の自動補正の材料)を毎晩更新 ----
+    // 直近30日の実測ズレ(ECE)から作る。測定できない期間は「補正なし」を正直に保存。
+    const calibrationMap = buildCalibrationMap(
+      accuracyTrendNow && accuracyTrendNow.last30Days && accuracyTrendNow.last30Days.markets
+        && accuracyTrendNow.last30Days.markets.oneX2 && accuracyTrendNow.last30Days.markets.oneX2.ece,
+      runAt.toISOString()
+    );
+    await upstashSetJSON("learn:calibration:map", calibrationMap);
+
+    // ---- 自己改善ループ: 診断 → 効果測定 → 提案 → 安全な実行 → 履歴 ----
+    let selfImprovementReport = null;
+    try {
+      const budgetSummary = apiBudget.summary();
+      const budgetUsagePct = (budgetSummary.dailyBudget > 0)
+        ? Math.round((budgetSummary.totalSpent / budgetSummary.dailyBudget) * 1000) / 10 : null;
+      // ① 自己診断(保存済みの実測のみ。deps.getApiCallStatsはserver経由の実行時だけ存在)
+      const diagnosis = buildSelfDiagnosis({
+        recentRecords: await loadRecentRecordsOnce(),
+        featureEffectiveness: featureEffectivenessToday,
+        apiCallStats: (typeof deps.getApiCallStats === "function") ? deps.getApiCallStats() : null,
+        errors,
+        accuracyTrend: accuracyTrendNow,
+      });
+      const xgGapEntry = (diagnosis.dataGaps || []).find((g) => g.key === "xg");
+      const metricsNow = {
+        xgMissingRatePct: xgGapEntry ? xgGapEntry.missingRatePct : null,
+        playersUpdatedToday: universeStats ? universeStats.playersUpdated : null,
+        budgetUsagePct,
+        hit7dPct: diagnosis.hit7dPct,
+      };
+      // ④ まず「評価日が来た過去の変更」を効果測定する(悪化していれば自動差し戻し)
+      const evaluations = evaluateDueChanges(selfTuneConfig, metricsNow, runAt.toISOString());
+      // ② 提案 → ③ 安全な範囲で実行(1日最大2件・評価待ちのノブは触らない)
+      const proposals = buildImprovementProposals(diagnosis, selfTuneConfig, { budgetUsagePct });
+      const applied = applyProposals(selfTuneConfig, proposals, runAt.toISOString());
+      // 新しく登録された評価待ちに、改善前の実測(基準値)を刻む
+      for (const pe of selfTuneConfig.pendingEvaluations || []) {
+        if (pe.baseline === null || pe.baseline === undefined) {
+          pe.baseline = Number.isFinite(metricsNow[pe.metricName]) ? metricsNow[pe.metricName] : null;
+        }
+      }
+      await saveTuneConfig(intelDeps, selfTuneConfig);
+      // ⑤ 履歴(診断→提案→変更→評価のすべてを記録)
+      const historyEvents = [];
+      historyEvents.push({
+        at: runAt.toISOString(), type: "diagnosis",
+        summaryJa: `診断: ${diagnosis.leagueAccuracy.length ? `最も弱いリーグ=${diagnosis.leagueAccuracy[0].league}(的中率${diagnosis.leagueAccuracy[0].hitRatePct}%)` : "リーグ別は判定不能"} / ${diagnosis.dataGaps.length ? `欠損最大=${diagnosis.dataGaps[0].labelJa}(${diagnosis.dataGaps[0].missingRatePct}%)` : "欠損率は判定不能"} / API成功率${diagnosis.apiFailures.successRatePct !== null ? diagnosis.apiFailures.successRatePct + "%" : "計測前"}`,
+      });
+      for (const p of proposals) {
+        historyEvents.push({ at: runAt.toISOString(), type: "proposal", targetJa: p.targetJa, summaryJa: p.proposalJa, executed: applied.some((a) => p.action && a.knob === p.action.knob) });
+      }
+      for (const a of applied) {
+        historyEvents.push({ at: runAt.toISOString(), type: "change", knob: a.knob, labelJa: a.labelJa, from: a.from, to: a.to, summaryJa: `${a.labelJa}を${a.from}→${a.to}へ変更(${EVAL_AFTER_DAYS}日後に効果測定)` });
+      }
+      for (const ev of evaluations) {
+        historyEvents.push({ at: ev.at, type: ev.type, knob: ev.knob, verdict: ev.verdict, summaryJa: ev.detailJa });
+      }
+      await appendHistory({ upstashEnabled, upstashCmd }, historyEvents);
+      selfImprovementReport = {
+        diagnosis: {
+          overallHitPct: diagnosis.overallHitPct,
+          worstLeague: diagnosis.leagueAccuracy[0] || null,
+          leagueAccuracy: diagnosis.leagueAccuracy.slice(0, 5),
+          leagueAccuracyNoteJa: diagnosis.leagueAccuracyNoteJa,
+          dataGaps: diagnosis.dataGaps,
+          dataGapsNoteJa: diagnosis.dataGapsNoteJa,
+          ineffectiveFeatures: diagnosis.ineffectiveFeatures,
+          apiFailures: diagnosis.apiFailures,
+        },
+        proposals: proposals.map((p) => ({ targetJa: p.targetJa, proposalJa: p.proposalJa, executed: !!(p.action && applied.some((a) => a.knob === p.action.knob)) })),
+        applied,
+        evaluations,
+        currentConfig: Object.fromEntries(Object.keys(TUNABLE_KNOBS).map((k) => [k, selfTuneConfig[k]])),
+        noteJa: "AIが毎晩、自分の弱点を診断→改善を提案→安全な範囲(上下限つき・1日2件まで)で実行→数日後に改善前後を数値比較し、悪化していれば自動で差し戻します。全記録が履歴に残ります。",
+      };
+    } catch (e) {
+      errors.push(`self_improvement_failed:${e.message}`);
+    }
+
     const intelligenceReport = {
       date: dateKey,
       generatedAt: new Date().toISOString(),
+      selfImprovement: selfImprovementReport, // 自己改善ループ(診断→提案→実行→効果測定)
       selfAssessment,                    // ⑨ 自己評価(数値の証明つき)
       engineGrowth,                      // ⑧ エンジン別成長率
       knowledgeContribution,             // ① 知識の寄与ランキング(方法論つき)
       accuracyDiagnosis,                 // ⑦ 精度低下の自己分析
       reasoningTrend: intelTrendNow,     // ③ 考察の質の推移・⑤ RAG使用率
       hypothesisStats: computeHypothesisStats(hypothesesConfirmed, hypothesesDiscarded), // 仮説的中率
+      // 精度証明ラウンド: ROI(市場比較)と較正補正の状態
+      roi: await getRoiTrend(intelDeps, dateKey).catch(() => ({ available: false })),
+      calibration: { available: calibrationMap.available, reasonJa: calibrationMap.reasonJa || null, noteJa: calibrationMap.noteJa || null },
     };
     await upstashSetJSON(`${INTEL_REPORT_KEY_PREFIX}${dateKey}`, intelligenceReport);
     await upstashSetJSON("learn:intel:report:latest", intelligenceReport);
@@ -1984,6 +2176,7 @@ async function runDailyLearning(deps) {
     // growthLogにも同梱して再保存する(daily-report/growth-logの両方から読めるように)。
     // 注: SETはTTLを消すため、日付つきキーは再保存の後で必ずEXPIREを付け直す。
     mergedGrowthLog.intelligence = intelligenceReport;
+    mergedGrowthLog.knowledgeByCategoryToday = knowledgeByCategoryToday || mergedGrowthLog.knowledgeByCategoryToday || null;
     await upstashSetJSON(`learn:growthlog:${dateKey}`, mergedGrowthLog);
     await upstashSetJSON("learn:growthlog:latest", mergedGrowthLog);
     await upstashCmd(["EXPIRE", `learn:growthlog:${dateKey}`, String(120 * 86400)]).catch(() => {});

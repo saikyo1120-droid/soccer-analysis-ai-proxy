@@ -323,7 +323,10 @@ async function collectUniverse(deps, runAt, dateKey) {
   // 保存済みの名簿から、更新が最も古い選手を優先して選ぶ。
   // 1人=1リクエスト。UNIVERSE_PLAYER_CAP(既定300)まで。
   try {
-    const cap = PLAYER_CAP_DEFAULT;
+    // 自己改善ループ: 上限はAI自身が150〜400の安全範囲で調整できる(既定300)
+    const cap = (deps.tune && Number.isFinite(deps.tune.playerDetailCap))
+      ? Math.max(150, Math.min(400, deps.tune.playerDetailCap))
+      : PLAYER_CAP_DEFAULT;
     const candidates = [];
     for (const club of CLUB_UNIVERSE) {
       const d = await clubDossier.getDossier(club.nameEn);
@@ -396,7 +399,7 @@ async function collectUniverse(deps, runAt, dateKey) {
   // ============================================================
   // ご指示⑩: 学習計画の優先クラブは、tier Bでも輪番外でも今日のxG更新に加える
   // (xGは1クラブ5リクエストと高価なため、優先追加は最大3クラブに制限)。
-  const xgRotation = alreadyRanToday ? [] : clubsForXgUpdate(dateKey);
+  const xgRotation = alreadyRanToday ? [] : clubsForXgUpdate(dateKey, deps.tune && deps.tune.xgRotationDays);
   const xgClubs = alreadyRanToday ? [] : [
     ...priorityClubs.filter((p) => !xgRotation.includes(p)).slice(0, 3),
     ...xgRotation,

@@ -356,6 +356,10 @@ function buildEngineGrowth(input) {
     growthRow("Reasoning Engine", "考察の質スコア(形式的な質の機械採点)",
       (intT && intT.measurable) ? intT.avgReasoningScore : null,
       (intY && intY.measurable) ? intY.avgReasoningScore : null, "点"),
+    // 成長可視化ラウンド①: RAGの成長(取得した知識のうち回答に実際に使われた割合)
+    growthRow("RAG", "知識の使用率(取得した知識のうち回答に使われた割合)",
+      (intT && intT.measurable && Number.isFinite(intT.ragUtilizationPct)) ? intT.ragUtilizationPct : null,
+      (intY && intY.measurable && Number.isFinite(intY.ragUtilizationPct)) ? intY.ragUtilizationPct : null, "%"),
   ];
   return {
     rows,
@@ -567,6 +571,89 @@ function buildSelfAssessment(input) {
   };
 }
 
+// ---------------------------------------------------------------
+// 9. 「以前は答えられなかった質問に、今は答えられる」実績台帳(ご指示⑥)
+// ---------------------------------------------------------------
+// 考察の自信度(星)は「実データの裏付けの量」を表す。同じ対象(クラブ・選手)への
+// 星が、初回より2以上高くなったとき「答えられるようになった」実績として記録する。
+// ■ でっち上げ防止: 星は回答の正しさではなく裏付けの量の実測であること、
+//   記録は実際の質問履歴からのみ作られることを表示に明記する。
+// ■ 設計: 質問時はメモリ記録のみ。日次学習が対象ごとの台帳
+//   (learn:answerability:<subjectKey>)を更新し、改善イベントを最大50件保持する。
+
+const ANSWERABILITY_KEY_PREFIX = "learn:answerability:";
+const ANSWERABILITY_EVENTS_KEY = "learn:answerability:events";
+const ANSWERABILITY_IMPROVE_THRESHOLD = 2; // 星が初回より2以上高くなったら「答えられるようになった」
+const ANSWERABILITY_MAX_SUBJECTS_PER_DAY = 30; // 夜間バッチの読み書き上限(コスト有界)
+
+/** その日の考察バッファから、対象ごとの最高星を集める(フラッシュ前に呼ぶ) */
+function collectAnswerabilityFromBuffer() {
+  const bySubject = new Map();
+  for (const s of discussSampleBuffer) {
+    if (!s || !s.subjectKey || !Number.isFinite(s.stars)) continue;
+    const cur = bySubject.get(s.subjectKey);
+    if (!cur || s.stars > cur.bestStars) {
+      bySubject.set(s.subjectKey, { subjectKey: s.subjectKey, subjectJa: s.subjectJa || s.subjectKey, bestStars: s.stars });
+    }
+  }
+  return Array.from(bySubject.values()).slice(0, ANSWERABILITY_MAX_SUBJECTS_PER_DAY);
+}
+
+async function processAnswerability(deps, subjects, nowIso) {
+  const { upstashEnabled, upstashGetJSON, upstashSetJSON, upstashCmd } = deps || {};
+  if (!upstashEnabled || !subjects || !subjects.length) return { updated: 0, improvedEvents: 0 };
+  let updated = 0, improvedEvents = 0;
+  for (const s of subjects) {
+    try {
+      const key = `${ANSWERABILITY_KEY_PREFIX}${s.subjectKey}`;
+      const existing = await upstashGetJSON(key).catch(() => null);
+      if (!existing) {
+        await upstashSetJSON(key, { subjectJa: s.subjectJa, firstStars: s.bestStars, firstAt: nowIso, bestStars: s.bestStars, bestAt: nowIso, improvedRecorded: false });
+        updated++;
+        continue;
+      }
+      if (s.bestStars > (existing.bestStars || 0)) {
+        existing.bestStars = s.bestStars;
+        existing.bestAt = nowIso;
+        if (!existing.subjectJa && s.subjectJa) existing.subjectJa = s.subjectJa;
+        if (!existing.improvedRecorded && (existing.bestStars - (existing.firstStars || 0)) >= ANSWERABILITY_IMPROVE_THRESHOLD) {
+          existing.improvedRecorded = true;
+          await upstashCmd(["RPUSH", ANSWERABILITY_EVENTS_KEY, JSON.stringify({
+            subjectJa: existing.subjectJa || s.subjectJa,
+            fromStars: existing.firstStars, toStars: existing.bestStars,
+            firstAt: existing.firstAt, at: nowIso,
+          })]).catch(() => {});
+          await upstashCmd(["LTRIM", ANSWERABILITY_EVENTS_KEY, "-50", "-1"]).catch(() => {});
+          await upstashCmd(["INCR", "learn:answerability:improvedCount"]).catch(() => {});
+          improvedEvents++;
+        }
+        await upstashSetJSON(key, existing);
+        updated++;
+      }
+    } catch (e) { /* 1件の失敗で台帳全体を止めない */ }
+  }
+  return { updated, improvedEvents };
+}
+
+/** ダッシュボード用: 改善実績の累計と直近のイベント(最大3件) */
+async function getAnswerabilitySummary(deps) {
+  const { upstashEnabled, upstashCmd } = deps || {};
+  if (!upstashEnabled) return { available: false };
+  try {
+    const [countRaw, eventsRaw] = await Promise.all([
+      upstashCmd(["GET", "learn:answerability:improvedCount"]).catch(() => null),
+      upstashCmd(["LRANGE", ANSWERABILITY_EVENTS_KEY, "-3", "-1"]).catch(() => []),
+    ]);
+    const events = (eventsRaw || []).map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean).reverse();
+    return {
+      available: true,
+      improvedCount: parseInt(countRaw, 10) || 0,
+      latestEvents: events,
+      noteJa: "星は「実データの裏付けの量」の実測です(回答の正しさそのものではありません)。同じ対象への星が初回より2以上高くなったとき「答えられるようになった」として記録します。",
+    };
+  } catch (e) { return { available: false }; }
+}
+
 function round1(v) { return Math.round(v * 10) / 10; }
 
 module.exports = {
@@ -577,4 +664,6 @@ module.exports = {
   emptyIntelDaily, mergeIntelDaily, summarizeIntelDaily, getIntelTrend,
   computeHypothesisStats, buildEngineGrowth,
   buildKnowledgeContributionRanking, buildAccuracyDiagnosis, buildSelfAssessment,
+  collectAnswerabilityFromBuffer, processAnswerability, getAnswerabilitySummary,
+  ANSWERABILITY_IMPROVE_THRESHOLD,
 };
