@@ -54,6 +54,21 @@ const crypto = require("crypto");
 const DEFAULT_EXPIRY_DAYS = { fact: 14, analysis: 30, opinion: 7, profile: 60, reflection: 90 };
 const MAX_ITEMS_PER_TEAM = 80;
 
+// ============================================================================
+// 2026年8月・最終方針「Knowledge Engineは使用回数まで管理」対応。
+// 知識が実際に読まれた(RAG・推論の根拠候補になった)回数を記録する。
+// ■ 設計(質問時の追加負荷ゼロ): 利用者の質問処理中はメモリ上のMapを
+//   増やすだけでRedisへは書かない(最終方針「質問した瞬間に重い処理を行う
+//   設計は禁止」)。毎日の学習ジョブが1日1回だけ knowledge:usage(1キー)へ
+//   まとめて加算保存する。プロセス再起動でその日の未保存分は失われうるが、
+//   「傾向を知る」という目的には十分で、正確性より応答速度を優先する
+//   (この近似であることはREADMEに明記)。
+// モジュール全体で共有(同一プロセス内のserver用/学習用インスタンス共通)。
+const knowledgeUsageBuffer = new Map(); // hash -> count
+const USAGE_KEY = "knowledge:usage";
+const USAGE_MAX_TRACKED = 500; // 保存する件数の上限(使用回数の多い順。無限成長させない)
+
+
 function stableHash(input) {
   return crypto.createHash("sha1").update(input).digest("hex").slice(0, 16);
 }
@@ -191,6 +206,10 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
       if (record) items.push(record);
     }
     const active = items.filter((i) => !isExpired(i, now));
+    // 使用回数の記録(メモリ加算のみ=応答速度に影響しない。日次ジョブで保存)
+    for (const i of active) {
+      if (i.hash) knowledgeUsageBuffer.set(i.hash, (knowledgeUsageBuffer.get(i.hash) || 0) + 1);
+    }
     return {
       facts: active.filter((i) => i.type === "fact"),
       analyses: active.filter((i) => i.type === "analysis"),
@@ -263,8 +282,45 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
     return getKnowledgeDiffByEntity(leagueEn ? `league:${leagueEn}` : null, dateKey, nowMs);
   }
 
+  /**
+   * メモリ上の使用回数を knowledge:usage(1キー)へまとめて加算保存する。
+   * 毎日の学習ジョブから1日1回呼ばれる(質問時には呼ばない)。
+   */
+  async function flushUsageCounters() {
+    if (!upstashEnabled || knowledgeUsageBuffer.size === 0) return { flushed: 0 };
+    try {
+      const stored = (await upstashGetJSON(USAGE_KEY).catch(() => null)) || {};
+      let flushed = 0;
+      for (const [hash, count] of knowledgeUsageBuffer) {
+        stored[hash] = (stored[hash] || 0) + count;
+        flushed += count;
+      }
+      // 上限を超えたら使用回数の少ないものから削る(無限成長させない)
+      const entries = Object.entries(stored).sort((a, b) => b[1] - a[1]).slice(0, USAGE_MAX_TRACKED);
+      await upstashSetJSON(USAGE_KEY, Object.fromEntries(entries));
+      knowledgeUsageBuffer.clear();
+      return { flushed, tracked: entries.length };
+    } catch (e) {
+      return { flushed: 0, error: e.message }; // 保存できなくても本処理は妨げない
+    }
+  }
+
+  /** 使用回数の多い知識(上位N件)を、本文つきで返す(ダッシュボード表示用) */
+  async function getTopUsedKnowledge(limit) {
+    if (!upstashEnabled) return [];
+    const stored = (await upstashGetJSON(USAGE_KEY).catch(() => null)) || {};
+    const top = Object.entries(stored).sort((a, b) => b[1] - a[1]).slice(0, limit || 5);
+    const out = [];
+    for (const [hash, count] of top) {
+      const item = await upstashGetJSON(`knowledge:item:${hash}`).catch(() => null);
+      if (item) out.push({ usageCount: count, statement: item.statement, teamJa: item.teamJa || null, type: item.type });
+    }
+    return out;
+  }
+
   return {
     saveKnowledgeItem, getActiveKnowledge, getKnowledgeDiffForTeam,
+    flushUsageCounters, getTopUsedKnowledge,
     getActiveKnowledgeForLeague, getKnowledgeDiffForLeague,
   };
 }
