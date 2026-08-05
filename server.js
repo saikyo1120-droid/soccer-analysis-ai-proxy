@@ -62,6 +62,10 @@ const { getMetricsTrend } = require("./learning/dailyMetrics");
 // 2026年8月・「本当に毎日賢くなるAI」フェーズ(ご指示②⑨⑩):
 // 予測精度の毎日測定・学習計画・信頼度の説明をダッシュボードへ返す
 const { getAccuracyTrend, computeMarketProbs } = require("./learning/accuracyTracker");
+// 2026年8月・精度証明ラウンド②: 較正(実測のズレ)に基づく表示勝率の自動補正
+const { applyCalibration } = require("./learning/calibrationCorrection");
+// 自己改善ループ⑤: 「この1か月でAIが何を改善してきたか」の履歴読み出し
+const { getSelfImprovementHistory } = require("./learning/selfImprovement");
 // 2026年8月・AI知能計測ラウンド(ご指示③⑤): 考察の質とRAG使用率を、質問時は
 // メモリ集計のみ(応答速度への影響ゼロ)で記録する。日次保存はdailyJobが行う。
 const intelligenceMetrics = require("./learning/intelligenceMetrics");
@@ -210,6 +214,8 @@ function perfSnapshot() {
     // AI知能計測ラウンド: まだ日次保存されていない考察サンプル数(メモリ集計中)。
     // 質問時にRedisへ書かない設計が本番でも動いていることを外から確認できる。
     intelligenceBuffer: { pendingSamples: intelligenceMetrics.pendingSampleCount() },
+    // 成長可視化ラウンド②: API成功率(プロセス起動からの実測)
+    apiCalls: apiCallStatsSnapshot(),
   };
 }
 
@@ -655,6 +661,28 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
   });
 }
 
+// ---- 2026年8月・成長可視化ラウンド②: API成功率の常時計測 ----
+// すべてのAPI-Football呼び出しがcallApiFootballを通るため、ここで成功/失敗を
+// 数えるだけで正確なAPI成功率が出る(メモリカウンタのみ=負荷ゼロ。プロセス
+// 起動からの累計で、perf欄とdaily-reportの学習品質パネルに実測値として出す)。
+const apiCallStats = { attempts: 0, failures: 0, byCode: {} };
+function recordApiCallOutcome(ok, code) {
+  apiCallStats.attempts++;
+  if (!ok) {
+    apiCallStats.failures++;
+    const key = code || "unknown";
+    apiCallStats.byCode[key] = (apiCallStats.byCode[key] || 0) + 1;
+  }
+}
+function apiCallStatsSnapshot() {
+  return {
+    attempts: apiCallStats.attempts,
+    failures: apiCallStats.failures,
+    successRatePct: apiCallStats.attempts ? Math.round(((apiCallStats.attempts - apiCallStats.failures) / apiCallStats.attempts) * 1000) / 10 : null,
+    failuresByCode: { ...apiCallStats.byCode },
+  };
+}
+
 async function callApiFootball(endpoint, params, opts) {
   if (!API_KEY) {
     const err = new Error("API_FOOTBALL_KEY が設定されていません(.envを確認してください)");
@@ -697,6 +725,9 @@ async function callApiFootball(endpoint, params, opts) {
   let res;
   try {
     res = await fetchWithTimeout(url.toString(), { headers }, API_FOOTBALL_TIMEOUT_MS);
+  } catch (e) {
+    recordApiCallOutcome(false, e.code || "network"); // 成長可視化ラウンド②: 失敗を数える
+    throw e;
   } finally {
     await maybeFlushBudget(budget);
   }
@@ -723,6 +754,7 @@ async function callApiFootball(endpoint, params, opts) {
     }
   }
   if (!res.ok) {
+    recordApiCallOutcome(false, `http_${res.status}`);
     const err = new Error(`API-Football HTTP ${res.status}`);
     err.code = "HTTP_ERROR";
     throw err;
@@ -730,10 +762,12 @@ async function callApiFootball(endpoint, params, opts) {
   const json = await res.json();
   const errCount = Array.isArray(json.errors) ? json.errors.length : Object.keys(json.errors || {}).length;
   if (errCount) {
+    recordApiCallOutcome(false, "api_error");
     const err = new Error("API-Football error: " + JSON.stringify(json.errors));
     err.code = "API_ERROR";
     throw err;
   }
+  recordApiCallOutcome(true, null);
   return json;
 }
 
@@ -1375,14 +1409,28 @@ function prioritizeFixturesForDisplay(fixtures, cap) {
 // 試合一覧は handleFixturesToday の既存キャッシュを共有する。
 
 /** 今日の試合1件 + 保存済みのAI予測レコード → 画面表示用の1行(純関数・テスト対象) */
-function buildTodayPredictionEntry(fixture, record) {
+function buildTodayPredictionEntry(fixture, record, calibrationMap) {
   if (!fixture || !record) return null;
   const probs = (Number.isFinite(record.homeLambda) && Number.isFinite(record.awayLambda))
     ? computeMarketProbs(record.homeLambda, record.awayLambda) : null;
   const pct = (v) => Math.round(v * 100);
   const topFactor = Array.isArray(record.factorImportance) && record.factorImportance.length
     ? (record.factorImportance.find((f) => f && f.stars > 0) || record.factorImportance[0]) : null;
+  // 精度証明ラウンド②: 実測のズレ(較正マップ)による表示勝率の補正。
+  // 補正できる実測が無ければnull(生の値だけを表示。数字をでっち上げない)。
+  const rawWinnerPct = probs
+    ? (record.predictedWinner === "home" ? probs.homeWin * 100 : record.predictedWinner === "away" ? probs.awayWin * 100 : probs.draw * 100)
+    : null;
+  const calibrated = (rawWinnerPct !== null) ? applyCalibration(rawWinnerPct, calibrationMap) : null;
   return {
+    // 精度証明ラウンド: 較正補正・市場比較(オッズ)・似た試合(RAG強化)
+    calibrated,
+    market: record.odds ? {
+      odds: record.odds,
+      impliedPct: record.marketImplied || null,
+      edgePt: Number.isFinite(record.marketEdgePt) ? record.marketEdgePt : null,
+    } : null,
+    similarPastJa: record.similarPastJa || null,
     fixtureId: fixture.id,
     league: fixture.league || record.league || null,
     country: fixture.country || null,
@@ -1395,6 +1443,12 @@ function buildTodayPredictionEntry(fixture, record) {
     probs: probs ? { homeWinPct: pct(probs.homeWin), drawPct: pct(probs.draw), awayWinPct: pct(probs.awayWin) } : null,
     predictedScoreline: record.predictedScoreline || null,
     topFactorJa: topFactor ? topFactor.labelJa : null,
+    // 成長可視化ラウンド⑤: 判断根拠のスコア(この予測に実際に影響した要素と影響度)。
+    // 予測記録のfactorImportance(モデルの重み×特徴量の実計算)から機械的に出す。
+    // 注: 市場オッズは予測の入力には使っていない(市場比較専用)ため、ここには出ない。
+    factors: Array.isArray(record.factorImportance)
+      ? record.factorImportance.filter((f) => f && f.stars > 0).slice(0, 5).map((f) => ({ labelJa: f.labelJa, stars: f.stars }))
+      : [],
     // 「学習v◯の重みで予測」— 重みが更新されるたびにこの数字が上がる=
     // AIが学習しながら予想していることが利用者にも見える
     weightsVersion: Number.isFinite(record.weightsVersion) ? record.weightsVersion : null,
@@ -1421,12 +1475,32 @@ async function handlePredictionsToday() {
   }
   const fixtures = fx.fixtures || [];
   let predictions = [];
+  let calibrationMap = null;
   if (UPSTASH_ENABLED && fixtures.length) {
-    // Redisの読み取りのみ(1試合1コマンド・上限60・結果は5分キャッシュ)
+    // Redisの読み取りのみ(1試合1コマンド+較正マップ1コマンド・上限60・結果は5分キャッシュ)
+    calibrationMap = await upstashGetJSON("learn:calibration:map").catch(() => null);
     const target = fixtures.slice(0, 60);
     const records = await Promise.all(target.map((f) => upstashGetJSON(`learn:ownpred:${f.id}`).catch(() => null)));
-    predictions = target.map((f, i) => buildTodayPredictionEntry(f, records[i])).filter(Boolean);
+    predictions = target.map((f, i) => buildTodayPredictionEntry(f, records[i], calibrationMap)).filter(Boolean);
     predictions.sort((a, b) => new Date(a.kickoff || 0) - new Date(b.kickoff || 0));
+  }
+  // ---- 精度証明ラウンド③: 今日のベスト予想 ----
+  // まだ始まっていない試合のうち、(補正後があれば補正後の)勝率が最も高い1試合。
+  // 機械的な選定であり、選定基準もそのまま開示する。該当が無ければ出さない。
+  let bestPick = null;
+  for (const p of predictions) {
+    if (p.resolved || FINISHED_STATUSES.has(p.status) || LIVE_STATUSES.has(p.status)) continue;
+    const conf = p.calibrated ? p.calibrated.calibratedPct
+      : (p.probs ? (p.predictedWinner === "home" ? p.probs.homeWinPct : p.predictedWinner === "away" ? p.probs.awayWinPct : p.probs.drawPct) : null);
+    if (conf === null) continue;
+    if (!bestPick || conf > bestPick.confidencePct) {
+      bestPick = {
+        fixtureId: p.fixtureId,
+        confidencePct: conf,
+        calibrated: !!p.calibrated,
+        reasonJa: `本日のAI予想の中で${p.calibrated ? "補正後の" : ""}勝率が最も高い試合です(${conf}%${p.topFactorJa ? `・最重要要素: ${p.topFactorJa}` : ""})。`,
+      };
+    }
   }
   const payload = {
     found: true,
@@ -1434,6 +1508,8 @@ async function handlePredictionsToday() {
     generatedAt: new Date().toISOString(),
     totalFixturesToday: fixtures.length,
     predictions,
+    bestPick,
+    calibrationAvailable: !!(calibrationMap && calibrationMap.available),
     // 予想が無い日も、その理由を正直に表示する(推測で予想をでっち上げない)
     noteJa: predictions.length
       ? "AI自身の予測モデル(実データで毎日学習した重み)による予想です。予想は毎朝の学習時に生成・保存され、試合終了後に必ず答え合わせされて学習に使われます。"
@@ -1443,6 +1519,55 @@ async function handlePredictionsToday() {
   };
   cacheSet(cacheKey, payload, 5 * 60 * 1000);
   return { status: 200, body: payload };
+}
+
+// ---- 2026年8月・精度証明ラウンド④: 学習状態の週次バックアップ出力 ----
+// AIの「脳」= 作り直せない学習状態(重み・精度履歴・較正・使用実績・知能レポート)
+// をJSONで出力する。GitHub Actions(weekly-backup.yml)が週1回これを取得して
+// リポジトリへ保存する。知識アイテム本体は含めない(APIから数日で再収集できる
+// 派生データであり、容量が大きいため。この選択も応答に明記して開示する)。
+async function handleBackupExport() {
+  if (!UPSTASH_ENABLED) return { status: 200, body: { ok: false, reasonJa: "Upstash未設定のためバックアップ対象がありません。" } };
+  const todayKey = appDateKey();
+  const getJ = (k) => upstashGetJSON(k).catch(() => null);
+  const base = new Date(`${todayKey}T00:00:00Z`).getTime();
+  const days = [];
+  for (let i = 0; i < 30; i++) days.push(new Date(base - i * 86400000).toISOString().slice(0, 10));
+  const [weights, weightsHistoryRaw, apiplan, calibration, similarClubs, knowledgeUsage, growthLatest, intelLatest, agendaLatest] = await Promise.all([
+    getJ("learn:weights"),
+    upstashCmd(["LRANGE", "learn:weights:history", "-50", "-1"]).catch(() => []),
+    getJ("learn:apiplan"),
+    getJ("learn:calibration:map"),
+    getJ("kb:similar:clubs"),
+    getJ("knowledge:usage"),
+    getJ("learn:growthlog:latest"),
+    getJ("learn:intel:report:latest"),
+    getJ("learn:agenda:latest"),
+  ]);
+  const perDay = async (prefix) => {
+    const rows = await Promise.all(days.map((d) => getJ(`${prefix}${d}`)));
+    const out = {};
+    days.forEach((d, i) => { if (rows[i]) out[d] = rows[i]; });
+    return out;
+  };
+  const [accuracyByDay, metricsByDay, roiByDay, intelByDay] = await Promise.all([
+    perDay("learn:accuracy:"), perDay("learn:metrics:"), perDay("learn:roi:"), perDay("learn:intel:"),
+  ]);
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      exportedAt: new Date().toISOString(),
+      version: 1,
+      noteJa: "AIの学習状態(重み・精度/ROI/知能の履歴30日・較正・似たクラブ索引・知識使用実績)のバックアップです。知識アイテム本体は含みません(APIから再収集できる派生データのため。消失時は数日で自動再収集されます)。",
+      data: {
+        weights, weightsHistory: (weightsHistoryRaw || []).map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean),
+        apiplan, calibration, similarClubs, knowledgeUsage,
+        growthLogLatest: growthLatest, intelReportLatest: intelLatest, agendaLatest,
+        accuracyByDay, metricsByDay, roiByDay, intelByDay,
+      },
+    },
+  };
 }
 
 // 2026年8月・優先順位⑤: 「今日の試合検索」で監督名からもチームを検索できる
@@ -2054,6 +2179,9 @@ const learningDeps = {
   // 2026年8月・欠陥Aの修正: 日次ジョブ(バッチ)の呼び出しであることを明示し、
   // 利用者用の予約枠を食い潰さないようにする。
   callApiFootball: (endpoint, params) => callApiFootball(endpoint, params, { jobCall: true }),
+  // 自己改善ループ①: API成功率の実測(自己診断の材料)
+  getApiCallStats: apiCallStatsSnapshot,
+  // (自己改善履歴の読み出しはdaily-report側で行う)
   resolveTeamId: (name) => resolveTeamId(name, { jobCall: true }),
   upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
   // Knowledge Engine Layer2(固定知識の自動生成)・Layer3(AIの毎日の見解)は
@@ -3465,6 +3593,39 @@ async function handleDiscuss(body, clientIp) {
           };
         }
       } catch (e) { /* 調査ファイルが無くても従来どおり動く */ }
+
+      // ---- 2026年8月・精度証明ラウンド①: RAG強化「似たクラブ」 ----
+      // 毎晩の学習が実測(順位・xG収支・ホーム勝率)の距離で作った索引を読み、
+      // 最も似たクラブとその蓄積知識(監督・戦術・フォーム等)を根拠に加える。
+      // 質問時のコストは索引1キーの読み出し(10分キャッシュ)+知識1クラブ分のみ。
+      try {
+        const simCacheKey = "kb:similar:clubs:cache";
+        let simIndex = cacheGet(simCacheKey);
+        if (simIndex === undefined) {
+          simIndex = UPSTASH_ENABLED ? await upstashGetJSON("kb:similar:clubs").catch(() => null) : null;
+          cacheSet(simCacheKey, simIndex || null, 10 * 60 * 1000);
+        }
+        const simEntry = simIndex && simIndex.available && simIndex.index ? simIndex.index[subject.labelEn.toLowerCase()] : null;
+        if (simEntry && Array.isArray(simEntry.similar) && simEntry.similar.length) {
+          const top = simEntry.similar[0];
+          // 成長可視化ラウンド③: 質的な共通点(同じ布陣・怪我人数の近さ)と
+          // 監督名も、実測の範囲で根拠に含める(似た監督・似た戦術・似た怪我状況)。
+          const traitsPart = (top.sharedTraitsJa && top.sharedTraitsJa.length) ? `共通点: ${top.sharedTraitsJa.join("・")}。` : "";
+          const coachPart = top.coachName ? `監督は${top.coachName}。` : "";
+          facts.push(`[似たクラブ] 実測データ(${top.basisJa})の距離では、${top.teamJa || top.teamEn}が${subject.labelJa || subject.labelEn}に最も近い状態のクラブです。${traitsPart}${coachPart}(毎晩更新の索引による機械的な判定)`);
+          try {
+            const simKnowledge = await knowledgeStore.getActiveKnowledge(top.teamEn);
+            (simKnowledge || []).slice(0, 2).forEach((k) => {
+              if (k && k.statement) facts.push(`[似たクラブ ${top.teamJa || top.teamEn} の知識] ${k.statement}`);
+            });
+          } catch (e) { /* 似たクラブの知識が無ければ何も足さない(でっち上げない) */ }
+          knowledgeMeta.similarClubs = {
+            basisJa: top.basisJa,
+            list: simEntry.similar.map((s) => ({ teamEn: s.teamEn, teamJa: s.teamJa, distance: s.distance })),
+          };
+        }
+      } catch (e) { /* 付加情報。失敗しても回答は返す */ }
+
       deliberationResult = deliberate({
         ranked: reasoningBundle.hypotheses,
         dataAvailability: {
@@ -3633,9 +3794,20 @@ async function handleDiscuss(body, clientIp) {
     ...(reasoningPromptBlock ? ["", reasoningPromptBlock] : []),
   ].join("\n");
 
+  // ---- 2026年8月・精度証明ラウンド⑥: AIモデルの自動切替 ----
+  // 機械的なルールで振り分ける(LLM自身に選ばせない):
+  //   実データの根拠が十分(6件以上)に揃ったクラブ考察 → 高性能モデル(深い分析に価値がある)
+  //   それ以外(一般質問・選手・根拠の薄い質問) → 軽量モデル(コストを抑える)
+  // 使ったモデルはmetaで開示する。LLM_TIER_ROUTING=off で全て既定モデルに戻せる。
+  const realFactCountForTier = facts.filter((f) => !String(f).startsWith("【AIによる推定】")).length;
+  const llmTier = (subject.type === "club" && subject.labelEn && realFactCountForTier >= 6) ? "heavy" : "light";
+
   let llmOut;
+  let llmModelUsed = null, llmTierUsed = null;
   try {
-    const { text } = await generateLLM({ systemPrompt: buildDiscussSystemPrompt(), userPrompt, maxTokens: 700 });
+    const { text, tier: usedTier, model: usedModel } = await generateLLM({ systemPrompt: buildDiscussSystemPrompt(), userPrompt, maxTokens: 700, tier: llmTier });
+    llmTierUsed = usedTier || null;
+    llmModelUsed = usedModel || null;
     llmOut = parseDiscussLlmOutput(text);
   } catch (e) {
     // これまでここでエラーの中身(実際のAnthropic APIのHTTPステータス・応答本文)を
@@ -3739,6 +3911,12 @@ async function handleDiscuss(body, clientIp) {
     intelligenceMetrics.recordDiscussSample({
       at: new Date().toISOString(),
       subjectType: subject.type || "general",
+      // 成長可視化ラウンド⑥: 「以前は答えられなかった質問に今は答えられる」台帳用。
+      // 対象を特定できる質問(クラブ・選手)だけ記録する(一般質問は対象外)。
+      subjectKey: subject.type === "club" && subject.labelEn ? `club:${subject.labelEn}`
+        : (subject.type === "player" && body.playerHint && body.playerHint.name ? `player:${body.playerHint.name}` : null),
+      subjectJa: subject.type === "club" ? (subject.labelJa || subject.labelEn)
+        : (subject.type === "player" && body.playerHint ? body.playerHint.name : null),
       parsedOk: !!llmOut.parsedOk,
       score: quality.total,
       components: quality.components,
@@ -3789,7 +3967,7 @@ async function handleDiscuss(body, clientIp) {
       mostImportantOpinion: llmOut.mostImportantOpinion,
       confidence,
       followUpQuestions: llmOut.followUpQuestions,
-      meta: { ...knowledgeMeta, llmProvider: currentProviderName(), parsedOk: llmOut.parsedOk, intelligence: intelligenceForMeta },
+      meta: { ...knowledgeMeta, llmProvider: currentProviderName(), llmTier: llmTierUsed, llmModel: llmModelUsed, parsedOk: llmOut.parsedOk, intelligence: intelligenceForMeta },
     },
   };
 }
@@ -3962,6 +4140,20 @@ const server = http.createServer(async (req, res) => {
         }
         const discussClientIp = clientKeyFromRequest(req);
         const { status, body } = await handleDiscuss(parsedBody, discussClientIp);
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
+      if (pathname === "/api/backup/export") {
+        // 精度証明ラウンド④: 学習状態のバックアップ。内部データを含むため、
+        // debug-status等と同じくAUTO_COLLECT_SECRET設定時は?key=一致を要求する。
+        const requiredSecret = process.env.AUTO_COLLECT_SECRET || "";
+        if (requiredSecret && parsed.searchParams.get("key") !== requiredSecret) {
+          res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "invalid or missing key" }));
+          return;
+        }
+        const { status, body } = await handleBackupExport();
         res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
         return;
@@ -4153,13 +4345,17 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         const todayKey = appDateKey();
-        const [growthRaw, accuracyTrend, agenda, intelReport, coverage] = await Promise.all([
+        const [growthRaw, accuracyTrend, agenda, intelReport, answerability, selfImproveHistory, coverage] = await Promise.all([
           learningDeps.upstashGetJSON("learn:growthlog:latest").catch(() => null),
           getAccuracyTrend(learningDeps, todayKey).catch(() => ({ available: false })),
           loadLatestAgenda(learningDeps).catch(() => null),
           // AI知能計測ラウンド(ご指示①〜⑨): 日次学習ジョブが保存した知能レポート
           // (自己評価・エンジン別成長率・知識の寄与ランキング・精度低下の自己分析)
           learningDeps.upstashGetJSON("learn:intel:report:latest").catch(() => null),
+          // 成長可視化ラウンド⑥: 「答えられるようになった」実績
+          intelligenceMetrics.getAnswerabilitySummary({ upstashEnabled: UPSTASH_ENABLED, upstashCmd }).catch(() => ({ available: false })),
+          // 自己改善ループ⑤: この1か月の自己改善履歴
+          getSelfImprovementHistory({ upstashEnabled: UPSTASH_ENABLED, upstashCmd }, 30).catch(() => ({ available: false })),
           // 第8次監査(Low)の修正: /api/knowledge/coverage と同じ5分キャッシュを共有し、
           // ホーム画面が両方を叩いたときに全クラブの読み出し(約100コマンド)が
           // 二重に走らないようにする。
@@ -4237,6 +4433,24 @@ const server = http.createServer(async (req, res) => {
           // エンジン別成長率、Knowledgeの寄与ランキング、精度低下の自己分析、
           // 考察の質・RAG使用率の推移。すべて日次学習ジョブ保存の実測値。
           intelligence: intelReport || null,
+          // ---- 成長可視化ラウンド ----
+          // ① 今日なにを覚えたか(カテゴリ別の採用/重複除外の内訳)
+          knowledgeByCategoryToday: g.knowledgeByCategoryToday || null,
+          // ② 学習品質パネル(取得検討・採用・重複除外・鮮度切れ・エラー・API成功率)
+          learningQuality: {
+            consideredToday: (g.knowledgeItemsSavedToday ?? 0) + (g.knowledgeItemsDuplicateToday ?? 0),
+            adoptedToday: g.knowledgeItemsSavedToday ?? 0,
+            duplicatesExcludedToday: g.knowledgeItemsDuplicateToday ?? 0,
+            staleExcludedTotal: g.knowledgeStaleTotal ?? null,
+            errorsToday: Array.isArray(g.errors) ? g.errors.length : 0,
+            apiCalls: apiCallStatsSnapshot(),
+            noteJa: "取得検討=採用+重複除外。鮮度切れは失効して根拠から自動除外されている知識の累計。API成功率はサーバー起動からの実測。",
+          },
+          // ⑥ 「以前は答えられなかった質問に、今は答えられる」実績
+          answerability: answerability && answerability.available ? answerability : null,
+          // ---- 自己改善ループ⑤: 「この1か月でAIが何を改善してきたか」 ----
+          // (本日のループの中身は intelligence.selfImprovement に入っている)
+          selfImprovementHistory: selfImproveHistory && selfImproveHistory.available ? selfImproveHistory : null,
         };
         cacheSet("learn:daily-report", body, 5 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
@@ -4320,6 +4534,7 @@ module.exports = {
   handleFixtureAnalysis,
   handlePredictionsToday, buildTodayPredictionEntry, // 利用者目線ラウンド: 今日のAI予想
   prioritizeFixturesForDisplay, // 利用者目線ラウンド: 表示上限の優先順位つき適用(テスト対象)
+  handleBackupExport, // 精度証明ラウンド④: 学習状態の週次バックアップ
   handleCoachSearch,
   handleAccuracyStats,
   handleAutoCollectPredictions,

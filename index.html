@@ -4,6 +4,13 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>サッカー分析AI(プロトタイプ)</title>
+<!-- 精度証明ラウンド③: SNSでリンクを共有したときの表示(OGP)。軽量な静的タグのみ -->
+<meta name="description" content="毎日学習して賢くなるサッカー分析AI。今日の試合のAI予想(勝敗・勝率・根拠)を毎朝自動生成し、結果と答え合わせして精度を公開しています。">
+<meta property="og:type" content="website">
+<meta property="og:title" content="サッカー分析AI — 今日のAI予想">
+<meta property="og:description" content="AIが毎朝、今日の試合の勝敗と勝率を予想。試合後に必ず答え合わせをして、的中率・学習の成長を毎日公開しています。">
+<meta property="og:site_name" content="サッカー分析AI">
+<meta name="twitter:card" content="summary">
 <style>
   :root {
     color-scheme: light;
@@ -6935,14 +6942,37 @@ function predResultBadgeHtml(p) {
     ? `<span style="color:#1c7c54; font-weight:bold; margin-left:6px;">✅ 的中</span>`
     : `<span style="color:#b3541e; font-weight:bold; margin-left:6px;">❌ 外れ</span>`;
 }
+// 成長可視化ラウンド⑤: 判断根拠のスコア行(この予測に実際に影響した要素と影響度)
+function predFactorsLineHtml(p) {
+  if (!p.factors || !p.factors.length) return "";
+  const parts = p.factors.map((f) => `${escapeHtml(f.labelJa)}${"★".repeat(Math.max(1, Math.min(5, Number(f.stars) || 1)))}`);
+  return `<div class="value-note" style="margin-top:2px;">🧮 根拠スコア: ${parts.join("・")}(★=この予測への影響度。市場オッズは予測には未使用・比較専用)</div>`;
+}
+// 成長可視化ラウンド④: 情報の鮮度(この予想がいつの材料で作られたか)
+function predFreshnessLineHtml(p) {
+  if (!p.loggedAt) return "";
+  const d = new Date(p.loggedAt);
+  if (isNaN(d.getTime())) return "";
+  return `<div class="value-note" style="margin-top:2px; opacity:.85;">🕓 予想生成: ${d.toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}(毎朝の学習時。フォーム・怪我などの材料もその時点の実測)</div>`;
+}
+
 // 予想の要約ブロック(予想勝者→バー→根拠→学習バージョンの順。詳細画面用)
 function predictionSummaryBlockHtml(p, titleJa) {
   if (!p) return "";
+  // 精度証明ラウンド: 実績補正後の勝率・似た試合・市場比較も(あるものだけ)表示
+  const calibLine = p.calibrated
+    ? `<div class="value-note" style="margin-top:2px;">🎚️ 実績補正後の勝率: <strong>${Number(p.calibrated.calibratedPct)}%</strong>(モデル生値${Number(p.calibrated.rawPct)}%・実測${Number(p.calibrated.basisN)}件に基づく補正)</div>`
+    : "";
+  const similarLine = p.similarPastJa ? `<div class="value-note" style="margin-top:2px;">📚 ${escapeHtml(p.similarPastJa)}</div>` : "";
+  const marketLine = (p.market && Number.isFinite(p.market.edgePt))
+    ? `<div class="value-note" style="margin-top:2px;">🏦 市場(オッズ)比較: AIは市場より${p.market.edgePt > 0 ? "強気" : "弱気"}(${p.market.edgePt > 0 ? "+" : ""}${Number(p.market.edgePt)}pt)</div>`
+    : "";
   return `
     <div style="margin:8px 0; padding:10px 12px; border-left:4px solid var(--series-2, #b3541e); background:rgba(0,0,0,.03); border-radius:6px;">
       <div>${escapeHtml(titleJa || "🤖 AIの予想")}: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predResultBadgeHtml(p)}</div>
       ${predBarHtml(p)}
       <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
+      ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${predFreshnessLineHtml(p)}
     </div>`;
 }
 // 一覧の行に足す1行の予想ストリップ(軽さ優先: バー無し・テキストのみ)
@@ -6979,11 +7009,22 @@ async function renderTodayPredictionsHero() {
     el.innerHTML = `<p class="value-note">${escapeHtml(data.noteJa || "本日のAI予想はありません。")}</p>`;
     return;
   }
-  const rows = data.predictions.slice(0, 5).map((p) => {
+  const rowHtml = (p) => {
     const homeName = escapeHtml((p.home && p.home.name) || "ホーム");
     const awayName = escapeHtml((p.away && p.away.name) || "アウェイ");
     const kickoffStr = p.kickoff ? new Date(p.kickoff).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "";
     const scoreStr = (p.score && p.score.home !== null && p.score.home !== undefined) ? ` <strong>${Number(p.score.home)} - ${Number(p.score.away)}</strong>` : "";
+    // 精度証明ラウンド: 実績補正後の勝率(較正)・似た試合・市場(オッズ)比較。
+    // それぞれ実測がある試合にだけ表示する(無いものは出さない=でっち上げない)。
+    const calibLine = p.calibrated
+      ? `<div class="value-note" style="margin-top:2px;">🎚️ 実績補正後の勝率: <strong>${Number(p.calibrated.calibratedPct)}%</strong>(モデル生値${Number(p.calibrated.rawPct)}%・同じ自信帯の実測${Number(p.calibrated.basisN)}件に基づく補正)</div>`
+      : "";
+    const similarLine = p.similarPastJa
+      ? `<div class="value-note" style="margin-top:2px;">📚 ${escapeHtml(p.similarPastJa)}</div>`
+      : "";
+    const marketLine = (p.market && Number.isFinite(p.market.edgePt))
+      ? `<div class="value-note" style="margin-top:2px;">🏦 市場(オッズ)比較: AIは市場より${p.market.edgePt > 0 ? "強気" : "弱気"}(${p.market.edgePt > 0 ? "+" : ""}${Number(p.market.edgePt)}pt)</div>`
+      : "";
     return `
       <div style="padding:10px 0; border-bottom:1px solid var(--border);">
         <div><strong>${homeName} vs ${awayName}</strong>${scoreStr}${predResultBadgeHtml(p)}
@@ -6991,16 +7032,47 @@ async function renderTodayPredictionsHero() {
         <div style="margin-top:2px;">🤖 AIの予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}</div>
         ${predBarHtml(p)}
         <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
+        ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${predFreshnessLineHtml(p)}
       </div>`;
-  });
-  const moreCount = data.predictions.length - 5;
+  };
+  // 精度証明ラウンド③: 今日のベスト予想(サーバーが機械的に選定・選定理由つき)を最初に出す
+  const best = data.bestPick ? data.predictions.find((x) => x.fixtureId === data.bestPick.fixtureId) : null;
+  const rest = data.predictions.filter((p) => !best || p.fixtureId !== best.fixtureId).slice(0, best ? 4 : 5);
+  const bestHtml = best ? `
+    <div style="border:2px solid var(--series-2, #b3541e); border-radius:8px; padding:8px 10px; margin-bottom:6px; background:rgba(179,84,30,.06);">
+      <div style="font-weight:700;">🎯 今日のベスト予想</div>
+      <div class="value-note">${escapeHtml((data.bestPick && data.bestPick.reasonJa) || "")}</div>
+      ${rowHtml(best)}
+    </div>` : "";
+  const rows = [bestHtml, ...rest.map(rowHtml)].filter(Boolean);
+  const shownCount = (best ? 1 : 0) + rest.length;
+  const moreCount = data.predictions.length - shownCount;
   el.innerHTML = `
     ${rows.join("")}
     ${moreCount > 0 ? `<p class="value-note" style="margin-top:6px;">ほか${moreCount}試合の予想は「📡 本日の実際の試合」から見られます。</p>` : ""}
-    <div style="margin-top:8px;">
+    <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
       <button class="more-details-btn" type="button" style="display:inline-block; width:auto; padding:5px 12px;" onclick="var c=document.getElementById('realFixturesCard'); if(c && c.style.display!=='none'){c.scrollIntoView({behavior:'smooth'});}">📡 試合の詳しい分析を見る ▼</button>
+      <button class="more-details-btn" type="button" id="sharePredictionsBtn" style="display:inline-block; width:auto; padding:5px 12px;">🔗 この予想をシェア</button>
     </div>
     <p class="value-note" style="margin-top:6px; opacity:.8;">${escapeHtml(data.noteJa || "")}</p>`;
+
+  // 精度証明ラウンド③: シェアボタン(端末の共有機能があればそれを、無ければURLコピー)
+  const shareBtn = document.getElementById("sharePredictionsBtn");
+  if (shareBtn) {
+    shareBtn.addEventListener("click", async () => {
+      const bestP = best;
+      const text = bestP
+        ? `⚽ 今日のAI予想: ${(bestP.home && bestP.home.name) || ""} vs ${(bestP.away && bestP.away.name) || ""} → ${predWinnerLabelJa(bestP)}${bestP.predictedScoreline ? `(予想スコア ${bestP.predictedScoreline})` : ""} | サッカー分析AI`
+        : "⚽ 今日のAI予想 | サッカー分析AI";
+      const url = location.origin + location.pathname;
+      try {
+        if (navigator.share) { await navigator.share({ title: "サッカー分析AI", text, url }); return; }
+        await navigator.clipboard.writeText(`${text}\n${url}`);
+        shareBtn.textContent = "✅ コピーしました";
+        setTimeout(() => { shareBtn.textContent = "🔗 この予想をシェア"; }, 2000);
+      } catch (e) { /* 共有のキャンセル等。何もしない */ }
+    });
+  }
 }
 
 async function renderDailyReportWidget() {
@@ -7026,6 +7098,12 @@ async function renderDailyReportWidget() {
   const accToday = acc.today && acc.today.markets && acc.today.markets.oneX2;
   const vsY = acc.vsYesterday || {};
   let accuracyHtml = "";
+  // 成長可視化ラウンド①: 7日・30日の精度推移も常に表示する(測定できる期間だけ)
+  const acc7 = acc.last7Days && acc.last7Days.markets && acc.last7Days.markets.oneX2;
+  const acc30 = acc.last30Days && acc.last30Days.markets && acc.last30Days.markets.oneX2;
+  const trendLine = (acc7 && acc7.measurable) || (acc30 && acc30.measurable)
+    ? `<div class="value-note">推移: ${acc7 && acc7.measurable ? `直近7日 的中率${acc7.hitRatePct}%(${acc7.n}件)` : "直近7日 測定なし"} ・ ${acc30 && acc30.measurable ? `直近30日 ${acc30.hitRatePct}%(${acc30.n}件)` : "直近30日 測定なし"}</div>`
+    : "";
   if (accToday && accToday.measurable) {
     const dRow = Number.isFinite(vsY.hitRateDeltaPct)
       ? `<div class="value-note">前日比: 的中率${sign(vsY.hitRateDeltaPct)}pt ・ Brier ${sign(vsY.brierDelta)} ・ LogLoss ${sign(vsY.logLossDelta)}(Brier/LogLossは減少=改善)</div>`
@@ -7034,9 +7112,10 @@ async function renderDailyReportWidget() {
       <div style="margin-top:6px;"><strong>🎯 本日の予測精度(答え合わせ${accToday.n}件)</strong>
         <div class="value-note">勝敗: 的中率${accToday.hitRatePct}% ・ Brier ${accToday.avgBrier} ・ LogLoss ${accToday.avgLogLoss}</div>
         ${dRow}
+        ${trendLine}
       </div>`;
   } else {
-    accuracyHtml = `<div class="value-note" style="margin-top:6px;">🎯 本日の予測精度: ${escapeHtml((acc.today && acc.today.reasonJa) || "本日答え合わせできた予測がまだありません(試合が終わり次第、自動で測定されます)。")}</div>`;
+    accuracyHtml = `<div class="value-note" style="margin-top:6px;">🎯 本日の予測精度: ${escapeHtml((acc.today && acc.today.reasonJa) || "本日答え合わせできた予測がまだありません(試合が終わり次第、自動で測定されます)。")}${trendLine}</div>`;
   }
 
   // ---- 学習で予測がどう変わったか(①) ----
@@ -7118,6 +7197,83 @@ async function renderDailyReportWidget() {
       </div>`
     : "";
 
+  // ---- 成長可視化ラウンド①: 今日なにを覚えたか(カテゴリ別内訳) ----
+  const KNOWLEDGE_CATEGORY_JA = {
+    recentFormTrend: "フォーム", injuries: "怪我", injury: "怪我", transfer: "移籍", coachChange: "監督",
+    standings: "順位", leagueStandings: "順位表", playerSeasonStats: "選手成績", playerProfile: "選手プロフィール",
+    clubProfile: "クラブプロフィール", formation: "布陣", matchReflection: "試合の振り返り",
+    predictionHypothesis: "仮説検証", aiLeadingFactor: "AI分析", goalRate: "得点力", xg: "xG",
+    leagueTopScorers: "得点ランキング", leagueTopAssists: "アシストランキング", dailyAiView: "AIの見解",
+  };
+  const catData = data.knowledgeByCategoryToday;
+  const categoriesHtml = catData
+    ? `<div style="margin-top:8px;"><strong>📖 今日なにを覚えたか(カテゴリ別)</strong>
+        <div class="value-note">${Object.entries(catData)
+          .sort((a, b) => (b[1].saved || 0) - (a[1].saved || 0))
+          .slice(0, 10)
+          .map(([cat, v]) => `${escapeHtml(KNOWLEDGE_CATEGORY_JA[cat] || cat)} <strong>+${Number(v.saved) || 0}</strong>${v.duplicate ? `(重複除外${Number(v.duplicate)})` : ""}`)
+          .join(" ・ ")}</div>
+      </div>`
+    : "";
+
+  // ---- 成長可視化ラウンド②: 学習品質パネル ----
+  const lq = data.learningQuality;
+  const qualityHtml = lq
+    ? `<div style="margin-top:8px;"><strong>🔬 学習品質(本日)</strong>
+        <div class="value-note">取得検討 ${num(lq.consideredToday)}件 → 採用 <strong>${num(lq.adoptedToday)}</strong>件 ・ 重複除外 ${num(lq.duplicatesExcludedToday)}件 ・ 鮮度切れで根拠から除外中 ${lq.staleExcludedTotal !== null ? `${lq.staleExcludedTotal}件` : "—"} ・ エラー ${num(lq.errorsToday)}件</div>
+        ${lq.apiCalls && Number.isFinite(lq.apiCalls.successRatePct) ? `<div class="value-note">API成功率: <strong>${lq.apiCalls.successRatePct}%</strong>(試行${lq.apiCalls.attempts}件・失敗${lq.apiCalls.failures}件・サーバー起動からの実測)</div>` : `<div class="value-note">API成功率: まだ計測データがありません(サーバー起動後のAPI呼び出しから実測されます)。</div>`}
+        <div class="value-note" style="opacity:.8;">${escapeHtml(lq.noteJa || "")}</div>
+      </div>`
+    : "";
+
+  // ---- 成長可視化ラウンド⑥: 答えられるようになった実績 ----
+  const ans = data.answerability;
+  const answerabilityHtml = ans
+    ? `<div style="margin-top:8px;"><strong>🎓 AIが答えられるようになったこと(累計${num(ans.improvedCount)}件)</strong>
+        ${(ans.latestEvents && ans.latestEvents.length)
+          ? `<ul style="margin:4px 0 0 1em; padding:0;">${ans.latestEvents.map((e) => `<li class="value-note">${escapeHtml(e.subjectJa || "")}: 実データの裏付け ★${Number(e.fromStars)}→★${Number(e.toStars)}(${e.firstAt ? new Date(e.firstAt).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" }) : "?"}→${e.at ? new Date(e.at).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" }) : "?"})</li>`).join("")}</ul>`
+          : `<div class="value-note">まだ改善イベントはありません(同じ対象への質問の裏付けが★2以上増えたときに、ここへ自動記録されます)。</div>`}
+        <div class="value-note" style="opacity:.8;">${escapeHtml(ans.noteJa || "")}</div>
+      </div>`
+    : "";
+
+  // ---- 自己改善ループ: 診断→提案→実行→効果測定→履歴 ----
+  const si = intel && intel.selfImprovement;
+  const siHistory = data.selfImprovementHistory;
+  let selfImproveHtml = "";
+  if (si || siHistory) {
+    const diagParts = [];
+    if (si && si.diagnosis) {
+      const d = si.diagnosis;
+      if (d.worstLeague) diagParts.push(`最も弱いリーグ: ${escapeHtml(d.worstLeague.league)}(的中率${d.worstLeague.hitRatePct}%・${d.worstLeague.n}件)`);
+      else if (d.leagueAccuracyNoteJa) diagParts.push(escapeHtml(d.leagueAccuracyNoteJa));
+      if (d.dataGaps && d.dataGaps.length) diagParts.push(`データ欠損の最大: ${escapeHtml(d.dataGaps[0].labelJa)}(予測時に${d.dataGaps[0].missingRatePct}%が欠損)`);
+      else if (d.dataGapsNoteJa) diagParts.push(escapeHtml(d.dataGapsNoteJa));
+      if (d.apiFailures && d.apiFailures.successRatePct !== null) diagParts.push(`API成功率: ${d.apiFailures.successRatePct}%`);
+      if (d.ineffectiveFeatures && d.ineffectiveFeatures.length) diagParts.push(`有害と実測された特徴量: ${d.ineffectiveFeatures.map((f) => escapeHtml(f.labelJa)).join("・")}`);
+    }
+    const proposalsHtml = (si && si.proposals && si.proposals.length)
+      ? `<ul style="margin:4px 0 0 1em; padding:0;">${si.proposals.slice(0, 5).map((p) => `<li class="value-note">${p.executed ? "✅ 実行: " : "💡 提案: "}${escapeHtml(p.proposalJa)}</li>`).join("")}</ul>`
+      : (si ? `<div class="value-note">本日は改善が必要なシグナルが検出されなかったため、変更はありません(現状維持も判断のうちです)。</div>` : "");
+    const evalHtml = (si && si.evaluations && si.evaluations.length)
+      ? `<ul style="margin:4px 0 0 1em; padding:0;">${si.evaluations.map((ev) => `<li class="value-note">${ev.verdict === "成功" ? "📈" : ev.verdict === "失敗→差し戻し" ? "↩️" : "⏸"} ${escapeHtml(ev.detailJa || "")}</li>`).join("")}</ul>`
+      : "";
+    const historyHtml = siHistory
+      ? `<div class="value-note" style="margin-top:4px;">📜 この${siHistory.periodDays}日間の自己改善: 記録${siHistory.totalEvents}件(変更${(siHistory.counts && siHistory.counts.change) || 0}・効果測定${(siHistory.counts && siHistory.counts.evaluation) || 0}・差し戻し${(siHistory.counts && siHistory.counts.revert) || 0})</div>
+         ${(siHistory.latest && siHistory.latest.length) ? `<ul style="margin:4px 0 0 1em; padding:0;">${siHistory.latest.slice(0, 5).map((e) => `<li class="value-note" style="opacity:.9;">${e.at ? new Date(e.at).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" }) : ""} [${escapeHtml(e.type || "")}] ${escapeHtml(e.summaryJa || "")}</li>`).join("")}</ul>` : ""}`
+      : "";
+    selfImproveHtml = `
+      <div style="margin-top:8px; padding:8px 10px; border-left:3px solid #5b2d86; background:rgba(91,45,134,.05); border-radius:4px;">
+        <strong>🔁 自己改善ループ(AIが自分で診断→提案→実行→効果測定)</strong>
+        ${diagParts.length ? `<div class="value-note" style="margin-top:4px;">🩺 診断: ${diagParts.join(" / ")}</div>` : ""}
+        ${proposalsHtml}
+        ${evalHtml}
+        ${si && si.currentConfig ? `<div class="value-note" style="margin-top:4px; opacity:.85;">現在の自己調整値: xG収集周期${si.currentConfig.xgRotationDays}日 ・ 選手詳細上限${si.currentConfig.playerDetailCap}人 ・ 優先クラブ枠${si.currentConfig.priorityClubsMax}</div>` : ""}
+        ${historyHtml}
+        ${si && si.noteJa ? `<div class="value-note" style="margin-top:4px; opacity:.75;">${escapeHtml(si.noteJa)}</div>` : ""}
+      </div>`;
+  }
+
   // ---- AI知能計測ラウンドの詳細(①⑤⑦⑧) ----
   let intelDetailsHtml = "";
   if (intel) {
@@ -7173,7 +7329,7 @@ async function renderDailyReportWidget() {
   }
 
   if (detailsEl) {
-    detailsEl.innerHTML = `${feHtml}${agendaHtml}${appliedHtml}${intelDetailsHtml}${legendHtml}${skippedHtml}
+    detailsEl.innerHTML = `${selfImproveHtml}${categoriesHtml}${qualityHtml}${answerabilityHtml}${feHtml}${agendaHtml}${appliedHtml}${intelDetailsHtml}${legendHtml}${skippedHtml}
       <p class="value-note" style="margin-top:8px; opacity:.8;">※ このダッシュボードの数字はすべてサーバーが毎日の学習で実際に記録した実測値です。測定できない項目は理由つきで「測定できない」と表示します(推測で埋めることはありません)。</p>`;
   }
   const toggleBtn = document.getElementById("dailyReportToggleBtn");
