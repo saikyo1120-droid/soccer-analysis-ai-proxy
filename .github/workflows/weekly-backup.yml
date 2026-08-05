@@ -1,0 +1,49 @@
+name: Weekly Learning-State Backup
+
+# 「AIの脳」(学習済みの重み・精度/ROI/知能の履歴・較正・使用実績)を週1回、
+# このリポジトリの backups/ フォルダへ自動保存する仕組みです。
+# 学習データはすべてUpstash(無料プラン)1箇所に保存されているため、万一の
+# データ消失時にAIが「全部忘れる」ことを防ぎます。知識アイテム本体は含みません
+# (API-Footballから数日で自動再収集できる派生データのため)。
+#
+# 事前準備: daily-learning.yml と同じ2つのSecretsを使います(追加設定は不要)。
+#   LEARNING_ENDPOINT_URL … 例) https://soccer-analysis-ai-proxy.onrender.com/api/learning/run-daily
+#   LEARNING_SECRET_KEY   … Renderの環境変数 AUTO_COLLECT_SECRET と同じ値
+
+on:
+  schedule:
+    - cron: "0 21 * * 0" # 毎週日曜 UTC 21:00 = 日本時間 月曜6:00(日次学習4:00の後)
+  workflow_dispatch: {} # 手動実行も可能(動作確認用)
+
+permissions:
+  contents: write # backups/ へのコミットに必要
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Export learning state
+        run: |
+          # LEARNING_ENDPOINT_URL は run-daily を指しているため、backup/export に読み替える
+          BASE_URL="${{ secrets.LEARNING_ENDPOINT_URL }}"
+          EXPORT_URL="${BASE_URL/\/api\/learning\/run-daily//api/backup/export}"
+          echo "export from: ${EXPORT_URL}"
+          mkdir -p backups
+          FILE="backups/backup-$(date -u +%Y-%m-%d).json"
+          HTTP_CODE=$(curl -sS -o "${FILE}" -w "%{http_code}" --max-time 120 "${EXPORT_URL}?key=${{ secrets.LEARNING_SECRET_KEY }}")
+          echo "HTTP ${HTTP_CODE}"
+          if [ "${HTTP_CODE}" != "200" ]; then echo "backup export failed"; cat "${FILE}"; exit 1; fi
+          # ok:true を含まない応答(Upstash未設定など)は失敗として扱う
+          grep -q '"ok":true' "${FILE}" || { echo "backup content invalid"; cat "${FILE}"; exit 1; }
+          ls -la backups/
+
+      - name: Commit backup
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backups/
+          git diff --cached --quiet && { echo "no changes"; exit 0; }
+          git commit -m "chore: weekly learning-state backup ($(date -u +%Y-%m-%d))"
+          git push
