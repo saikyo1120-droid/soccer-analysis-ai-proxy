@@ -88,7 +88,7 @@ const CLUB_UNIVERSE = [
   { rank: 53, nameEn: "Dinamo Zagreb", nameJa: "ディナモ・ザグレブ", country: "クロアチア", leagueId: null },
   { rank: 54, nameEn: "Young Boys", nameJa: "ヤングボーイズ", country: "スイス", leagueId: null },
   { rank: 55, nameEn: "FC Copenhagen", nameJa: "FCコペンハーゲン", country: "デンマーク", leagueId: null },
-  { rank: 56, nameEn: "Red Star Belgrade", nameJa: "レッドスター・ベオグラード", country: "セルビア", leagueId: null },
+  { rank: 56, nameEn: "Red Star Belgrade", nameJa: "レッドスター・ベオグラード", country: "セルビア", leagueId: null, searchAs: "Crvena Zvezda" },
   { rank: 57, nameEn: "Basel", nameJa: "バーゼル", country: "スイス", leagueId: null },
   { rank: 58, nameEn: "Union St. Gilloise", nameJa: "ユニオン・サン=ジロワーズ", country: "ベルギー", leagueId: 144 },
   { rank: 59, nameEn: "Gent", nameJa: "ヘント", country: "ベルギー", leagueId: 144 },
@@ -194,6 +194,69 @@ function clubsForBasicInfo(dateKey) {
   return CLUB_UNIVERSE.filter((c) => (c.rank % 28) === (day % 28));
 }
 
+// ---- 2026年8月・本番エラー調査で判明した「クラブ名が照合できない」問題への対処 ----
+// 実際に本番で発生した3件:
+//   ・Bodo/Glimt        … 検索文字列の "/" をAPI-Football側が受け付けずAPI_ERROR
+//   ・Union St. Gilloise… 同じく "." が原因でAPI_ERROR
+//   ・Red Star Belgrade … API-Football側の表記が "Crvena Zvezda" のため0件
+// いずれも「そのクラブだけ永久に収集できない」状態になっていた(毎日同じ失敗を繰り返す)。
+//
+// 第三者監査での指摘を受けた重要な修正:
+//   当初の実装は候補の最後に「原文」を残していたため、特殊文字を含むクラブでは
+//   最後の候補が必ずAPI_ERROR になり、(a)毎日2回ぶんの予算を無駄にし、
+//   (b)「一時的な障害」と誤判定されて否定キャッシュが永久に書かれない、という
+//   修正前と同じ状態に戻っていた。**検索に使う文字列は必ず英数字と空白だけ**にし、
+//   さらに「必ず部分一致する特徴的な単語」(例: Bodo/Glimt → "Glimt")を候補に加える。
+const GENERIC_CLUB_WORDS = new Set(["club", "sport", "sports", "sporting", "athletic", "atletico", "football", "futbol", "calcio", "united", "city", "town", "real", "royal"]);
+
+function sanitizeSearchTerm(s) {
+  return String(s || "").replace(/[^A-Za-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function searchVariantsOf(club) {
+  const out = [];
+  const push = (s) => {
+    const t = sanitizeSearchTerm(s); // API-Footballが受け付ける形(英数字と空白のみ)
+    if (t.length >= 3 && !out.includes(t)) out.push(t); // 検索は3文字以上が必須
+  };
+  if (club && club.searchAs) push(club.searchAs); // 表記が異なることが判明しているクラブ
+  const raw = (club && club.nameEn) || "";
+  push(raw);
+  // API側の表記ゆれ("Bodo/Glimt" のように区切り文字が違う場合)に最も強い候補:
+  // クラブ名の中で最も特徴的な単語。相手側の表記に必ず含まれるため部分一致する。
+  const words = raw.split(/[^A-Za-z0-9]+/)
+    .filter((w) => w.length >= 4 && !GENERIC_CLUB_WORDS.has(w.toLowerCase()))
+    .sort((a, b) => b.length - a.length);
+  if (words[0]) push(words[0]);
+  if (raw.includes("-")) push(raw.replace(/-/g, ""));
+  return out.slice(0, 3); // 1クラブあたりの再試行を上限3回に制限(予算保護)
+}
+
+function normalizeTeamName(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// B チーム・女子・ユース(例: "Porto B" "Basel W" "Gent U21")を表す語。
+// 検索語を短くするほどこれらが結果に混ざるため、本チームを選ぶために除外する。
+const SECONDARY_SQUAD_RE = /(^|[\s.-])(b|ii|iii|u1[5-9]|u2[0-3]|w|women|fem|femenino|feminin|reserves?|academy|youth|jr|junior|sub\d+)([\s.-]|$)/i;
+
+// 検索結果から「本当にそのクラブ」を選ぶ。
+//   ①B/女子/ユースと分かるものを除外 → ②正規化した完全一致 → ③先頭(従来の挙動)
+// 監査での指摘: 前方一致による選択は "Porto" が "Porto B" を、"Basel" が "Basel W" を
+// 掴む危険があり(しかもteamIdは調査ファイルに恒久保存されるため再解決されない)、
+// 従来より悪化する。前方一致は採用せず、除外+完全一致だけを足す。
+function pickBestTeamMatch(rows, club) {
+  const all = (rows || []).filter((r) => r && r.team && r.team.id && r.team.name);
+  if (!all.length) return null;
+  const names = [club && club.nameEn, club && club.searchAs].filter(Boolean);
+  const clubItselfLooksSecondary = names.some((n) => SECONDARY_SQUAD_RE.test(n));
+  const primaryOnly = all.filter((r) => !SECONDARY_SQUAD_RE.test(r.team.name));
+  const cands = (!clubItselfLooksSecondary && primaryOnly.length) ? primaryOnly : all;
+  const targets = names.map(normalizeTeamName);
+  const exact = cands.find((r) => targets.includes(normalizeTeamName(r.team.name)));
+  return exact || cands[0];
+}
+
 function findClub(nameEn) {
   if (!nameEn) return null;
   const lower = String(nameEn).toLowerCase();
@@ -211,4 +274,5 @@ module.exports = {
   clubsForBasicInfo,
   findClub,
   dayNumberOf,
+  searchVariantsOf, pickBestTeamMatch, normalizeTeamName, sanitizeSearchTerm,
 };

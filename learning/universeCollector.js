@@ -33,6 +33,7 @@
 const {
   CLUB_UNIVERSE, tierOf, clubsForCoreUpdate, clubsForSquadSync,
   clubsForXgUpdate, clubsForBasicInfo, UEFA_SNAPSHOT_NOTE_JA,
+  searchVariantsOf, pickBestTeamMatch,
 } = require("./clubUniverse");
 const {
   computeGoalRateFeatures, computeFatigueFeature, computeHomeAwaySplit,
@@ -81,6 +82,7 @@ async function collectUniverse(deps, runAt, dateKey) {
     standingsLeaguesUpdated: 0,
     changesDetected: [],
     skipped: [], // { stage, reasonJa } — 予算などで見送ったもの(正直に記録)
+    unresolvedClubs: [], // 名前が照合できず収集できなかったクラブ(データ提供元の表記差。正直に開示)
     agendaClubsApplied: priorityClubs.map((c) => c.nameEn), // 学習計画で優先したクラブ(実行の証拠)
     errors: [],
   };
@@ -105,28 +107,84 @@ async function collectUniverse(deps, runAt, dateKey) {
   const fixturesCache = new Map(); // teamId -> fixtures[]
 
   // ---- teamId の解決(調査ファイルに保存済みならAPIを呼ばない) ----
+  // ---- 2026年8月・本番エラー調査で判明した欠陥の修正(+第三者監査での再修正) ----
+  //   従来は club.nameEn をそのまま1回だけ /teams?search= に渡し、結果の先頭を
+  //   無条件に採用していた。本番で3クラブが恒久的に収集不能になっていた:
+  //     ・"Bodo/Glimt" / "Union St. Gilloise" … "/" "." をAPI側が受け付けずAPI_ERROR
+  //     ・"Red Star Belgrade" … API-Football側の表記が "Crvena Zvezda" のため0件
+  //   しかも失敗を覚えないため、毎日同じ失敗を繰り返して予算を消費していた。
+  //   ①APIが受け付ける表記の候補を順に試す(すべて英数字と空白のみ)
+  //   ②B/女子/ユースを除外し、名前が一致するクラブを選ぶ
+  //   ③「検索は成立したが一致が無い」場合だけ7日間の否定キャッシュで再試行を止める
+  //     (通信・API障害は一時的なものなのでキャッシュしない=自己修復する)
+  const unresolvedSeen = new Set(); // 同一実行内で同じクラブを二重に数えない
+  function markUnresolved(club, reasonJa) {
+    if (unresolvedSeen.has(club.nameEn)) return;
+    unresolvedSeen.add(club.nameEn);
+    stats.unresolvedClubs.push({ nameEn: club.nameEn, nameJa: club.nameJa, reasonJa });
+  }
+
   async function resolveTeam(club) {
     const dossier = await clubDossier.getDossier(club.nameEn);
     if (dossier && dossier.teamId) return { teamId: dossier.teamId, dossier };
-    if (!canSpend(1)) return { teamId: null, dossier, skipped: true };
-    try {
-      const data = await callApiFootball("/teams", { search: club.nameEn });
-      const row = (data.response || [])[0];
-      if (!row || !row.team) return { teamId: null, dossier };
-      // /teams の応答には基本情報も含まれるので、同じ1リクエストで保存する
-      await clubDossier.updateSection(club.nameEn, "basic", {
-        founded: row.team.founded ?? null,
-        countryEn: row.team.country ?? null,
-        venueName: (row.venue && row.venue.name) || null,
-        venueCity: (row.venue && row.venue.city) || null,
-        venueCapacity: (row.venue && row.venue.capacity) || null,
-        logo: row.team.logo || null,
-      }, metaOf(club, row.team.id, runAt));
-      return { teamId: row.team.id, dossier };
-    } catch (e) {
-      stats.errors.push(`universe_resolve_failed:${club.nameEn}:${e.code || e.message}`);
+
+    // 否定キャッシュ(直近7日以内に全候補で照合できなかったクラブは再試行しない)
+    const failKey = `kb:club:resolvefail:${club.nameEn}`;
+    if (deps.upstashGetJSON) {
+      const failed = await deps.upstashGetJSON(failKey).catch(() => null);
+      if (failed) {
+        markUnresolved(club, "直近7日以内に名前を照合できなかったため、今日は再試行を見送りました(7日後に自動で再挑戦します)。");
+        return { teamId: null, dossier, unresolved: true };
+      }
+    }
+
+    const variants = searchVariantsOf(club);
+    let sawSuccessfulSearch = false; // 1度でも検索が成立したか(=API側は正常)
+    let lastError = null;
+    for (const term of variants) {
+      if (!canSpend(1)) {
+        skip("resolve", `API予算の残量が安全ラインを下回ったため、${club.nameJa}の照合を見送りました。`);
+        return { teamId: null, dossier, skipped: true };
+      }
+      try {
+        const data = await callApiFootball("/teams", { search: term });
+        sawSuccessfulSearch = true;
+        const row = pickBestTeamMatch(data.response, club);
+        if (!row) continue; // この表記では見つからなかった → 次の候補へ
+        // /teams の応答には基本情報も含まれるので、同じ1リクエストで保存する
+        await clubDossier.updateSection(club.nameEn, "basic", {
+          founded: row.team.founded ?? null,
+          countryEn: row.team.country ?? null,
+          venueName: (row.venue && row.venue.name) || null,
+          venueCity: (row.venue && row.venue.city) || null,
+          venueCapacity: (row.venue && row.venue.capacity) || null,
+          logo: row.team.logo || null,
+        }, metaOf(club, row.team.id, runAt));
+        return { teamId: row.team.id, dossier };
+      } catch (e) {
+        lastError = e;
+        if (e && e.code === "BUDGET_EXHAUSTED") {
+          skip("resolve", `API予算を使い切ったため、${club.nameJa}の照合を見送りました。`);
+          return { teamId: null, dossier, skipped: true };
+        }
+      }
+    }
+
+    if (!sawSuccessfulSearch) {
+      // 一度も検索が成立しなかった = 通信・API側の一時的な問題。
+      // 否定キャッシュには入れない(次回そのまま再挑戦して自己修復する)。
+      stats.errors.push(`universe_resolve_failed:${club.nameEn}:${(lastError && (lastError.code || lastError.message)) || "unknown"}`);
       return { teamId: null, dossier };
     }
+    // 検索は成立したのに一致が無い = データ提供元の表記差。エラーではなく
+    // 「照合できないクラブ」として明示し、7日間は再試行しない。
+    markUnresolved(club, `データ提供元(API-Football)で「${club.nameEn}」に一致するクラブを見つけられませんでした(表記差の可能性)。7日後に自動で再挑戦します。`);
+    if (deps.upstashCmd) {
+      // SETとEXPIREを分けると、間で失敗した場合にTTLの無いキーが残り
+      // 「7日後に再挑戦」の約束が守られない(監査での指摘)。必ず一括で書く。
+      await deps.upstashCmd(["SET", failKey, JSON.stringify({ failedAt: runAt.toISOString(), nameEn: club.nameEn }), "EX", String(7 * 86400)]).catch(() => {});
+    }
+    return { teamId: null, dossier, unresolved: true };
   }
 
   function metaOf(club, teamId, at) {
@@ -157,7 +215,10 @@ async function collectUniverse(deps, runAt, dateKey) {
     if (!canSpend(4)) { skip("core", `予算残量が安全ラインを下回ったため、${club.nameJa}以降のコア更新を見送りました。`); break; }
     try {
       const { teamId } = await resolveTeam(club);
-      if (!teamId) { stats.errors.push(`universe_team_not_found:${club.nameEn}`); continue; }
+      // 未解決(表記差)・予算切れは resolveTeam 側で正直に記録済みのため、
+      // ここで重ねてエラーにはしない(同じ事象が二重に「エラー」と数えられ、
+      // 「エラーが原因で件数が少ない」という誤った表示につながっていた)。
+      if (!teamId) continue;
       const meta = metaOf(club, teamId, runAt);
 
       // --- 直近試合 → フォーム・得点傾向・過密日程・ホームアウェイ ---

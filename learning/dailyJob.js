@@ -357,6 +357,13 @@ function mergeGrowthLogs(previous, current) {
         changesDetected: changes,
         skipped: capList([...(p.skipped || []), ...(c.skipped || [])]),
         agendaClubsApplied: Array.from(new Set([...(p.agendaClubsApplied || []), ...(c.agendaClubsApplied || [])])),
+        unresolvedClubs: (() => {
+          const seen = new Set(); const out = [];
+          for (const u of [...(p.unresolvedClubs || []), ...(c.unresolvedClubs || [])]) {
+            if (u && u.nameEn && !seen.has(u.nameEn)) { seen.add(u.nameEn); out.push(u); }
+          }
+          return out;
+        })(),
       };
     })(),
     // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズの項目の合算規則 ----
@@ -1919,6 +1926,8 @@ async function runDailyLearning(deps) {
       changesDetected: (universeStats.changesDetected || []).slice(0, 20),
       skipped: universeStats.skipped || [],
       agendaClubsApplied: universeStats.agendaClubsApplied || [],
+      // 本番エラー調査: 名前を照合できず収集できなかったクラブ(正直に開示)
+      unresolvedClubs: universeStats.unresolvedClubs || [],
     } : null,
     // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ ----
     // ご指示⑨: 今日答え合わせして市場別に採点できた件数(詳細は learn:accuracy:<date>)
