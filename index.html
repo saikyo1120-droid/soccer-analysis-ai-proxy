@@ -413,6 +413,9 @@
       <input type="text" id="fixtureSearchInput" placeholder="例: レアル / プレミアリーグ / イングランド / 監督名" style="width:100%; box-sizing:border-box; padding:9px 12px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary); font-size:14px;">
       <p class="value-note" id="fixtureSearchHint" style="margin:6px 0 0; display:none;"></p>
     </div>
+    <!-- 利用者目線ラウンド: 「終了した試合しかない」ように見える理由(日本時間の
+         日付の仕組み)と、表示枠で省略した件数を正直に説明する欄 -->
+    <p class="value-note" id="fixturesContextNote" style="display:none; margin:0 0 10px; padding:8px 10px; background:rgba(0,0,0,.04); border-radius:6px;"></p>
     <div id="realFixturesList"></div>
   </div>
   <div id="realFixtureAnalysisWrap"></div>
@@ -4667,6 +4670,25 @@ async function renderRealFixturesIfAvailable() {
   lastFixturesToday = data.fixtures;
   renderFixturesListInto(listEl, lastFixturesToday);
   cardEl.style.display = "block";
+
+  // 利用者目線ラウンド: 「終了した試合しかない」ように見える状況の正直な説明。
+  //   ・この一覧は「日本時間の今日」の試合。ヨーロッパの今夜の試合は日本時間では
+  //     明日の日付になるため、夕方以降は終了済みばかりになるのが正常。
+  //   ・表示枠(80件)で省略した件数があれば、隠さずに件数を示す。
+  const noteEl = document.getElementById("fixturesContextNote");
+  if (noteEl) {
+    const groups = { live: 0, upcoming: 0, finished: 0, other: 0 };
+    (data.fixtures || []).forEach((f) => { groups[classifyFixtureStatus(f.status)]++; });
+    const noteParts = [];
+    if (groups.finished > 0 && groups.live === 0 && groups.upcoming === 0) {
+      noteParts.push("ℹ️ 日本時間の本日の試合はすべて終了しています。ヨーロッパの今夜の試合は日本時間では明日の日付になるため、明日の朝にこの欄と「🔮 今日のAI予想」へ並びます(AI予想は毎朝4時の学習で生成されます)。");
+    }
+    if (Number.isFinite(data.omittedCount) && data.omittedCount > 0) {
+      noteParts.push(`表示は${(data.fixtures || []).length}試合まで(この日に実際にあった${Number(data.totalToday)}試合のうち、終了済み${Number(data.omittedCount)}試合を省略しています。ライブ中・これからの試合は省略されません)。`);
+    }
+    if (noteParts.length) { noteEl.textContent = noteParts.join(" "); noteEl.style.display = "block"; }
+    else { noteEl.style.display = "none"; }
+  }
 
   const searchInput = document.getElementById("fixtureSearchInput");
   if (searchInput && !searchInput.dataset.fixtureSearchWired) {

@@ -1286,7 +1286,7 @@ async function handleFixturesToday(query, opts) {
       all = data.response || [];
     }
 
-    const fixtures = all
+    const mapped = all
       .filter((f) => !FIXTURE_NAME_DENYLIST.test((f.league && f.league.name) || ""))
       .map((f) => ({
         id: f.fixture.id,
@@ -1298,9 +1298,15 @@ async function handleFixturesToday(query, opts) {
         home: { name: f.teams.home.name, logo: f.teams.home.logo, winner: f.teams.home.winner },
         away: { name: f.teams.away.name, logo: f.teams.away.logo, winner: f.teams.away.winner },
         score: f.goals ? { home: f.goals.home, away: f.goals.away } : null,
-      }))
-      .sort((a, b) => new Date(a.date) - new Date(b.date))
-      .slice(0, 80); // a fully unrestricted worldwide day can have hundreds of matches — cap to a sane amount
+      }));
+    // 利用者目線ラウンドで発見した欠陥の修正:
+    //   従来は「キックオフの早い順に80件」で切っていたため、世界で80試合を超える
+    //   忙しい日は、日本時間の夕方〜夜の**まだ始まっていない試合が黙って消え**、
+    //   「本日は終了した試合しかない」ように見えていた(表示の嘘に相当)。
+    //   ライブ・これから、を必ず優先して残し、枠の残りに終了済み(新しい順)を
+    //   入れる。省略した件数は正直に返す(prioritizeFixturesForDisplay参照)。
+    const prioritized = prioritizeFixturesForDisplay(mapped, 80);
+    const fixtures = prioritized.fixtures;
 
     // 「ながら解決」: 今日の試合一覧を取得したついでに、記録済みだが未解決のまま
     // だったAI予測を解決できないか確認する。一覧に既にスコアと試合状況が含まれて
@@ -1321,7 +1327,12 @@ async function handleFixturesToday(query, opts) {
       }
     }
 
-    const payload = { found: true, source: "API-Football", date: today, fetchedAt: new Date().toISOString(), fixtures };
+    const payload = {
+      found: true, source: "API-Football", date: today, fetchedAt: new Date().toISOString(), fixtures,
+      // 正直な開示: この日に実際に存在した試合数と、表示枠(80)の都合で省略した件数
+      totalToday: prioritized.totalToday,
+      omittedCount: prioritized.omittedCount,
+    };
     cacheSet(cacheKey, payload, 15 * 60 * 1000);
     return { status: 200, body: payload };
   } catch (e) {
@@ -1329,6 +1340,30 @@ async function handleFixturesToday(query, opts) {
     cacheSet(cacheKey, payload, 5 * 60 * 1000);
     return { status: 200, body: payload };
   }
+}
+
+/**
+ * 「本日の試合」の表示上限(cap)適用を、状態の優先順位つきで行う純関数。
+ *   優先1: ライブ中 / 優先2: これから(未開始・延期等) / 残り枠: 終了済み(新しい順に残す)
+ * これにより「まだ始まっていない試合が表示枠の都合で消える」ことは起こらない
+ * (ライブ+これからだけで枠を超える日は理論上あり得るが、その場合も
+ *  omittedCountで正直に開示される)。
+ */
+function prioritizeFixturesForDisplay(fixtures, cap) {
+  const live = [], upcoming = [], finished = [];
+  for (const f of fixtures || []) {
+    if (LIVE_STATUSES.has(f.status)) live.push(f);
+    else if (FINISHED_STATUSES.has(f.status)) finished.push(f);
+    else upcoming.push(f);
+  }
+  const byDate = (a, b) => new Date(a.date) - new Date(b.date);
+  live.sort(byDate); upcoming.sort(byDate); finished.sort(byDate);
+  let kept = [...live, ...upcoming].slice(0, cap);
+  const room = cap - kept.length;
+  if (room > 0 && finished.length) kept = kept.concat(finished.slice(-room)); // 終了済みは新しい(遅い)ものを優先して残す
+  kept.sort(byDate); // 表示は従来どおり時系列
+  const total = (fixtures || []).length;
+  return { fixtures: kept, totalToday: total, omittedCount: Math.max(0, total - kept.length) };
 }
 
 // ---- 2026年8月・利用者目線ラウンド: 「今日のAI予想」を開いた瞬間に見せる ----
@@ -4284,6 +4319,7 @@ module.exports = {
   handleFixturesToday,
   handleFixtureAnalysis,
   handlePredictionsToday, buildTodayPredictionEntry, // 利用者目線ラウンド: 今日のAI予想
+  prioritizeFixturesForDisplay, // 利用者目線ラウンド: 表示上限の優先順位つき適用(テスト対象)
   handleCoachSearch,
   handleAccuracyStats,
   handleAutoCollectPredictions,
