@@ -86,6 +86,13 @@ function createPlayerProfileEngine({ generateLLM, knowledgeStore, setRelation, o
       return { generated: false, profile: null, reason: "LLM_NOT_CONFIGURED" };
     }
 
+    // 第5次監査での修正(clubProfileEngine.jsと同じ理由):
+    //   実データが1件も無い状態でLLMに推定させ、それを知識として保存するのは
+    //   「でっち上げない」原則に反する。実データが無ければ作らない。
+    if (!groundingFacts || !groundingFacts.length) {
+      return { generated: false, profile: null, reason: "NO_GROUNDING_DATA" };
+    }
+
     const { systemPrompt, userPrompt } = buildPlayerProfilePrompt(playerNameJa, playerNameEn, groundingFacts || []);
     let parsed = null;
     try {
@@ -95,6 +102,18 @@ function createPlayerProfileEngine({ generateLLM, knowledgeStore, setRelation, o
       return { generated: false, profile: null, reason: `LLM_ERROR:${e.code || e.message}` };
     }
     if (!parsed) return { generated: false, profile: null, reason: "PARSE_FAILED" };
+    // 第7次監査で発見した欠陥の修正:
+    //   JSONとして解釈できさえすれば(例: `{}` や `{"error":"insufficient data"}`)
+    //   中身が空文字だけのオブジェクトが返り、これは真値なので上のガードを素通りしていた。
+    //   結果として「戦術スタイル: 不明 / フォーメーション傾向: 不明」という
+    //   中身の無い文章が知識として保存され、
+    //     ・「今日追加した知識」として1件数えられ(成長の水増し)
+    //     ・利用者には「📊 根拠にした事実」として提示され
+    //     ・60日間は再生成もされない
+    //   という三重の害があった。実質的に空の応答は失敗として扱う。
+    if (!String(parsed.playstyle || "").trim()) {
+      return { generated: false, profile: null, reason: "EMPTY_RESPONSE" };
+    }
 
     const statement = [
       `【AIによる推定・プレースタイル】${parsed.playstyle || "不明"}`,

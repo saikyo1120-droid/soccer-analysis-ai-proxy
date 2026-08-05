@@ -42,23 +42,50 @@ const REQUIRED_DATA_SPECS = [
 ];
 
 // 根拠の種類ごとの信頼度。事実は最も信頼でき、意見は参考程度。
-const EVIDENCE_TYPE_TRUST = { fact: 1.0, analysis: 0.7, profile: 0.5, opinion: 0.3, reflection: 0.6 };
+// aiEstimate は第5次監査で追加。AIが実データ無しに一般論から推定した内容なので、
+// 信頼度は最も低く扱う(0にはしない。まったく無価値ではないが、実データとは
+// 決して同列に置かない)。
+const EVIDENCE_TYPE_TRUST = { fact: 1.0, analysis: 0.7, profile: 0.5, opinion: 0.3, reflection: 0.6, aiEstimate: 0.15 };
 
-/** 段階1: 必要データ取得 — 何が揃い、何が欠けているかを点検する。 */
-function assessDataAvailability(availability) {
+/**
+ * 段階1: 必要データ取得 — 何が揃い、何が欠けているかを点検する。
+ *
+ * 第5次監査での設計変更:
+ *   これまでは質問の内容にかかわらず、常に上記8種類すべてを「必要」として
+ *   点検していた。ところが本システムはクラブ単体の質問でxGや過去対戦成績を
+ *   そもそも取得しない設計のため、**どんなに完璧にデータが揃っても
+ *   必ず「不足している」と判定され、自信度が永久に★4止まりになる**という
+ *   矛盾を抱えていた(しかも実際に画面へ出ていた星は別計算で★5だったため、
+ *   本文と星が食い違っていた)。
+ *   質問に応じて「本当に必要なデータ」だけを点検対象にできるようにする。
+ *   requiredKeys を渡さなかった場合の挙動は従来どおり(8種類すべて)。
+ *
+ * @param {object} availability - {form:true, goals:false, ...}
+ * @param {string[]} [requiredKeys] - 今回の質問で本当に必要な項目のkey一覧
+ */
+function assessDataAvailability(availability, requiredKeys) {
   const a = availability || {};
+  const specs = Array.isArray(requiredKeys) && requiredKeys.length
+    ? REQUIRED_DATA_SPECS.filter((s) => requiredKeys.includes(s.key))
+    : REQUIRED_DATA_SPECS;
+  const specList = specs.length ? specs : REQUIRED_DATA_SPECS;
   const available = [];
   const missing = [];
-  for (const spec of REQUIRED_DATA_SPECS) {
+  for (const spec of specList) {
     if (a[spec.key]) available.push(spec.labelJa);
     else missing.push(spec.labelJa);
   }
-  const coveragePct = Math.round((available.length / REQUIRED_DATA_SPECS.length) * 100);
+  // 今回は必要としなかったが、あれば分析の幅が広がる項目(正直に別枠で示す)
+  const notRequired = REQUIRED_DATA_SPECS
+    .filter((s) => !specList.includes(s) && !a[s.key])
+    .map((s) => s.labelJa);
+  const coveragePct = Math.round((available.length / specList.length) * 100);
   return {
-    available, missing, coveragePct,
+    available, missing, notRequired, coveragePct,
     summaryJa: missing.length
-      ? `${available.length}/${REQUIRED_DATA_SPECS.length}種類のデータが揃っています(不足: ${missing.join("・")})。`
-      : `分析に必要な${REQUIRED_DATA_SPECS.length}種類のデータがすべて揃っています。`,
+      ? `${available.length}/${specList.length}種類のデータが揃っています(不足: ${missing.join("・")})。`
+      : `この質問の分析に必要な${specList.length}種類のデータがすべて揃っています。`
+        + (notRequired.length ? `(今回の質問には必須ではありませんが、${notRequired.join("・")}は取得していません。)` : ""),
   };
 }
 
@@ -89,7 +116,13 @@ function buildCounterArgument(comparison) {
     return { hasCounter: false, statementJa: "そもそも実データが不足しているため、賛成・反対のどちらの材料も十分にありません。" };
   }
   if (!c.second || !(c.second.score > 0)) {
-    return { hasCounter: false, statementJa: "実データ上、この見方に有力に対抗する材料は見つかりませんでした(反対意見が無いこと自体が根拠の強さを示します)。" };
+    // 第5次監査の修正: 「反対意見が無いこと自体が根拠の強さを示します」と
+    // 述べていたが、実際には**他の観点のデータをまだ取得できていないだけ**
+    // であることがほとんどで、強さの証明にはならない。正直に言い直す。
+    return {
+      hasCounter: false,
+      statementJa: "他の観点については、現時点で比較できるだけのデータが集まっていません。反対意見が見つからないことは、この見方が正しい証拠にはなりません。",
+    };
   }
   return {
     hasCounter: true,
@@ -113,13 +146,37 @@ function evaluateEvidence(comparison, dataAvailability, ranked) {
   else if (cov >= 60) { stars += 1; reasons.push(`データの${cov}%が揃っている`); }
   else reasons.push(`データが${cov}%しか揃っていない`);
 
-  const evidenceCount = top && Array.isArray(top.evidence) ? top.evidence.length : 0;
-  if (evidenceCount >= 3) { stars += 1; reasons.push(`採用した見方を裏づける実データが${evidenceCount}件ある`); }
-  else if (evidenceCount === 0) reasons.push("採用した見方を裏づける実データが無い");
-  else reasons.push(`裏づけとなる実データが${evidenceCount}件と少ない`);
+  // 第5次監査の修正:
+  //   これまで evidence の**総数**を数えて「実データが◯件ある」と述べていたが、
+  //   その中にはAIが一般論から推定しただけの文章(aiEstimate)も含まれていた。
+  //   「実データ」と呼ぶ以上、AIが作り出したものは数に入れない。
+  const factualCount = (top && Number.isFinite(top.factualCount))
+    ? top.factualCount
+    : (top && Array.isArray(top.evidence)
+      ? top.evidence.filter((e) => e && (e.type === "fact" || e.type === "analysis") && !e.isAiGenerated).length
+      : 0);
+  const totalEvidenceCount = top && Array.isArray(top.evidence) ? top.evidence.length : 0;
+  const aiOnlyCount = totalEvidenceCount - factualCount;
+  if (factualCount >= 3) { stars += 1; reasons.push(`採用した見方を裏づける実データが${factualCount}件ある`); }
+  else if (factualCount === 0) {
+    reasons.push(aiOnlyCount > 0
+      ? "採用した見方を裏づけるのはAIによる推定のみで、実データが無い"
+      : "採用した見方を裏づける実データが無い");
+  } else reasons.push(`裏づけとなる実データが${factualCount}件と少ない`);
 
-  if (comparison && comparison.second && !comparison.isClose) { stars += 1; reasons.push("対抗する見方より根拠が明確に強い"); }
-  else if (comparison && comparison.isClose) reasons.push("対抗する見方と根拠の強さが拮抗している");
+  // 第5次監査の修正:
+  //   「対抗する見方より根拠が明確に強い」で星を1つ足していたが、
+  //   これは**他のどの見方にもデータが1件も無い**場合にも成立してしまい、
+  //   「データが無いこと」が自信の根拠になるという逆立ちした挙動になっていた。
+  //   自分の側に実データがあり、かつ2位にも根拠がある場合にだけ加点する。
+  const secondHasEvidence = !!(comparison && comparison.second && (comparison.second.score || 0) > 0);
+  if (secondHasEvidence && !comparison.isClose && factualCount > 0) {
+    stars += 1; reasons.push("対抗する見方より根拠が明確に強い");
+  } else if (comparison && comparison.isClose) {
+    reasons.push("対抗する見方と根拠の強さが拮抗している");
+  } else if (!secondHasEvidence) {
+    reasons.push("他の見方にはそもそも根拠となるデータが無く、比較ができていない");
+  }
 
   if (dataAvailability && dataAvailability.missing.length) {
     reasons.push(`${dataAvailability.missing.join("・")}のデータが不足している`);
@@ -171,11 +228,26 @@ function buildFinalConclusion(comparison, evaluation, previousConclusion) {
   // 「私は○○が最も重要だと考えます」と断定してしまっていた。
   // これはこのモジュール自身が冒頭で宣言している「根拠が1件も無い観点を
   // 『最も重要』とは言わない」という原則に反するため、スコア0は保留扱いにする。
+  //
+  // 第5次監査での追加修正:
+  //   score > 0 だけでは不十分だった。クラブプロフィール(Layer2)は
+  //   **実データが1件も取れなかったときにLLMへ「一般的なサッカーの知識のみに
+  //   基づいて推定してください」と指示して書かせた文章**を含むが、それが
+  //   analysis(重み1.5)として採点されていたため score > 0 を満たしてしまい、
+  //   実データ0%の状態でも「私は○○が最も重要だと考えます」と断言できていた。
+  //   実データ(fact / 検証済みanalysis)が1件も無ければ断言しない。
   const hasEvidence = !!top && (top.score || 0) > 0;
-  if (!hasEvidence) {
+  const factualCount = (top && Number.isFinite(top.factualCount))
+    ? top.factualCount
+    : (top && Array.isArray(top.evidence)
+      ? top.evidence.filter((e) => e && (e.type === "fact" || e.type === "analysis") && !e.isAiGenerated).length
+      : 0);
+  if (!hasEvidence || factualCount === 0) {
     return {
       headlineJa: "私は、現時点では確かなことを申し上げられないと考えます。",
-      bodyJa: "実データから支持できる見方が見つからなかったためです。データが揃い次第、改めて分析します。",
+      bodyJa: hasEvidence
+        ? "現在手元にあるのはAIによる一般論の推定だけで、この見方を裏づける実データがまだ取得できていないためです。実データが揃い次第、改めて分析します。"
+        : "実データから支持できる見方が見つからなかったためです。データが揃い次第、改めて分析します。",
       changedFromPrevious: null,
     };
   }
@@ -219,7 +291,8 @@ function deliberate(input) {
   const i = input || {};
   const ranked = Array.isArray(i.ranked) ? i.ranked : [];
 
-  const dataGathering = assessDataAvailability(i.dataAvailability);
+  // requiredKeys: 今回の質問で本当に必要なデータの種類(未指定なら従来どおり8種類すべて)
+  const dataGathering = assessDataAvailability(i.dataAvailability, i.requiredKeys);
   const comparison = compareHypotheses(ranked);
   const counterArgument = buildCounterArgument(comparison);
   const evaluation = evaluateEvidence(comparison, dataGathering, ranked);

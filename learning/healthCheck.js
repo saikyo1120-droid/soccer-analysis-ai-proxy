@@ -268,7 +268,21 @@ function buildEngineStatuses(ctx) {
 
   // 4. Upstash
   if (upstashEnabled) {
-    push("upstash", "Upstash Redis(知識の保存先)", "ok", "接続設定が有効です。実際に読み書きできています(この画面の数値がその証拠です)。");
+    // 第6次監査で発見した誤りの修正:
+    //   UPSTASH_ENABLED は環境変数が2つ入っているかどうかだけの判定で、
+    //   実際に読み書きできるかは一切確認していない。にもかかわらず
+    //   「実際に読み書きできています」と断言していたため、トークンが失効している
+    //   状態でも正常と表示され、しかも同じ画面が(読めないせいで生じた)
+    //   「実行記録が無い」を GitHub Actions のせいだと誤って表示していた。
+    //   実際に読めたかどうかで表現を変える。
+    if (log && log.ranYet) {
+      push("upstash", "Upstash Redis(知識の保存先)", "ok",
+        "接続設定が有効で、実際に学習記録を読み出せています(この画面に表示している日次の記録がその証拠です)。");
+    } else {
+      push("upstash", "Upstash Redis(知識の保存先)", "unknown",
+        "接続設定は入っていますが、学習記録をまだ1件も読み出せていません。設定が正しいのに読めない場合は、URL/トークンの誤りや失効の可能性があります。",
+        "Renderの環境変数 UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN が現在有効な値か確認してください(/api/debug-status で実際の疎通を確認できます)。");
+    }
   } else {
     push("upstash", "Upstash Redis(知識の保存先)", "error",
       "未設定です。保存先が無いため、学習しても何も残りません。",
@@ -336,8 +350,18 @@ function buildEngineStatuses(ctx) {
   if (log.weightsUpdated || log.weightsUpdatedV2) {
     push("prediction", "Prediction Engine(予測モデル)", "ok", "本日、実データに基づいて重みを更新しました。");
   } else if (resolvedSoFar >= minNeeded) {
+    // 第6次監査で発見した誤りの修正:
+    //   「更新すると精度が悪化すると判定した」と断言していたが、実際に
+    //   重みが更新されない理由は4通りある(改善する候補が無かった/予測の記録に
+    //   拡張特徴量がまだ無い/検証用に取り置けるデータが足りない/書き込みに失敗)。
+    //   後ろの3つは**比較そのものを行っていない**のに、行ったうえで見送ったと
+    //   報告していた。dailyJobは本当の理由を learn:weights:history に書いているので、
+    //   それを読んで表示する。
+    const histNote = (log && log.weightsHistoryNoteJa) || null;
     push("prediction", "Prediction Engine(予測モデル)", "ok",
-      `検証済み${resolvedSoFar}件。本日は「更新すると精度が悪化する」と判定したため、あえて重みを据え置きました(悪化する変更は採用しない設計)。`);
+      histNote
+        ? `検証済み${resolvedSoFar}件。本日は重みを更新していません。理由: ${histNote}`
+        : `検証済み${resolvedSoFar}件。本日は重みを更新していません(その理由は学習履歴に記録されています)。`);
   } else {
     push("prediction", "Prediction Engine(予測モデル)", "ok",
       `検証済み${resolvedSoFar}件 / 更新に必要な${minNeeded}件(あと${Math.max(0, minNeeded - resolvedSoFar)}件)。少ないデータで重みを動かすと過学習になるため、意図的に固定しています。`);

@@ -101,16 +101,27 @@ function buildEvidencePool(knowledge, teamEn) {
   // ものや、過去の議論モードでAIが導いた分析(analysis)が含まれる。
   const ke = knowledge.knowledgeEngine;
   if (ke) {
-    (ke.facts || []).forEach((item) => pool.push({ category: item.category || "recentForm", type: "fact", teamEn, statement: item.statement }));
-    (ke.analyses || []).forEach((item) => pool.push({ category: item.category || "recentForm", type: "analysis", teamEn, statement: item.statement }));
-    (ke.opinions || []).forEach((item) => pool.push({ category: item.category || "recentForm", type: "opinion", teamEn, statement: item.statement }));
-    // Layer2(固定知識プロフィール)・Layer4(振り返り)は、2026年8月の知識拡張
-    // フェーズまでは保存されるだけで議論モードの根拠プールには渡っていなかった
-    // (取りこぼし)。実データを根拠にした導出情報という位置づけはanalysisに近い
-    // ため、ここでもanalysis扱いとして根拠プールに含める(evidenceRanking.jsの
-    // 重み付けをそのまま流用)。
-    (ke.profiles || []).forEach((item) => pool.push({ category: item.category || "clubProfile", type: "analysis", teamEn, statement: item.statement }));
-    (ke.reflections || []).forEach((item) => pool.push({ category: item.category || "matchReflection", type: "analysis", teamEn, statement: item.statement }));
+    // 第5次監査で発見した最も重大な「でっち上げ」経路の修正。
+    //   これまでは Layer2(クラブプロフィール)を無条件に analysis 扱いにしていた。
+    //   ところが Layer2 は**実データが1件も無いときにLLMへ
+    //   「一般的なサッカーの知識のみに基づいて推定してください」と指示して
+    //   生成させた文章**を含む。その推定文が重み1.5(実データの1.0より上)で
+    //   採点され、しかも熟考エンジンの本文では「実データ」と呼ばれていた。
+    //   結果、実データ0%でもAIが自信を持って「私は○○が最も重要だと考えます」と
+    //   断言してしまう状態だった。
+    //   AI生成の推定は、実データより明確に低い重み(aiEstimate)で扱う。
+    const typeFor = (item, fallback) => (item && item.isAiGenerated ? "aiEstimate" : fallback);
+    const push = (item, category, type) => pool.push({
+      category: item.category || category, type, teamEn, statement: item.statement,
+      isAiGenerated: !!item.isAiGenerated,
+    });
+    (ke.facts || []).forEach((item) => push(item, "recentForm", typeFor(item, "fact")));
+    (ke.analyses || []).forEach((item) => push(item, "recentForm", typeFor(item, "analysis")));
+    (ke.opinions || []).forEach((item) => push(item, "recentForm", typeFor(item, "opinion")));
+    // Layer2(固定知識プロフィール)・Layer4(振り返り)も根拠プールに含める。
+    // ただしLayer2はAI推定を含むため、上記の判定で自動的に aiEstimate になる。
+    (ke.profiles || []).forEach((item) => push(item, "clubProfile", typeFor(item, "analysis")));
+    (ke.reflections || []).forEach((item) => push(item, "matchReflection", typeFor(item, "analysis")));
   }
 
   return pool;

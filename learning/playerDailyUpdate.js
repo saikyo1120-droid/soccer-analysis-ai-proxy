@@ -115,6 +115,10 @@ async function resolvePlayerIdCached(player, deps) {
         return { id, spentRequests: spent };
       }
     } catch (e) {
+      // 第4次監査で発見した欠陥の修正: 予算切れを「このリーグにいなかった」と
+      // 誤解して次のリーグを試し続けると、利用者には
+      // 「SEARCH_LEAGUESに追加してください」という無関係な案内が出てしまう。
+      if (e && e.code === "BUDGET_EXHAUSTED") throw e;
       // このリーグでは見つからなかっただけの可能性があるので次のリーグを試す
     }
   }
@@ -161,17 +165,52 @@ function formatRecent(summary) {
 }
 
 // 蓄積してきた評価スナップショットから「推移」の説明文を作る
+//
+// ■ 第5次監査で発見した重大な欠陥の修正(「毎日賢くなった」の水増し)
+//   従来この文には「記録${withRating.length}回」という**毎日1ずつ増える
+//   カウンター**が埋め込まれていた。Knowledge Engineの重複排除は文面を
+//   そのままハッシュ化して判定するため、選手の成績がまったく変わっていない日でも
+//   文面が変わり、**毎日「新しい知識を1件獲得した」と記録され続けていた**。
+//
+//     1日目 → 平均評価7.20(記録1回目…)                ハッシュ 85467544…
+//     2日目 → 平均評価7.20(記録2回・初回7.20から横ばい)  ハッシュ 2a431aa1…
+//     3日目 → 平均評価7.20(記録3回・初回7.20から横ばい)  ハッシュ c572b986…
+//
+//   これは「文面に日付を埋め込んではいけない」という本プロジェクトの重複排除
+//   ルールに、日付ではなく連番という形で違反していたことになる。しかもこの
+//   水増しが、そのまま「昨日より知識が◯件増えました」という利用者への報告に
+//   直結していた(=データで証明したはずの成長が、実は自作自演だった)。
+//
+//   対策: 文面には**実際の値だけ**を書く。記録回数のように、内容が変わらなくても
+//   増えてしまうメタ情報は文面から外す(件数を知りたければ
+//   learn:playerhistory:* の配列長を見ればよい)。
 function describeRatingTrend(history) {
   const withRating = (history || []).filter((h) => h && Number.isFinite(h.rating));
   if (!withRating.length) return null;
   const latest = withRating[withRating.length - 1];
-  if (withRating.length === 1) {
-    return `平均評価${latest.rating.toFixed(2)}(記録1回目。明日以降ここに推移が積み上がります)`;
-  }
-  const first = withRating[0];
-  const diff = latest.rating - first.rating;
-  const dir = diff > 0.005 ? "上昇" : diff < -0.005 ? "下降" : "横ばい";
-  return `平均評価${latest.rating.toFixed(2)}(記録${withRating.length}回・初回${first.rating.toFixed(2)}から${dir}${diff === 0 ? "" : diff > 0 ? `+${diff.toFixed(2)}` : diff.toFixed(2)})`;
+  if (withRating.length === 1) return `平均評価${latest.rating.toFixed(2)}`;
+  // ■ 第6次監査で発見した、同じ水増しの「残り火」の修正
+  //   基準にしていた「初回の値」は、記録が上限(RATING_HISTORY_MAX=60件)に
+  //   達すると窓がずれるため**毎日変わる**。すると選手の評価がまったく動いて
+  //   いなくても「初回6.50から上昇+0.50」→「初回6.55から上昇+0.45」と文面が
+  //   毎日変わり、知識件数が毎日1ずつ水増しされ続ける
+  //   (60日後に必ず発火する、時限式の同じ欠陥)。変化幅を丸めるだけでは、
+  //   窓がずれ続ける以上いつかは境界をまたぐので不十分だった。
+  //
+  //   対策: 数値の基準を文面から完全に外し、**方向だけ**を書く。さらに判定は
+  //   「直近5件の平均」と「その前5件の平均」の比較で行う。**どちらの窓も
+  //   直近10件の中だけで動く**ため、60件の上限で古い記録が押し出されても
+  //   判定結果は一切変わらない(=評価が動かない日は文面も動かない)。
+  //   方向が変わるのは「この選手について分かったことが実際に変わった」ときなので、
+  //   そのときに知識が1件増えるのは正しい。
+  const mean = (arr) => arr.reduce((s, h) => s + h.rating, 0) / arr.length;
+  const recent = withRating.slice(-5);
+  const older = withRating.slice(-10, -5);
+  if (!older.length) return `平均評価${latest.rating.toFixed(2)}`;
+  const gap = mean(recent) - mean(older);
+  if (gap > 0.1) return `平均評価${latest.rating.toFixed(2)}(直近は上昇傾向)`;
+  if (gap < -0.1) return `平均評価${latest.rating.toFixed(2)}(直近は下降傾向)`;
+  return `平均評価${latest.rating.toFixed(2)}`;
 }
 
 /**
@@ -341,7 +380,18 @@ async function collectPlayerKnowledge(deps, runAt, dateKey) {
   // 同じクラブの選手が複数いる場合に、クラブの直近試合を使い回すためのキャッシュ
   const teamFixturesCache = new Map();
 
-  const reserve = (n, label) => (apiBudget ? apiBudget.tryReserve(n, label) : { allowed: true, remaining: Infinity, reason: null });
+  // 2026年8月・API予算ガードの構造的修正:
+  // 実際の消費は callApiFootball の内部で行われるようになったため、ここで
+  // tryReserve すると二重計上になる。ここでの目的は「予算が無いなら
+  // そもそも呼びに行かない」という事前判断なので、消費しない canAfford を使う。
+  const reserve = (n, label) => {
+    if (!apiBudget) return { allowed: true, remaining: Infinity, reason: null };
+    if (apiBudget.canAfford(n)) return { allowed: true, remaining: apiBudget.remainingForJob(), reason: null };
+    return {
+      allowed: false, remaining: apiBudget.remainingForJob(),
+      reason: `APIリクエストの1日の予算が不足したため${label ? `「${label}」を` : ""}見送りました(必要${n}件・残り${apiBudget.remainingForJob()}件)。API_DAILY_BUDGETを引き上げる(有料プランへの移行)と自動的に再開します。`,
+    };
+  };
 
   for (const player of targets) {
     const notes = {};

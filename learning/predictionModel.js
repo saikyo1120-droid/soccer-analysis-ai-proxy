@@ -72,17 +72,71 @@ const FEATURE_LABELS_JA = {
  * @param {object} awayCtx - 同上(アウェイ側)
  * @param {object} h2h - computeHeadToHeadFeatureの戻り値
  */
-function computeMatchFeatures(homeCtx, awayCtx, h2h) {
-  const hGoalNet = (homeCtx.avgGoalsFor ?? 0) - (homeCtx.avgGoalsAgainst ?? 0);
-  const aGoalNet = (awayCtx.avgGoalsFor ?? 0) - (awayCtx.avgGoalsAgainst ?? 0);
+// 2026年8月・第5次監査で発見した最重要欠陥の修正。
+//
+// これまで goalRateDiff / injuryDiff / standingsDiff / fatigueDiff / formDiff /
+// headToHeadDiff / suspensionDiff は、片側ずつ `?? 0` を使っていた。すると
+// 「片方のチームだけAPI取得に失敗した」場合に、失敗した側が0として扱われ、
+// **取れなかっただけなのに「相手が圧倒的に有利」という嘘の差**が
+// 予測モデルへ入っていた。
+//
+// 例) ホームの/injuriesが成功して「4人負傷」、アウェイが予算切れで失敗
+//     → injuryDiff = 0 - 4 = -4 → 「アウェイの方が4人ぶん有利」と誤解する。
+//     実際には「アウェイの負傷者数は不明」でしかない。
+//     順位(standingsDiff)ではこれがさらに悪質で、リーグIDを特定できなかった
+//     チームは「1試合あたり0勝点」扱いになり、相手に最大級の下駄を履かせていた。
+//     しかも画面には「順位データは考慮されていません」と表示していたため、
+//     **利用者への説明そのものが事実と違っていた**。
+//
+// featureEngine.js の設計方針(値が取れなければnullのままにする。0にしない)を
+// 予測モデル側でも必ず守る。**両側が揃っているときだけ差を計算し、片側でも
+// 欠けていれば0**にする。ここでの0は「差が無い」ではなく「この特徴量は今回
+// 使わない」という意味になる(重みを掛けても寄与0、星も0になるため)。
+function diffOrZero(a, b) {
+  return (a ?? null) !== null && (b ?? null) !== null ? a - b : 0;
+}
+
+/**
+ * 各特徴量について「実データが両側そろっていたか」を返す。
+ * ご指示⑥「途中で0/null/undefinedになっていないことをログ付きで確認」の証拠、
+ * および利用者向けの「このデータは取れなかったので考慮していません」という
+ * 正直な注記(dataNotes)を出すために使う。
+ */
+function computeFeatureAvailability(homeCtx, awayCtx, h2h) {
+  const h = homeCtx || {};
+  const a = awayCtx || {};
+  const both = (x, y) => (x ?? null) !== null && (y ?? null) !== null;
+  const hGoalOk = both(h.avgGoalsFor, h.avgGoalsAgainst);
+  const aGoalOk = both(a.avgGoalsFor, a.avgGoalsAgainst);
   return {
-    formDiff: (homeCtx.formScore ?? 0) - (awayCtx.formScore ?? 0),
-    goalRateDiff: hGoalNet - aGoalNet,
+    formDiff: both(h.formScore, a.formScore),
+    goalRateDiff: hGoalOk && aGoalOk,
+    injuryDiff: both(h.injuryCount, a.injuryCount),
+    standingsDiff: both(h.pointsPerGame, a.pointsPerGame),
+    headToHeadDiff: !!(h2h && both(h2h.homeSideWins, h2h.awaySideWins)),
+    fatigueDiff: both(h.matchesLast7Days, a.matchesLast7Days),
+    venueDiff: both(h.homeVenueWinRate, a.awayVenueWinRate),
+    suspensionDiff: both(h.suspensionCount, a.suspensionCount),
+    xgDiff: both(h.xgNet, a.xgNet),
+    topScorerDiff: both(h.topScorerGoals, a.topScorerGoals),
+  };
+}
+
+function computeMatchFeatures(homeCtx, awayCtx, h2h) {
+  const h = homeCtx || {};
+  const a = awayCtx || {};
+  const bothOk = (x, y) => (x ?? null) !== null && (y ?? null) !== null;
+  // 得点力は「得点平均 - 失点平均」。片方でも欠けていればそのチームの値は不明。
+  const hGoalNet = bothOk(h.avgGoalsFor, h.avgGoalsAgainst) ? h.avgGoalsFor - h.avgGoalsAgainst : null;
+  const aGoalNet = bothOk(a.avgGoalsFor, a.avgGoalsAgainst) ? a.avgGoalsFor - a.avgGoalsAgainst : null;
+  return {
+    formDiff: diffOrZero(h.formScore, a.formScore),
+    goalRateDiff: diffOrZero(hGoalNet, aGoalNet),
     // 相手の負傷者が多いほど自チームに有利、なので符号は「相手 - 自分」。
-    injuryDiff: (awayCtx.injuryCount ?? 0) - (homeCtx.injuryCount ?? 0),
-    standingsDiff: (homeCtx.pointsPerGame ?? 0) - (awayCtx.pointsPerGame ?? 0),
-    headToHeadDiff: h2h ? (h2h.homeSideWins ?? 0) - (h2h.awaySideWins ?? 0) : 0,
-    fatigueDiff: (awayCtx.matchesLast7Days ?? 0) - (homeCtx.matchesLast7Days ?? 0),
+    injuryDiff: diffOrZero(a.injuryCount, h.injuryCount),
+    standingsDiff: diffOrZero(h.pointsPerGame, a.pointsPerGame),
+    headToHeadDiff: h2h ? diffOrZero(h2h.homeSideWins, h2h.awaySideWins) : 0,
+    fatigueDiff: diffOrZero(a.matchesLast7Days, h.matchesLast7Days),
     // ---- 2026年8月・優先順位②で追加した特徴量 ----
     // どれも「値が取れなければ0(＝予測に影響しない)」とする。存在しない
     // データを推測で埋めない(このプロジェクトの一貫した方針)。
@@ -90,23 +144,19 @@ function computeMatchFeatures(homeCtx, awayCtx, h2h) {
     // venueDiff: 「ホームチームがホームでどれだけ勝てているか」と
     //   「アウェイチームがアウェイでどれだけ勝てているか」の差。
     //   既存のformDiffは会場を区別しない全体の調子なので、別の情報になる。
-    venueDiff: (homeCtx.homeVenueWinRate ?? null) !== null && (awayCtx.awayVenueWinRate ?? null) !== null
-      ? (homeCtx.homeVenueWinRate - awayCtx.awayVenueWinRate)
-      : 0,
+    venueDiff: diffOrZero(h.homeVenueWinRate, a.awayVenueWinRate),
     // suspensionDiff: 出場停止は「確実に出られない」ため、出場が不確実な
     //   負傷者(injuryDiff)とは分けて学習させる。符号は相手 - 自分。
-    suspensionDiff: (awayCtx.suspensionCount ?? 0) - (homeCtx.suspensionCount ?? 0),
+    //   第5次監査の修正: 以前は `?? 0` だったため、/injuries の取得に失敗した
+    //   側が「出場停止0人」と断定され、勝敗予想そのものが反転していた。
+    suspensionDiff: diffOrZero(a.suspensionCount, h.suspensionCount),
     // xgDiff: xG(期待得点) - xGA(期待失点) の差。実際の得点(goalRateDiff)は
     //   運に左右されるが、xGは「チャンスの質」を表すため、実力の指標として
     //   より安定するとされる。取得できないリーグでは0のままになる。
-    xgDiff: (homeCtx.xgNet ?? null) !== null && (awayCtx.xgNet ?? null) !== null
-      ? (homeCtx.xgNet - awayCtx.xgNet)
-      : 0,
+    xgDiff: diffOrZero(h.xgNet, a.xgNet),
     // topScorerDiff: 各チームのリーグ得点ランキング上位選手の得点数の差。
     //   「エースがいるか」を数値化する(架空のキーマン診断はしない)。
-    topScorerDiff: (homeCtx.topScorerGoals ?? null) !== null && (awayCtx.topScorerGoals ?? null) !== null
-      ? (homeCtx.topScorerGoals - awayCtx.topScorerGoals)
-      : 0,
+    topScorerDiff: diffOrZero(h.topScorerGoals, a.topScorerGoals),
   };
 }
 
@@ -213,18 +263,81 @@ function backtestAccuracyV2(records, weights) {
 
 // 負の対数尤度(NLL)。実際に起きた結果に、モデルがどれだけ高い確率を
 // 割り当てられていたかを損失として測る(低いほど良い)。
-function computeNegativeLogLikelihood(records, weights) {
+//
+// 2026年8月・「本当に毎日賢くなるAI」フェーズ(ご指示⑤)での拡張:
+// opts.sampleWeightOf(record) を渡すと、記録ごとの重み(=その予測に使った
+// データの信頼度)つきの加重平均になる。信頼度の高いデータで行った予測の
+// 結果ほど強く学習し、古い・信頼度の低いデータでの予測は学習への影響を
+// 弱める。opts無しの呼び出しは従来と完全に同じ動作(既存テストを壊さない)。
+function computeNegativeLogLikelihood(records, weights, opts) {
   const usable = (records || []).filter((r) => r && r.actualWinner && r.features);
   if (!usable.length) return null;
+  const weightOf = opts && typeof opts.sampleWeightOf === "function" ? opts.sampleWeightOf : null;
   let total = 0;
+  let totalWeight = 0;
   for (const r of usable) {
     const { homeLambda, awayLambda } = predictOutcomeV2(r.features, weights);
     const probs = computeMatchProbabilitiesRaw(homeLambda, awayLambda);
     const pFrac = r.actualWinner === "home" ? probs.homeWin : r.actualWinner === "away" ? probs.awayWin : probs.draw;
     const pClamped = Math.max(0.005, pFrac); // log(0)回避のための下限クランプ
-    total += -Math.log(pClamped);
+    const sw = weightOf ? weightOf(r) : 1;
+    const swSafe = Number.isFinite(sw) && sw > 0 ? sw : 1; // 異常な重みで学習を壊さない
+    total += -Math.log(pClamped) * swSafe;
+    totalWeight += swSafe;
   }
-  return total / usable.length;
+  return totalWeight > 0 ? total / totalWeight : null;
+}
+
+// ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ(ご指示⑧) ----
+// 「どの特徴量が当たりやすいか・どの特徴量が不要か」を自動分析する。
+// 方法: 各特徴量について「その重みだけを0にしたモデル」のNLLを実測し、
+//   contribution = NLL(その特徴量なし) - NLL(現在)
+// を計算する。正の値=その特徴量を外すと損失が増える=役に立っている。
+// 負の値=外した方が良い=有害(過学習など)。ゼロ重みの特徴量は「未学習」。
+// すべて実データ(検証済み予測)に対する実測で、推測は入らない。
+function computeFeatureEffectiveness(records, weights, opts) {
+  const usable = (records || []).filter((r) => r && r.actualWinner && r.features);
+  if (usable.length < 5) {
+    return { measurable: false, sampleSize: usable.length, reasonJa: `検証済みの予測が${usable.length}件しかないため、特徴量ごとの有効性はまだ測定できません(5件以上で測定します)。`, features: [] };
+  }
+  const base = computeNegativeLogLikelihood(usable, weights, opts);
+  if (base === null) return { measurable: false, sampleSize: usable.length, reasonJa: "損失を計算できませんでした。", features: [] };
+  const features = [];
+  for (const [fKey, wKey] of Object.entries(FEATURE_WEIGHT_MAP)) {
+    const w = weights[wKey] || 0;
+    if (Math.abs(w) < 1e-6) {
+      features.push({ key: fKey, labelJa: FEATURE_LABELS_JA[fKey], weight: 0, contribution: null, verdictJa: "未学習(重み0のため予測に使われていません)" });
+      continue;
+    }
+    const ablated = { ...weights, [wKey]: 0 };
+    const without = computeNegativeLogLikelihood(usable, ablated, opts);
+    const contribution = without === null ? null : Math.round((without - base) * 10000) / 10000;
+    features.push({
+      key: fKey, labelJa: FEATURE_LABELS_JA[fKey],
+      weight: Math.round(w * 1000) / 1000,
+      contribution,
+      verdictJa: contribution === null ? "測定不能"
+        : contribution > 0.002 ? "有効(この特徴量を外すと予測が悪化します)"
+        : contribution < -0.002 ? "有害の疑い(外した方が損失が下がります。次回の重み学習で0化候補になります)"
+        : "影響は小さい(あっても無くても損失がほぼ変わりません)",
+    });
+  }
+  features.sort((a, b) => (b.contribution ?? -Infinity) - (a.contribution ?? -Infinity));
+  return { measurable: true, sampleSize: usable.length, baseLoss: Math.round(base * 10000) / 10000, features };
+}
+
+// 有害と実測された特徴量を0にした候補を作る(ご指示⑧「不要な特徴量は重みを
+// 減らす」の実行部)。候補は必ず既存のホールドアウト関門(学習用・検証用の
+// 両方で改善した場合のみ採用)を通るため、誤検出で予測が悪化することはない。
+function buildAblationCandidates(effectivenessReport, currentWeights) {
+  if (!effectivenessReport || !effectivenessReport.measurable) return [];
+  return effectivenessReport.features
+    .filter((f) => f.contribution !== null && f.contribution < -0.002)
+    .map((f) => ({
+      w: { ...currentWeights, [FEATURE_WEIGHT_MAP[f.key]]: 0 },
+      method: `ablation_${f.key}`,
+      noteJa: `実測で「${f.labelJa}」が予測を悪化させていた(寄与${f.contribution})ため、この特徴量を外す候補を試しました。`,
+    }));
 }
 
 // 2026年8月・優先順位②の実装中に、重みの学習シミュレーションで発見した重大な
@@ -248,24 +361,60 @@ function fitWeightsGradientDescent(records, initialWeights, opts) {
   const lr = (opts && opts.learningRate) || 0.08;
   const iterations = (opts && opts.iterations) || 40;
   const epsilon = 1e-3;
+  // 2026年8月・ご指示⑤: 信頼度の高いデータで行った予測ほど強く学習する
+  // (opts.sampleWeightOf経由。渡さなければ従来どおり全件同じ重み)。
+  const nllOpts = opts && opts.sampleWeightOf ? { sampleWeightOf: opts.sampleWeightOf } : undefined;
 
   for (let iter = 0; iter < iterations; iter++) {
-    const baseLoss = computeNegativeLogLikelihood(usable, weights);
+    const baseLoss = computeNegativeLogLikelihood(usable, weights, nllOpts);
     if (baseLoss === null) break;
     const grad = {};
     for (const k of LEARNABLE_KEYS) {
       const bumped = { ...weights, [k]: weights[k] + epsilon };
-      const bumpedLoss = computeNegativeLogLikelihood(usable, bumped);
+      const bumpedLoss = computeNegativeLogLikelihood(usable, bumped, nllOpts);
       grad[k] = bumpedLoss === null ? 0 : (bumpedLoss - baseLoss) / epsilon;
     }
     const next = { ...weights };
     for (const k of LEARNABLE_KEYS) {
       const updated = weights[k] - lr * grad[k];
-      next[k] = Math.max(-1, Math.min(1, updated)); // 発散防止のクリップ
+      // 2026年8月・第5次監査で発見した「NaN汚染」の修正。
+      // Math.max(-1, Math.min(1, NaN)) は NaN をそのまま通してしまう。
+      // 保存された1件の記録に数値でない特徴量が混ざっているだけで、損失が
+      // NaN → 勾配が NaN → 重みが NaN となり、しかも predictOutcomeV2 の
+      // `(w[wKey] || 0)` が NaN を静かに0へ落とすため、**その特徴量が
+      // 二度と使われない状態が永久に続く**(エラーも出ない)。
+      // 有限な数値でなければ、その回の更新を捨てて直前の値を維持する。
+      next[k] = Number.isFinite(updated) ? Math.max(-1, Math.min(1, updated)) : weights[k];
     }
     weights = next;
   }
+  // 最終防衛線: 万一どこかでNaN/Infinityが残っていたら学習結果を採用しない。
+  // (「壊れた重みを保存する」より「今日は学習しなかった」の方が正直で安全)
+  if (!isSaneWeights(weights)) return null;
   return weights;
+}
+
+/**
+ * 重みオブジェクトが「保存してよい状態か」を検査する。
+ * 第5次監査の指摘への対応: これまで学習結果を無条件に Upstash へ書いていたため、
+ * NaN が1つ混ざるだけで以降の予測が恒久的に壊れる設計だった。
+ * 保存の直前に必ずこれを通す。
+ */
+function isSaneWeights(w) {
+  if (!w || typeof w !== "object") return false;
+  const numericKeys = [...LEARNABLE_KEYS, "homeBase", "awayBase"];
+  for (const k of numericKeys) {
+    const v = w[k];
+    if (v === undefined) continue; // 既定値で補われるキーは許容する
+    if (!Number.isFinite(v)) return false;
+    // 学習で動きうる範囲を大きく超えた値は、計算が破綻した証拠とみなす。
+    if (Math.abs(v) > 10) return false;
+  }
+  // 基礎得点はポアソン分布の平均なので、負やゼロはあり得ない。
+  for (const k of ["homeBase", "awayBase"]) {
+    if (w[k] !== undefined && !(w[k] > 0 && w[k] <= 5)) return false;
+  }
+  return true;
 }
 
 // ---- 2026年8月・知識拡張フェーズ: 「利用者にも学習内容を見えるようにする」----
@@ -671,6 +820,8 @@ module.exports = {
   WEIGHT_LABELS_JA,
   FAILURE_REASON_LABELS_JA,
   computeMatchFeatures,
+  computeFeatureAvailability,
+  isSaneWeights,
   predictOutcomeV2,
   poissonPmf,
   computeMatchProbabilitiesRaw,
@@ -679,6 +830,8 @@ module.exports = {
   computeFactorImportance,
   backtestAccuracyV2,
   computeNegativeLogLikelihood,
+  computeFeatureEffectiveness,
+  buildAblationCandidates,
   fitWeightsGradientDescent,
   describeWeightsHistoryEntry,
   buildLearningSummary,

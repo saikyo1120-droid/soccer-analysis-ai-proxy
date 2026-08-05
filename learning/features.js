@@ -68,7 +68,14 @@ function computeGoalRateFeatures(fixtures, teamId) {
 function computeFatigueFeature(fixtures, referenceDateMs) {
   const refMs = referenceDateMs || Date.now();
   const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
-  const recentCount = (fixtures || []).filter((f) => {
+  const list = fixtures || [];
+  // 第6次監査で発見した欠陥の修正:
+  //   これまでは常に数値(0以上)を返していたため、/fixtures の取得に失敗した
+  //   (=空配列が渡ってきた)場合まで「直近7日間の試合数は0=完全に休養十分」と
+  //   断定していた。片方のチームだけ取得に失敗すると fatigueDiff に嘘の差が生まれる。
+  //   試合データそのものが1件も無ければ、正直に「不明(null)」を返す。
+  if (!list.length) return { matchesLast7Days: null };
+  const recentCount = list.filter((f) => {
     const d = f && f.fixture && f.fixture.date ? new Date(f.fixture.date).getTime() : null;
     return d !== null && !Number.isNaN(d) && d < refMs && refMs - d <= sevenDaysMs;
   }).length;
@@ -252,7 +259,12 @@ async function fetchHeadToHeadFeature(homeTeamId, awayTeamId, callApiFootball) {
     const data = await callApiFootball("/fixtures/headtohead", { h2h: `${homeTeamId}-${awayTeamId}`, last: 10 });
     return computeHeadToHeadFeature(data.response, homeTeamId, awayTeamId);
   } catch (e) {
-    return { homeSideWins: 0, awaySideWins: 0, draws: 0, sampleSize: 0, homeSideWinRate: null, error: e.message };
+    // 第6次監査で発見した欠陥の修正:
+    //   取得に失敗したときに 0勝0敗 を返していたため、「両方0で数値としては
+    //   そろっている」と判定され、**取れなかったのに『過去対戦成績を考慮した』**
+    //   ことになっていた(しかも画面には「見つかりませんでした」と表示され、
+    //   1つの回答の中で矛盾していた)。勝敗数もnullにして不明であることを示す。
+    return { homeSideWins: null, awaySideWins: null, draws: null, sampleSize: 0, homeSideWinRate: null, error: e.message };
   }
 }
 

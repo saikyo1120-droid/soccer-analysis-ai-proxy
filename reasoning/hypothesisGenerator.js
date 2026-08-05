@@ -78,7 +78,7 @@ const HYPOTHESIS_FACTORS = [
   {
     id: "coach",
     label: "監督(采配・就任時期)が原因という仮説",
-    relevantCategories: ["coach", "coachChange"],
+    relevantCategories: ["coach", "coachChange", "managerHistory"],
     buildStatement: (teamJa, matched) =>
       matched.length
         ? `${teamJa}の状態は、現在の監督の采配方針が影響している可能性がある。`
@@ -87,7 +87,7 @@ const HYPOTHESIS_FACTORS = [
   {
     id: "home_away",
     label: "ホーム/アウェイの違いが原因という仮説",
-    relevantCategories: ["homeAway", "leagueStandings"],
+    relevantCategories: ["homeAway"],
     buildStatement: (teamJa, matched) =>
       matched.length
         ? `${teamJa}はホームとアウェイで成績差が大きく、開催地が結果に影響している可能性がある。`
@@ -114,7 +114,12 @@ const HYPOTHESIS_FACTORS = [
   {
     id: "standings",
     label: "リーグ順位・置かれた状況が原因という仮説",
-    relevantCategories: ["standings", "dailyAiView", "predictionHypothesis"],
+    // 第6次監査での追加: leagueTopScorers / leagueTopAssists は毎日保存されて
+    // いるのに、どの仮説の relevantCategories にも入っておらず、根拠として
+    // 一度も使われていなかった。得点・アシストのランキングは
+    // 「そのクラブがリーグの中でどういう位置にいるか」を示す実データなので、
+    // この仮説の根拠に含める。
+    relevantCategories: ["standings", "leagueStandings", "leagueTopScorers", "leagueTopAssists", "dailyAiView", "predictionHypothesis"],
     buildStatement: (teamJa, matched) =>
       matched.length
         ? `${teamJa}の現在のリーグ順位が、モチベーションや戦い方の選択に影響している可能性がある。`

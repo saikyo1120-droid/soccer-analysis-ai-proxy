@@ -88,6 +88,16 @@ function createClubProfileEngine({ generateLLM, knowledgeStore, setRelation }) {
       return { generated: false, profile: null, reason: "LLM_NOT_CONFIGURED" };
     }
 
+    // 第5次監査での修正(「でっち上げない」原則の徹底):
+    //   これまでは実データが1件も無い場合でも、LLMへ
+    //   「一般的なサッカーの知識のみに基づいて推定してください」と指示し、
+    //   その出力を知識として保存していた。これは根拠ゼロの文章を知識ベースへ
+    //   書き込む行為であり、本プロジェクトの原則に真っ向から反する。
+    //   実データが1件も無い場合はプロフィールを作らず、正直に理由を返す。
+    if (!groundingFacts || !groundingFacts.length) {
+      return { generated: false, profile: null, reason: "NO_GROUNDING_DATA" };
+    }
+
     const { systemPrompt, userPrompt } = buildProfilePrompt(teamJa, teamEn, groundingFacts || []);
     let parsed = null;
     try {
@@ -97,6 +107,18 @@ function createClubProfileEngine({ generateLLM, knowledgeStore, setRelation }) {
       return { generated: false, profile: null, reason: `LLM_ERROR:${e.code || e.message}` };
     }
     if (!parsed) return { generated: false, profile: null, reason: "PARSE_FAILED" };
+    // 第7次監査で発見した欠陥の修正:
+    //   JSONとして解釈できさえすれば(例: `{}` や `{"error":"insufficient data"}`)
+    //   中身が空文字だけのオブジェクトが返り、これは真値なので上のガードを素通りしていた。
+    //   結果として「戦術スタイル: 不明 / フォーメーション傾向: 不明」という
+    //   中身の無い文章が知識として保存され、
+    //     ・「今日追加した知識」として1件数えられ(成長の水増し)
+    //     ・利用者には「📊 根拠にした事実」として提示され
+    //     ・60日間は再生成もされない
+    //   という三重の害があった。実質的に空の応答は失敗として扱う。
+    if (!String(parsed.tacticalStyle || "").trim()) {
+      return { generated: false, profile: null, reason: "EMPTY_RESPONSE" };
+    }
 
     const statement = [
       `【AIによる推定・戦術傾向】戦術スタイル: ${parsed.tacticalStyle || "不明"}`,

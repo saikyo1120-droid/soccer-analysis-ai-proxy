@@ -56,7 +56,13 @@ const { createClubProfileEngine } = require("../knowledge/clubProfileEngine");
 const { summarizeTransfers } = require("../rag/knowledgeSource");
 const { collectLeagueKnowledge } = require("./leagueKnowledge");
 const { collectPlayerKnowledge, PLAYER_UPDATE_CAP_DEFAULT } = require("./playerDailyUpdate");
+const { buildMatchFeatures } = require("./featureEngine");
 const { createApiBudget, DEFAULT_DAILY_BUDGET, DEFAULT_USER_RESERVE } = require("./apiBudget");
+// 2026年8月・優先順位⑫: 「何でも保存する」のをやめ、AI自身が学ぶ価値を判断する
+const { assessImportance, summarizeImportance } = require("./importanceEngine");
+// 2026年8月・「知識量を大幅に増やす」フェーズ: UEFA上位100クラブの日次収集
+const { collectUniverse } = require("./universeCollector");
+const { createClubDossier } = require("../knowledge/clubDossier");
 const { buildDailySnapshot, saveDailyMetrics } = require("./dailyMetrics");
 const {
   computeGoalRateFeatures, computeFatigueFeature,
@@ -65,11 +71,21 @@ const {
   fetchTeamXgAverage, fetchTeamTopScorer,
 } = require("./features");
 const {
-  EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, predictOutcomeV2,
+  EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, predictOutcomeV2, isSaneWeights,
   computeFactorImportance, backtestAccuracyV2, fitWeightsGradientDescent,
   buildLearningSummary, classifyFailureReasons, summarizeFailureReasons,
   classifySuccessReasons, summarizeSuccessReasons, classifyContextualFailureReasons,
+  computeFeatureEffectiveness, buildAblationCandidates, mostLikelyScoreline,
 } = require("./predictionModel");
+// ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ ----
+// ⑨ 予測精度の毎日測定(勝敗/BTTS/Over-Under、Brier・LogLoss・較正)
+const { scorePrediction, buildDailyAccuracy, saveDailyAccuracy } = require("./accuracyTracker");
+// ① 学習によって「予測がどう変わったか」の記録
+const { computePredictionShift } = require("./predictionShift");
+// ⑩ AIが自分で「次に何を学ぶか」を決める
+const { buildLearningAgenda, priorityClubsOf, saveAgenda, loadLatestAgenda } = require("./learningAgenda");
+// ⑤ データの信頼度(出所×鮮度)。信頼度の高いデータほど強く学習する
+const { sampleWeightOf, buildFeatureTrust } = require("./trustEngine");
 
 // ---- 調整可能な上限(API-Football無料プランの1日100リクエスト枠を守るため) ----
 const OWN_PREDICT_LOG_CAP = 5; // 1回の実行で新しく記録する自社予測の件数上限
@@ -273,22 +289,165 @@ function mergeGrowthLogs(previous, current) {
     profilesGenerated: sum(previous.profilesGenerated, current.profilesGenerated),
     aiViewsChanged: sum(previous.aiViewsChanged, current.aiViewsChanged),
     aiViewsUnchanged: sum(previous.aiViewsUnchanged, current.aiViewsUnchanged),
-    failureReasonsToday: [...(previous.failureReasonsToday || []), ...(current.failureReasonsToday || [])],
-    successReasonsToday: [...(previous.successReasonsToday || []), ...(current.successReasonsToday || [])],
+    // 第5次監査で発見した「成長ログの肥大化」の修正。
+    //   この3項目だけが重複排除も上限も無いまま単純連結されていた。
+    //   API-Footballが落ちている日は1回の実行で約100件のエラー文字列が出るため、
+    //   同日に何度も実行されると learn:growthlog:<date> という**1つのJSON値**に
+    //   千件以上の文字列が積み上がる。この値は実行のたびに読み込み→結合→
+    //   2つのキーへ書き戻すため転送量が二乗で増え、さらに
+    //   learn:growthlog:latest はトップページを開くたびに取得される。
+    //   同じ内容を何度も並べても情報は増えないので、重複排除したうえで上限を設ける。
+    failureReasonsToday: capList([...(previous.failureReasonsToday || []), ...(current.failureReasonsToday || [])]),
+    successReasonsToday: capList([...(previous.successReasonsToday || []), ...(current.successReasonsToday || [])]),
     llmSkippedReasons: Array.from(new Set([...(previous.llmSkippedReasons || []), ...(current.llmSkippedReasons || [])])),
-    errors: [...(previous.errors || []), ...(current.errors || [])],
+    // 優先順位⑫: 同日に複数回実行された場合、重要度の内訳は合算し、
+    // 「今日いちばん学ぶ価値があったこと」は重要な方を残す。
+    importanceSummary: mergeImportanceSummaries(previous.importanceSummary, current.importanceSummary),
+    // 宇宙収集は輪番のため、同日の再実行では対象が同じ=最大値を採用する。
+    // 変化の一覧は内容で重複排除する。
+    universe: (() => {
+      const p = previous.universe; const c = current.universe;
+      if (!p) return c || null;
+      if (!c) return p;
+      const seen = new Set();
+      const changes = [...(p.changesDetected || []), ...(c.changesDetected || [])]
+        .filter((x) => { const k = `${x.club}|${x.changeJa}`; if (seen.has(k)) return false; seen.add(k); return true; })
+        .slice(0, 20);
+      return {
+        coreClubsPlanned: Math.max(p.coreClubsPlanned || 0, c.coreClubsPlanned || 0),
+        coreClubsUpdated: Math.max(p.coreClubsUpdated || 0, c.coreClubsUpdated || 0),
+        squadsUpdated: Math.max(p.squadsUpdated || 0, c.squadsUpdated || 0),
+        playersUpdated: Math.max(p.playersUpdated || 0, c.playersUpdated || 0),
+        xgClubsUpdated: Math.max(p.xgClubsUpdated || 0, c.xgClubsUpdated || 0),
+        standingsLeaguesUpdated: Math.max(p.standingsLeaguesUpdated || 0, c.standingsLeaguesUpdated || 0),
+        changesDetected: changes,
+        skipped: capList([...(p.skipped || []), ...(c.skipped || [])]),
+        agendaClubsApplied: Array.from(new Set([...(p.agendaClubsApplied || []), ...(c.agendaClubsApplied || [])])),
+      };
+    })(),
+    // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズの項目の合算規則 ----
+    // 答え合わせ件数は実行ごとに別の試合なので合算。予測変化・特徴量有効性・
+    // 学習計画・学習証明は「その日最後に計算できた値」を残す(後の実行がnullでも
+    // 前の実行の実測を消さない)。
+    accuracyScoredToday: sum(previous.accuracyScoredToday, current.accuracyScoredToday),
+    predictionShift: current.predictionShift || previous.predictionShift || null,
+    featureEffectiveness: current.featureEffectiveness || previous.featureEffectiveness || null,
+    learningAgenda: current.learningAgenda || previous.learningAgenda || null,
+    agendaAppliedToday: current.agendaAppliedToday || previous.agendaAppliedToday || null,
+    learningProof: current.learningProof || previous.learningProof || null,
+    errors: capList([...(previous.errors || []), ...(current.errors || [])]),
   };
+}
+
+// 依存を増やさない小さな安定ハッシュ(knowledgeStore.js の stableHash と同じ方式)。
+// 「前回と根拠が1文字も変わっていないか」の比較だけに使う。
+function stableTextHash(input) {
+  const s = String(input || "");
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 + c + i, 0x85ebca6b) >>> 0;
+  }
+  return (h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0"));
+}
+
+// 優先順位⑫: 同じ日に複数回実行されたときの、重要度内訳の合算。
+// 件数は足し算、ハイライトは重要度の高い順に最大5件だけ残す。
+function mergeImportanceSummaries(prev, cur) {
+  if (!prev) return cur || null;
+  if (!cur) return prev;
+  const IMP_ORDER = { critical: 4, high: 3, medium: 2, low: 1, routine: 0 };
+  const counts = {};
+  for (const k of ["critical", "high", "medium", "low", "routine"]) {
+    counts[k] = ((prev.counts && prev.counts[k]) || 0) + ((cur.counts && cur.counts[k]) || 0);
+  }
+  const seen = new Set();
+  const highlights = [...(prev.highlights || []), ...(cur.highlights || [])]
+    .filter((h) => { const k = `${h.teamJa}|${h.statement}`; if (seen.has(k)) return false; seen.add(k); return true; })
+    .sort((a, b) => (IMP_ORDER[b.level] || 0) - (IMP_ORDER[a.level] || 0))
+    .slice(0, 5);
+  const notableCount = counts.critical + counts.high;
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  return {
+    counts, notableCount, highlights,
+    summaryJa: notableCount > 0
+      ? `本日学んだ${total}件のうち、${counts.critical}件が最重要、${counts.high}件が重要でした。`
+      : `本日学んだ${total}件は、いずれも日常的な更新の範囲でした(特筆すべき変化はありませんでした)。`,
+  };
+}
+
+// 成長ログに載せるリストの上限。重複を除いたうえで先頭N件だけ残し、
+// 打ち切った場合は「何件省略したか」を正直に記す(黙って捨てない)。
+//
+// ■ 第6次監査(第5次の修正内容そのものの検証)で発見した2つの不具合の修正
+//   (1) この関数は最初、文字列だけを想定して `typeof s === "string"` で
+//       絞り込んでいた。ところが failureReasonsToday / successReasonsToday は
+//       **オブジェクトの配列**({id, labelJa, detail, teamEn})である。
+//       その結果、同じ日に2回目の実行が走ると、今日分析した失敗理由・成功理由が
+//       **まるごと消える**という深刻な後退を招いていた
+//       (Renderのスリープ復帰や6時間ごとのcronで、同日2回目は日常的に起きる)。
+//   (2) 重複を「(N件)」と文面に書き足していたため、次の実行でその文字列を
+//       もう一度この関数に通すと「(2件)(2件)」と入れ子になり、
+//       件数そのものも誤りになっていた。
+//   対策: 文字列でもオブジェクトでも扱えるようにし、件数は文面に書き足さず
+//   別フィールド(occurrences)として持つ。文面は決して書き換えない。
+const GROWTH_LOG_LIST_CAP = 60;
+function capList(list, cap = GROWTH_LOG_LIST_CAP) {
+  const items = (list || []).filter((v) => v !== null && v !== undefined && v !== "");
+  // 同じ内容が何度出たかは残す価値があるので、内容をキーにまとめる。
+  // 文字列はそのまま、オブジェクトはJSONを鍵にする(文面は一切変えない)。
+  const COUNT_SUFFIX = /【(\d+)回】$/;
+  const byKey = new Map();
+  for (const v of items) {
+    // 前回の実行で付けた「【N回】」を一度はがしてから数え直す。
+    // これをしないと再実行のたびに入れ子になり、件数も誤りになる。
+    const isStr = typeof v === "string";
+    const m = isStr ? v.match(COUNT_SUFFIX) : null;
+    const base = isStr ? (m ? v.slice(0, m.index) : v) : v;
+    const n = m ? Number(m[1]) : (!isStr && v && Number.isFinite(v.occurrences) ? v.occurrences : 1);
+    let bare = base;
+    if (!isStr && base && typeof base === "object" && "occurrences" in base) {
+      bare = { ...base }; delete bare.occurrences;
+    }
+    let key;
+    try { key = isStr ? bare : JSON.stringify(bare); } catch (e) { key = String(bare); }
+    const hit = byKey.get(key);
+    if (hit) hit.occurrences += n;
+    else byKey.set(key, { value: bare, occurrences: n });
+  }
+  const unique = Array.from(byKey.values()).map(({ value, occurrences }) => {
+    if (occurrences <= 1) return value;
+    // 文字列は別フィールドを持てないため、末尾に一度だけ回数を付ける。
+    if (typeof value === "string") return `${value}【${occurrences}回】`;
+    return { ...value, occurrences };
+  });
+  if (unique.length <= cap) return unique;
+  return [...unique.slice(0, cap), `…ほか${unique.length - cap}種類を省略しました(表示件数の上限${cap}件)`];
 }
 
 async function runDailyLearning(deps) {
   const {
     callApiFootball, resolveTeamId,
     upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON,
-    now, generateLLM, getApiPlanInfo,
+    now, generateLLM, getApiPlanInfo, getSharedApiBudget,
+    // 第7次監査で追加: 日付キーの基準となるタイムゾーンを呼び出し側から渡す。
+    // これが無いとUTC基準になり、日本の利用者が「今朝動いた」と感じる実行が
+    // 前日の記録として保存され、健康診断が一日中「実行記録がありません」と
+    // 誤報していた。未指定なら従来通りUTC(既存のテストとの後方互換)。
+    appDateKey: appDateKeyFn,
+    // 2026年8月・優先順位⑲/⑳で追加(いずれも任意。未指定でも従来通り動く)
+    //   knowledgeGraph  … クラブ→監督→戦術→選手→怪我→布陣→試合→分析→学習結果 を
+    //                     相互に辿れる知識グラフ
+    //   thoughtTimeline … 見立て→きっかけ→予測→結果→学び を1本の線として記録する
+    knowledgeGraph, thoughtTimeline,
   } = deps;
   const nowFn = typeof now === "function" ? now : () => new Date();
   const runAt = nowFn();
-  const dateKey = runAt.toISOString().slice(0, 10); // YYYY-MM-DD
+  const dateKey = typeof appDateKeyFn === "function"
+    ? appDateKeyFn(runAt)
+    : runAt.toISOString().slice(0, 10); // YYYY-MM-DD(利用者のいる地域の「今日」)
   // 2026年8月・完全自動Learning Cycle ⑧「Learning Time」: 学習にかかった実時間を計測する。
   const learningStartedAtMs = Date.now();
 
@@ -297,6 +456,71 @@ async function runDailyLearning(deps) {
   }
 
   const knowledgeStore = createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON });
+  // 2026年8月・優先順位⑫: その日に学んだ内容を「重要度つき」で集める。
+  // 単に件数を数えるのではなく、何が最重要だったかを利用者へ伝えるため。
+  const learnedWithImportance = [];
+  // 実データから拾った手がかりを、クラブごとに集約しておく
+  // (重要度の判定は、1つの事実だけでなく「そのクラブに今日何が起きたか」を
+  //  まとめて見た方が正確になるため)。
+  const teamSignals = new Map();
+  const signalOf = (nameEn) => {
+    if (!teamSignals.has(nameEn)) teamSignals.set(nameEn, {});
+    return teamSignals.get(nameEn);
+  };
+  /**
+   * 知識を保存し、同時に「なぜ学ぶ価値があると判断したか」を記録する。
+   * 既存の saveKnowledgeItem をそのまま使うので、保存の挙動は変えていない。
+   */
+  // どのカテゴリの知識に、どの手がかりを使ってよいか。
+  //
+  // ■ 監査で発見した重大な欠陥の修正
+  //   当初はクラブ単位で集めた手がかり(監督交代・移籍件数など)を、
+  //   **そのクラブの全ての知識に無条件で適用**していた。その結果、
+  //   「直近5試合の得失点差が上昇しました(+0.31)」という何でもない事実に対して
+  //   「監督が交代しました。だから最優先で学ぶべきと判断しました」という
+  //   **その項目とは無関係な理由**が付き、しかもそれが画面の最も目立つ場所に
+  //   「AIがこれを学ぶべきと判断した理由」として表示されていた。
+  //   理由が事実と食い違っている以上、これはでっち上げそのものだった。
+  //   知識の種類ごとに、その項目について語ってよい手がかりだけを使う。
+  const SIGNALS_ALLOWED_BY_CATEGORY = {
+    coachChange: ["coachChanged"],
+    transferImpact: ["transferCount"],
+    injuries: ["injuryCount", "previousInjuryCount"],
+    recentFormTrend: ["formDelta", "streak"],
+    homeAway: ["formDelta"],
+    matchReflection: ["predictionMissMargin"],
+    predictionFailureReason: ["predictionMissMargin"],
+    predictionContextualFailure: ["predictionMissMargin"],
+    predictionSuccessReason: [],
+  };
+  const saveWithImportance = async (item, extraSignals) => {
+    const result = await knowledgeStore.saveKnowledgeItem(item);
+    if (result.saved) {
+      const allowed = SIGNALS_ALLOWED_BY_CATEGORY[item.category] || [];
+      const clubSignals = teamSignals.get(item.teamEn) || {};
+      const picked = {};
+      for (const k of allowed) if (clubSignals[k] !== undefined) picked[k] = clubSignals[k];
+      const importance = assessImportance({
+        category: item.category,
+        ...picked,
+        ...(extraSignals || {}),
+      });
+      learnedWithImportance.push({
+        teamEn: item.teamEn, teamJa: item.teamJa || item.teamEn,
+        category: item.category, statement: item.statement, importance,
+      });
+      // 重要度と判断理由は知識そのものにも書き戻す(後から検証できるように)
+      // 監査の指摘への対応: 上限もTTLも無いまま書き続けていた。
+      // 知識そのものの失効(最長60日)より長く残す意味は無いので、90日で消す。
+      await upstashSetJSON(`knowledge:importance:${result.hash}`, {
+        level: importance.level, score: importance.score,
+        reasonJa: importance.reasonJa, signals: importance.signals,
+        recordedAt: runAt.toISOString(),
+      }).catch(() => {});
+      await upstashCmd(["EXPIRE", `knowledge:importance:${result.hash}`, "7776000"]).catch(() => {});
+    }
+    return result;
+  };
   // 2026年8月・優先順位⑦: APIリクエスト予算ガード。1日の上限に静かに突き当たって
   // 「エラーだらけで知識0件」になる事故(優先順位⑨のご指摘)を防ぐため、消費量を
   // 記録し、予算が尽きそうなときはオプション扱いの処理を理由つきで見送る。
@@ -327,12 +551,19 @@ async function runDailyLearning(deps) {
     effectiveDailyBudget = DEFAULT_DAILY_BUDGET;
     budgetSourceJa = `既定値(${DEFAULT_DAILY_BUDGET}件/日・無料プラン想定)を採用しました。`;
   }
-  const apiBudget = createApiBudget({
-    upstashEnabled, upstashGetJSON, upstashSetJSON,
-    dailyBudget: effectiveDailyBudget,
-    userReserve: Number(process.env.API_USER_RESERVE) || DEFAULT_USER_RESERVE,
-  });
-  await apiBudget.init(dateKey);
+  // 2026年8月・API予算ガードの構造的修正:
+  // 予算チェックは callApiFootball の内部へ移した(どこから呼んでも必ず通る)。
+  // ここで別インスタンスを作ると二重計上になるため、server.js が持つ
+  // 共有インスタンスを使う。注入されていない場合(単体テスト等)だけ自前で作る。
+  const usingSharedBudget = (typeof getSharedApiBudget === "function");
+  const apiBudget = usingSharedBudget
+    ? await getSharedApiBudget()
+    : createApiBudget({
+      upstashEnabled, upstashGetJSON, upstashSetJSON,
+      dailyBudget: effectiveDailyBudget,
+      userReserve: Number(process.env.API_USER_RESERVE) || DEFAULT_USER_RESERVE,
+    });
+  if (typeof getSharedApiBudget !== "function") await apiBudget.init(dateKey);
   const memoryStore = createMemoryStore({ upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON });
   const relationshipIndex = createRelationshipIndex({ upstashEnabled, upstashGetJSON, upstashSetJSON });
   const clubProfileEngine = createClubProfileEngine({ generateLLM, knowledgeStore, setRelation: relationshipIndex.setRelation });
@@ -443,6 +674,26 @@ async function runDailyLearning(deps) {
           `直近試合の平均得点: ${cached.avgGoalsFor ?? "不明"}、平均失点: ${cached.avgGoalsAgainst ?? "不明"}`,
           `直近7日間の試合数(過密日程の目安): ${cached.matchesLast7Days ?? "不明"}`,
         ].join("\n");
+
+        // ---- 第5次監査で発見した「知識の水増し」への対策 ----
+        //   LLMは同じ入力を与えても毎回わずかに違う文面を返す。Knowledge Engineの
+        //   重複排除は文面のハッシュで判定するため、**実データがまったく
+        //   変わっていない日でも「新しい知識を獲得した」と記録され続けていた**。
+        //   さらに同日に複数回実行されると、その水増しが足し算されていた。
+        //   結果として「昨日より賢くなりましたか?」という問いに、この仕組みは
+        //   構造的に「はい」としか答えられなくなっていた。
+        //
+        //   対策: 根拠となる実データが前回と1文字も変わっていない場合は、
+        //   LLMを呼ばずにスキップする。API/LLMのコストも同時に下がる。
+        //   実データが動いた日にだけ見解を作り直すので、
+        //   「知識が増えた=実際に何かが変わった」が成り立つようになる。
+        const groundingKey = `learn:aiview:grounding:${team.nameEn}`;
+        const groundingHash = stableTextHash(factsBlock);
+        const prevGrounding = await upstashCmd(["GET", groundingKey]).catch(() => null);
+        if (prevGrounding && String(prevGrounding) === groundingHash) {
+          aiViewsUnchanged++;
+          continue;
+        }
         const systemPrompt = [
           "あなたはサッカークラブを毎日観察しているアナリストAIです。",
           "与えられた最新の実データだけを根拠に、このクラブについて今日のあなたの見解を1文(60文字以内)で述べてください。",
@@ -463,6 +714,9 @@ async function runDailyLearning(deps) {
         const parsed = JSON.parse(text.slice(start, end + 1));
         const viewStatement = String(parsed.view || "").slice(0, 200).trim();
         if (!viewStatement) continue;
+        // 実データが動いたので、次回の比較用に今回の根拠を記録しておく
+        // (48時間で自動削除。復活しても最悪もう一度生成されるだけで害はない)
+        await upstashCmd(["SET", groundingKey, groundingHash, "EX", "172800"]).catch(() => {});
 
         const saveResult = await memoryStore.saveConclusion(
           `team:${team.nameEn}:dailyView`,
@@ -529,10 +783,20 @@ async function runDailyLearning(deps) {
           if (coachSaveResult.changed && coachSaveResult.reason === "CHANGED") {
             coachChangesDetectedToday++;
             const statement = `${team.nameJa}の監督が交代しました: ${coachSaveResult.previousStatement} → ${coachInfo.currentCoachName}。`;
-            await knowledgeStore.saveKnowledgeItem({
+            signalOf(team.nameEn).coachChanged = true;
+            await saveWithImportance({
               teamEn: team.nameEn, teamJa: team.nameJa, category: "coachChange", type: "fact",
               statement, computedAt: runAt.toISOString(), source: "API-Footballの実データ(/coachs)",
             });
+            // 優先順位⑲: 知識グラフへ「クラブ→監督」の辺を張る(逆方向も辿れる)
+            if (knowledgeGraph) {
+              await knowledgeGraph.addEdge({
+                fromType: "team", fromId: team.nameEn, fromLabelJa: team.nameJa,
+                relation: "manager", toType: "coach", toId: coachInfo.currentCoachName,
+                toLabelJa: coachInfo.currentCoachName, sinceAt: runAt.toISOString(),
+                meta: { source: "API-Football /coachs" },
+              }).catch(() => {});
+            }
             otherFactsToday.push({ teamEn: team.nameEn, teamJa: team.nameJa, statement, category: "coachChange" });
           }
         }
@@ -546,11 +810,27 @@ async function runDailyLearning(deps) {
         const recentTransfers = summarizeTransfers(transfersData && transfersData.response, teamId, 5, sinceDate);
         for (const t of recentTransfers) {
           const statement = `${team.nameJa}: ${t.playerName}が${t.counterpart || "不明"}${t.direction === "加入" ? "から加入" : "へ退団"}しました(${t.date ? t.date.slice(0, 10) : "日付不明"})。`;
-          const saveResult = await knowledgeStore.saveKnowledgeItem({
+          // 監査で発見した欠陥の修正:
+          //   /transfers は直近30日ぶんを返すため、同じ移籍が30日間ずっと数えられ、
+          //   「直近で3件の移籍がありました。最優先で学ぶべき」という判定が
+          //   1か月間毎日続いていた。新しく保存できたもの(=初めて知ったもの)
+          //   だけを数える。件数の加算は保存の成否が分かった後に行う。
+          const sig = signalOf(team.nameEn);
+          const saveResult = await saveWithImportance({
             teamEn: team.nameEn, teamJa: team.nameJa, category: "transferImpact", type: "fact",
             statement, computedAt: runAt.toISOString(), source: "API-Footballの実データ(/transfers)",
           });
+          // 優先順位⑲: 「クラブ→加入/退団した選手」の辺(選手側から逆引きもできる)
+          if (knowledgeGraph && t.playerName) {
+            await knowledgeGraph.addEdge({
+              fromType: "team", fromId: team.nameEn, fromLabelJa: team.nameJa,
+              relation: t.direction === "加入" ? "transferredIn" : "transferredOut",
+              toType: "player", toId: t.playerName, toLabelJa: t.playerName,
+              sinceAt: t.date || null, meta: { counterpart: t.counterpart || null },
+            }).catch(() => {});
+          }
           if (saveResult.saved) {
+            sig.transferCount = (sig.transferCount || 0) + 1;
             transferFactsAddedToday++;
             otherFactsToday.push({ teamEn: team.nameEn, teamJa: team.nameJa, statement, category: "transferImpact" });
           }
@@ -597,6 +877,9 @@ async function runDailyLearning(deps) {
   }
 
   // ---- ② 保留中の自社予測を解決(試合が終わっていれば的中/不的中を確定) ----
+  // 2026年8月・ご指示⑨: 解決した予測はその場で全市場(勝敗/BTTS/Over-Under/
+  // スコア)の採点を行い、日次の精度記録(learn:accuracy:<date>)に積む。
+  const resolvedScoredToday = [];
   const pendingIds = (await upstashCmd(["LRANGE", "learn:ownpred:pending", "0", String(OWN_PREDICT_RESOLVE_CAP - 1)]).catch(() => [])) || [];
   for (const fixtureIdStr of pendingIds) {
     try {
@@ -618,13 +901,42 @@ async function runDailyLearning(deps) {
         errors.push(`prediction_unresolvable:${fixtureIdStr}:${shortStatus}`);
         continue;
       }
-      if (!fx || !fx.fixture || shortStatus !== "FT") continue; // まだ終わっていない
+      // 第5次監査で発見した「もう一つの先頭詰まり」の修正:
+      //   上のステータス判定は fx が取れている場合しか働かない。
+      //   /fixtures?id=… が**空の応答を返す**(試合IDが振り直された・
+      //   シーズン移行で消えた等)場合、fx は null のまま下の continue に落ち、
+      //   そのIDは保留キューから永久に消えなかった。これが10件たまると
+      //   検証が完全に止まり、通算検証数が10件に届かないため
+      //   **重みの学習が二度と実行されない**(=もう賢くならない)。
+      //   しかも毎日10件のAPIリクエストを無駄に使い続ける。
+      //   何度確認しても存在しない試合は、確認回数を記録したうえで打ち切る。
+      if (!fx || !fx.fixture) {
+        const attempts = (Number(record.resolveAttempts) || 0) + 1;
+        record.resolveAttempts = attempts;
+        await upstashSetJSON(`learn:ownpred:${fixtureIdStr}`, record);
+        if (attempts >= 3) {
+          await upstashCmd(["LREM", "learn:ownpred:pending", "0", fixtureIdStr]).catch(() => {});
+          errors.push(`prediction_fixture_missing:${fixtureIdStr}:${attempts}回確認しても試合が見つからないため検証を打ち切りました`);
+        } else {
+          errors.push(`prediction_fixture_not_found:${fixtureIdStr}:${attempts}`);
+        }
+        continue;
+      }
+      if (shortStatus !== "FT") continue; // まだ終わっていない
       const actualWinner = outcomeFromScore(fx.goals.home, fx.goals.away);
       if (!actualWinner) continue;
       record.resolved = true;
       record.actualWinner = actualWinner;
       record.correct = actualWinner === record.predictedWinner;
       record.resolvedAt = runAt.toISOString();
+      // 2026年8月・ご指示⑨: 実スコアを保存する(BTTS・Over/Under・スコア一致の
+      // 採点に必要。従来は勝敗しか残しておらず、市場別の精度が測れなかった)。
+      record.actualScore = { home: fx.goals.home, away: fx.goals.away };
+      // 全市場の採点(Brier・LogLoss・的中)。予測時のポアソンλから機械的に導出。
+      try {
+        record.marketScores = scorePrediction(record);
+        if (record.marketScores) resolvedScoredToday.push(record.marketScores);
+      } catch (e) { errors.push(`accuracy_scoring_failed:${fixtureIdStr}:${e.message}`); }
 
       // ---- Failure Learning(ご要望①): 外れた場合は「何故外れたのか」を分類して保存する ----
       // 従来は正解/不正解のカウントだけで、原因は一切記録していなかった。
@@ -647,7 +959,8 @@ async function runDailyLearning(deps) {
       let contextualFailureReasons = [];
       if (!record.correct) {
         let resolvedContext = null;
-        const canSpendLineup = apiBudget ? apiBudget.tryReserve(1, "外れた試合のスタメン照合").allowed : true;
+        // 予算はcallApiFootball内で確保されるため、ここでは消費せず残量だけ確認する(二重計上の防止)
+        const canSpendLineup = apiBudget ? apiBudget.canAfford(1) : true;
         if (canSpendLineup) {
           try {
             const lu = await callApiFootball("/fixtures/lineups", { fixture: fixtureIdStr });
@@ -708,17 +1021,65 @@ async function runDailyLearning(deps) {
       try {
         const reflection = buildReflectionText(record, record.weightsSnapshot, failureReasons);
         const outcomeLabelJa = (w) => (w === "home" ? "ホーム勝利" : w === "away" ? "アウェイ勝利" : "引き分け");
+
+        // ---- 優先順位⑫: 「大きく外した予測ほど学びが大きい」を数値で判定する ----
+        // 予測時に、勝つと思っていた側へ何%の確率を与えていたか。
+        // 自信を持っていたほど、外れたときの学びが大きい。
+        const confidenceOnPick = (() => {
+          const p = record.winProbability || record.probabilities || null;
+          if (!p) return null;
+          if (record.predictedWinner === "home" && Number.isFinite(p.homeWinPct)) return p.homeWinPct / 100;
+          if (record.predictedWinner === "away" && Number.isFinite(p.awayWinPct)) return p.awayWinPct / 100;
+          if (record.predictedWinner === "draw" && Number.isFinite(p.drawPct)) return p.drawPct / 100;
+          return null;
+        })();
+        const missMargin = (!record.correct && Number.isFinite(confidenceOnPick)) ? confidenceOnPick : null;
+
+        // ---- 優先順位⑳: 「予測 → 結果 → 答え合わせ → 学んだこと」を時系列へ ----
+        // これまでは知識として1件保存するだけで、因果の並びは残っていなかった。
+        if (thoughtTimeline && record.originTeamEn) {
+          // 監査で発見した欠陥の修正:
+          //   予測・結果・学びを「見立て」と同じキーへ書いていたため、
+          //   1試合につき3件ずつ積まれ、上限60件で**過去の見立てが押し出されて
+          //   消えていた**(約20試合で全滅)。そうなると「以前と比べて考えが
+          //   変わった理由」が永久に説明できなくなる。試合の答え合わせは別の線にする。
+          const tlKey = `team:${record.originTeamEn}:matches`;
+          await thoughtTimeline.recordOutcome(tlKey, {
+            predictionJa: `${record.homeTeamEn} vs ${record.awayTeamEn} は${outcomeLabelJa(record.predictedWinner)}と予測しました。`,
+            resultJa: `実際は${outcomeLabelJa(record.actualWinner)}でした(${record.correct ? "的中" : "不的中"})。`,
+            correct: record.correct,
+            lessonJa: reflection.improvement,
+            evidence: [reflection.why].filter(Boolean),
+            at: runAt.toISOString(),
+          }).catch(() => {});
+        }
         const statement = [
           `【振り返り】${record.homeTeamEn} vs ${record.awayTeamEn}`,
           `予想: ${outcomeLabelJa(record.predictedWinner)} / 結果: ${outcomeLabelJa(record.actualWinner)}(${record.correct ? "的中" : "不的中"})`,
           `理由: ${reflection.why}`,
           `改善点: ${reflection.improvement}`,
         ].join(" ");
-        await knowledgeStore.saveKnowledgeItem({
+        await saveWithImportance({
           teamEn: record.originTeamEn || record.homeTeamEn, category: "matchReflection", type: "reflection",
           statement, detail: { predicted: record.predictedWinner, actual: record.actualWinner, correct: record.correct, failureReasons, ...reflection },
           computedAt: runAt.toISOString(), source: "試合結果と予測時点の特徴量・重みから機械的に生成(LLM不使用)",
-        });
+        }, { predictionMissMargin: missMargin });
+        // 優先順位⑲: 「クラブ→試合→分析」の連鎖を知識グラフへ張る
+        if (knowledgeGraph && record.originTeamEn) {
+          const matchId = `${record.homeTeamEn} vs ${record.awayTeamEn}#${fixtureIdStr}`;
+          await knowledgeGraph.addEdge({
+            fromType: "team", fromId: record.originTeamEn, relation: "playedMatch",
+            toType: "match", toId: matchId, toLabelJa: `${record.homeTeamEn} vs ${record.awayTeamEn}`,
+            sinceAt: runAt.toISOString(),
+            meta: { predicted: record.predictedWinner, actual: record.actualWinner, correct: record.correct },
+          }).catch(() => {});
+          await knowledgeGraph.addEdge({
+            fromType: "match", fromId: matchId, relation: "learnedFrom",
+            toType: "lesson", toId: `${fixtureIdStr}:${record.correct ? "hit" : "miss"}`,
+            toLabelJa: reflection.improvement ? String(reflection.improvement).slice(0, 60) : (record.correct ? "的中" : "不的中"),
+            sinceAt: runAt.toISOString(),
+          }).catch(() => {});
+        }
         reflectionsSaved++;
 
         // ---- Failure Learning(ご要望①続き): 外れた理由を単独のKnowledge Engine
@@ -793,6 +1154,23 @@ async function runDailyLearning(deps) {
     }
   }
 
+  // ---- ②-b 今日答え合わせした予測の精度を市場別に記録する(ご指示⑨) ----
+  // 的中率だけでなくBrier Score・Log Loss・較正の材料を日次で保存し、
+  // 昨日・先週・先月との比較を可能にする。答え合わせが0件の日は保存しない
+  // (存在しない測定値を作らない)。
+  if (resolvedScoredToday.length) {
+    try {
+      const aggToday = buildDailyAccuracy(resolvedScoredToday);
+      await saveDailyAccuracy({ upstashEnabled, upstashGetJSON, upstashSetJSON }, dateKey, aggToday);
+    } catch (e) { errors.push(`accuracy_save_failed:${e.message}`); }
+  }
+
+  // 2026年8月・「本当に毎日賢くなるAI」フェーズで追加した記録用の変数。
+  let weightsMetaUsedToday = null; // 今日の予測が実際に使った重みのversion/更新時刻(ご指示①③④の証明)
+  let featureEffectivenessToday = null; // ご指示⑧: 特徴量ごとの有効性の実測
+  let predictionShiftToday = null; // ご指示①: 学習で予測がどう変わったか
+  let agendaAppliedToday = null; // ご指示⑩: 前回の学習計画を今日の収集に反映した内容
+
   // ---- ③ 登録クラブの直近の試合について、新しく自社予測を立てる ----
   // 日付ベースでどのクラブから調べ始めるかをずらし、特定のクラブだけ毎回
   // リクエストが偏らないようにする(単純なローテーション)。
@@ -826,8 +1204,12 @@ async function runDailyLearning(deps) {
       }
       const homeForm = isHome ? cached || teamFormCache.get(team.nameEn) : opponentForm;
       const awayForm = isHome ? opponentForm : cached || teamFormCache.get(team.nameEn);
-      const homeFormScore = (homeForm && homeForm.currentFormScore) || 0;
-      const awayFormScore = (awayForm && awayForm.currentFormScore) || 0;
+      // 第6次監査の修正: `|| 0` だと、実際に得失点差が0だった場合と
+      // データが取れなかった場合を区別できず、後者を「0」として記録に残していた。
+      // 記録には正直にnullを入れる(v1バックテストは typeof === "number" で
+      // 絞り込むため、nullの記録は自動的に対象外になる)。
+      const homeFormScore = (homeForm && Number.isFinite(homeForm.currentFormScore)) ? homeForm.currentFormScore : null;
+      const awayFormScore = (awayForm && Number.isFinite(awayForm.currentFormScore)) ? awayForm.currentFormScore : null;
 
       // ---- Prediction Engine v2: 追加特徴量(怪我人・順位・過去対戦)を取得する ----
       // このループはOWN_PREDICT_LOG_CAP(既定5)件/回に絞られているため、ここで
@@ -840,8 +1222,14 @@ async function runDailyLearning(deps) {
       const [homeInjuries, awayInjuries, homeStandings, awayStandings, h2h] = await Promise.all([
         fetchInjuryCountFeature(homeTeamId, season, callApiFootball),
         fetchInjuryCountFeature(awayTeamId, season, callApiFootball),
+        // 第4次監査で発見した欠陥の修正: 両チームの順位を同じリーグIDで引いていたため、
+        // アウェイチームがそのリーグの順位表に載っていない場合(別リーグ・カップ戦の
+        // 相手など)に points/played が0扱いになり、standingsDiff が
+        // 「ホームの勝点/試合 − 0」という誤った大きな差になっていた。
+        // オンデマンド分析側(server.js)は既にチームごとにリーグIDを推定しているので、
+        // 日次ジョブ側も同じ扱いに揃える。
         fetchStandingsFeature(leagueId, season, homeTeamId, callApiFootball),
-        fetchStandingsFeature(leagueId, season, awayTeamId, callApiFootball),
+        fetchStandingsFeature(inferLeagueIdFromFixtures(awayForm.fixtures || []) || leagueId, season, awayTeamId, callApiFootball),
         fetchHeadToHeadFeature(homeTeamId, awayTeamId, callApiFootball),
       ]);
       // ---- 2026年8月・優先順位②: Proプラン移行に伴う特徴量の拡張 ----
@@ -863,61 +1251,43 @@ async function runDailyLearning(deps) {
       const homeCoachNameAtPrediction = await readCoachName(isHome ? team.nameEn : opponentName);
       const opponentCoachNameAtPrediction = await readCoachName(isHome ? opponentName : team.nameEn);
 
-      const homeSplit = computeHomeAwaySplit(homeForm.fixtures || [], homeTeamId);
-      const awaySplit = computeHomeAwaySplit(awayForm.fixtures || [], awayTeamId);
-
-      // ---- xG(期待得点)とエースの得点力を取得する(2026年8月・優先順位②) ----
-      // xGは1試合につき1リクエスト必要なため、必ず予算ガードを通す
-      // (Proプランでも無制限ではないので、直近XG_SAMPLE_FIXTURES試合に絞る)。
-      // 取得できなかった場合はnullのままにして、予測に影響させない
-      // (0を入れると「チャンスの質が最低」と誤解釈されてしまうため)。
+      // ---- 2026年8月・ご指示③: 共通Feature Engineで特徴量を組み立てる ----
+      // オンデマンド分析(server.js)と同じ関数を通すことで、
+      // 「片方だけ新特徴量が0」というズレが構造的に起きないようにする。
       const XG_SAMPLE_FIXTURES = Number(process.env.XG_SAMPLE_FIXTURES) || 5;
-      const canSpendXg = () => (apiBudget ? apiBudget.tryReserve(1, "xGの取得").allowed : true);
+      const canSpendXg = () => (apiBudget ? apiBudget.canAfford(1) : true);
       const [homeXg, awayXg, homeTop, awayTop] = await Promise.all([
-        fetchTeamXgAverage(homeForm.fixtures || [], homeTeamId, callApiFootball, { limit: XG_SAMPLE_FIXTURES, canSpend: canSpendXg }),
-        fetchTeamXgAverage(awayForm.fixtures || [], awayTeamId, callApiFootball, { limit: XG_SAMPLE_FIXTURES, canSpend: canSpendXg }),
-        // 得点ランキングは優先順位⑥のリーグ日次取得と同じエンドポイントなので、
-        // 同じ実行内で複数回呼ばれてもキャッシュ(teamTopScorerCache)で1回に抑える。
+        fetchTeamXgAverage(homeForm.fixtures || [], homeTeamId, callApiFootball, { limit: XG_SAMPLE_FIXTURES, canSpend: canSpendXg }).catch(() => ({ xgNet: null })),
+        fetchTeamXgAverage(awayForm.fixtures || [], awayTeamId, callApiFootball, { limit: XG_SAMPLE_FIXTURES, canSpend: canSpendXg }).catch(() => ({ xgNet: null })),
         (async () => {
           const key = `${leagueId}:${homeTeamId}`;
           if (teamTopScorerCache.has(key)) return teamTopScorerCache.get(key);
-          const r = await fetchTeamTopScorer(leagueId, season, homeTeamId, callApiFootball);
-          teamTopScorerCache.set(key, r);
-          return r;
+          const r = await fetchTeamTopScorer(leagueId, season, homeTeamId, callApiFootball).catch(() => ({ player: null }));
+          teamTopScorerCache.set(key, r); return r;
         })(),
         (async () => {
           const key = `${leagueId}:${awayTeamId}`;
           if (teamTopScorerCache.has(key)) return teamTopScorerCache.get(key);
-          const r = await fetchTeamTopScorer(leagueId, season, awayTeamId, callApiFootball);
-          teamTopScorerCache.set(key, r);
-          return r;
+          const r = await fetchTeamTopScorer(leagueId, season, awayTeamId, callApiFootball).catch(() => ({ player: null }));
+          teamTopScorerCache.set(key, r); return r;
         })(),
       ]);
-      if (homeXg && homeXg.reasonJa && !homeXg.sampleSize) errors.push(`xg_unavailable:${homeForm.teamId}:${homeXg.reasonJa}`);
-      const homeCtx = {
-        formScore: homeFormScore, avgGoalsFor: homeForm.avgGoalsFor, avgGoalsAgainst: homeForm.avgGoalsAgainst,
-        injuryCount: homeInjuries.injuryCount, pointsPerGame: homeStandings.played ? (homeStandings.points / homeStandings.played) : null,
-        matchesLast7Days: homeForm.matchesLast7Days,
-        // ホームチームは「ホームでの勝率」で評価する(会場を区別しないformScoreとは別の情報)
-        homeVenueWinRate: homeSplit.home.winRate,
-        suspensionCount: (homeInjuries.suspendedPlayers || []).length,
-        xgNet: homeXg.xgNet ?? null,
-        topScorerGoals: (homeTop && homeTop.player) ? homeTop.player.goals : null,
-      };
-      const awayCtx = {
-        formScore: awayFormScore, avgGoalsFor: awayForm.avgGoalsFor, avgGoalsAgainst: awayForm.avgGoalsAgainst,
-        injuryCount: awayInjuries.injuryCount, pointsPerGame: awayStandings.played ? (awayStandings.points / awayStandings.played) : null,
-        matchesLast7Days: awayForm.matchesLast7Days,
-        // アウェイチームは「アウェイでの勝率」で評価する
-        awayVenueWinRate: awaySplit.away.winRate,
-        suspensionCount: (awayInjuries.suspendedPlayers || []).length,
-        xgNet: awayXg.xgNet ?? null,
-        topScorerGoals: (awayTop && awayTop.player) ? awayTop.player.goals : null,
-      };
-      const features = computeMatchFeatures(homeCtx, awayCtx, h2h);
+      const built = buildMatchFeatures(
+        { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXg, topScorer: homeTop },
+        { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXg, topScorer: awayTop },
+        h2h
+      );
+      const homeCtx = built.homeCtx;
+      const awayCtx = built.awayCtx;
+      const features = built.features;
 
       const storedWeightsRaw = (await upstashGetJSON("learn:weights")) || {};
       const weights = { ...EXTENDED_DEFAULT_WEIGHTS, ...storedWeightsRaw }; // 過去バージョンの重みにも新しいキーを補完
+      // 2026年8月・ご指示①③④の証明: 「昨日の学習が今日の予測に反映された」を
+      // ログで示せるよう、今日の予測が実際に使った重みのversion/更新時刻を記録する。
+      // 重みは予測のたびにストレージから読み直すため、昨日更新された重みは
+      // 今日の最初の予測から必ず使われる(古い重みを使い続ける経路は存在しない)。
+      weightsMetaUsedToday = { version: weights.version ?? 0, updatedAt: weights.updatedAt || null };
       const { predictedWinner, homeLambda, awayLambda } = predictOutcomeV2(features, weights);
       const importance = computeFactorImportance(features, weights);
       const topFactor = importance.find((i) => i.stars > 0);
@@ -939,6 +1309,20 @@ async function runDailyLearning(deps) {
         kickoff: fx.fixture.date, loggedAt: runAt.toISOString(),
         resolved: false, actualWinner: null, correct: null, resolvedAt: null,
         originTeamEn: team.nameEn, stateHypothesis,
+        // 2026年8月・ご指示⑨: 最終スコア予想(ポアソン分布の最頻値)も記録し、
+        // 試合後にスコア一致まで採点できるようにする。
+        predictedScoreline: mostLikelyScoreline(homeLambda, awayLambda),
+        // ご指示③④の証明: この予測がどのversionの重みで行われたか。
+        weightsVersion: weights.version ?? 0,
+        // ご指示⑤: この予測に使ったデータの信頼度(出所×鮮度)。すべて今取得した
+        // 実データのため取得直後の信頼度になる。重み学習はこの信頼度で強弱をつける。
+        featureTrust: buildFeatureTrust([
+          { key: "form", source: "derived", kind: "form", computedAt: runAt.toISOString() },
+          { key: "injuries", source: "api-football", kind: "injuries", computedAt: runAt.toISOString() },
+          { key: "standings", source: "api-football", kind: "standings", computedAt: runAt.toISOString() },
+          ...(homeXg && homeXg.xgNet !== null && awayXg && awayXg.xgNet !== null
+            ? [{ key: "xg", source: "api-football", kind: "xg", computedAt: runAt.toISOString() }] : []),
+        ], runAt.getTime()),
         // 2026年8月・優先順位③: モデルの外側にある原因(監督交代・スタメン変更等)を
         // 試合後に特定できるよう、予測時点の文脈を保存しておく。
         // ここでは追加のAPI呼び出しを増やさず、既に取得済みの情報だけを記録する
@@ -960,6 +1344,39 @@ async function runDailyLearning(deps) {
     }
   }
 
+  // ---- ③-b UEFA上位100クラブの知識収集(2026年8月・知識拡大フェーズ) ----
+  // ご指示①②③: 上位100クラブとその選手の実データを、更新頻度の階層つきで
+  // 毎日収集し、クラブ調査ファイル(kb:club:*)へ構造化して保存する。
+  // 自社予測の記録・検証(②③)より後に置くのは、監査で判明した
+  // 「学習の中核が予算切れで飢える」事故を繰り返さないため。
+  let universeStats = null;
+  try {
+    const clubDossier = createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON });
+    // 2026年8月・ご指示⑩: 前回の学習計画(AIが自分で決めた「次に学ぶテーマ」)を
+    // 読み、優先クラブを今日の収集で実際に優先させる(決めるだけで終わらせない)。
+    let priorityClubs = [];
+    try {
+      const latestAgenda = await loadLatestAgenda({ upstashEnabled, upstashGetJSON });
+      priorityClubs = priorityClubsOf(latestAgenda);
+      if (priorityClubs.length) {
+        agendaAppliedToday = {
+          generatedAt: latestAgenda.generatedAt || null,
+          priorityClubs,
+          noteJa: `前回の学習計画に基づき、${priorityClubs.length}クラブ(苦手と実測されたクラブ)を今日の収集で優先しました。`,
+        };
+      }
+    } catch (e) { /* 計画が無ければ通常の輪番のみ */ }
+    universeStats = await collectUniverse({
+      callApiFootball, apiBudget, clubDossier, knowledgeStore,
+      knowledgeGraph, thoughtTimeline, computeFormScore,
+      recordLearned: saveWithImportance,
+      priorityClubs,
+    }, runAt, dateKey);
+    if (universeStats.errors && universeStats.errors.length) errors.push(...universeStats.errors);
+  } catch (e) {
+    errors.push(`universe_collection_failed:${e.message}`);
+  }
+
   // ---- ④ 十分な検証データが溜まっていれば、モデルの重みを再調整する ----
   const totalResolvedRaw = await upstashCmd(["GET", "learn:ownpred:resolved"]).catch(() => null);
   const totalCorrectRaw = await upstashCmd(["GET", "learn:ownpred:correct"]).catch(() => null);
@@ -967,84 +1384,235 @@ async function runDailyLearning(deps) {
   const totalCorrect = parseInt(totalCorrectRaw, 10) || 0;
   const ownAccuracyBefore = totalResolved > 0 ? Math.round((totalCorrect / totalResolved) * 1000) / 10 : null;
   let weightsUpdated = false;
+  // 第5次監査で発見した「単位のすり替え」の修正。
+  //   ownAccuracyBefore は**通算**の的中率(累計正解 ÷ 累計検証済み)である。
+  //   ところが従来は、重みを更新した日にかぎって ownAccuracyAfter を
+  //   **その日のバックテストの的中率**で上書きしていた。まったく別の指標なので、
+  //   dailyMetrics が両者を引き算して「的中率がNポイント改善しました」と
+  //   表示していた数字は、単位の違いによる見かけの変化でしかなかった。
+  //   通算的中率は過去にさかのぼって良くなることはないので、重みの更新では
+  //   動かさない。モデルの良し悪しは v2AccuracyBefore/After(バックテスト)で
+  //   別枠で報告する。
   let ownAccuracyAfter = ownAccuracyBefore;
   let weightsUpdatedV2 = false; // Prediction Engine v2(拡張特徴量)の重みが更新されたか
   let v2AccuracyBefore = null;
   let v2AccuracyAfter = null;
+  let v1BacktestReference = null; // 旧v1モデルの的中率(参考値。採否の判定には使わない)
 
+  // 2026年8月・第5次監査での設計変更(ご指示「より良い設計を積極的に提案・実装して
+  // ください」に基づく)。
+  //
+  // ■ これまでの重大な設計上の誤り
+  //   重みの学習は2段構えになっていた。
+  //     ④-a グリッドサーチ(v1): sensitivity と homeBase を振ってみる
+  //     ④-b 勾配降下法(v2): 拡張特徴量10項目の重みを学習する
+  //   ところが両者は**同じ learn:weights キーへ書き込む**のに、
+  //   ④-a の採否は「v1モデル(フォームスコアだけを見る旧モデル)」の的中率で
+  //   判定していた。利用者に見えている予測は v2 モデルなのに、である。
+  //   その結果、v1の物差しでだけ良く見える重みが v2 の予測へ無検証で流し込まれ、
+  //   実測で**v2の的中率が 88.3% → 83.3% へ悪化した状態が、
+  //   「重みを更新しました。的中率が改善しました」という表示とともに保存される**
+  //   ことがシミュレーションで再現できた。
+  //
+  // ■ 変更後の設計
+  //   1) 物差しを1本にする。採否の判定は**必ず利用者が見ている v2 モデル**
+  //      (backtestAccuracyV2)で行う。v1の的中率は参考値としてのみ記録する。
+  //   2) ホールドアウト検証を導入する。直近30%を検証用に取り置き、残り70%で
+  //      学習・探索し、**検証用データでも改善している場合だけ採用**する。
+  //      これまでは同じデータで探して同じデータで採点していたため、
+  //      「改善」の多くは選択によるまぐれ(過学習)だった。
+  //   3) 保存の直前に isSaneWeights() を必ず通す。NaN・発散した値を弾く。
+  //   4) 書き込みの成否を確認してから「更新した」と報告する。
+  //      これまでは Upstash への書き込みが失敗しても成功表示をしていた。
+  //
+  // ■ 全体を try/catch で包む理由
+  //   このブロックが例外を投げると、後続の⑤(知識の保存)・成長ログ・
+  //   メトリクスまで丸ごと失われ、外からは「その日はジョブが動かなかった」と
+  //   しか見えなくなる(健康診断も「GitHub Actionsが動いていない可能性」と
+  //   誤った原因を表示する)。学習に失敗しても、その日の知識は必ず残す。
   if (totalResolved >= MIN_RESOLVED_FOR_RECALIBRATION) {
-    const recentRaw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "0", "-1"]).catch(() => [])) || [];
-    const recentRecords = recentRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
-    const currentWeights = (await upstashGetJSON("learn:weights")) || DEFAULT_WEIGHTS;
-    const currentBacktest = backtestAccuracy(recentRecords, currentWeights);
-    if (currentBacktest) {
-      // 実データに対する簡単な近傍探索(グリッドサーチ)。ディープラーニングではなく、
-      // 「今の重みの近くを少しだけ振ってみて、実データで的中率が上がるか試す」だけの
-      // 単純で説明可能な調整。
-      const candidates = [
-        currentWeights,
-        { ...currentWeights, sensitivity: currentWeights.sensitivity * 1.2 },
-        { ...currentWeights, sensitivity: currentWeights.sensitivity * 0.8 },
-        { ...currentWeights, homeBase: currentWeights.homeBase + 0.1 },
-        { ...currentWeights, homeBase: Math.max(0.8, currentWeights.homeBase - 0.1) },
-      ];
-      let best = { weights: currentWeights, result: currentBacktest };
-      for (const cand of candidates) {
-        const result = backtestAccuracy(recentRecords, cand);
-        if (result && result.accuracy > best.result.accuracy) best = { weights: cand, result };
-      }
-      let weightsAfterV1 = currentWeights;
-      if (best.weights !== currentWeights && best.result.accuracy > currentBacktest.accuracy) {
-        const newWeights = { ...best.weights, version: (currentWeights.version || 0) + 1, updatedAt: runAt.toISOString() };
-        await upstashSetJSON("learn:weights", newWeights);
-        weightsUpdated = true;
-        ownAccuracyAfter = best.result.accuracy;
-        weightsAfterV1 = newWeights;
-        await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
-          date: dateKey, adopted: true, method: "grid_search_v1", oldWeights: currentWeights, newWeights,
-          oldAccuracy: currentBacktest.accuracy, newAccuracy: best.result.accuracy, sampleSize: currentBacktest.sampleSize,
-        })]).catch(() => {});
-      } else {
-        await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
-          date: dateKey, adopted: false, method: "grid_search_v1", oldWeights: currentWeights, newWeights: null,
-          oldAccuracy: currentBacktest.accuracy, newAccuracy: null, sampleSize: currentBacktest.sampleSize,
-          note: "既存の重みを上回る候補が見つからなかったため更新なし",
-        })]).catch(() => {});
-      }
+    try {
+      const recentRaw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "0", "-1"]).catch(() => [])) || [];
+      const recentRecords = recentRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
+      const storedWeights = await upstashGetJSON("learn:weights");
+      const currentWeights = { ...EXTENDED_DEFAULT_WEIGHTS, ...DEFAULT_WEIGHTS, ...(storedWeights || {}) };
 
-      // ---- ④-b Prediction Engine v2: 拡張特徴量(怪我人・順位・過去対戦・過密日程等)の
-      // 重要度を、数値微分による勾配降下法で学習する(server/learning/predictionModel.js)。
-      // v1のグリッドサーチ(上記)とは独立して動く。record.featuresを持つ「新形式」の
-      // レコードがまだ無い/少ないうち(移行期間中)は自動的にスキップされる
-      // (backtestAccuracyV2がfeatures無しレコードを除外するため)。
-      const extendedCurrentWeights = { ...EXTENDED_DEFAULT_WEIGHTS, ...weightsAfterV1 };
-      const v2Backtest = backtestAccuracyV2(recentRecords, extendedCurrentWeights);
-      if (v2Backtest && v2Backtest.sampleSize >= 5) {
-        const fitted = fitWeightsGradientDescent(recentRecords, extendedCurrentWeights);
-        if (fitted) {
-          const fittedBacktest = backtestAccuracyV2(recentRecords, fitted);
-          if (fittedBacktest && fittedBacktest.accuracy > v2Backtest.accuracy) {
-            const newExtendedWeights = { ...fitted, version: (extendedCurrentWeights.version || 0) + 1, updatedAt: runAt.toISOString() };
-            await upstashSetJSON("learn:weights", newExtendedWeights);
-            weightsUpdatedV2 = true;
-            v2AccuracyBefore = v2Backtest.accuracy;
-            v2AccuracyAfter = fittedBacktest.accuracy;
-            await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
-              date: dateKey, adopted: true, method: "gradient_descent_v2", oldWeights: extendedCurrentWeights, newWeights: newExtendedWeights,
-              oldAccuracy: v2Backtest.accuracy, newAccuracy: fittedBacktest.accuracy, sampleSize: v2Backtest.sampleSize,
-            })]).catch(() => {});
-          } else {
-            v2AccuracyBefore = v2Backtest.accuracy;
-            v2AccuracyAfter = v2Backtest.accuracy;
-            await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
-              date: dateKey, adopted: false, method: "gradient_descent_v2", oldWeights: extendedCurrentWeights, newWeights: null,
-              oldAccuracy: v2Backtest.accuracy, newAccuracy: fittedBacktest ? fittedBacktest.accuracy : null, sampleSize: v2Backtest.sampleSize,
-              note: "拡張特徴量での学習を試みたが、既存の重みを上回らなかったため更新なし",
-            })]).catch(() => {});
-          }
+      // ---- ホールドアウト分割(直近30%を検証用に取り置く) ----
+      // learn:ownpred:recent は古い順に並んでいるため、末尾が新しい。
+      // 「過去で学び、未来で検証する」という時系列的に正しい分割になる。
+      const HOLDOUT_RATIO = 0.3;
+      const usable = recentRecords.filter((r) => r && r.actualWinner && r.features);
+      const holdoutSize = Math.floor(usable.length * HOLDOUT_RATIO);
+      const canHoldout = holdoutSize >= 3 && usable.length - holdoutSize >= 5;
+      // 第6次監査で発見した「見せかけのホールドアウト」の修正:
+      //   検証用に取り置けるデータが足りないとき、従来は trainSet と validSet に
+      //   **同じ配列**を入れていた。すると「学習用でも検証用でも改善した候補だけを
+      //   採用する」という二重の関門が、実質1回の判定に潰れてしまう(過学習を
+      //   まったく防げない)。それどころか採用理由には
+      //   「取り置いた検証用N件でも改善したため採用しました」と書かれるため、
+      //   **やっていない検証をやったと記録に残していた**。
+      //   検証用データを用意できないなら、重みは変更しない。
+      const validSet = canHoldout ? usable.slice(usable.length - holdoutSize) : [];
+      const fitSet = canHoldout ? usable.slice(0, usable.length - holdoutSize) : usable;
+
+      // 採否の判定に使う唯一の物差し(利用者が実際に見ているモデル)
+      const scoreOn = (records, w) => (records && records.length ? backtestAccuracyV2(records, w) : null);
+      const baseTrain = scoreOn(fitSet, currentWeights);
+      const baseValid = scoreOn(validSet, currentWeights);
+      // 参考値として旧v1モデルの的中率も残す(表示には使わない)
+      const v1Reference = backtestAccuracy(recentRecords, currentWeights);
+
+      // 2026年8月・ご指示⑤: 信頼度の高いデータで行った予測ほど強く学習する。
+      const trustOpts = { sampleWeightOf };
+      // 2026年8月・ご指示⑧: どの特徴量が当たりに寄与し、どれが不要かを実測する。
+      // (重みを1つずつ0にしたときの損失変化 = その特徴量の実際の寄与)
+      try {
+        featureEffectivenessToday = computeFeatureEffectiveness(usable, currentWeights, trustOpts);
+        if (featureEffectivenessToday && featureEffectivenessToday.measurable) {
+          await upstashSetJSON(`learn:features:report:${dateKey}`, featureEffectivenessToday).catch(() => {});
         }
+      } catch (e) { errors.push(`feature_effectiveness_failed:${e.message}`); }
+
+      const adopt = async (candidate, method, note) => {
+        // ---- 保存前の安全確認(第5次監査で追加) ----
+        if (!isSaneWeights(candidate)) {
+          errors.push(`weights_rejected_insane:${method}`);
+          await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
+            date: dateKey, adopted: false, method, oldWeights: currentWeights, newWeights: null,
+            oldAccuracy: baseValid ? baseValid.accuracy : null, newAccuracy: null,
+            sampleSize: validSet.length,
+            note: "学習結果に数値として異常な値(NaNや発散)が含まれていたため、安全のため採用しませんでした。",
+          })]).catch(() => {});
+          return false;
+        }
+        const newWeights = { ...candidate, version: (currentWeights.version || 0) + 1, updatedAt: runAt.toISOString() };
+        const written = await upstashSetJSON("learn:weights", newWeights);
+        if (written === false) {
+          // 書き込み失敗を「更新できた」と報告しない(第5次監査の指摘)
+          errors.push(`weights_write_failed:${method}`);
+          return false;
+        }
+        await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
+          date: dateKey, adopted: true, method, oldWeights: currentWeights, newWeights,
+          oldAccuracy: baseValid ? baseValid.accuracy : null,
+          newAccuracy: scoreOn(validSet, newWeights) ? scoreOn(validSet, newWeights).accuracy : null,
+          sampleSize: validSet.length,
+          holdout: canHoldout, note,
+        })]).catch(() => {});
+        return true;
+      };
+
+      if (baseTrain && baseValid) {
+        v2AccuracyBefore = baseValid.accuracy;
+        v2AccuracyAfter = baseValid.accuracy;
+
+        // ---- 候補①: ホーム補正と感度の近傍探索(旧グリッドサーチ) ----
+        // 探索そのものは残すが、**採点はv2モデルで行う**。homeBase は
+        // LEARNABLE_KEYS に含まれないため、これが唯一のホーム補正の調整手段になる。
+        const gridCandidates = [
+          { ...currentWeights, sensitivity: currentWeights.sensitivity * 1.2 },
+          { ...currentWeights, sensitivity: currentWeights.sensitivity * 0.8 },
+          { ...currentWeights, homeBase: Math.min(3, currentWeights.homeBase + 0.1) },
+          { ...currentWeights, homeBase: Math.max(0.8, currentWeights.homeBase - 0.1) },
+        ];
+        // ---- 候補②: 勾配降下法で拡張特徴量の重みを学習する ----
+        // ご指示⑤: 信頼度による加重(trustOpts)つき。信頼度の記録が無い
+        // 古い記録は重み1.0として扱われるため、従来の挙動を壊さない。
+        const fitted = fitWeightsGradientDescent(fitSet, currentWeights, trustOpts);
+
+        // ---- 候補③(ご指示⑧): 実測で「有害」と出た特徴量を外した候補 ----
+        // 有効性の実測(featureEffectivenessToday)で損失を悪化させていた特徴量を
+        // 0にした候補。他の候補と同じホールドアウト関門を通るため、誤検出で
+        // 予測が悪化することはない(改善した場合だけ採用される)。
+        const ablationCandidates = buildAblationCandidates(featureEffectivenessToday, currentWeights);
+
+        const allCandidates = [
+          ...gridCandidates.map((w) => ({ w, method: "grid_search_v1" })),
+          ...(fitted ? [{ w: fitted, method: "gradient_descent_v2" }] : []),
+          ...ablationCandidates.map((c) => ({ w: c.w, method: c.method })),
+        ];
+
+        let best = null;
+        for (const c of allCandidates) {
+          const trainScore = scoreOn(fitSet, c.w);
+          const validScore = scoreOn(validSet, c.w);
+          if (!trainScore || !validScore) continue;
+          // **学習用でも検証用でも改善している候補だけ**を採用対象にする。
+          // 検証用だけで良く見える候補は、たまたま当たっただけの可能性が高い。
+          if (trainScore.accuracy <= baseTrain.accuracy) continue;
+          if (validScore.accuracy <= baseValid.accuracy) continue;
+          if (!best || validScore.accuracy > best.validScore.accuracy) best = { ...c, trainScore, validScore };
+        }
+
+        if (best) {
+          const ok = await adopt(best.w, best.method,
+            `学習用${fitSet.length}件で${baseTrain.accuracy}%→${best.trainScore.accuracy}%、` +
+            `取り置いた検証用${validSet.length}件でも${baseValid.accuracy}%→${best.validScore.accuracy}%と改善したため採用しました。`);
+          if (ok) {
+            weightsUpdated = true;
+            weightsUpdatedV2 = best.method === "gradient_descent_v2";
+            v2AccuracyAfter = best.validScore.accuracy;
+            // ---- 2026年8月・ご指示①: 「その学習によって予測がどう変わったか」 ----
+            // 直近の検証済み試合に旧重み・新重みの両方で予測を計算し、
+            // ホーム勝率±%・引き分け確率±%・期待得点±・自信±% の実測差を保存する。
+            try {
+              predictionShiftToday = computePredictionShift(usable.slice(-30), currentWeights, best.w);
+              if (predictionShiftToday) {
+                await upstashCmd(["RPUSH", "learn:weights:impact", JSON.stringify({
+                  date: dateKey, at: runAt.toISOString(), method: best.method,
+                  weightsVersionFrom: currentWeights.version || 0,
+                  weightsVersionTo: (currentWeights.version || 0) + 1,
+                  shift: predictionShiftToday,
+                })]).catch(() => {});
+                await upstashCmd(["LTRIM", "learn:weights:impact", "-30", "-1"]).catch(() => {});
+                // Memory Engineの時系列にも「AIの判断が変わった」として残す
+                if (thoughtTimeline) {
+                  await thoughtTimeline.append("model:weights:beliefs", {
+                    kind: "belief",
+                    statementJa: predictionShiftToday.summaryJa,
+                    evidence: [`重みversion ${(currentWeights.version || 0)}→${(currentWeights.version || 0) + 1}(${best.method})`],
+                    at: runAt.toISOString(),
+                  }).catch(() => {});
+                }
+              }
+            } catch (e) { errors.push(`prediction_shift_failed:${e.message}`); }
+          }
+        } else {
+          await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
+            date: dateKey, adopted: false, method: "holdout_validated", oldWeights: currentWeights, newWeights: null,
+            oldAccuracy: baseValid.accuracy, newAccuracy: null, sampleSize: validSet.length, holdout: canHoldout,
+            note: canHoldout
+              ? "学習用と検証用の両方で改善する候補が見つからなかったため、重みは変更しませんでした(過学習の防止)。"
+              : "検証用に取り置けるだけのデータがまだ無いため、慎重を期して重みは変更しませんでした。",
+          })]).catch(() => {});
+        }
+      } else {
+        // 重みを見直せなかった場合。黙って何もしないと「学習が動いていない」のか
+        // 「動いた結果変更なし」なのか区別できないため、**本当の理由**を必ず残す。
+        // 第6次監査の指摘への対応: 従来はどの理由でも一律に
+        // 「拡張特徴量がまだ含まれていないため」と記録しており、
+        // 健康診断の画面が誤った原因を表示していた。
+        const skipReason = !usable.length
+          ? { method: "skipped_no_v2_records", note: "予測の記録に拡張特徴量(features)がまだ含まれていないため、現在の予測モデルでの検証ができませんでした。新しい形式で記録された予測が溜まり次第、自動的に再開します。" }
+          : !canHoldout
+            ? { method: "skipped_insufficient_holdout", note: `検証用に取り置けるだけのデータがまだありません(検証可能な記録${usable.length}件)。同じデータで探して同じデータで採点すると「たまたま当たっただけ」を改善と誤認するため、慎重を期して重みは変更していません。` }
+            : { method: "skipped_not_scorable", note: "検証データの採点ができなかったため、重みは変更していません。" };
+        await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
+          date: dateKey, adopted: false, method: skipReason.method,
+          oldWeights: currentWeights, newWeights: null,
+          oldAccuracy: v1Reference ? v1Reference.accuracy : null, newAccuracy: null,
+          sampleSize: usable.length, holdout: canHoldout,
+          note: skipReason.note,
+        })]).catch(() => {});
+      }
+      if (v1Reference) {
+        // 旧v1モデルの数字は参考値であることを記録に残す(表示には使わない)
+        v1BacktestReference = v1Reference.accuracy;
       }
       await upstashCmd(["LTRIM", "learn:weights:history", "-30", "-1"]).catch(() => {});
+    } catch (e) {
+      // 学習に失敗しても、その日の知識・成長ログは必ず残す
+      errors.push(`weight_learning_failed:${e && (e.code || e.message)}`);
     }
   }
 
@@ -1056,12 +1624,27 @@ async function runDailyLearning(deps) {
   let knowledgeItemsDuplicateToday = 0;
   for (const f of factsToday) {
     try {
-      const saveResult = await knowledgeStore.saveKnowledgeItem({
-        teamEn: f.teamEn, teamJa: f.teamJa, category: "recentFormTrend", type: "fact",
+      // 第5次監査で発見した「事実の取り違え」の修正:
+      //   factsToday には category:"フォーム" と category:"ホームアウェイ差" の
+      //   2種類が入るのに、保存時に**全部 recentFormTrend で上書き**していた。
+      //   そのためホーム/アウェイの得意不得意という事実が、推論エンジンでは
+      //   「直近の調子」の根拠として数えられ、本来の
+      //   「ホーム/アウェイ(home_away)」仮説の根拠には一切ならなかった。
+      const KNOWLEDGE_CATEGORY_BY_FACT = {
+        "ホームアウェイ差": "homeAway",
+        "フォーム": "recentFormTrend",
+      };
+      const saveResult = await saveWithImportance({
+        teamEn: f.teamEn, teamJa: f.teamJa,
+        category: KNOWLEDGE_CATEGORY_BY_FACT[f.category] || "recentFormTrend", type: "fact",
         statement: f.statement, computedAt: runAt.toISOString(),
-      });
+      }, { formDelta: Number.isFinite(f.delta) ? f.delta : null });
       if (saveResult.saved) knowledgeItemsSavedToday++;
-      else if (saveResult.reason === "DUPLICATE") knowledgeItemsDuplicateToday++;
+      else if (saveResult.reason === "DUPLICATE" || saveResult.reason === "DUPLICATE_RELINKED") knowledgeItemsDuplicateToday++;
+      // 第7次監査での追加: 保存先の読み取りに失敗した場合(第6次の修正で
+      // 「新しい知識」として数えるのはやめたが)、そのまま黙って消えると
+      // 「今日は変化が無かった」と区別がつかない。理由として残す。
+      else if (saveResult.reason === "LOOKUP_FAILED") errors.push(`knowledge_lookup_failed:${f.teamEn}`);
     } catch (e) {
       errors.push(`knowledge_save_failed:${f.teamEn}:${e.message}`);
     }
@@ -1092,11 +1675,19 @@ async function runDailyLearning(deps) {
   // failureReasonsを保持している解決済みレコード)から機械的に集計する。
   let topFailureReasonsRecent = [];
   let topSuccessReasonsRecent = []; // 2026年8月: 最近うまくいっている判断基準
+  let agendaToday = null; // ご指示⑩: AIが自分で決めた「次に学ぶテーマ」
   try {
     const recentForFailuresRaw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "0", "-1"]).catch(() => [])) || [];
     const recentForFailures = recentForFailuresRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
     topFailureReasonsRecent = summarizeFailureReasons(recentForFailures, 5);
     topSuccessReasonsRecent = summarizeSuccessReasons(recentForFailures, 5);
+    // ---- 2026年8月・ご指示⑩: 次に何を学ぶかをAI自身が決める ----
+    // 実測(どのクラブで外しているか・何が原因で外れているか)から優先順位つきの
+    // 学習計画を作り、保存する。明日の収集(上の③-b)がこれを読んで実行する。
+    try {
+      agendaToday = buildLearningAgenda(recentForFailures, topFailureReasonsRecent, { nowIso: runAt.toISOString() });
+      await saveAgenda({ upstashEnabled, upstashSetJSON }, dateKey, agendaToday);
+    } catch (e) { errors.push(`agenda_build_failed:${e.message}`); }
   } catch (e) { /* ベストエフォート */ }
 
   const growthLog = {
@@ -1128,7 +1719,16 @@ async function runDailyLearning(deps) {
     playerUnavailableReasonsToday: playerResult.unavailableReasonsToday,
     // 2026年8月・優先順位⑦: APIリクエスト予算の使用状況(優先順位⑨の診断用)。
     // 優先順位⑪: どうやってその予算値を決めたか(自動判定/手動設定/既定値)も併記する。
-    apiBudget: { ...apiBudget.summary(), sourceJa: budgetSourceJa, detectedPlan: detectedPlan || null },
+    // 欠陥Cの修正: 共有インスタンスを使う場合、ローカルで計算した
+    // effectiveDailyBudget は採用されていない。実際に使われている値と
+    // 食い違う説明を表示しないよう、共有時は実インスタンスの状態を正とする。
+    apiBudget: {
+      ...apiBudget.summary(),
+      sourceJa: usingSharedBudget
+        ? `サーバー共有の予算インスタンスを使用しています(実際の上限: ${apiBudget.summary().dailyBudget}件/日)。すべてのAPI呼び出しがこの1つの予算を通ります。`
+        : budgetSourceJa,
+      detectedPlan: detectedPlan || null,
+    },
     matchesResolvedToday,
     newPredictionsLogged,
     hypothesesConfirmed, hypothesesDiscarded,
@@ -1145,7 +1745,48 @@ async function runDailyLearning(deps) {
     weightsUpdatedV2, v2AccuracyBefore, v2AccuracyAfter, // v2(拡張特徴量)モデルの重みが更新されたか
     totalOwnPredictionsResolved: totalResolved,
     knowledgeNewToday, knowledgeUpdatedToday, knowledgeStaleTotal, // 「昨日より知識が増えている」ことの可視化用
-    errors,
+    v1BacktestReference, // 旧v1モデルの的中率(参考値。採否の判定には使っていない)
+    // ---- 2026年8月・優先順位⑫: 「何を、なぜ学ぶ価値があると判断したか」 ----
+    // 「今日は知識が34件増えました」だけでは中身の重みが分からなかったため、
+    // 重要度別の内訳と、その日いちばん学ぶ価値があった出来事を添える。
+    importanceSummary: summarizeImportance(learnedWithImportance),
+    // 知識拡大フェーズ: 上位100クラブの収集状況(何を更新し、何を見送ったか)
+    universe: universeStats ? {
+      coreClubsPlanned: universeStats.coreClubsPlanned,
+      coreClubsUpdated: universeStats.coreClubsUpdated,
+      squadsUpdated: universeStats.squadsUpdated,
+      playersUpdated: universeStats.playersUpdated,
+      xgClubsUpdated: universeStats.xgClubsUpdated,
+      standingsLeaguesUpdated: universeStats.standingsLeaguesUpdated,
+      changesDetected: (universeStats.changesDetected || []).slice(0, 20),
+      skipped: universeStats.skipped || [],
+      agendaClubsApplied: universeStats.agendaClubsApplied || [],
+    } : null,
+    // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ ----
+    // ご指示⑨: 今日答え合わせして市場別に採点できた件数(詳細は learn:accuracy:<date>)
+    accuracyScoredToday: resolvedScoredToday.length,
+    // ご指示①: 学習によって予測がどう変わったか(採用があった日のみ。実計算の差分)
+    predictionShift: predictionShiftToday,
+    // ご指示⑧: 特徴量ごとの有効性の実測(有効/有害/未学習)
+    featureEffectiveness: featureEffectivenessToday ? {
+      measurable: featureEffectivenessToday.measurable,
+      sampleSize: featureEffectivenessToday.sampleSize,
+      reasonJa: featureEffectivenessToday.reasonJa || null,
+      features: (featureEffectivenessToday.features || []).map((f) => ({ labelJa: f.labelJa, weight: f.weight, contribution: f.contribution, verdictJa: f.verdictJa })),
+    } : null,
+    // ご指示⑩: AIが自分で決めた「次に学ぶテーマ」と、前回の計画を今日反映した内容
+    learningAgenda: agendaToday,
+    agendaAppliedToday,
+    // ご指示①③④の証明: 今日の予測が実際に使った重みのversion。
+    // 昨日重みが更新されていれば、このversionが昨日より増えている=
+    // 「昨日の学習が今日の予測に反映された」ことがこのログだけで確認できる。
+    learningProof: weightsMetaUsedToday ? {
+      weightsVersionUsedForTodaysPredictions: weightsMetaUsedToday.version,
+      weightsLastUpdatedAt: weightsMetaUsedToday.updatedAt,
+      noteJa: `本日の新規予測${newPredictionsLogged}件は、重みversion ${weightsMetaUsedToday.version}(最終更新: ${weightsMetaUsedToday.updatedAt || "初期値のまま"})を使用しました。予測のたびに保存済みの最新重みを読み直すため、前日までの学習は必ず当日の予測に反映されます。`,
+    } : null,
+    // 1回の実行ぶんでも、エラーが大量に出た日にログが肥大化しないよう上限を設ける
+    errors: capList(errors),
   };
 
   // 同じ日付の既存ログがあれば合算する(上のmergeGrowthLogsのコメント参照)。

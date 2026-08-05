@@ -80,4 +80,48 @@ async function resolveLeagueId(league, { callApiFootball, upstashGetJSON, upstas
   }
 }
 
-module.exports = { MANDATORY_LEAGUES, EXTENDED_LEAGUES, leagueEntityKey, resolveLeagueId };
+/**
+ * リーグIDから、Knowledge Engine の entity key を逆引きする。
+ *
+ * 第6次監査で発見した「4リーグぶんの知識が読めない」問題への対応:
+ *   拡張5リーグのうち4つは静的な設定にIDを持たず(誤ったIDを決め打ちしない方針)、
+ *   実行時に /leagues 検索で解決してUpstashへキャッシュしている。
+ *   ところが読み出し側は**静的な設定のIDとしか照合していなかった**ため、
+ *   その4リーグの知識は毎日APIを使って集めているのに一度も読み出せなかった。
+ *   解決済みIDのキャッシュも参照して逆引きできるようにする。
+ *   (追加のAPI呼び出しは発生しない。Redisの読み取りが増えるだけ)
+ */
+// 第7次監査での追加: この関数は /api/discuss のたびに呼ばれるが、
+// 静的IDに一致しないリーグ(チャンピオンズリーグ・エールディヴィジ・Jリーグ・
+// 各国のカップ戦など)では毎回4件のUpstash読み取りが**直列**で走り、
+// 応答が遅くなっていた(Upstashが不調なときは最悪で数十秒)。
+// 解決結果をプロセス内に覚えておく(リーグIDは通常変わらない)。
+const _leagueEntityKeyMemo = new Map();
+async function leagueEntityKeyFromId(leagueId, { upstashGetJSON, upstashEnabled } = {}) {
+  const id = Number(leagueId);
+  if (!Number.isFinite(id)) return null;
+  if (_leagueEntityKeyMemo.has(id)) return _leagueEntityKeyMemo.get(id);
+  const all = [...MANDATORY_LEAGUES, ...EXTENDED_LEAGUES];
+  const staticHit = all.find((l) => l.id && Number(l.id) === id);
+  if (staticHit) {
+    const key = leagueEntityKey(staticHit);
+    _leagueEntityKeyMemo.set(id, key);
+    return key;
+  }
+  if (!upstashEnabled || typeof upstashGetJSON !== "function") return null;
+  for (const league of all) {
+    if (league.id) continue; // 静的IDを持つものは上で判定済み
+    const cacheKey = `learn:leagueid:${league.nameEn}:${league.searchCountry || league.countryJa}`;
+    const cached = await upstashGetJSON(cacheKey).catch(() => null);
+    if (cached && Number(cached.id) === id) {
+      const key = leagueEntityKey(league);
+      _leagueEntityKeyMemo.set(id, key);
+      return key;
+    }
+  }
+  // 一致しなかったことも覚えておく(毎回4件のRedis読み取りを繰り返さないため)
+  _leagueEntityKeyMemo.set(id, null);
+  return null;
+}
+
+module.exports = { MANDATORY_LEAGUES, EXTENDED_LEAGUES, leagueEntityKey, leagueEntityKeyFromId, resolveLeagueId };

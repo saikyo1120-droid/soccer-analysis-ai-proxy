@@ -47,11 +47,36 @@ function assembleReasoning(evidencePool, teamInfo) {
   const hypotheses = generateHypotheses(evidencePool, teamInfo);
   const ranked = rankHypotheses(hypotheses);
   const selfCheck = runSelfCheck(ranked);
+
+  // ---- 第5次監査で指摘された「監視の穴」への対応 ----
+  //   これまでの監査で、同じ種類の欠陥が繰り返し見つかっている:
+  //   「知識は正しく保存されているのに、仮説側が探しているカテゴリ名と
+  //     一致しないため、すべての仮説がスコア0のまま静かに捨てられていた」。
+  //   この状態は例外も出ず画面上も普通に見えるため、誰も気づけなかった。
+  //   根拠が1件以上あるのに全仮説が0点、という状況は必ず配線ミスなので、
+  //   その場で警告を出し、次からは即座に気づけるようにする。
+  const pool = evidencePool || [];
+  let orphanCategories = [];
+  if (pool.length > 0 && ranked.length > 0 && ranked.every((h) => (h.score || 0) === 0)) {
+    const matched = new Set();
+    for (const h of ranked) for (const e of h.evidence || []) if (e && e.category) matched.add(e.category);
+    orphanCategories = Array.from(new Set(
+      pool.map((e) => e && e.category).filter((c) => c && !matched.has(c))
+    ));
+    console.warn(
+      `[reasoning] 根拠が${pool.length}件あるのに、すべての仮説のスコアが0でした。` +
+      "知識のカテゴリ名と hypothesisGenerator.js の relevantCategories が一致していない可能性があります。" +
+      `未対応のカテゴリ: ${orphanCategories.join(", ") || "(不明)"}`
+    );
+  }
+
   return {
     hypotheses: ranked,
     selected: ranked[0] || null,
     selfCheck,
-    evidencePoolSize: (evidencePool || []).length,
+    evidencePoolSize: pool.length,
+    // 配線ミスの検知結果(/api/discuss の meta にも載せて外から確認できるようにする)
+    orphanCategories,
   };
 }
 

@@ -135,6 +135,12 @@ function createKnowledgeSource({
   //     強化フェーズで追加。質問文が順位に言及した場合のみ追加の1リクエストで取得する。
   ensureClubProfile, fetchCoachCareer, saveKnowledgeItem,
   fetchStandingsFeature, inferLeagueIdFromFixtures,
+  //   getActiveKnowledgeForLeague / leagueEntityKeyFromId … 第5次監査で追加。
+  //     優先順位⑥で毎日ためているリーグの知識(順位表・得点/アシストランキング)は
+  //     knowledge:byTeam:league:◯◯ という別の名前空間に入るため、クラブ名で引く
+  //     getActiveKnowledge では**絶対に読めなかった**。その結果、毎日APIを使って
+  //     集めていたリーグの知識は議論モードで一度も使われていなかった。
+  getActiveKnowledgeForLeague, leagueEntityKeyFromId,
 }) {
   /**
    * @param {string} teamNameEnglish - API-Football側の検索に使う英語クラブ名
@@ -169,7 +175,9 @@ function createKnowledgeSource({
       // 重なる場合があるが、こちらは失効管理・重複排除を経た正式な知識ベースの
       // ビューであり、Reasoning Engineの根拠プール(server/reasoning/evidencePool.js)
       // が優先的に参照する。Knowledge Engine未設定・データ無しの場合は正直に空。
-      knowledgeEngine: { facts: [], analyses: [], opinions: [], totalStored: 0, totalActive: 0 },
+      // profiles/reflections も初期値に含める(リーグ知識の合流時に
+      // undefined へ concat しないようにするため)。
+      knowledgeEngine: { facts: [], analyses: [], opinions: [], profiles: [], reflections: [], totalStored: 0, totalActive: 0 },
       fetchedTypes: [], errors: [],
     };
 
@@ -263,6 +271,35 @@ function createKnowledgeSource({
         }
       } catch (e) { result.errors.push("standings_failed"); }
     }
+
+    // ---- 第5次監査で追加: 所属リーグの知識を、そのクラブの根拠として読み込む ----
+    // 優先順位⑥の日次ジョブが毎日ためている順位表・得点/アシストランキングは
+    // knowledge:byTeam:league:◯◯ という別の名前空間へ入るため、クラブ名で引く
+    // getActiveKnowledge では読めなかった(=毎日集めた知識が使われていなかった)。
+    // 追加のAPI呼び出しは発生しない(Redisの読み取りが1回増えるだけ)。
+    result.leagueKnowledgeEntity = null;
+    if (typeof getActiveKnowledgeForLeague === "function" && typeof leagueEntityKeyFromId === "function"
+        && typeof inferLeagueIdFromFixtures === "function" && rawFixturesForLeagueId.length) {
+      try {
+        const leagueId = inferLeagueIdFromFixtures(rawFixturesForLeagueId);
+        const entity = leagueId ? await leagueEntityKeyFromId(leagueId) : null;
+        if (entity) {
+          const leagueKnowledge = await getActiveKnowledgeForLeague(entity);
+          if (leagueKnowledge && leagueKnowledge.totalActive > 0) {
+            result.leagueKnowledgeEntity = entity;
+            // クラブ自身の知識と同じ配列へ合流させる(カテゴリはそのまま残るので、
+            // 推論エンジン側でどの仮説の根拠になるかは自動的に決まる)。
+            for (const k of ["facts", "analyses", "opinions", "profiles", "reflections"]) {
+              if (Array.isArray(leagueKnowledge[k]) && Array.isArray(result.knowledgeEngine[k])) {
+                result.knowledgeEngine[k] = result.knowledgeEngine[k].concat(leagueKnowledge[k]);
+              }
+            }
+            result.fetchedTypes.push("leagueKnowledge");
+          }
+        }
+      } catch (e) { result.errors.push("league_knowledge_failed"); }
+    }
+
     // ---- 2026年8月・知識拡張フェーズ: 監督遍歴(Layer1事実+Knowledge Graph) ----
     // 同じクラブについて何度も聞かれるたびに/coachsを呼び直さないよう、既に
     // 有効な"managerHistory"事実が無い場合だけ取得する(getActiveKnowledgeで
@@ -273,7 +310,13 @@ function createKnowledgeSource({
       const hasRecentManagerHistoryFact = (result.knowledgeEngine.facts || []).some((f) => f.category === "managerHistory");
       if (!hasRecentManagerHistoryFact) {
         try {
-          const career = await fetchCoachCareer(teamId);
+          // 第5次監査で発見した引数不足の修正:
+          //   正しくは fetchCoachCareer(teamId, callApiFootball) だが、
+          //   第2引数を渡していなかった。関数の中で callApiFootball が undefined と
+          //   なり TypeError を投げるものの、それが関数自身のtry/catchで
+          //   握りつぶされて {career: []} を返すため、**議論モードの監督遍歴は
+          //   一度もデータを取得できていなかった**(エラー表示すら出ない)。
+          const career = await fetchCoachCareer(teamId, callApiFootball);
           if (career && career.career && career.career.length) {
             result.managerCareer = career;
             result.fetchedTypes.push("managerCareer");

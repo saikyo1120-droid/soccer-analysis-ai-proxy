@@ -110,13 +110,24 @@ function compareSnapshots(today, yesterday) {
   const memoryDelta = delta(today.memoryTotal, yesterday.memoryTotal);
   const accuracyDelta = delta(today.predictionAccuracy, yesterday.predictionAccuracy);
 
+  // 第6次監査で発見した欠陥の修正:
+  //   「外れた理由を3件分析しました」という**その日の活動量**だけで
+  //   improved=true(緑の📈「昨日より賢くなりました」)になっていた。
+  //   自分の失敗を分析するのは活動であって、測定された改善ではない。
+  //   知識が1件も増えず、記憶も増えず、的中率が8ポイント下がった日でも
+  //   「賢くなりました」と表示されてしまう状態だった。
+  //   「賢くなった」と言ってよいのは、前日と比べて**実際に増えた/上がった**
+  //   ものがある場合だけに限る。活動量は別枠(activities)で正直に併記する。
   const points = [];
   if (knowledgeDelta !== null && knowledgeDelta > 0) points.push(`知識が${knowledgeDelta}件増えました`);
   if (memoryDelta !== null && memoryDelta > 0) points.push(`記憶(振り返り)が${memoryDelta}件増えました`);
   if (accuracyDelta !== null && accuracyDelta > 0) points.push(`自社予測の的中率が${accuracyDelta}ポイント改善しました`);
   if (today.weightsUpdated) points.push("実データに基づいて予測モデルの重みを更新しました");
-  if ((today.successReasonsToday || 0) > 0) points.push(`当たった理由を${today.successReasonsToday}件分析しました`);
-  if ((today.failureReasonsToday || 0) > 0) points.push(`外れた理由を${today.failureReasonsToday}件分析しました`);
+
+  // 活動量(それ自体は「賢くなった証拠」にはならないが、何をしたかは伝える)
+  const activities = [];
+  if ((today.successReasonsToday || 0) > 0) activities.push(`当たった理由を${today.successReasonsToday}件分析しました`);
+  if ((today.failureReasonsToday || 0) > 0) activities.push(`外れた理由を${today.failureReasonsToday}件分析しました`);
 
   const declines = [];
   if (accuracyDelta !== null && accuracyDelta < 0) declines.push(`的中率が${Math.abs(accuracyDelta)}ポイント下がりました`);
@@ -126,6 +137,7 @@ function compareSnapshots(today, yesterday) {
   if (points.length) {
     improved = true;
     verdictJa = `昨日より賢くなりました: ${points.join("、")}。`;
+    if (activities.length) verdictJa += ` また、${activities.join("、")}。`;
     if (declines.length) {
       // 良い点だけを並べて悪化を隠さない(誠実さの方針)
       verdictJa += ` ただし、${declines.join("、")}(検証データが少ないうちは的中率が上下します)。`;
@@ -136,9 +148,18 @@ function compareSnapshots(today, yesterday) {
   } else {
     improved = null;
     verdictJa = "本日は、知識・記憶・的中率のいずれにも変化がありませんでした(取得したデータが前日と同じ内容だった場合に起こります。異常ではありません)。";
+    if (activities.length) verdictJa += ` なお、${activities.join("、")}が、これ自体は「賢くなった」ことの証拠にはなりません。`;
   }
 
-  return { hasBaseline: true, knowledgeDelta, memoryDelta, accuracyDelta, verdictJa, improved };
+  return {
+    hasBaseline: true, knowledgeDelta, memoryDelta, accuracyDelta, verdictJa, improved,
+    // 「賢くなった」の判定には使わないが、その日に何をしたかは別枠で返す
+    activitiesJa: activities,
+    // 第6次監査の指摘への対応: 比較対象が「本当に前日か」を呼び出し側が
+    // 判断できるようにする(飛び日をまたいだ比較を「昨日より」と呼ばないため)
+    comparedFromDate: yesterday.date || null,
+    comparedToDate: today.date || null,
+  };
 }
 
 /**
@@ -173,12 +194,35 @@ async function getMetricsTrend(deps, days, todayDateKey) {
   const recorded = withDelta.filter((r) => r.recorded);
   const latest = recorded[0] || null;
   const previous = recorded[1] || null;
+  // 第6次監査で発見した欠陥の修正:
+  //   recorded[0]/recorded[1] は「記録がある直近2日」であって、
+  //   必ずしも連続した2日ではない。日次ジョブが1日休むと、2日分の増加を
+  //   「昨日より知識が12件増えました」と表示してしまっていた。
+  //   また、その日の記録がまだ書かれていない時間帯(=1日の大半)は、
+  //   「前日比」と書かれた数字が1日ぶん古い状態だった。
+  //   実際に何日離れているかを添えて、呼び出し側が正しく言い換えられるようにする。
+  const daysApart = (latest && previous)
+    ? Math.round((new Date(latest.date + "T00:00:00Z") - new Date(previous.date + "T00:00:00Z")) / 86400000)
+    : null;
   return {
     available: true,
     days: withDelta,
     recordedDays: recorded.length,
     latest,
-    comparison: compareSnapshots(latest, previous),
+    comparison: (() => {
+      const c = compareSnapshots(latest, previous);
+      if (c && c.hasBaseline && Number.isFinite(daysApart) && daysApart !== 1) {
+        // 連続していない2日を比べている場合は、「昨日より」と言わずに
+        // 実際に比べた日付をそのまま示す(利用者に誤解させないため)。
+        c.verdictJa = c.verdictJa.replace(/^昨日より賢くなりました/, `${previous.date}から${latest.date}までの間に賢くなりました`);
+        c.verdictJa += ` (比較したのは${previous.date}と${latest.date}です。日次学習の記録が無い日が間にあるため、厳密な「前日比」ではありません。)`;
+        c.adjacentDays = false;
+      } else if (c && c.hasBaseline) {
+        c.adjacentDays = true;
+      }
+      return c;
+    })(),
+    comparisonDaysApart: daysApart,
     // 期間全体での伸び(「先週より今週の方が賢いか」を1行で言い切るための指標)
     rangeGrowth: (recorded.length >= 2)
       ? {

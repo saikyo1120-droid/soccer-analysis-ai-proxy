@@ -79,7 +79,13 @@ function computeItemHash(item) {
 function isExpired(item, nowMs) {
   const days = item.expiresRelevanceDays || DEFAULT_EXPIRY_DAYS[item.type] || 14;
   const computedAtMs = new Date(item.computedAt).getTime();
-  if (!Number.isFinite(computedAtMs)) return false;
+  // 第6次監査で発見した欠陥の修正:
+  //   日時が壊れている(パースできない)レコードを「失効していない」として
+  //   扱っていたため、**いつ観測したか分からない知識が永久に有効なまま
+  //   根拠として使われ続ける**状態だった。いつのものか分からない情報は
+  //   根拠にできないので、失効扱いにする(誤って古い情報を根拠にするより、
+  //   正直に「根拠が無い」と言う方がこのプロジェクトの方針に合う)。
+  if (!Number.isFinite(computedAtMs)) return true;
   return nowMs - computedAtMs > days * 24 * 60 * 60 * 1000;
 }
 
@@ -98,12 +104,46 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
     if (!["fact", "analysis", "opinion", "profile", "reflection"].includes(item.type)) return { saved: false, reason: "INVALID_TYPE", hash: null };
 
     const hash = computeItemHash(item);
-    const existing = await upstashGetJSON(`knowledge:item:${hash}`);
+    // ---- 第6次監査で発見した最重要欠陥の修正(成長の偽装) ----
+    //   ここは upstashGetJSON を使っていたが、この関数は**失敗を握りつぶして
+    //   null を返す**(タイムアウト・5xx・認証エラーのいずれも「まだ無い」と
+    //   区別がつかない)。その結果、Upstashが一瞬でも不調だと:
+    //     ・何ヶ月も前からある知識の firstSeenAt が今日に書き換わり、
+    //       「今日新しく覚えた知識」として数えられる
+    //     ・同じハッシュが一覧へ二重登録され、有効件数が水増しされる
+    //     ・累計カウンターが二重に増える
+    //     ・その日の成長レポートが「昨日より賢くなりました」と表示する
+    //   何も学んでいないのに学んだと報告する状態で、本プロジェクトの
+    //   「でっち上げない」原則に真っ向から反する。読み取りに失敗したときは
+    //   新規保存へ進まず、正直に「判定できなかった」と返す。
+    let existing = null;
+    try {
+      const raw = await upstashCmd(["GET", `knowledge:item:${hash}`]);
+      existing = (raw === null || raw === undefined) ? null : JSON.parse(raw);
+    } catch (e) {
+      return { saved: false, reason: "LOOKUP_FAILED", hash };
+    }
     if (existing) {
       // 既に全く同じ内容が登録済み。重複登録はしないが、鮮度だけ更新する
       // (「今日も変わらず観測されている」という事実は意味があるため)。
       existing.lastSeenAt = item.computedAt;
+      // 第6次監査での追加: この判定を導入する前に保存されたレコードには
+      // isAiGenerated が付いていない。放置すると、AIが推定で書いた文章が
+      // 失効するまで「実データ」として扱われ続けるため、この機会に補う。
+      if (item.isAiGenerated && !existing.isAiGenerated) existing.isAiGenerated = true;
       await upstashSetJSON(`knowledge:item:${hash}`, existing);
+      // 第6次監査での追加: 一覧(byTeam)の上限から溢れて消えていた場合、
+      // 本体だけが残って**二度と読み出せない幽霊知識**になっていた
+      // (重複判定でヒットするため、一覧へ戻る機会が永久に来ない)。
+      // 一覧に載っているか確認し、無ければ載せ直す。
+      try {
+        const list = (await upstashCmd(["LRANGE", `knowledge:byTeam:${entity}`, "0", "-1"])) || [];
+        if (!list.includes(hash)) {
+          await upstashCmd(["RPUSH", `knowledge:byTeam:${entity}`, hash]).catch(() => {});
+          await upstashCmd(["LTRIM", `knowledge:byTeam:${entity}`, String(-MAX_ITEMS_PER_TEAM), "-1"]).catch(() => {});
+          return { saved: false, reason: "DUPLICATE_RELINKED", hash };
+        }
+      } catch (e) { /* 一覧を確認できなくても本処理は続行する */ }
       return { saved: false, reason: "DUPLICATE", hash };
     }
 

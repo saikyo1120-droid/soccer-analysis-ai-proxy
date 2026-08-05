@@ -107,7 +107,23 @@ function describeEvaluationChange(previous, current) {
   const reasonsJa = [];
   const prevF = prev.features || {};
   const curF = cur.features || {};
+  // 第6次監査で発見した欠陥の修正:
+  //   特徴量は「両チーム分そろわなかった」場合も0として保存されるため、
+  //   昨日は取得できていたxGが今日は取得できなかっただけで
+  //   「xGがアウェイ側に有利な方向へ0.80動きました」という、
+  //   **データ障害をサッカー的な理由として説明する**文が出ていた。
+  //   どちらの時点で実データが揃っていたか(supplied)を見て、
+  //   片方でも揃っていない項目は理由に使わず、正直に別枠で伝える。
+  const prevSupplied = prev.supplied || null;
+  const curSupplied = cur.supplied || null;
+  const bothSupplied = (k) => {
+    if (!prevSupplied || !curSupplied) return true; // 記録が古く判定材料が無い場合は従来通り
+    return prevSupplied[k] !== false && curSupplied[k] !== false;
+  };
+  const lostDataKeys = Object.keys(FEATURE_LABELS_JA).filter((k) =>
+    prevSupplied && curSupplied && prevSupplied[k] === true && curSupplied[k] === false);
   const moves = Object.keys(FEATURE_LABELS_JA)
+    .filter(bothSupplied)
     .map((k) => ({ key: k, delta: (curF[k] || 0) - (prevF[k] || 0) }))
     .filter((m) => Math.abs(m.delta) > 0.01)
     .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
@@ -117,9 +133,21 @@ function describeEvaluationChange(previous, current) {
     const dir = m.delta > 0 ? "ホーム側に有利な方向へ" : "アウェイ側に有利な方向へ";
     reasonsJa.push(`${label}が${dir}${Math.abs(m.delta).toFixed(2)}動きました。`);
   }
+  if (lostDataKeys.length) {
+    // データが取れなくなったことは、サッカー的な理由ではない。別枠で正直に言う。
+    reasonsJa.push(`なお、前回は取得できていた${lostDataKeys.map((k) => FEATURE_LABELS_JA[k]).join("・")}のデータが今回は取得できませんでした(この項目は今回の判断には使っていません)。`);
+  }
   if (!reasonsJa.length) {
-    // 特徴量が動いていないのに評価が変わった＝学習した重みが変わったということ。
-    reasonsJa.push("試合のデータ自体は前回とほぼ同じですが、AIが他の試合から学習して重み(何を重視するか)を更新したため、評価が変わりました。");
+    // 第6次監査で発見した誤りの修正:
+    //   「AIが他の試合から学習して重みを更新したため」と断言していたが、
+    //   重みが実際に更新されたかどうかは、この関数では一切確認していない。
+    //   前回の記録が古くて特徴量を持っていない場合もここへ来る。
+    //   確認していないことを原因として述べない。
+    const weightsChanged = Number.isFinite(prev.weightsVersion) && Number.isFinite(cur.weightsVersion)
+      && prev.weightsVersion !== cur.weightsVersion;
+    reasonsJa.push(weightsChanged
+      ? `試合のデータ自体は前回とほぼ同じですが、その間にAIが他の試合から学習して重み(何を重視するか)を更新したため(バージョン${prev.weightsVersion}→${cur.weightsVersion})、評価が変わりました。`
+      : "試合のデータ自体は前回とほぼ同じでしたが、評価の数値がわずかに変わりました(理由をこれ以上特定できていません)。");
   }
 
   // 何を学んだか
@@ -169,6 +197,11 @@ async function recordPredictionEvaluation(deps, homeTeamEn, awayTeamEn, evaluati
           predictedWinner: evaluation.predictedWinner,
           homeWinPct: evaluation.homeWinPct,
           features: evaluation.features || {},
+          // 第6次監査での追加: 「その特徴量に実データが入っていたか」も一緒に
+          // 記録する。これが無いと、次回の比較で「データ障害」と
+          // 「本当にサッカー的な変化」を区別できない。
+          supplied: evaluation.supplied || null,
+          weightsVersion: Number.isFinite(evaluation.weightsVersion) ? evaluation.weightsVersion : null,
         },
       },
       change.isMeaningful ? change.headlineJa : "この対戦の初回評価を記録しました。"
