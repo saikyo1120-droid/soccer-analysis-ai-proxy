@@ -6642,9 +6642,18 @@ async function renderGrowthLogWidget() {
   // かった(dailyJob.js側は各処理をerrors配列に記録していたが、フロント側で
   // 一切表示していなかった)。エラーが1件でもあれば、詳細を開かなくても分かる
   // よう要約行に警告を出す。
+  // 2026年8月・本番エラー調査での修正: 従来はエラーの中身にかかわらず
+  //   「取得件数が少ない原因はこのエラーだ」と断定的に表示していた。
+  //   実際に本番で出たのは「3クラブの名前がデータ提供元と一致しない」
+  //   という局所的な事象で、他の収集にはまったく影響していなかったため、
+  //   利用者に誤った不安を与える表示になっていた。中身で説明を出し分ける。
   const todayErrors = log.errors || [];
+  const unresolvedClubs = (log.universe && log.universe.unresolvedClubs) || [];
+  const unresolvedHtml = unresolvedClubs.length
+    ? `<div class="value-note" style="margin-top:2px;">ℹ️ ${unresolvedClubs.length}クラブ(${unresolvedClubs.slice(0, 3).map((u) => escapeHtml(u.nameJa || u.nameEn)).join("・")}${unresolvedClubs.length > 3 ? "ほか" : ""})は、データ提供元での表記が異なるため今回は収集できませんでした。<strong>他のクラブの収集には影響していません</strong>(7日後に自動で再挑戦します)。</div>`
+    : "";
   const errorWarningHtml = todayErrors.length
-    ? `<div class="value-note" style="margin-top:2px; color:#c0392b;">⚠️ 本日のデータ取得で${todayErrors.length}件のエラーが発生しました(詳細は「詳しく見る」)。件数が少ないのはこのエラーが原因の可能性があります。</div>`
+    ? `<div class="value-note" style="margin-top:2px; color:#c0392b;">⚠️ 本日のデータ取得で${todayErrors.length}件のエラーが発生しました(詳細は「詳しく見る」)。該当した処理だけが見送られています。</div>`
     : "";
   // 2026年8月・バグ修正: Renderのスリープ起床待ち等で同じ日に学習エンジンが
   // 複数回実行されることがある(サーバー側では合算表示するよう修正済みだが、
@@ -6732,6 +6741,7 @@ async function renderGrowthLogWidget() {
     ${zeroDiagHtml}
     ${zeroVerifyHtml}
     ${errorWarningHtml}
+    ${unresolvedHtml}
     ${runsTodayHtml}
   `;
 

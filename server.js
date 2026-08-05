@@ -4388,6 +4388,8 @@ const server = http.createServer(async (req, res) => {
             knowledgeDuplicate: g.knowledgeItemsDuplicateToday ?? 0,
             failures: Array.isArray(g.errors) ? g.errors.length : 0,
             universeSkipped: (g.universe && g.universe.skipped) || [],
+            // 本番エラー調査: データ提供元の表記差で照合できなかったクラブ
+            unresolvedClubs: (g.universe && g.universe.unresolvedClubs) || [],
           },
           // ---- ② API使用数 ----
           apiUsage: g.apiBudget ? {
