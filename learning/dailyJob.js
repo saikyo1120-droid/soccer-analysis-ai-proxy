@@ -1892,7 +1892,11 @@ async function runDailyLearning(deps) {
       sourceJa: usingSharedBudget
         ? `サーバー共有の予算インスタンスを使用しています(実際の上限: ${apiBudget.summary().dailyBudget}件/日)。すべてのAPI呼び出しがこの1つの予算を通ります。`
         : budgetSourceJa,
-      detectedPlan: detectedPlan || null,
+      // 2026年8月・本番の表示ズレの修正: detectedPlan は実行開始時点(=まだ
+      // 1度もAPIを呼んでいない時点)のスナップショットだったため、実際には
+      // Proの7,500件/日で動いているのに「まだ判定できていません」と表示されて
+      // いた。ログを書く時点で読み直し、実行中に判明した値を正しく残す。
+      detectedPlan: ((typeof getApiPlanInfo === "function") ? getApiPlanInfo() : null) || detectedPlan || null,
     },
     matchesResolvedToday,
     newPredictionsLogged,
