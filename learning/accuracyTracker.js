@@ -20,6 +20,19 @@
  *   ・Log Loss: 実際の結果に割り当てていた確率の対数損失(低いほど良い。
  *     自信満々で外すと大きく罰される)。
  *   ・Calibration: 「70%と言った予測は本当に70%当たっているか」。
+ *
+ * ■ 2026年8月・AI知能計測ラウンド(ご指示⑥)での拡張
+ *   ・Precision / Recall / F1: 1X2はホーム勝ち・引き分け・アウェイ勝ちの
+ *     3クラスなので、クラスごとの混同行列(予測回数・実際の回数・正解回数)を
+ *     毎日積み上げ、マクロ平均のPrecision/Recall/F1を出す。
+ *   ・ECE(Expected Calibration Error): 較正の帯ごとに「申告した自信の平均」も
+ *     保存し(confSum)、|平均自信 − 実際の的中率| の加重平均を厳密に計算する。
+ *   ・Top1/Top3: 1X2は3クラスしかないため「Top3的中率」は定義上必ず100%になる
+ *     (=無意味な数字)。でっち上げた高得点を出さないため、Top3は最も難しい
+ *     「スコア(何対何)」で測る: ポアソン格子の上位3スコアのどれかが実スコアと
+ *     一致したか。Top1は従来どおり予測スコアそのものの一致。
+ *   いずれも過去に保存済みの集計(古い形式)とマージしても壊れないよう、
+ *   新フィールドは欠けていれば0(または「測定不能」)として扱う。
  */
 
 const { poissonPmf } = require("./predictionModel");
@@ -47,6 +60,24 @@ function computeMarketProbs(homeLambda, awayLambda, maxGoals) {
     homeWin: pHome / total, draw: pDraw / total, awayWin: pAway / total,
     btts: pBtts / total, over25: pOver25 / total,
   };
+}
+
+/**
+ * AI知能計測ラウンド(ご指示⑥・Top3): ポアソン格子から確率の高い順に
+ * 上位Nスコアを返す。予測時と同じλ・同じ格子から機械的に導出するため、
+ * 「後から都合の良いスコアを選ぶ」ことはできない。
+ */
+function topScorelines(homeLambda, awayLambda, topN, maxGoals) {
+  if (!Number.isFinite(homeLambda) || !Number.isFinite(awayLambda)) return null;
+  const cap = maxGoals || 8;
+  const cells = [];
+  for (let h = 0; h <= cap; h++) {
+    for (let a = 0; a <= cap; a++) {
+      cells.push({ scoreline: `${h}-${a}`, p: poissonPmf(h, homeLambda) * poissonPmf(a, awayLambda) });
+    }
+  }
+  cells.sort((x, y) => y.p - x.p);
+  return cells.slice(0, Math.max(1, topN || 3)).map((c) => ({ scoreline: c.scoreline, prob: round4(c.p) }));
 }
 
 /** 実スコアから各市場の実際の結果を出す */
@@ -86,6 +117,10 @@ function scorePrediction(record) {
       logLoss: round4(-Math.log(Math.max(P_FLOOR, pActual))),
       confidence: round4(maxProb), // 予測時の自信(較正の材料)
       probs: { homeWin: round4(probs.homeWin), draw: round4(probs.draw), awayWin: round4(probs.awayWin) },
+      // ご指示⑥(Precision/Recall/F1): クラス別混同行列の材料として、
+      // 「どのクラスを予測したか」も採点結果に残す(記録に予測が保存されて
+      // いればそれを使い、無ければ確率の最大クラス=当時の予測を使う)。
+      predicted: record.predictedWinner || predictedWinner,
       actual: actualWinner,
     };
   }
@@ -98,7 +133,18 @@ function scorePrediction(record) {
     out.markets.over25 = binaryScore(probs.over25, actuals.over25);
     // 最終スコアの一致(最も難しい市場。参考値として記録)
     if (record.predictedScoreline) {
-      out.markets.scoreline = { hit: record.predictedScoreline === `${score.home}-${score.away}`, predicted: record.predictedScoreline, actual: `${score.home}-${score.away}` };
+      const actualSl = `${score.home}-${score.away}`;
+      // ご指示⑥(Top3): 予測時と同じポアソン格子から上位3スコアを再導出し、
+      // 実スコアがその中に入っていたかを採点する(1X2のTop3は3クラスで
+      // 必ず100%になるため、意味のあるスコア市場で測る。冒頭コメント参照)。
+      const top3 = topScorelines(record.homeLambda, record.awayLambda, 3);
+      out.markets.scoreline = {
+        hit: record.predictedScoreline === actualSl,
+        predicted: record.predictedScoreline,
+        actual: actualSl,
+        top3: top3 ? top3.map((t) => t.scoreline) : null,
+        top3Hit: top3 ? top3.some((t) => t.scoreline === actualSl) : null,
+      };
     }
   }
   return out;
@@ -134,27 +180,43 @@ function buildDailyAccuracy(scoredList) {
       a.brierSum = round4(a.brierSum + mk.brier);
       a.logLossSum = round4(a.logLossSum + mk.logLoss);
       if (m === "oneX2" && Number.isFinite(mk.confidence)) {
-        // Calibration: 自信(最大確率)の帯ごとに「実際に当たった割合」を貯める
+        // Calibration: 自信(最大確率)の帯ごとに「実際に当たった割合」を貯める。
+        // ご指示⑥(ECE): 帯ごとの「申告した自信の合計」も貯める。これで
+        // ECE = Σ(帯の件数/全件数)×|帯の平均自信 − 帯の的中率| が厳密に出せる。
         const bin = mk.confidence < 0.45 ? "33-45" : mk.confidence < 0.55 ? "45-55" : mk.confidence < 0.7 ? "55-70" : "70+";
         a.calibration[bin].n++;
         if (mk.hit) a.calibration[bin].hits++;
+        a.calibration[bin].confSum = round4((a.calibration[bin].confSum || 0) + mk.confidence);
+      }
+      // ご指示⑥(Precision/Recall/F1): クラス別の混同行列を積み上げる
+      if (m === "oneX2" && mk.predicted && mk.actual && a.perClass[mk.predicted] && a.perClass[mk.actual]) {
+        a.perClass[mk.predicted].pred++;
+        a.perClass[mk.actual].actual++;
+        if (mk.predicted === mk.actual) a.perClass[mk.predicted].correct++;
       }
     }
     if (s.markets.scoreline) {
       agg.scoreline.n++;
       if (s.markets.scoreline.hit) agg.scoreline.hits++;
+      // ご指示⑥(Top3): top3Hitが採点されている記録だけを分母に数える
+      // (古い採点結果にはtop3が無いため、無いものを外れ扱いにしない)。
+      if (typeof s.markets.scoreline.top3Hit === "boolean") {
+        agg.scoreline.top3N++;
+        if (s.markets.scoreline.top3Hit) agg.scoreline.top3Hits++;
+      }
     }
   }
   return agg;
 }
 
 function emptyDailyAccuracy() {
-  const bins = () => ({ "33-45": { n: 0, hits: 0 }, "45-55": { n: 0, hits: 0 }, "55-70": { n: 0, hits: 0 }, "70+": { n: 0, hits: 0 } });
+  const bins = () => ({ "33-45": { n: 0, hits: 0, confSum: 0 }, "45-55": { n: 0, hits: 0, confSum: 0 }, "55-70": { n: 0, hits: 0, confSum: 0 }, "70+": { n: 0, hits: 0, confSum: 0 } });
+  const perClass = () => ({ home: { pred: 0, actual: 0, correct: 0 }, draw: { pred: 0, actual: 0, correct: 0 }, away: { pred: 0, actual: 0, correct: 0 } });
   return {
-    oneX2: { n: 0, hits: 0, brierSum: 0, logLossSum: 0, calibration: bins() },
+    oneX2: { n: 0, hits: 0, brierSum: 0, logLossSum: 0, calibration: bins(), perClass: perClass() },
     btts: { n: 0, hits: 0, brierSum: 0, logLossSum: 0, calibration: bins() },
     over25: { n: 0, hits: 0, brierSum: 0, logLossSum: 0, calibration: bins() },
-    scoreline: { n: 0, hits: 0 },
+    scoreline: { n: 0, hits: 0, top3N: 0, top3Hits: 0 },
   };
 }
 
@@ -170,11 +232,88 @@ function mergeDailyAccuracy(a, b) {
     for (const bin of Object.keys(out[m].calibration)) {
       out[m].calibration[bin].n = (a[m]?.calibration?.[bin]?.n || 0) + (b[m]?.calibration?.[bin]?.n || 0);
       out[m].calibration[bin].hits = (a[m]?.calibration?.[bin]?.hits || 0) + (b[m]?.calibration?.[bin]?.hits || 0);
+      // 古い保存形式にはconfSumが無い → 0として加算(ECE側は「confSumの無い
+      // 件が混ざった帯」を測定対象から外すため、嘘の自信0%にはならない)
+      out[m].calibration[bin].confSum = round4((a[m]?.calibration?.[bin]?.confSum || 0) + (b[m]?.calibration?.[bin]?.confSum || 0));
     }
+  }
+  for (const cls of ["home", "draw", "away"]) {
+    out.oneX2.perClass[cls].pred = (a.oneX2?.perClass?.[cls]?.pred || 0) + (b.oneX2?.perClass?.[cls]?.pred || 0);
+    out.oneX2.perClass[cls].actual = (a.oneX2?.perClass?.[cls]?.actual || 0) + (b.oneX2?.perClass?.[cls]?.actual || 0);
+    out.oneX2.perClass[cls].correct = (a.oneX2?.perClass?.[cls]?.correct || 0) + (b.oneX2?.perClass?.[cls]?.correct || 0);
   }
   out.scoreline.n = (a.scoreline?.n || 0) + (b.scoreline?.n || 0);
   out.scoreline.hits = (a.scoreline?.hits || 0) + (b.scoreline?.hits || 0);
+  out.scoreline.top3N = (a.scoreline?.top3N || 0) + (b.scoreline?.top3N || 0);
+  out.scoreline.top3Hits = (a.scoreline?.top3Hits || 0) + (b.scoreline?.top3Hits || 0);
   return out;
+}
+
+/**
+ * ご指示⑥(Precision/Recall/F1): クラス別混同行列からマクロ平均を計算する。
+ * ・Precision(そのクラスを予測したときに当たっていた割合)は、そのクラスを
+ *   一度も予測していなければ定義できない → 実際に出現しているクラスなら0点、
+ *   そもそも出現していないクラスはマクロ平均から除外(嘘の0点で平均を
+ *   下げない・嘘の満点で上げない)。
+ */
+function computePrecisionRecallF1(perClass) {
+  if (!perClass) return { measurable: false, reasonJa: "クラス別の集計がまだ保存されていません(この機能の追加前に保存された記録です)。" };
+  const CLASS_JA = { home: "ホーム勝ち", draw: "引き分け", away: "アウェイ勝ち" };
+  const classes = [];
+  for (const cls of ["home", "draw", "away"]) {
+    const c = perClass[cls] || { pred: 0, actual: 0, correct: 0 };
+    if (!c.pred && !c.actual) continue; // データに一度も出ていないクラスは評価しない
+    const precision = c.pred > 0 ? c.correct / c.pred : (c.actual > 0 ? 0 : null);
+    const recall = c.actual > 0 ? c.correct / c.actual : (c.pred > 0 ? 0 : null);
+    const f1 = (precision !== null && recall !== null && (precision + recall) > 0)
+      ? (2 * precision * recall) / (precision + recall) : (precision === null || recall === null ? null : 0);
+    classes.push({
+      cls, labelJa: CLASS_JA[cls], predicted: c.pred, actual: c.actual, correct: c.correct,
+      precision: precision === null ? null : round4(precision),
+      recall: recall === null ? null : round4(recall),
+      f1: f1 === null ? null : round4(f1),
+    });
+  }
+  const usable = classes.filter((c) => c.precision !== null && c.recall !== null);
+  if (!usable.length) return { measurable: false, reasonJa: "混同行列に件数がまだありません。", classes };
+  const mean = (key) => round4(usable.reduce((s, c) => s + c[key], 0) / usable.length);
+  return {
+    measurable: true,
+    macroPrecision: mean("precision"), macroRecall: mean("recall"), macroF1: mean("f1"),
+    evaluatedClasses: usable.length,
+    classes,
+    noteJa: "3クラス(ホーム勝ち/引き分け/アウェイ勝ち)のマクロ平均です。データに出現したクラスだけで平均しています。",
+  };
+}
+
+/**
+ * ご指示⑥(ECE): 較正の帯ごとの |平均自信 − 実際の的中率| を件数で加重平均する。
+ * confSumはこの機能の追加後に保存された記録にしか無いため、confSumの無い帯は
+ * 測定対象から正直に外す(0%の自信と偽って計算しない)。
+ */
+function computeEce(calibration) {
+  if (!calibration) return { measurable: false, reasonJa: "較正の帯がまだ保存されていません。" };
+  let totalN = 0, coveredN = 0, weighted = 0;
+  const binDetails = [];
+  for (const [bin, v] of Object.entries(calibration)) {
+    if (!v || !v.n) continue;
+    totalN += v.n;
+    if (!(v.confSum > 0)) continue; // 旧形式(自信の合計が無い)は測定不能として除外
+    const avgConf = v.confSum / v.n;
+    const hitRate = v.hits / v.n;
+    coveredN += v.n;
+    weighted += v.n * Math.abs(avgConf - hitRate);
+    binDetails.push({ bin: `${bin}%`, n: v.n, avgConfPct: round1(avgConf * 100), actualHitPct: round1(hitRate * 100), gapPt: round1(Math.abs(avgConf - hitRate) * 100) });
+  }
+  if (!coveredN) return { measurable: false, reasonJa: totalN ? "自信の合計(confSum)が保存される前の記録のため、ECEは計算できません(新しい採点分から自動的に測定されます)。" : "採点済みの予測がまだありません。", bins: [] };
+  return {
+    measurable: true,
+    ece: round4(weighted / coveredN),
+    ecePct: round1((weighted / coveredN) * 100),
+    measuredOnN: coveredN, totalN,
+    bins: binDetails,
+    noteJa: `ECE = 自信の帯ごとの|平均自信−実際の的中率|の加重平均(0が最良)。${coveredN < totalN ? `全${totalN}件のうち自信が記録されている${coveredN}件で測定。` : ""}`,
+  };
 }
 
 /** 集計を人間が読む形(的中率%・平均Brier・平均LogLoss・較正表)へ変換 */
@@ -196,9 +335,24 @@ function summarizeAccuracy(agg) {
         .filter(([, v]) => v.n > 0)
         .map(([bin, v]) => ({ bin: `${bin}%`, n: v.n, actualHitPct: round1((v.hits / v.n) * 100) })),
     };
+    // ご指示⑥: 1X2にはPrecision/Recall/F1(マクロ平均)とECEを追加する
+    if (m === "oneX2") {
+      out.markets.oneX2.precisionRecallF1 = computePrecisionRecallF1(a.perClass);
+      out.markets.oneX2.ece = computeEce(a.calibration);
+    }
   }
   if (agg.scoreline && agg.scoreline.n) {
-    out.scoreline = { n: agg.scoreline.n, hitRatePct: round1((agg.scoreline.hits / agg.scoreline.n) * 100) };
+    out.scoreline = {
+      n: agg.scoreline.n,
+      hitRatePct: round1((agg.scoreline.hits / agg.scoreline.n) * 100),
+      // ご指示⑥(Top1/Top3): Top1=予測スコアそのものの一致率。Top3=同じ
+      // ポアソン格子の上位3スコアのどれかが実スコアだった割合(採点済み分のみ)。
+      top1HitRatePct: round1((agg.scoreline.hits / agg.scoreline.n) * 100),
+      top3: (agg.scoreline.top3N > 0)
+        ? { n: agg.scoreline.top3N, hitRatePct: round1((agg.scoreline.top3Hits / agg.scoreline.top3N) * 100) }
+        : { n: 0, measurable: false, reasonJa: "Top3の採点はこの機能の追加後の答え合わせから記録されます。" },
+      noteJa: "1X2のTop3的中率は3クラスしか無いため定義上100%になり無意味です。そのためTop3は最も難しい「スコア一致」で測っています。",
+    };
   }
   out.measurable = any;
   if (!any) out.reasonJa = "この期間に答え合わせできた予測がありません(試合が無い・まだ結果が出ていない場合は正常です)。";
@@ -257,7 +411,8 @@ async function getAccuracyTrend(deps, todayDateKey) {
 
 module.exports = {
   ACCURACY_KEY_PREFIX,
-  computeMarketProbs, outcomesFromScore, scorePrediction,
+  computeMarketProbs, outcomesFromScore, scorePrediction, topScorelines,
   buildDailyAccuracy, mergeDailyAccuracy, emptyDailyAccuracy,
+  computePrecisionRecallF1, computeEce,
   summarizeAccuracy, saveDailyAccuracy, getAccuracyTrend,
 };

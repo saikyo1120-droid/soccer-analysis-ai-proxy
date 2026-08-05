@@ -63,7 +63,7 @@ const { assessImportance, summarizeImportance } = require("./importanceEngine");
 // 2026年8月・「知識量を大幅に増やす」フェーズ: UEFA上位100クラブの日次収集
 const { collectUniverse } = require("./universeCollector");
 const { createClubDossier } = require("../knowledge/clubDossier");
-const { buildDailySnapshot, saveDailyMetrics } = require("./dailyMetrics");
+const { buildDailySnapshot, saveDailyMetrics, compareSnapshots, METRICS_KEY_PREFIX } = require("./dailyMetrics");
 const {
   computeGoalRateFeatures, computeFatigueFeature,
   fetchInjuryCountFeature, fetchStandingsFeature, fetchHeadToHeadFeature,
@@ -79,7 +79,15 @@ const {
 } = require("./predictionModel");
 // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ ----
 // ⑨ 予測精度の毎日測定(勝敗/BTTS/Over-Under、Brier・LogLoss・較正)
-const { scorePrediction, buildDailyAccuracy, saveDailyAccuracy } = require("./accuracyTracker");
+const { scorePrediction, buildDailyAccuracy, saveDailyAccuracy, getAccuracyTrend } = require("./accuracyTracker");
+// ---- 2026年8月・AI知能計測ラウンド(ご指示①〜⑨) ----
+// 考察の質・RAG使用率の日次保存、エンジン別成長率、Knowledgeの寄与ランキング、
+// 精度低下の自己分析、そして毎日の自己評価「今日のAIは昨日より賢くなったか?」
+const {
+  flushIntelDaily, getIntelTrend, computeHypothesisStats, buildEngineGrowth,
+  buildKnowledgeContributionRanking, buildAccuracyDiagnosis, buildSelfAssessment,
+  INTEL_KEY_PREFIX, INTEL_REPORT_KEY_PREFIX,
+} = require("./intelligenceMetrics");
 // ① 学習によって「予測がどう変わったか」の記録
 const { computePredictionShift } = require("./predictionShift");
 // ⑩ AIが自分で「次に何を学ぶか」を決める
@@ -345,6 +353,10 @@ function mergeGrowthLogs(previous, current) {
     learningAgenda: current.learningAgenda || previous.learningAgenda || null,
     agendaAppliedToday: current.agendaAppliedToday || previous.agendaAppliedToday || null,
     learningProof: current.learningProof || previous.learningProof || null,
+    // AI知能計測ラウンド(ご指示①〜⑨): 知能レポート(自己評価・成長率など)も
+    // 「その日最後に計算できた値」を残す(後の実行がまだ計算していなくても
+    // 前の実行の実測を消さない)。
+    intelligence: current.intelligence || previous.intelligence || null,
     errors: capList([...(previous.errors || []), ...(current.errors || [])]),
   };
 }
@@ -1913,6 +1925,76 @@ async function runDailyLearning(deps) {
   // 最終方針「Knowledge Engineは使用回数まで管理」: その日メモリに貯めた
   // 知識の使用回数を1日1回まとめて保存する(質問時にはRedisへ書かない設計)。
   try { await knowledgeStore.flushUsageCounters(); } catch (e) { /* ベストエフォート */ }
+
+  // ---- 2026年8月・AI知能計測ラウンド(ご指示①〜⑨) ----
+  // 1日の最後に「AIの脳」の測定をまとめて行う(重い読み書きはすべて夜間バッチの
+  // ここで行い、利用者の質問時には一切行わない。最終方針⑥)。
+  try {
+    const intelDeps = { upstashEnabled, upstashGetJSON, upstashSetJSON };
+    // ③⑤ 考察の質・RAG使用率: メモリ集計をその日のキーへ保存
+    await flushIntelDaily(intelDeps, dateKey);
+    await upstashCmd(["EXPIRE", `${INTEL_KEY_PREFIX}${dateKey}`, String(120 * 86400)]).catch(() => {});
+
+    // 測定材料を読み出す(すべて保存済みの実測値)
+    const yesterdayKey = new Date(new Date(`${dateKey}T00:00:00Z`).getTime() - 86400000).toISOString().slice(0, 10);
+    const [accuracyTrendNow, intelTrendNow, yesterdayMetrics, topUsedNow] = await Promise.all([
+      getAccuracyTrend(intelDeps, dateKey).catch(() => ({ available: false })),
+      getIntelTrend(intelDeps, dateKey).catch(() => ({ available: false })),
+      upstashGetJSON(`${METRICS_KEY_PREFIX}${yesterdayKey}`).catch(() => null),
+      knowledgeStore.getTopUsedKnowledge(10).catch(() => []),
+    ]);
+
+    // ⑧ エンジン別の成長率(実測の前日差分のみ)
+    const engineGrowth = buildEngineGrowth({
+      todayMetrics: metricsSnapshot, yesterdayMetrics,
+      accuracyTrend: accuracyTrendNow, intelTrend: intelTrendNow,
+    });
+    // ① Knowledgeの寄与ランキング(特徴量寄与の実測×知識の対応+使用実績)
+    const knowledgeContribution = buildKnowledgeContributionRanking({
+      featureEffectiveness: featureEffectivenessToday, topUsedKnowledge: topUsedNow,
+    });
+    // ⑦ 「最近精度が落ちている原因」の自己分析(実測シグナルからの機械的な特定)
+    const accuracyDiagnosis = buildAccuracyDiagnosis({
+      accuracyTrend: accuracyTrendNow, featureEffectiveness: featureEffectivenessToday, agenda: agendaToday,
+    });
+    // ⑨ 毎日の自己評価「今日のAIは昨日より賢くなったか?」(YES/NO/判定不能)
+    const selfAssessment = buildSelfAssessment({
+      accuracyTrend: accuracyTrendNow,
+      metricsComparison: compareSnapshots(metricsSnapshot, yesterdayMetrics),
+      intelTrend: intelTrendNow,
+      agenda: agendaToday,
+      hypothesisStats: computeHypothesisStats(hypothesesConfirmed, hypothesesDiscarded),
+      weightsUpdated: !!(weightsUpdated || weightsUpdatedV2),
+    });
+
+    const intelligenceReport = {
+      date: dateKey,
+      generatedAt: new Date().toISOString(),
+      selfAssessment,                    // ⑨ 自己評価(数値の証明つき)
+      engineGrowth,                      // ⑧ エンジン別成長率
+      knowledgeContribution,             // ① 知識の寄与ランキング(方法論つき)
+      accuracyDiagnosis,                 // ⑦ 精度低下の自己分析
+      reasoningTrend: intelTrendNow,     // ③ 考察の質の推移・⑤ RAG使用率
+      hypothesisStats: computeHypothesisStats(hypothesesConfirmed, hypothesesDiscarded), // 仮説的中率
+    };
+    await upstashSetJSON(`${INTEL_REPORT_KEY_PREFIX}${dateKey}`, intelligenceReport);
+    await upstashSetJSON("learn:intel:report:latest", intelligenceReport);
+    await upstashCmd(["EXPIRE", `${INTEL_REPORT_KEY_PREFIX}${dateKey}`, String(120 * 86400)]).catch(() => {});
+
+    // growthLogにも同梱して再保存する(daily-report/growth-logの両方から読めるように)。
+    // 注: SETはTTLを消すため、日付つきキーは再保存の後で必ずEXPIREを付け直す。
+    mergedGrowthLog.intelligence = intelligenceReport;
+    await upstashSetJSON(`learn:growthlog:${dateKey}`, mergedGrowthLog);
+    await upstashSetJSON("learn:growthlog:latest", mergedGrowthLog);
+    await upstashCmd(["EXPIRE", `learn:growthlog:${dateKey}`, String(120 * 86400)]).catch(() => {});
+  } catch (e) {
+    // 知能計測は日次学習の成果を壊してはいけない(ベストエフォート)。
+    // ただし黙って消えると「測定していないのに測定済みに見える」ため、errorsに残す。
+    mergedGrowthLog.errors = capList([...(mergedGrowthLog.errors || []), `intelligence_report_failed:${e.message}`]);
+    await upstashSetJSON(`learn:growthlog:${dateKey}`, mergedGrowthLog).catch(() => {});
+    await upstashSetJSON("learn:growthlog:latest", mergedGrowthLog).catch(() => {});
+    await upstashCmd(["EXPIRE", `learn:growthlog:${dateKey}`, String(120 * 86400)]).catch(() => {});
+  }
 
   return { ok: true, ...mergedGrowthLog };
 }
