@@ -6107,14 +6107,18 @@ function renderPlayerChips() {
   const posVal = document.getElementById("posFilter").value;
   const countryVal = document.getElementById("countryFilter").value;
   const clubVal = document.getElementById("clubFilter").value;
+  // 2026年8月・ご指示: 選手一覧は常に「AI総合評価の高い順」に並べる。
+  // 並べ替えは描画のたびに行うため、今後選手が追加された場合も、
+  // 次の描画で自動的に点数順の正しい位置に入る(手作業での並べ直しは不要)。
+  // 同点の場合は名前順で安定させる。
   const list = Object.entries(PLAYERS).filter(([key, p]) => {
     if (posVal && positionGroup(p.position) !== posVal) return false;
     if (countryVal && countryBase(p) !== countryVal) return false;
     if (clubVal && clubBase(p) !== clubVal) return false;
     return true;
-  });
+  }).sort((a, b) => ((b[1].overall || 0) - (a[1].overall || 0)) || String(a[1].nameJa).localeCompare(String(b[1].nameJa), "ja"));
   document.getElementById("playerChips").innerHTML = list.length
-    ? list.map(([key, p]) => `<button class="chip" data-name="${p.nameJa}"><span class="chip-avatar" id="chipAvatar-${key}">${photoCache[key] ? `<img src="${photoCache[key]}" alt="">` : p.emoji}</span>${p.nameJa}</button>`).join("")
+    ? list.map(([key, p]) => `<button class="chip" data-name="${p.nameJa}"><span class="chip-avatar" id="chipAvatar-${key}">${photoCache[key] ? `<img src="${photoCache[key]}" alt="">` : p.emoji}</span>${p.nameJa}<span style="opacity:.6; font-size:.85em; margin-left:4px;">${fmt(p.overall, 1)}</span></button>`).join("")
     : `<p class="value-note">条件に合う登録選手がいません。</p>`;
   // lazily fetch real photos for whichever chips don't have one cached yet (capped concurrency)
   photoQueue.length = 0; // drop any stale pending jobs from a previous filter pass
@@ -6138,7 +6142,10 @@ document.getElementById("clubFilter").addEventListener("change", renderPlayerChi
 populatePlayerFilters();
 renderPlayerChips();
 
-document.getElementById("playerNameList").innerHTML = Object.values(PLAYERS).map(p => `<option value="${p.nameJa}"><option value="${p.name}">`).join("");
+// 検索欄の入力候補も総合評価の高い順に出す(ご指示: 点数の高い順)
+document.getElementById("playerNameList").innerHTML = Object.values(PLAYERS)
+  .slice().sort((a, b) => (b.overall || 0) - (a.overall || 0))
+  .map(p => `<option value="${p.nameJa}"><option value="${p.name}">`).join("");
 document.getElementById("playerLevelHint").textContent = "解説文はレベル切り替え(超入門/標準/戦術)に連動します。絞り込み(ポジション・国/地域・所属クラブ)は選手候補一覧(下のボタン)に適用され、検索欄の直接入力はどの選手でも対象になります。";
 
 /* =========================================================
