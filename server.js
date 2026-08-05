@@ -61,7 +61,7 @@ const { recordPredictionEvaluation, buildComparisonForResponse } = require("./me
 const { getMetricsTrend } = require("./learning/dailyMetrics");
 // 2026年8月・「本当に毎日賢くなるAI」フェーズ(ご指示②⑨⑩):
 // 予測精度の毎日測定・学習計画・信頼度の説明をダッシュボードへ返す
-const { getAccuracyTrend } = require("./learning/accuracyTracker");
+const { getAccuracyTrend, computeMarketProbs } = require("./learning/accuracyTracker");
 // 2026年8月・AI知能計測ラウンド(ご指示③⑤): 考察の質とRAG使用率を、質問時は
 // メモリ集計のみ(応答速度への影響ゼロ)で記録する。日次保存はdailyJobが行う。
 const intelligenceMetrics = require("./learning/intelligenceMetrics");
@@ -1331,6 +1331,85 @@ async function handleFixturesToday(query, opts) {
   }
 }
 
+// ---- 2026年8月・利用者目線ラウンド: 「今日のAI予想」を開いた瞬間に見せる ----
+// 「このサイトの一番の価値はAIによる試合予想」というご指摘への対応。
+// 予想は毎朝の日次学習でAI自身のモデル(学習済みの重み)が生成・保存した
+// learn:ownpred レコードをそのまま読むだけで、このエンドポイントが新しい
+// 予測計算やAPI-Football呼び出しを発生させることはない(最終方針⑥:
+// 「利用者が質問した瞬間に重い処理を行う設計は禁止」)。
+// 試合一覧は handleFixturesToday の既存キャッシュを共有する。
+
+/** 今日の試合1件 + 保存済みのAI予測レコード → 画面表示用の1行(純関数・テスト対象) */
+function buildTodayPredictionEntry(fixture, record) {
+  if (!fixture || !record) return null;
+  const probs = (Number.isFinite(record.homeLambda) && Number.isFinite(record.awayLambda))
+    ? computeMarketProbs(record.homeLambda, record.awayLambda) : null;
+  const pct = (v) => Math.round(v * 100);
+  const topFactor = Array.isArray(record.factorImportance) && record.factorImportance.length
+    ? (record.factorImportance.find((f) => f && f.stars > 0) || record.factorImportance[0]) : null;
+  return {
+    fixtureId: fixture.id,
+    league: fixture.league || record.league || null,
+    country: fixture.country || null,
+    kickoff: fixture.date || record.kickoff || null,
+    status: fixture.status || null,
+    home: fixture.home || null,
+    away: fixture.away || null,
+    score: fixture.score || null,
+    predictedWinner: record.predictedWinner || null,
+    probs: probs ? { homeWinPct: pct(probs.homeWin), drawPct: pct(probs.draw), awayWinPct: pct(probs.awayWin) } : null,
+    predictedScoreline: record.predictedScoreline || null,
+    topFactorJa: topFactor ? topFactor.labelJa : null,
+    // 「学習v◯の重みで予測」— 重みが更新されるたびにこの数字が上がる=
+    // AIが学習しながら予想していることが利用者にも見える
+    weightsVersion: Number.isFinite(record.weightsVersion) ? record.weightsVersion : null,
+    loggedAt: record.loggedAt || null,
+    resolved: !!record.resolved,
+    correct: record.resolved ? record.correct : null,
+    actualWinner: record.resolved ? (record.actualWinner || null) : null,
+  };
+}
+
+async function handlePredictionsToday() {
+  const cacheKey = `predictions-today:${appDateKey()}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return { status: 200, body: cached };
+
+  const { body: fx } = await handleFixturesToday(new URLSearchParams(), {});
+  if (!fx || !fx.found) {
+    const payload = {
+      found: false, reason: (fx && fx.reason) || "fixtures_unavailable",
+      noteJa: "本日の試合一覧を取得できなかったため、AI予想を表示できません(サーバー起動直後やAPI利用上限時に起こります。しばらくして再読み込みしてください)。",
+    };
+    cacheSet(cacheKey, payload, 2 * 60 * 1000);
+    return { status: 200, body: payload };
+  }
+  const fixtures = fx.fixtures || [];
+  let predictions = [];
+  if (UPSTASH_ENABLED && fixtures.length) {
+    // Redisの読み取りのみ(1試合1コマンド・上限60・結果は5分キャッシュ)
+    const target = fixtures.slice(0, 60);
+    const records = await Promise.all(target.map((f) => upstashGetJSON(`learn:ownpred:${f.id}`).catch(() => null)));
+    predictions = target.map((f, i) => buildTodayPredictionEntry(f, records[i])).filter(Boolean);
+    predictions.sort((a, b) => new Date(a.kickoff || 0) - new Date(b.kickoff || 0));
+  }
+  const payload = {
+    found: true,
+    date: fx.date,
+    generatedAt: new Date().toISOString(),
+    totalFixturesToday: fixtures.length,
+    predictions,
+    // 予想が無い日も、その理由を正直に表示する(推測で予想をでっち上げない)
+    noteJa: predictions.length
+      ? "AI自身の予測モデル(実データで毎日学習した重み)による予想です。予想は毎朝の学習時に生成・保存され、試合終了後に必ず答え合わせされて学習に使われます。"
+      : (fixtures.length
+        ? `本日の試合${fixtures.length}件の中に、AIが予想を保存している試合はまだありません。予想は毎朝4時の学習で、AIが毎日追跡しているクラブ(欧州上位クラブ)の試合について生成されます。オフシーズン中は対象試合が少ないのが正常です。`
+        : "本日は対象となる試合がありません。シーズン中は毎朝の学習で、ここにAI予想が並びます。"),
+  };
+  cacheSet(cacheKey, payload, 5 * 60 * 1000);
+  return { status: 200, body: payload };
+}
+
 // 2026年8月・優先順位⑤: 「今日の試合検索」で監督名からもチームを検索できる
 // ようにするための軽量エンドポイント。今日の試合一覧に登場する全チーム(最大
 // 160チーム分)の監督データを毎回先読みするとAPI予算(月間上限あり)を圧迫する
@@ -1494,6 +1573,17 @@ async function handleFixtureAnalysis(query) {
     const homePlayers = buildTeamPlayers(homeTeamBlock);
     const awayPlayers = buildTeamPlayers(awayTeamBlock);
 
+    // 利用者目線ラウンド: 「選手評価データがありません」だけでは、待てば出るのか
+    // 永遠に出ないのか利用者に分からない。空である理由を機械的に区別して添える。
+    //   ・取得失敗(予算切れ・通信) → 開き直せば再取得される(dataIncompleteNoteJaも参照)
+    //   ・取得成功なのに空 → API-Football側がこの試合の選手統計を提供していない
+    //     (親善試合・一部の大会では提供されない。提供され次第自動で表示される)
+    const playersUnavailableReasonJa = (!homePlayers.length && !awayPlayers.length)
+      ? (subFetchFailed
+        ? "選手評価の取得に失敗しました(APIの利用上限・通信の問題)。時間をおいてこの画面を開き直すと自動で再取得します。"
+        : "データ提供元(API-Football)がこの試合の選手評価を提供していません。親善試合や一部の大会では選手のレーティングが提供されないことがあり、これは蓄積不足ではなくデータ提供元側の範囲の問題です。主要リーグの公式戦では提供されます。")
+      : null;
+
     const events = (eventsData.response || []).map((e) => ({
       minute: e.time ? e.time.elapsed : null,
       extra: e.time ? e.time.extra : null,
@@ -1515,6 +1605,7 @@ async function handleFixtureAnalysis(query) {
         awayPlayers,
         events,
         elapsed: entry.fixture.status ? entry.fixture.status.elapsed : null,
+        playersUnavailableReasonJa,
       };
       cacheSet(cacheKey, payload, 60 * 1000);
       return { status: 200, body: payload };
@@ -1534,6 +1625,7 @@ async function handleFixtureAnalysis(query) {
       homePlayers,
       awayPlayers,
       events,
+      playersUnavailableReasonJa,
       motmHome: homePlayers[0] || null,
       motmAway: awayPlayers[0] || null,
       aiPredictionResult: predictionRecord && predictionRecord.resolved
@@ -3762,6 +3854,14 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(body));
         return;
       }
+      if (pathname === "/api/predictions/today") {
+        // 利用者目線ラウンド: トップページの「🔮 今日のAI予想」。保存済み予測の
+        // 読み出しのみ(新しい予測計算・API呼び出しは発生しない)。
+        const { status, body } = await handlePredictionsToday();
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
       if (pathname === "/api/fixtures/analysis") {
         const { status, body } = await handleFixtureAnalysis(parsed.searchParams);
         res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -4183,6 +4283,7 @@ module.exports = {
   handlePlayerSeasonStats,
   handleFixturesToday,
   handleFixtureAnalysis,
+  handlePredictionsToday, buildTodayPredictionEntry, // 利用者目線ラウンド: 今日のAI予想
   handleCoachSearch,
   handleAccuracyStats,
   handleAutoCollectPredictions,

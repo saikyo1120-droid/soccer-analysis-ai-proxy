@@ -360,6 +360,15 @@
     </div>
   </header>
 
+  <!-- 2026年8月・利用者目線ラウンド: 「AIは今日の試合をどう予想しているのか」を
+       開いた瞬間(5秒以内)に見せる。中身は毎朝の学習でAI自身のモデルが生成・
+       保存した予測(learn:ownpred)の読み出しで、このカードが新しい計算を
+       発生させることはない。予想が無い日は理由を正直に表示する。 -->
+  <div class="card" id="todayPredictionsCard" style="border:1.5px solid var(--series-2, #b3541e);">
+    <h2 style="margin-bottom:6px;">🔮 今日のAI予想</h2>
+    <div id="todayPredictionsBody"><p class="value-note">今日のAI予想を読み込み中…</p></div>
+  </div>
+
   <div class="card" id="heroAiChat" style="border:1.5px solid var(--series-home);">
     <h2>🤖 AIに質問する</h2>
     <p class="sub" style="margin-bottom:12px;">何について知りたいですか？選手・クラブ・今日の試合について、思いついたまま聞いてみてください。</p>
@@ -4982,6 +4991,13 @@ function buildDecisivePointsText(analysis, level) {
       ? `一番活躍したのは${motmTeam}の${motm.name}選手でした(評価${motm.rating})。`
       : `この試合のマン・オブ・ザ・マッチ候補は${motmTeam}の${motm.name}(評価${motm.rating})です。`);
   }
+  // 利用者目線ラウンド: 選手評価もイベントも無い試合では、スコア以外の分析材料が
+  // 存在しない。理由を正直に添える(推測で「勝敗を分けた要因」を作らないため)。
+  if (homeAvg === null && awayAvg === null && !(analysis.events || []).length) {
+    parts.push(analysis.playersUnavailableReasonJa
+      ? `なお、${analysis.playersUnavailableReasonJa}このため、スコア以上の詳しい要因分析はできません。`
+      : `なお、この試合は選手評価・イベントのデータが無いため、スコア以上の詳しい要因分析はできません(推測で理由は作りません)。`);
+  }
   return parts.join("");
 }
 // 2026年8月・優先順位④: 試合中(ライブ)の実データ表示。終了後の「振り返り」
@@ -5006,11 +5022,11 @@ function buildLiveAnalysisHtml(analysis, level) {
       <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:10px;">
         <div style="flex:1; min-width:240px;">
           <strong>${f.home.name} 現在の選手評価</strong>
-          <div style="margin-top:6px;">${analysis.homePlayers.map(playerRatingRowHtml).join("") || `<p class="value-note">まだ評価データがありません。</p>`}</div>
+          <div style="margin-top:6px;">${analysis.homePlayers.map(playerRatingRowHtml).join("") || `<p class="value-note">${escapeHtml(analysis.playersUnavailableReasonJa || "まだ評価データがありません。")}</p>`}</div>
         </div>
         <div style="flex:1; min-width:240px;">
           <strong>${f.away.name} 現在の選手評価</strong>
-          <div style="margin-top:6px;">${analysis.awayPlayers.map(playerRatingRowHtml).join("") || `<p class="value-note">まだ評価データがありません。</p>`}</div>
+          <div style="margin-top:6px;">${analysis.awayPlayers.map(playerRatingRowHtml).join("") || `<p class="value-note">${escapeHtml(analysis.playersUnavailableReasonJa || "まだ評価データがありません。")}</p>`}</div>
         </div>
       </div>
       <div style="margin-top:10px;">
@@ -5036,11 +5052,11 @@ function buildFinishedAnalysisHtml(analysis, level) {
       <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:10px;">
         <div style="flex:1; min-width:240px;">
           <strong>${f.home.name} 選手評価${analysis.motmHome ? "(MOTM候補: " + analysis.motmHome.name + ")" : ""}</strong>
-          <div style="margin-top:6px;">${analysis.homePlayers.map(playerRatingRowHtml).join("") || `<p class="value-note">選手評価データがありません。</p>`}</div>
+          <div style="margin-top:6px;">${analysis.homePlayers.map(playerRatingRowHtml).join("") || `<p class="value-note">${escapeHtml(analysis.playersUnavailableReasonJa || "選手評価データがありません。")}</p>`}</div>
         </div>
         <div style="flex:1; min-width:240px;">
           <strong>${f.away.name} 選手評価${analysis.motmAway ? "(MOTM候補: " + analysis.motmAway.name + ")" : ""}</strong>
-          <div style="margin-top:6px;">${analysis.awayPlayers.map(playerRatingRowHtml).join("") || `<p class="value-note">選手評価データがありません。</p>`}</div>
+          <div style="margin-top:6px;">${analysis.awayPlayers.map(playerRatingRowHtml).join("") || `<p class="value-note">${escapeHtml(analysis.playersUnavailableReasonJa || "選手評価データがありません。")}</p>`}</div>
         </div>
       </div>
       <div style="margin-top:10px;">
@@ -6822,6 +6838,63 @@ renderGrowthLogWidget();
 // 毎日の学習ダッシュボード。サーバーの実測値のみを表示し、
 // 測定できない項目は「測定できない理由」をそのまま出す(でっち上げない)。
 // ============================================================
+// ---- 2026年8月・利用者目線ラウンド: 「🔮 今日のAI予想」ヒーローカード ----
+// サーバーの /api/predictions/today(保存済み予測の読み出しのみ)を表示する。
+// 予想が無い日は「なぜ無いのか」をサーバーの正直な説明そのままで表示する。
+async function renderTodayPredictionsHero() {
+  const el = document.getElementById("todayPredictionsBody");
+  if (!el) return;
+  let data = null;
+  try {
+    data = await fetchJsonWithTimeout(`${API_PROXY_BASE}/predictions/today`, backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { /* 下のnull処理へ */ }
+  if (!data) {
+    el.innerHTML = `<p class="value-note">AI予想を取得できませんでした(サーバー起動待ちの可能性があります。しばらくして再読み込みしてください)。</p>`;
+    return;
+  }
+  if (!data.found || !Array.isArray(data.predictions) || !data.predictions.length) {
+    el.innerHTML = `<p class="value-note">${escapeHtml(data.noteJa || "本日のAI予想はありません。")}</p>`;
+    return;
+  }
+  const winnerLabel = (p) => p.predictedWinner === "home" ? `${p.home && p.home.name ? p.home.name : "ホーム"} 勝利`
+    : p.predictedWinner === "away" ? `${p.away && p.away.name ? p.away.name : "アウェイ"} 勝利`
+    : "引き分け";
+  const rows = data.predictions.slice(0, 5).map((p) => {
+    const homeName = escapeHtml((p.home && p.home.name) || "ホーム");
+    const awayName = escapeHtml((p.away && p.away.name) || "アウェイ");
+    const kickoffStr = p.kickoff ? new Date(p.kickoff).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "";
+    const resultBadge = p.resolved
+      ? (p.correct
+        ? `<span style="color:#1c7c54; font-weight:bold; margin-left:6px;">✅ 的中</span>`
+        : `<span style="color:#b3541e; font-weight:bold; margin-left:6px;">❌ 外れ</span>`)
+      : "";
+    const scoreStr = (p.score && p.score.home !== null && p.score.home !== undefined) ? ` <strong>${Number(p.score.home)} - ${Number(p.score.away)}</strong>` : "";
+    const probBar = p.probs ? `
+      <div style="display:flex; height:14px; border-radius:7px; overflow:hidden; margin:6px 0 2px; font-size:10px; line-height:14px; color:#fff; text-align:center;">
+        <div style="width:${Number(p.probs.homeWinPct)}%; background:var(--series-home, #2563eb); min-width:28px;">${Number(p.probs.homeWinPct)}%</div>
+        <div style="width:${Number(p.probs.drawPct)}%; background:#8a97a3; min-width:24px;">${Number(p.probs.drawPct)}%</div>
+        <div style="width:${Number(p.probs.awayWinPct)}%; background:var(--series-away, #b3541e); min-width:28px;">${Number(p.probs.awayWinPct)}%</div>
+      </div>
+      <div class="value-note" style="display:flex; justify-content:space-between; font-size:11px;"><span>${homeName}勝利</span><span>引分</span><span>${awayName}勝利</span></div>` : "";
+    return `
+      <div style="padding:10px 0; border-bottom:1px solid var(--border);">
+        <div><strong>${homeName} vs ${awayName}</strong>${scoreStr}${resultBadge}
+          <span class="value-note" style="margin-left:8px;">${escapeHtml(p.league || "")}${kickoffStr ? " ・ " + kickoffStr : ""}</span></div>
+        <div style="margin-top:2px;">🤖 AIの予想: <strong>${escapeHtml(winnerLabel(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}</div>
+        ${probBar}
+        <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
+      </div>`;
+  });
+  const moreCount = data.predictions.length - 5;
+  el.innerHTML = `
+    ${rows.join("")}
+    ${moreCount > 0 ? `<p class="value-note" style="margin-top:6px;">ほか${moreCount}試合の予想は「📡 本日の実際の試合」から見られます。</p>` : ""}
+    <div style="margin-top:8px;">
+      <button class="more-details-btn" type="button" style="display:inline-block; width:auto; padding:5px 12px;" onclick="var c=document.getElementById('realFixturesCard'); if(c && c.style.display!=='none'){c.scrollIntoView({behavior:'smooth'});}">📡 試合の詳しい分析を見る ▼</button>
+    </div>
+    <p class="value-note" style="margin-top:6px; opacity:.8;">${escapeHtml(data.noteJa || "")}</p>`;
+}
+
 async function renderDailyReportWidget() {
   const summaryEl = document.getElementById("dailyReportSummary");
   const detailsEl = document.getElementById("dailyReportDetails");
@@ -7005,6 +7078,7 @@ async function renderDailyReportWidget() {
   }
 }
 renderDailyReportWidget();
+renderTodayPredictionsHero();
 </script>
 </body>
 </html>
