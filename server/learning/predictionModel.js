@@ -263,18 +263,81 @@ function backtestAccuracyV2(records, weights) {
 
 // 負の対数尤度(NLL)。実際に起きた結果に、モデルがどれだけ高い確率を
 // 割り当てられていたかを損失として測る(低いほど良い)。
-function computeNegativeLogLikelihood(records, weights) {
+//
+// 2026年8月・「本当に毎日賢くなるAI」フェーズ(ご指示⑤)での拡張:
+// opts.sampleWeightOf(record) を渡すと、記録ごとの重み(=その予測に使った
+// データの信頼度)つきの加重平均になる。信頼度の高いデータで行った予測の
+// 結果ほど強く学習し、古い・信頼度の低いデータでの予測は学習への影響を
+// 弱める。opts無しの呼び出しは従来と完全に同じ動作(既存テストを壊さない)。
+function computeNegativeLogLikelihood(records, weights, opts) {
   const usable = (records || []).filter((r) => r && r.actualWinner && r.features);
   if (!usable.length) return null;
+  const weightOf = opts && typeof opts.sampleWeightOf === "function" ? opts.sampleWeightOf : null;
   let total = 0;
+  let totalWeight = 0;
   for (const r of usable) {
     const { homeLambda, awayLambda } = predictOutcomeV2(r.features, weights);
     const probs = computeMatchProbabilitiesRaw(homeLambda, awayLambda);
     const pFrac = r.actualWinner === "home" ? probs.homeWin : r.actualWinner === "away" ? probs.awayWin : probs.draw;
     const pClamped = Math.max(0.005, pFrac); // log(0)回避のための下限クランプ
-    total += -Math.log(pClamped);
+    const sw = weightOf ? weightOf(r) : 1;
+    const swSafe = Number.isFinite(sw) && sw > 0 ? sw : 1; // 異常な重みで学習を壊さない
+    total += -Math.log(pClamped) * swSafe;
+    totalWeight += swSafe;
   }
-  return total / usable.length;
+  return totalWeight > 0 ? total / totalWeight : null;
+}
+
+// ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ(ご指示⑧) ----
+// 「どの特徴量が当たりやすいか・どの特徴量が不要か」を自動分析する。
+// 方法: 各特徴量について「その重みだけを0にしたモデル」のNLLを実測し、
+//   contribution = NLL(その特徴量なし) - NLL(現在)
+// を計算する。正の値=その特徴量を外すと損失が増える=役に立っている。
+// 負の値=外した方が良い=有害(過学習など)。ゼロ重みの特徴量は「未学習」。
+// すべて実データ(検証済み予測)に対する実測で、推測は入らない。
+function computeFeatureEffectiveness(records, weights, opts) {
+  const usable = (records || []).filter((r) => r && r.actualWinner && r.features);
+  if (usable.length < 5) {
+    return { measurable: false, sampleSize: usable.length, reasonJa: `検証済みの予測が${usable.length}件しかないため、特徴量ごとの有効性はまだ測定できません(5件以上で測定します)。`, features: [] };
+  }
+  const base = computeNegativeLogLikelihood(usable, weights, opts);
+  if (base === null) return { measurable: false, sampleSize: usable.length, reasonJa: "損失を計算できませんでした。", features: [] };
+  const features = [];
+  for (const [fKey, wKey] of Object.entries(FEATURE_WEIGHT_MAP)) {
+    const w = weights[wKey] || 0;
+    if (Math.abs(w) < 1e-6) {
+      features.push({ key: fKey, labelJa: FEATURE_LABELS_JA[fKey], weight: 0, contribution: null, verdictJa: "未学習(重み0のため予測に使われていません)" });
+      continue;
+    }
+    const ablated = { ...weights, [wKey]: 0 };
+    const without = computeNegativeLogLikelihood(usable, ablated, opts);
+    const contribution = without === null ? null : Math.round((without - base) * 10000) / 10000;
+    features.push({
+      key: fKey, labelJa: FEATURE_LABELS_JA[fKey],
+      weight: Math.round(w * 1000) / 1000,
+      contribution,
+      verdictJa: contribution === null ? "測定不能"
+        : contribution > 0.002 ? "有効(この特徴量を外すと予測が悪化します)"
+        : contribution < -0.002 ? "有害の疑い(外した方が損失が下がります。次回の重み学習で0化候補になります)"
+        : "影響は小さい(あっても無くても損失がほぼ変わりません)",
+    });
+  }
+  features.sort((a, b) => (b.contribution ?? -Infinity) - (a.contribution ?? -Infinity));
+  return { measurable: true, sampleSize: usable.length, baseLoss: Math.round(base * 10000) / 10000, features };
+}
+
+// 有害と実測された特徴量を0にした候補を作る(ご指示⑧「不要な特徴量は重みを
+// 減らす」の実行部)。候補は必ず既存のホールドアウト関門(学習用・検証用の
+// 両方で改善した場合のみ採用)を通るため、誤検出で予測が悪化することはない。
+function buildAblationCandidates(effectivenessReport, currentWeights) {
+  if (!effectivenessReport || !effectivenessReport.measurable) return [];
+  return effectivenessReport.features
+    .filter((f) => f.contribution !== null && f.contribution < -0.002)
+    .map((f) => ({
+      w: { ...currentWeights, [FEATURE_WEIGHT_MAP[f.key]]: 0 },
+      method: `ablation_${f.key}`,
+      noteJa: `実測で「${f.labelJa}」が予測を悪化させていた(寄与${f.contribution})ため、この特徴量を外す候補を試しました。`,
+    }));
 }
 
 // 2026年8月・優先順位②の実装中に、重みの学習シミュレーションで発見した重大な
@@ -298,14 +361,17 @@ function fitWeightsGradientDescent(records, initialWeights, opts) {
   const lr = (opts && opts.learningRate) || 0.08;
   const iterations = (opts && opts.iterations) || 40;
   const epsilon = 1e-3;
+  // 2026年8月・ご指示⑤: 信頼度の高いデータで行った予測ほど強く学習する
+  // (opts.sampleWeightOf経由。渡さなければ従来どおり全件同じ重み)。
+  const nllOpts = opts && opts.sampleWeightOf ? { sampleWeightOf: opts.sampleWeightOf } : undefined;
 
   for (let iter = 0; iter < iterations; iter++) {
-    const baseLoss = computeNegativeLogLikelihood(usable, weights);
+    const baseLoss = computeNegativeLogLikelihood(usable, weights, nllOpts);
     if (baseLoss === null) break;
     const grad = {};
     for (const k of LEARNABLE_KEYS) {
       const bumped = { ...weights, [k]: weights[k] + epsilon };
-      const bumpedLoss = computeNegativeLogLikelihood(usable, bumped);
+      const bumpedLoss = computeNegativeLogLikelihood(usable, bumped, nllOpts);
       grad[k] = bumpedLoss === null ? 0 : (bumpedLoss - baseLoss) / epsilon;
     }
     const next = { ...weights };
@@ -764,6 +830,8 @@ module.exports = {
   computeFactorImportance,
   backtestAccuracyV2,
   computeNegativeLogLikelihood,
+  computeFeatureEffectiveness,
+  buildAblationCandidates,
   fitWeightsGradientDescent,
   describeWeightsHistoryEntry,
   buildLearningSummary,

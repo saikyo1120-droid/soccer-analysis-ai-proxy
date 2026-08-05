@@ -75,7 +75,17 @@ const {
   computeFactorImportance, backtestAccuracyV2, fitWeightsGradientDescent,
   buildLearningSummary, classifyFailureReasons, summarizeFailureReasons,
   classifySuccessReasons, summarizeSuccessReasons, classifyContextualFailureReasons,
+  computeFeatureEffectiveness, buildAblationCandidates, mostLikelyScoreline,
 } = require("./predictionModel");
+// ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ ----
+// ⑨ 予測精度の毎日測定(勝敗/BTTS/Over-Under、Brier・LogLoss・較正)
+const { scorePrediction, buildDailyAccuracy, saveDailyAccuracy } = require("./accuracyTracker");
+// ① 学習によって「予測がどう変わったか」の記録
+const { computePredictionShift } = require("./predictionShift");
+// ⑩ AIが自分で「次に何を学ぶか」を決める
+const { buildLearningAgenda, priorityClubsOf, saveAgenda, loadLatestAgenda } = require("./learningAgenda");
+// ⑤ データの信頼度(出所×鮮度)。信頼度の高いデータほど強く学習する
+const { sampleWeightOf, buildFeatureTrust } = require("./trustEngine");
 
 // ---- 調整可能な上限(API-Football無料プランの1日100リクエスト枠を守るため) ----
 const OWN_PREDICT_LOG_CAP = 5; // 1回の実行で新しく記録する自社予測の件数上限
@@ -312,8 +322,19 @@ function mergeGrowthLogs(previous, current) {
         standingsLeaguesUpdated: Math.max(p.standingsLeaguesUpdated || 0, c.standingsLeaguesUpdated || 0),
         changesDetected: changes,
         skipped: capList([...(p.skipped || []), ...(c.skipped || [])]),
+        agendaClubsApplied: Array.from(new Set([...(p.agendaClubsApplied || []), ...(c.agendaClubsApplied || [])])),
       };
     })(),
+    // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズの項目の合算規則 ----
+    // 答え合わせ件数は実行ごとに別の試合なので合算。予測変化・特徴量有効性・
+    // 学習計画・学習証明は「その日最後に計算できた値」を残す(後の実行がnullでも
+    // 前の実行の実測を消さない)。
+    accuracyScoredToday: sum(previous.accuracyScoredToday, current.accuracyScoredToday),
+    predictionShift: current.predictionShift || previous.predictionShift || null,
+    featureEffectiveness: current.featureEffectiveness || previous.featureEffectiveness || null,
+    learningAgenda: current.learningAgenda || previous.learningAgenda || null,
+    agendaAppliedToday: current.agendaAppliedToday || previous.agendaAppliedToday || null,
+    learningProof: current.learningProof || previous.learningProof || null,
     errors: capList([...(previous.errors || []), ...(current.errors || [])]),
   };
 }
@@ -856,6 +877,9 @@ async function runDailyLearning(deps) {
   }
 
   // ---- ② 保留中の自社予測を解決(試合が終わっていれば的中/不的中を確定) ----
+  // 2026年8月・ご指示⑨: 解決した予測はその場で全市場(勝敗/BTTS/Over-Under/
+  // スコア)の採点を行い、日次の精度記録(learn:accuracy:<date>)に積む。
+  const resolvedScoredToday = [];
   const pendingIds = (await upstashCmd(["LRANGE", "learn:ownpred:pending", "0", String(OWN_PREDICT_RESOLVE_CAP - 1)]).catch(() => [])) || [];
   for (const fixtureIdStr of pendingIds) {
     try {
@@ -905,6 +929,14 @@ async function runDailyLearning(deps) {
       record.actualWinner = actualWinner;
       record.correct = actualWinner === record.predictedWinner;
       record.resolvedAt = runAt.toISOString();
+      // 2026年8月・ご指示⑨: 実スコアを保存する(BTTS・Over/Under・スコア一致の
+      // 採点に必要。従来は勝敗しか残しておらず、市場別の精度が測れなかった)。
+      record.actualScore = { home: fx.goals.home, away: fx.goals.away };
+      // 全市場の採点(Brier・LogLoss・的中)。予測時のポアソンλから機械的に導出。
+      try {
+        record.marketScores = scorePrediction(record);
+        if (record.marketScores) resolvedScoredToday.push(record.marketScores);
+      } catch (e) { errors.push(`accuracy_scoring_failed:${fixtureIdStr}:${e.message}`); }
 
       // ---- Failure Learning(ご要望①): 外れた場合は「何故外れたのか」を分類して保存する ----
       // 従来は正解/不正解のカウントだけで、原因は一切記録していなかった。
@@ -1122,6 +1154,23 @@ async function runDailyLearning(deps) {
     }
   }
 
+  // ---- ②-b 今日答え合わせした予測の精度を市場別に記録する(ご指示⑨) ----
+  // 的中率だけでなくBrier Score・Log Loss・較正の材料を日次で保存し、
+  // 昨日・先週・先月との比較を可能にする。答え合わせが0件の日は保存しない
+  // (存在しない測定値を作らない)。
+  if (resolvedScoredToday.length) {
+    try {
+      const aggToday = buildDailyAccuracy(resolvedScoredToday);
+      await saveDailyAccuracy({ upstashEnabled, upstashGetJSON, upstashSetJSON }, dateKey, aggToday);
+    } catch (e) { errors.push(`accuracy_save_failed:${e.message}`); }
+  }
+
+  // 2026年8月・「本当に毎日賢くなるAI」フェーズで追加した記録用の変数。
+  let weightsMetaUsedToday = null; // 今日の予測が実際に使った重みのversion/更新時刻(ご指示①③④の証明)
+  let featureEffectivenessToday = null; // ご指示⑧: 特徴量ごとの有効性の実測
+  let predictionShiftToday = null; // ご指示①: 学習で予測がどう変わったか
+  let agendaAppliedToday = null; // ご指示⑩: 前回の学習計画を今日の収集に反映した内容
+
   // ---- ③ 登録クラブの直近の試合について、新しく自社予測を立てる ----
   // 日付ベースでどのクラブから調べ始めるかをずらし、特定のクラブだけ毎回
   // リクエストが偏らないようにする(単純なローテーション)。
@@ -1234,6 +1283,11 @@ async function runDailyLearning(deps) {
 
       const storedWeightsRaw = (await upstashGetJSON("learn:weights")) || {};
       const weights = { ...EXTENDED_DEFAULT_WEIGHTS, ...storedWeightsRaw }; // 過去バージョンの重みにも新しいキーを補完
+      // 2026年8月・ご指示①③④の証明: 「昨日の学習が今日の予測に反映された」を
+      // ログで示せるよう、今日の予測が実際に使った重みのversion/更新時刻を記録する。
+      // 重みは予測のたびにストレージから読み直すため、昨日更新された重みは
+      // 今日の最初の予測から必ず使われる(古い重みを使い続ける経路は存在しない)。
+      weightsMetaUsedToday = { version: weights.version ?? 0, updatedAt: weights.updatedAt || null };
       const { predictedWinner, homeLambda, awayLambda } = predictOutcomeV2(features, weights);
       const importance = computeFactorImportance(features, weights);
       const topFactor = importance.find((i) => i.stars > 0);
@@ -1255,6 +1309,20 @@ async function runDailyLearning(deps) {
         kickoff: fx.fixture.date, loggedAt: runAt.toISOString(),
         resolved: false, actualWinner: null, correct: null, resolvedAt: null,
         originTeamEn: team.nameEn, stateHypothesis,
+        // 2026年8月・ご指示⑨: 最終スコア予想(ポアソン分布の最頻値)も記録し、
+        // 試合後にスコア一致まで採点できるようにする。
+        predictedScoreline: mostLikelyScoreline(homeLambda, awayLambda),
+        // ご指示③④の証明: この予測がどのversionの重みで行われたか。
+        weightsVersion: weights.version ?? 0,
+        // ご指示⑤: この予測に使ったデータの信頼度(出所×鮮度)。すべて今取得した
+        // 実データのため取得直後の信頼度になる。重み学習はこの信頼度で強弱をつける。
+        featureTrust: buildFeatureTrust([
+          { key: "form", source: "derived", kind: "form", computedAt: runAt.toISOString() },
+          { key: "injuries", source: "api-football", kind: "injuries", computedAt: runAt.toISOString() },
+          { key: "standings", source: "api-football", kind: "standings", computedAt: runAt.toISOString() },
+          ...(homeXg && homeXg.xgNet !== null && awayXg && awayXg.xgNet !== null
+            ? [{ key: "xg", source: "api-football", kind: "xg", computedAt: runAt.toISOString() }] : []),
+        ], runAt.getTime()),
         // 2026年8月・優先順位③: モデルの外側にある原因(監督交代・スタメン変更等)を
         // 試合後に特定できるよう、予測時点の文脈を保存しておく。
         // ここでは追加のAPI呼び出しを増やさず、既に取得済みの情報だけを記録する
@@ -1284,10 +1352,25 @@ async function runDailyLearning(deps) {
   let universeStats = null;
   try {
     const clubDossier = createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON });
+    // 2026年8月・ご指示⑩: 前回の学習計画(AIが自分で決めた「次に学ぶテーマ」)を
+    // 読み、優先クラブを今日の収集で実際に優先させる(決めるだけで終わらせない)。
+    let priorityClubs = [];
+    try {
+      const latestAgenda = await loadLatestAgenda({ upstashEnabled, upstashGetJSON });
+      priorityClubs = priorityClubsOf(latestAgenda);
+      if (priorityClubs.length) {
+        agendaAppliedToday = {
+          generatedAt: latestAgenda.generatedAt || null,
+          priorityClubs,
+          noteJa: `前回の学習計画に基づき、${priorityClubs.length}クラブ(苦手と実測されたクラブ)を今日の収集で優先しました。`,
+        };
+      }
+    } catch (e) { /* 計画が無ければ通常の輪番のみ */ }
     universeStats = await collectUniverse({
       callApiFootball, apiBudget, clubDossier, knowledgeStore,
       knowledgeGraph, thoughtTimeline, computeFormScore,
       recordLearned: saveWithImportance,
+      priorityClubs,
     }, runAt, dateKey);
     if (universeStats.errors && universeStats.errors.length) errors.push(...universeStats.errors);
   } catch (e) {
@@ -1379,6 +1462,17 @@ async function runDailyLearning(deps) {
       // 参考値として旧v1モデルの的中率も残す(表示には使わない)
       const v1Reference = backtestAccuracy(recentRecords, currentWeights);
 
+      // 2026年8月・ご指示⑤: 信頼度の高いデータで行った予測ほど強く学習する。
+      const trustOpts = { sampleWeightOf };
+      // 2026年8月・ご指示⑧: どの特徴量が当たりに寄与し、どれが不要かを実測する。
+      // (重みを1つずつ0にしたときの損失変化 = その特徴量の実際の寄与)
+      try {
+        featureEffectivenessToday = computeFeatureEffectiveness(usable, currentWeights, trustOpts);
+        if (featureEffectivenessToday && featureEffectivenessToday.measurable) {
+          await upstashSetJSON(`learn:features:report:${dateKey}`, featureEffectivenessToday).catch(() => {});
+        }
+      } catch (e) { errors.push(`feature_effectiveness_failed:${e.message}`); }
+
       const adopt = async (candidate, method, note) => {
         // ---- 保存前の安全確認(第5次監査で追加) ----
         if (!isSaneWeights(candidate)) {
@@ -1422,11 +1516,20 @@ async function runDailyLearning(deps) {
           { ...currentWeights, homeBase: Math.max(0.8, currentWeights.homeBase - 0.1) },
         ];
         // ---- 候補②: 勾配降下法で拡張特徴量の重みを学習する ----
-        const fitted = fitWeightsGradientDescent(fitSet, currentWeights);
+        // ご指示⑤: 信頼度による加重(trustOpts)つき。信頼度の記録が無い
+        // 古い記録は重み1.0として扱われるため、従来の挙動を壊さない。
+        const fitted = fitWeightsGradientDescent(fitSet, currentWeights, trustOpts);
+
+        // ---- 候補③(ご指示⑧): 実測で「有害」と出た特徴量を外した候補 ----
+        // 有効性の実測(featureEffectivenessToday)で損失を悪化させていた特徴量を
+        // 0にした候補。他の候補と同じホールドアウト関門を通るため、誤検出で
+        // 予測が悪化することはない(改善した場合だけ採用される)。
+        const ablationCandidates = buildAblationCandidates(featureEffectivenessToday, currentWeights);
 
         const allCandidates = [
           ...gridCandidates.map((w) => ({ w, method: "grid_search_v1" })),
           ...(fitted ? [{ w: fitted, method: "gradient_descent_v2" }] : []),
+          ...ablationCandidates.map((c) => ({ w: c.w, method: c.method })),
         ];
 
         let best = null;
@@ -1449,6 +1552,30 @@ async function runDailyLearning(deps) {
             weightsUpdated = true;
             weightsUpdatedV2 = best.method === "gradient_descent_v2";
             v2AccuracyAfter = best.validScore.accuracy;
+            // ---- 2026年8月・ご指示①: 「その学習によって予測がどう変わったか」 ----
+            // 直近の検証済み試合に旧重み・新重みの両方で予測を計算し、
+            // ホーム勝率±%・引き分け確率±%・期待得点±・自信±% の実測差を保存する。
+            try {
+              predictionShiftToday = computePredictionShift(usable.slice(-30), currentWeights, best.w);
+              if (predictionShiftToday) {
+                await upstashCmd(["RPUSH", "learn:weights:impact", JSON.stringify({
+                  date: dateKey, at: runAt.toISOString(), method: best.method,
+                  weightsVersionFrom: currentWeights.version || 0,
+                  weightsVersionTo: (currentWeights.version || 0) + 1,
+                  shift: predictionShiftToday,
+                })]).catch(() => {});
+                await upstashCmd(["LTRIM", "learn:weights:impact", "-30", "-1"]).catch(() => {});
+                // Memory Engineの時系列にも「AIの判断が変わった」として残す
+                if (thoughtTimeline) {
+                  await thoughtTimeline.append("model:weights:beliefs", {
+                    kind: "belief",
+                    statementJa: predictionShiftToday.summaryJa,
+                    evidence: [`重みversion ${(currentWeights.version || 0)}→${(currentWeights.version || 0) + 1}(${best.method})`],
+                    at: runAt.toISOString(),
+                  }).catch(() => {});
+                }
+              }
+            } catch (e) { errors.push(`prediction_shift_failed:${e.message}`); }
           }
         } else {
           await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
@@ -1548,11 +1675,19 @@ async function runDailyLearning(deps) {
   // failureReasonsを保持している解決済みレコード)から機械的に集計する。
   let topFailureReasonsRecent = [];
   let topSuccessReasonsRecent = []; // 2026年8月: 最近うまくいっている判断基準
+  let agendaToday = null; // ご指示⑩: AIが自分で決めた「次に学ぶテーマ」
   try {
     const recentForFailuresRaw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "0", "-1"]).catch(() => [])) || [];
     const recentForFailures = recentForFailuresRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
     topFailureReasonsRecent = summarizeFailureReasons(recentForFailures, 5);
     topSuccessReasonsRecent = summarizeSuccessReasons(recentForFailures, 5);
+    // ---- 2026年8月・ご指示⑩: 次に何を学ぶかをAI自身が決める ----
+    // 実測(どのクラブで外しているか・何が原因で外れているか)から優先順位つきの
+    // 学習計画を作り、保存する。明日の収集(上の③-b)がこれを読んで実行する。
+    try {
+      agendaToday = buildLearningAgenda(recentForFailures, topFailureReasonsRecent, { nowIso: runAt.toISOString() });
+      await saveAgenda({ upstashEnabled, upstashSetJSON }, dateKey, agendaToday);
+    } catch (e) { errors.push(`agenda_build_failed:${e.message}`); }
   } catch (e) { /* ベストエフォート */ }
 
   const growthLog = {
@@ -1625,6 +1760,30 @@ async function runDailyLearning(deps) {
       standingsLeaguesUpdated: universeStats.standingsLeaguesUpdated,
       changesDetected: (universeStats.changesDetected || []).slice(0, 20),
       skipped: universeStats.skipped || [],
+      agendaClubsApplied: universeStats.agendaClubsApplied || [],
+    } : null,
+    // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ ----
+    // ご指示⑨: 今日答え合わせして市場別に採点できた件数(詳細は learn:accuracy:<date>)
+    accuracyScoredToday: resolvedScoredToday.length,
+    // ご指示①: 学習によって予測がどう変わったか(採用があった日のみ。実計算の差分)
+    predictionShift: predictionShiftToday,
+    // ご指示⑧: 特徴量ごとの有効性の実測(有効/有害/未学習)
+    featureEffectiveness: featureEffectivenessToday ? {
+      measurable: featureEffectivenessToday.measurable,
+      sampleSize: featureEffectivenessToday.sampleSize,
+      reasonJa: featureEffectivenessToday.reasonJa || null,
+      features: (featureEffectivenessToday.features || []).map((f) => ({ labelJa: f.labelJa, weight: f.weight, contribution: f.contribution, verdictJa: f.verdictJa })),
+    } : null,
+    // ご指示⑩: AIが自分で決めた「次に学ぶテーマ」と、前回の計画を今日反映した内容
+    learningAgenda: agendaToday,
+    agendaAppliedToday,
+    // ご指示①③④の証明: 今日の予測が実際に使った重みのversion。
+    // 昨日重みが更新されていれば、このversionが昨日より増えている=
+    // 「昨日の学習が今日の予測に反映された」ことがこのログだけで確認できる。
+    learningProof: weightsMetaUsedToday ? {
+      weightsVersionUsedForTodaysPredictions: weightsMetaUsedToday.version,
+      weightsLastUpdatedAt: weightsMetaUsedToday.updatedAt,
+      noteJa: `本日の新規予測${newPredictionsLogged}件は、重みversion ${weightsMetaUsedToday.version}(最終更新: ${weightsMetaUsedToday.updatedAt || "初期値のまま"})を使用しました。予測のたびに保存済みの最新重みを読み直すため、前日までの学習は必ず当日の予測に反映されます。`,
     } : null,
     // 1回の実行ぶんでも、エラーが大量に出た日にログが肥大化しないよう上限を設ける
     errors: capList(errors),

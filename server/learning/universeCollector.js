@@ -66,6 +66,12 @@ async function collectUniverse(deps, runAt, dateKey) {
     thoughtTimeline, computeFormScore, recordLearned,
   } = deps;
   const season = seasonOf(runAt);
+  // 2026年8月・ご指示⑩: AIが前日に決めた学習計画の「優先クラブ」。
+  // 該当クラブは輪番を待たずに、今日のコア更新・xG更新の対象に加わる
+  // (計画を立てるだけでなく、実際の収集行動を変える)。
+  const priorityClubs = (deps.priorityClubs || [])
+    .map((nameEn) => CLUB_UNIVERSE.find((c) => c.nameEn.toLowerCase() === String(nameEn).toLowerCase()))
+    .filter(Boolean);
   const stats = {
     coreClubsPlanned: 0, coreClubsUpdated: 0,
     squadsPlanned: 0, squadsUpdated: 0,
@@ -74,6 +80,7 @@ async function collectUniverse(deps, runAt, dateKey) {
     standingsLeaguesUpdated: 0,
     changesDetected: [],
     skipped: [], // { stage, reasonJa } — 予算などで見送ったもの(正直に記録)
+    agendaClubsApplied: priorityClubs.map((c) => c.nameEn), // 学習計画で優先したクラブ(実行の証拠)
     errors: [],
   };
   const canSpend = (n) => (apiBudget ? apiBudget.remainingForJob() >= BUDGET_FLOOR + n : true);
@@ -114,7 +121,16 @@ async function collectUniverse(deps, runAt, dateKey) {
   // ============================================================
   // ① コア更新(フォーム・怪我・監督/布陣・移籍)
   // ============================================================
-  const coreClubs = clubsForCoreUpdate(dateKey);
+  // 優先クラブを先頭に置く(予算切れで打ち切られる場合も優先クラブは必ず処理される)。
+  const coreRotation = clubsForCoreUpdate(dateKey);
+  const coreClubs = [
+    ...priorityClubs.filter((p) => !coreRotation.includes(p)),
+    ...coreRotation.sort((a, b) => {
+      const ap = priorityClubs.includes(a) ? 0 : 1;
+      const bp = priorityClubs.includes(b) ? 0 : 1;
+      return ap - bp || a.rank - b.rank;
+    }),
+  ];
   stats.coreClubsPlanned = coreClubs.length;
   // 順位表はリーグ単位でまとめて取るため、クラブ→リーグIDをここで集める
   const leagueTeams = new Map(); // leagueId -> [{club, teamId}]
@@ -349,7 +365,14 @@ async function collectUniverse(deps, runAt, dateKey) {
   // ============================================================
   // ⑤ xG(tier Aのみ・7日で一巡。1クラブ5リクエストと高価)
   // ============================================================
-  for (const club of clubsForXgUpdate(dateKey)) {
+  // ご指示⑩: 学習計画の優先クラブは、tier Bでも輪番外でも今日のxG更新に加える
+  // (xGは1クラブ5リクエストと高価なため、優先追加は最大3クラブに制限)。
+  const xgRotation = clubsForXgUpdate(dateKey);
+  const xgClubs = [
+    ...priorityClubs.filter((p) => !xgRotation.includes(p)).slice(0, 3),
+    ...xgRotation,
+  ];
+  for (const club of xgClubs) {
     if (!canSpend(5)) { skip("xg", `予算残量が安全ラインを下回ったため、${club.nameJa}以降のxG更新を見送りました。`); break; }
     try {
       const { teamId } = await resolveTeam(club);

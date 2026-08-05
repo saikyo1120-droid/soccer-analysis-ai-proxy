@@ -59,6 +59,11 @@ const { buildMatchFeatures } = require("./learning/featureEngine");
 const { recordPredictionEvaluation, buildComparisonForResponse } = require("./memory/predictionMemory");
 // 2026年8月・完全自動Learning Cycle ⑧: 「本当に昨日より賢くなったのか」を数値で示す。
 const { getMetricsTrend } = require("./learning/dailyMetrics");
+// 2026年8月・「本当に毎日賢くなるAI」フェーズ(ご指示②⑨⑩):
+// 予測精度の毎日測定・学習計画・信頼度の説明をダッシュボードへ返す
+const { getAccuracyTrend } = require("./learning/accuracyTracker");
+const { loadLatestAgenda } = require("./learning/learningAgenda");
+const { SOURCE_TRUST, HALF_LIFE_HOURS } = require("./learning/trustEngine");
 // /debug診断ページが「毎日学習エンジンが対象にしている全クラブ」を横断して
 // Knowledge Engine / Memory Engineの件数を集計するために使う一覧(新機能ではなく
 // 既存のクラブ一覧を読み取り専用で再利用するだけ)。
@@ -3829,6 +3834,90 @@ const server = http.createServer(async (req, res) => {
           .catch((e) => ({ available: false, reasonJa: `指標の読み出しに失敗しました(${e.message})。`, days: [] }));
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify({ ok: true, generatedAt: new Date().toISOString(), ...trend }));
+        return;
+      }
+      if (pathname === "/api/learning/daily-report") {
+        // 2026年8月・「本当に毎日賢くなるAI」フェーズ(ご指示②)。
+        // 「学習しました」ではなく数字で証明するための日次ダッシュボード:
+        //   何クラブ・何選手更新したか / 知識の増加・重複・失敗 / API使用数 /
+        //   予測件数・答え合わせ件数 / 前日より精度が何%改善したか /
+        //   学習で予測がどう変わったか / 特徴量の有効性 / 次に学ぶテーマ。
+        // すべて実測の保存値から組み立てる(このエンドポイントは何も推測しない)。
+        const drCached = cacheGet("learn:daily-report");
+        if (drCached) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify(drCached));
+          return;
+        }
+        const todayKey = appDateKey();
+        const [growthRaw, accuracyTrend, agenda, coverage] = await Promise.all([
+          learningDeps.upstashGetJSON("learn:growthlog:latest").catch(() => null),
+          getAccuracyTrend(learningDeps, todayKey).catch(() => ({ available: false })),
+          loadLatestAgenda(learningDeps).catch(() => null),
+          clubDossier.getCoverageSummary().catch(() => null),
+        ]);
+        const g = growthRaw || {};
+        const body = {
+          ok: true,
+          generatedAt: new Date().toISOString(),
+          date: g.date || todayKey,
+          isToday: g.date === todayKey,
+          noteJa: g.date
+            ? (g.date === todayKey ? "本日の学習実行の実測値です。" : `最新の学習記録は${g.date}のものです(本日分はまだ実行されていません)。`)
+            : "学習ジョブの記録がまだありません。",
+          // ---- ② 更新量(何クラブ・何選手・何件) ----
+          updates: {
+            universeClubsUpdated: (g.universe && g.universe.coreClubsUpdated) ?? 0,
+            universeClubsPlanned: (g.universe && g.universe.coreClubsPlanned) ?? 0,
+            universePlayersUpdated: (g.universe && g.universe.playersUpdated) ?? 0,
+            registeredClubsAnalyzed: g.teamsAnalyzed ?? 0,
+            leaguesAnalyzed: g.leaguesAnalyzedToday ?? 0,
+            playersChecked: g.playersCheckedToday ?? 0,
+            knowledgeAdded: g.knowledgeItemsSavedToday ?? 0,
+            knowledgeDuplicate: g.knowledgeItemsDuplicateToday ?? 0,
+            failures: Array.isArray(g.errors) ? g.errors.length : 0,
+            universeSkipped: (g.universe && g.universe.skipped) || [],
+          },
+          // ---- ② API使用数 ----
+          apiUsage: g.apiBudget ? {
+            usedToday: g.apiBudget.totalSpent ?? null,
+            dailyBudget: g.apiBudget.dailyBudget ?? null,
+            detectedPlan: g.apiBudget.detectedPlan || null,
+          } : null,
+          // ---- ② 予測件数・答え合わせ件数 ----
+          predictions: {
+            newToday: g.newPredictionsLogged ?? 0,
+            resolvedToday: g.matchesResolvedToday ?? 0,
+            scoredToday: g.accuracyScoredToday ?? 0,
+            resolvedTotal: g.totalOwnPredictionsResolved ?? 0,
+          },
+          // ---- ⑨ 精度(的中率・Brier・LogLoss・較正、昨日/先週/先月比較) ----
+          accuracy: accuracyTrend,
+          // ---- ① 学習で予測がどう変わったか ----
+          predictionShift: g.predictionShift || null,
+          // ---- ③④ 「昨日の学習が今日の予測に反映された」証明 ----
+          learningProof: g.learningProof || null,
+          weightsUpdatedToday: !!(g.weightsUpdated || g.weightsUpdatedV2),
+          // ---- ⑧ 特徴量の有効性 ----
+          featureEffectiveness: g.featureEffectiveness || null,
+          // ---- ⑩ AIが自分で決めた学習テーマと、今日実際に反映した内容 ----
+          learningAgenda: agenda || g.learningAgenda || null,
+          agendaAppliedToday: g.agendaAppliedToday || null,
+          // ---- ⑤ 信頼度の凡例(どの出所を何点とし、何時間で半減するか) ----
+          trustLegend: {
+            sources: Object.entries(SOURCE_TRUST).map(([k, v]) => ({ source: k, base: v.base, labelJa: v.labelJa })),
+            halfLifeHours: HALF_LIFE_HOURS,
+            noteJa: "信頼度 = 出所の基礎点 × 鮮度(半減期方式)。古い情報ほど自動的に評価が下がり、信頼度の高いデータほど重み学習に強く反映されます。",
+          },
+          // ---- 知識蓄積の実数(TOP100) ----
+          knowledgeCoverage: coverage && coverage.available ? {
+            clubCount: coverage.clubCount, playerCount: coverage.playerCount,
+            staleClubs: coverage.staleClubs,
+          } : null,
+        };
+        cacheSet("learn:daily-report", body, 5 * 60 * 1000);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
         return;
       }
       if (pathname === "/api/learning/health") {
