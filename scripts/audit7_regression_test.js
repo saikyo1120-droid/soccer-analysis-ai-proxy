@@ -187,7 +187,9 @@ test("★欠陥68: ?force=1 でシークレット無しに学習ジョブを無�
   // `GET /api/learning/run-daily?force=1&sync=1` を繰り返すだけで
   // ロックも実行中フラグも両方すり抜けて学習ジョブを無制限に同時起動でき、
   // 1回あたり数十〜100件のAPIを消費できた。
-  assert.ok(/if \(forceRequested && !requiredSecret && !consumeUnprotectedForceRun\(\)\)/.test(SERVER),
+  // 第8次監査でconsumeUnprotectedForceRunはUpstash永続化のためasync化された
+  // (保護は同一・むしろ強化: スリープ再起動でカウンタが消えなくなった)。
+  assert.ok(/if \(forceRequested && !requiredSecret && !\(await consumeUnprotectedForceRun\(\)\)\)/.test(SERVER),
     "forceの回数制限が無い");
   assert.ok(/UNPROTECTED_FORCE_RUN_MAX/.test(SERVER), "1日あたりの上限が定義されていない");
   const idxRunning = SERVER.indexOf("if (dailyLearningRunning) {");
@@ -283,7 +285,9 @@ test("★欠陥76: 1件の失敗で予測自動収集を「失敗」と報告し
 });
 
 test("★欠陥77: AI考察の全体上限に達した日に、利用者個人の枠を無駄に消費しない", () => {
-  assert.ok(/tryConsumeLlmBudget\(\) && tryConsumeLlmBudgetForIp\(clientIp\)/.test(SERVER),
+  // 第8次監査でtryConsumeLlmBudgetはUpstash永続化のためasync化(await)された。
+  // 「全体の枠→個人の枠」の確認順序は同一。
+  assert.ok(/\(await tryConsumeLlmBudget\(\)\) && tryConsumeLlmBudgetForIp\(clientIp\)/.test(SERVER),
     "全体の枠を先に確認していない");
 });
 

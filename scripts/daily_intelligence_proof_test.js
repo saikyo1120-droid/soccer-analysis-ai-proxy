@@ -90,16 +90,27 @@ async function main() {
     assert.ok(Math.abs(t.score - 0.475) <= 0.01, String(t.score));
   });
 
-  await ok("A5: 学習のサンプル重み=信頼度平均(記録が無い古いレコードは1.0で除外しない)", () => {
-    assert.strictEqual(sampleWeightOf({}), 1);
-    assert.strictEqual(sampleWeightOf({ featureTrust: { avgScore: 0.6 } }), 0.6);
-    assert.strictEqual(sampleWeightOf({ featureTrust: { avgScore: 0.01 } }), 0.1, "下限0.1でクランプ");
+  await ok("A5: 学習のサンプル重み=鮮度基準(取得直後=1.0で古いレコードと同格・古いほど弱く)", () => {
+    assert.strictEqual(sampleWeightOf({}), 1, "信頼度記録の無い古いレコードは1.0(除外しない)");
+    // 第8次監査の修正後: 学習の強弱は鮮度(avgFreshness)で決める。
+    // 取得直後のデータで行った予測は1.0=古いレコードとの「逆転」が起きない。
+    assert.strictEqual(sampleWeightOf({ featureTrust: { avgFreshness: 1 } }), 1);
+    assert.strictEqual(sampleWeightOf({ featureTrust: { avgFreshness: 0.6 } }), 0.6);
+    assert.strictEqual(sampleWeightOf({ featureTrust: { avgFreshness: 0.01 } }), 0.1, "下限0.1でクランプ");
+    // avgFreshnessを持たない移行期レコードはavgScoreを最高基礎点で正規化して近似
+    const approx = sampleWeightOf({ featureTrust: { avgScore: 0.6 } });
+    assert.ok(Math.abs(approx - 0.6 / 0.95) < 1e-9, String(approx));
     const now = Date.now();
     const ft = buildFeatureTrust([
       { key: "form", source: "derived", kind: "form", computedAt: new Date(now).toISOString() },
       { key: "xg", source: "api-football", kind: "xg", computedAt: new Date(now - 480 * 3600000).toISOString() },
     ], now);
     assert.ok(ft.avgScore > 0 && ft.avgScore < 1);
+    assert.ok(Number.isFinite(ft.avgFreshness) && ft.avgFreshness < 1, "古いxGが混ざれば鮮度平均は1未満");
+    const fresh = buildFeatureTrust([
+      { key: "form", source: "derived", kind: "form", computedAt: new Date(now).toISOString() },
+    ], now);
+    assert.strictEqual(fresh.avgFreshness, 1, "全データ取得直後なら鮮度1.0");
     assert.ok(ft.noteJa.includes("xg"), "信頼度が下がっているデータを名指しで注記する");
   });
 
