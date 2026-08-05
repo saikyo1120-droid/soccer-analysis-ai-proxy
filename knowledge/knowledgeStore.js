@@ -68,6 +68,18 @@ const knowledgeUsageBuffer = new Map(); // hash -> count
 const USAGE_KEY = "knowledge:usage";
 const USAGE_MAX_TRACKED = 500; // 保存する件数の上限(使用回数の多い順。無限成長させない)
 
+// ---- 2026年8月・成長可視化ラウンド①②: 「今日なにを覚えたか」のカテゴリ別集計 ----
+// saveKnowledgeItemの結果(採用/重複)をカテゴリごとにメモリで数え、日次学習が
+// 1日1回 learn:knowledge:categories:<date> へ加算保存する(usageBufferと同じ設計)。
+const categoryCountsBuffer = new Map(); // category -> { saved, duplicate }
+function bumpCategoryCount(category, outcome) {
+  const key = category || "(カテゴリなし)";
+  const c = categoryCountsBuffer.get(key) || { saved: 0, duplicate: 0 };
+  if (outcome === "saved") c.saved++;
+  else if (outcome === "duplicate") c.duplicate++;
+  categoryCountsBuffer.set(key, c);
+}
+
 
 function stableHash(input) {
   return crypto.createHash("sha1").update(input).digest("hex").slice(0, 16);
@@ -163,9 +175,11 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
             } catch (e) { /* ベストエフォート */ }
           }
           await upstashCmd(["LTRIM", `knowledge:byTeam:${entity}`, String(-MAX_ITEMS_PER_TEAM), "-1"]).catch(() => {});
+          bumpCategoryCount(item.category, "duplicate");
           return { saved: false, reason: "DUPLICATE_RELINKED", hash };
         }
       } catch (e) { /* 一覧を確認できなくても本処理は続行する */ }
+      bumpCategoryCount(item.category, "duplicate");
       return { saved: false, reason: "DUPLICATE", hash };
     }
 
@@ -190,6 +204,7 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
     // カウンター(knowledge:trackedPlayerProfilesと同じ既存パターン)を別途持つ。
     // 失効しても減らない「累計保存件数」であることは呼び出し側で正直に明示する。
     await upstashCmd(["INCR", "knowledge:totalItemsSavedCounter"]).catch(() => {});
+    bumpCategoryCount(item.category, "saved"); // 成長可視化ラウンド: カテゴリ別の採用数
     return { saved: true, hash };
   }
 
@@ -318,9 +333,33 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
     return out;
   }
 
+  /**
+   * 成長可視化ラウンド①②: 「今日なにを覚えたか」のカテゴリ別集計を
+   * learn:knowledge:categories:<date> へ加算保存する(日次学習から1日1回)。
+   * 戻り値に今回フラッシュした内訳を含め、growthLogにも同梱できるようにする。
+   */
+  async function flushCategoryCounters(dateKey) {
+    if (!upstashEnabled || !dateKey || categoryCountsBuffer.size === 0) return { flushed: 0, categories: {} };
+    const snapshot = {};
+    categoryCountsBuffer.forEach((v, k) => { snapshot[k] = { saved: v.saved, duplicate: v.duplicate }; });
+    try {
+      const key = `learn:knowledge:categories:${dateKey}`;
+      const stored = (await upstashGetJSON(key).catch(() => null)) || {};
+      for (const [cat, v] of Object.entries(snapshot)) {
+        const cur = stored[cat] || { saved: 0, duplicate: 0 };
+        stored[cat] = { saved: (cur.saved || 0) + v.saved, duplicate: (cur.duplicate || 0) + v.duplicate };
+      }
+      await upstashSetJSON(key, stored);
+      categoryCountsBuffer.clear();
+      return { flushed: Object.keys(snapshot).length, categories: stored };
+    } catch (e) {
+      return { flushed: 0, categories: snapshot, error: e.message }; // 保存失敗時はバッファ保持
+    }
+  }
+
   return {
     saveKnowledgeItem, getActiveKnowledge, getKnowledgeDiffForTeam,
-    flushUsageCounters, getTopUsedKnowledge,
+    flushUsageCounters, getTopUsedKnowledge, flushCategoryCounters,
     getActiveKnowledgeForLeague, getKnowledgeDiffForLeague,
   };
 }
