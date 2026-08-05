@@ -12,7 +12,8 @@ name: Weekly Learning-State Backup
 
 on:
   schedule:
-    - cron: "0 21 * * 0" # 毎週日曜 UTC 21:00 = 日本時間 月曜6:00(日次学習4:00の後)
+    # 00分は混雑で遅延するため41分にずらす(daily-learning.ymlと同じ理由)
+    - cron: "41 21 * * 0" # 毎週日曜 UTC 21:41 = 日本時間 月曜6:41(日次学習の後)
   workflow_dispatch: {} # 手動実行も可能(動作確認用)
 
 permissions:

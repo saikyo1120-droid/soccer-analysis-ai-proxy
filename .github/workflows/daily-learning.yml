@@ -18,31 +18,91 @@ name: Daily Learning Engine
 
 on:
   schedule:
-    - cron: "0 19 * * *" # 毎日 UTC 19:00 = 日本時間 翌4:00
+    # 2026年8月・本番調査での修正: 以前は "0 19 * * *"(=日本時間4:00ちょうど)
+    # だったが、GitHub Actionsの定時実行は「毎時00分」に世界中の予約が集中するため
+    # 大幅に遅延する。実際に2026-08-05は4:00指定の実行が7:42に走っていた
+    # (3時間42分の遅れ)。混雑を避けるため、00分から外した時刻に変更する。
+    - cron: "17 19 * * *" # 毎日 UTC 19:17 = 日本時間 翌4:17
+    # 取りこぼし対策の再実行。上の実行が遅延・失敗しても、その日のうちに必ず
+    # 一度は学習が走るようにする。同日2回目は収集の同日ガード
+    # (kb:universe:ran:<date>)が働き、同じ収集を繰り返さないので無駄がない。
+    - cron: "43 23 * * *" # 毎日 UTC 23:43 = 日本時間 翌8:43(保険)
   workflow_dispatch: {} # 「Actions」タブから手動実行もできるようにしておく(動作確認用)
 
 jobs:
   run-daily-learning:
     runs-on: ubuntu-latest
     steps:
-      - name: Call the daily learning engine endpoint
+      # 2026年8月・本番調査で発見された不具合の修正: 以前はこのリクエストが
+      # 「学習ジョブが完全に終わるまで」応答を返さなかったため、実際の本番データ
+      # (11クラブぶんの外部API呼び出し+LLM生成)ではこの処理全体が2分
+      # (--max-time)を超えることがあり、GitHub Actions側が待ちきれず
+      # exit code 28で失敗し続けていた(サーバー側は実際には処理を続けており、
+      # いずれ正常に完了・保存されていた可能性が高い)。
+      # サーバー側を「リクエストを受けたら即座に応答し、実処理はバックグラウンドで
+      # 継続する」方式に変更したため、ここでの応答は一瞬で返るようになった。
+      # そのぶん、以下の手順が変わった:
+      #   1. まず呼び出して「開始できたか」だけを確認する(以前より高速)。
+      #   2. 実際に処理が完了したかどうかは、少し待ってから/api/growth-logの
+      #      実行時刻(ranAt)が本当に「たった今」のものになっているかで確認する
+      #      (これが無いと、「呼び出しには成功したが実際には裏で失敗していた」
+      #      ことに誰も気づけない)。
+      - name: Call the daily learning engine endpoint (fire-and-forget)
         run: |
           curl -sS -X POST "${LEARNING_ENDPOINT_URL}?key=${LEARNING_SECRET_KEY}" \
-            --max-time 120 \
+            --max-time 60 \
             --retry 2 \
             --retry-delay 30 \
             -w "\nHTTP status: %{http_code}\n" \
             -o response.json
           cat response.json
-          # Renderの無料プランはアクセスが無いとスリープするため、初回リクエストの
-          # 起動待ちで失敗することがある。念のためもう一度だけ叩き直す。
           if ! grep -q '"ok":true' response.json; then
             echo "1回目が失敗した可能性があるため、60秒待って再試行します"
             sleep 60
             curl -sS -X POST "${LEARNING_ENDPOINT_URL}?key=${LEARNING_SECRET_KEY}" \
-              --max-time 120 -w "\nHTTP status: %{http_code}\n" -o response.json
+              --max-time 60 -w "\nHTTP status: %{http_code}\n" -o response.json
             cat response.json
+          fi
+          if ! grep -q '"ok":true' response.json; then
+            echo "::error::学習エンジンの呼び出しに失敗しました(応答に \"ok\":true が含まれません)。上のresponse.jsonの内容を確認してください。よくある原因: LEARNING_SECRET_KEYとRenderのAUTO_COLLECT_SECRETの不一致/Render側のエラー。"
+            exit 1
           fi
         env:
           LEARNING_ENDPOINT_URL: ${{ secrets.LEARNING_ENDPOINT_URL }}
           LEARNING_SECRET_KEY: ${{ secrets.LEARNING_SECRET_KEY }}
+
+      - name: Wait for the background job, then verify it actually finished
+        run: |
+          # このステップの開始時刻を基準に、「その後にranAtが更新されたか」だけを
+          # 見るシンプルな判定にする(経過秒数の計算で毎回帳尻を合わせるより確実)。
+          job_started_epoch=$(date +%s)
+          echo "バックグラウンドの学習処理が終わるまで待ちます(最大6分)..."
+          GROWTH_LOG_URL="${LEARNING_ENDPOINT_URL%/api/learning/run-daily}/api/growth-log"
+          attempt=0
+          max_attempts=12   # 30秒間隔 x 12回 = 最大6分待つ
+          success=0
+          while [ $attempt -lt $max_attempts ]; do
+            sleep 30
+            attempt=$((attempt + 1))
+            curl -sS --max-time 30 "$GROWTH_LOG_URL" -o growth.json || true
+            ran_at=$(jq -r '.ranAt // empty' growth.json 2>/dev/null || echo "")
+            if [ -n "$ran_at" ]; then
+              ran_at_epoch=$(date -d "$ran_at" +%s 2>/dev/null || echo 0)
+              echo "確認 ${attempt}/${max_attempts}: 最新の実行時刻(ranAt) = ${ran_at}"
+              # このステップを開始した時刻より後に更新されていれば、今回のリクエスト
+              # によるジョブが実際に完了して保存されたとみなせる(多少のクロック
+              # ずれを考慮して10秒の余裕を持たせる)。
+              if [ "$ran_at_epoch" -gt 0 ] && [ "$ran_at_epoch" -ge $((job_started_epoch - 10)) ]; then
+                success=1
+                break
+              fi
+            fi
+          done
+          cat growth.json 2>/dev/null || true
+          if [ "$success" != "1" ]; then
+            echo "::error::学習ジョブの開始には成功しましたが、6分待っても/api/growth-logの実行時刻が更新されませんでした。バックグラウンド処理が失敗しているか、想定より時間がかかっている可能性があります。Renderのログを確認してください。"
+            exit 1
+          fi
+          echo "学習ジョブの完了を確認しました。"
+        env:
+          LEARNING_ENDPOINT_URL: ${{ secrets.LEARNING_ENDPOINT_URL }}

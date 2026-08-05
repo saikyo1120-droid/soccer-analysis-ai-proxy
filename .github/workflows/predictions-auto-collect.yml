@@ -26,7 +26,9 @@ name: Predictions Auto-Collect
 
 on:
   schedule:
-    - cron: "0 */6 * * *" # 6時間おき(UTC 0/6/12/18時)= 1日4回
+    # 00分は定時実行が世界的に混雑し大幅に遅延するため、37分にずらす(下記の
+    # daily-learning.ymlと同じ理由。2026-08-05に3時間42分の遅延を実測)。
+    - cron: "37 */6 * * *" # 6時間おき(UTC 0/6/12/18時の37分)= 1日4回
   workflow_dispatch: {} # 「Actions」タブから手動実行もできるようにしておく(動作確認用)
 
 jobs:
@@ -50,6 +52,13 @@ jobs:
             curl -sS -X POST "${AUTO_COLLECT_ENDPOINT_URL}?key=${LEARNING_SECRET_KEY}" \
               --max-time 90 -w "\nHTTP status: %{http_code}\n" -o response.json
             cat response.json
+          fi
+          # 2026年8月・監査で発見された不具合の修正: リトライ後の最終結果を
+          # 確認しないまま終了していたため、実際には失敗していてもGitHub Actions
+          # 上は常に「Success」と表示されていた。ここで明示的に確認する。
+          if ! grep -q '"ok":true' response.json; then
+            echo "::error::予測自動収集の呼び出しに失敗しました(応答に \"ok\":true が含まれません)。上のresponse.jsonの内容を確認してください。"
+            exit 1
           fi
         env:
           AUTO_COLLECT_ENDPOINT_URL: ${{ secrets.AUTO_COLLECT_ENDPOINT_URL }}
