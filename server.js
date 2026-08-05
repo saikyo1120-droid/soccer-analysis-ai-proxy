@@ -156,10 +156,62 @@ const cache = new Map();
 // /api/learning/run-daily をfire-and-forget化(下記参照)したことに伴う、
 // 二重起動防止用のフラグ。
 let dailyLearningRunning = false;
+// ============================================================================
+// 2026年8月・最終方針「必ず提出するもの」対応: 性能の常時計測。
+// 応答時間(エンドポイント別の平均/p95)・キャッシュヒット率・プロセスの
+// CPU/メモリを、追加コストほぼゼロ(メモリ上のカウンタのみ)で常時計測し、
+// /api/debug-status で実測値として提出できるようにする。
+// 「実装しました」ではなく実測値で示すための土台。
+// ============================================================================
+const perfStats = {
+  startedAt: Date.now(),
+  cacheHits: 0,
+  cacheMisses: 0,
+  endpoints: new Map(), // pathGroup -> { count, totalMs, ring: number[](最新200件) }
+};
+const PERF_RING_SIZE = 200;
+function recordPerf(pathGroup, ms) {
+  let e = perfStats.endpoints.get(pathGroup);
+  if (!e) {
+    if (perfStats.endpoints.size >= 50) return; // 未知のパスの氾濫でメモリを食わない
+    e = { count: 0, totalMs: 0, ring: [] };
+    perfStats.endpoints.set(pathGroup, e);
+  }
+  e.count++;
+  e.totalMs += ms;
+  e.ring.push(ms);
+  if (e.ring.length > PERF_RING_SIZE) e.ring.shift();
+}
+function percentileOf(arr, p) {
+  if (!arr.length) return null;
+  const sorted = [...arr].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))];
+}
+function perfSnapshot() {
+  const mem = process.memoryUsage();
+  const cpu = process.cpuUsage();
+  const totalCache = perfStats.cacheHits + perfStats.cacheMisses;
+  return {
+    uptimeSec: Math.round((Date.now() - perfStats.startedAt) / 1000),
+    cache: {
+      hits: perfStats.cacheHits, misses: perfStats.cacheMisses,
+      hitRatePct: totalCache ? Math.round((perfStats.cacheHits / totalCache) * 1000) / 10 : null,
+    },
+    memory: { rssMb: Math.round(mem.rss / 1048576), heapUsedMb: Math.round(mem.heapUsed / 1048576) },
+    cpu: { userMs: Math.round(cpu.user / 1000), systemMs: Math.round(cpu.system / 1000) },
+    endpoints: [...perfStats.endpoints.entries()].map(([path, e]) => ({
+      path, count: e.count,
+      avgMs: Math.round(e.totalMs / e.count),
+      p95Ms: percentileOf(e.ring, 95),
+    })).sort((a, b) => b.count - a.count),
+  };
+}
+
 function cacheGet(key) {
   const hit = cache.get(key);
-  if (!hit) return undefined;
-  if (Date.now() > hit.expires) { cache.delete(key); return undefined; }
+  if (!hit) { perfStats.cacheMisses++; return undefined; }
+  if (Date.now() > hit.expires) { cache.delete(key); perfStats.cacheMisses++; return undefined; }
+  perfStats.cacheHits++;
   return hit.data;
 }
 // 第7次監査で発見した欠陥の修正:
@@ -2763,6 +2815,8 @@ async function handleDebugStatus() {
       knowledgeEngine: knowledgeEngineInfo,
       memoryEngine: memoryEngineInfo,
       predictionEngine: predictionEngineInfo,
+      // 最終方針「必ず提出するもの」: 応答時間・キャッシュヒット率・CPU/メモリの実測
+      perf: perfSnapshot(),
     },
   };
 }
@@ -3616,6 +3670,12 @@ function readJsonBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // 最終方針: 全リクエストの応答時間を常時計測(perfSnapshotで提出)。
+  {
+    const perfT0 = Date.now();
+    const perfPath = String(req.url || "").split("?")[0].split("/").slice(0, 3).join("/") || "/";
+    res.on("finish", () => { try { recordPerf(perfPath, Date.now() - perfT0); } catch (e) { /* 計測は本処理を妨げない */ } });
+  }
   const parsed = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const pathname = parsed.pathname;
 
@@ -3982,6 +4042,9 @@ const server = http.createServer(async (req, res) => {
             clubCount: coverage.clubCount, playerCount: coverage.playerCount,
             staleClubs: coverage.staleClubs,
           } : null,
+          // ---- 最終方針「使用回数まで管理」: 実際によく使われている知識の上位 ----
+          // (使用回数は応答速度を守るためメモリ集計→日次保存の近似値)
+          topUsedKnowledge: await knowledgeStore.getTopUsedKnowledge(5).catch(() => []),
         };
         cacheSet("learn:daily-report", body, 5 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
@@ -4067,6 +4130,7 @@ module.exports = {
   handleAccuracyStats,
   handleAutoCollectPredictions,
   handlePredictMatch,
+  perfSnapshot, // 最終方針: 性能の常時計測(テスト・負荷試験から参照)
   handleDiscuss,
   getOrLogPrediction,
   resolvePrediction,
