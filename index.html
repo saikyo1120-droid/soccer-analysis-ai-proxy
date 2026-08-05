@@ -3857,15 +3857,17 @@ async function renderExternalPanel(player) {
   photoCache[photoCacheKey(player)] = photo;
   if (photo) {
     const avatarEl = document.getElementById("playerAvatar");
-    if (avatarEl) avatarEl.innerHTML = `<img src="${photo}" alt="${player.name}" onerror="this.parentElement.textContent='${player.emoji}';">`;
+    if (avatarEl) avatarEl.innerHTML = `<img src="${escapeHtml(photo)}" alt="${escapeHtml(player.name)}" onerror="this.parentElement.textContent='${player.emoji}';">`;
   }
   let html = "";
   if (result.sdb) {
-    html += `<div style="margin-bottom:10px; font-size:13px;"><b>TheSportsDB</b>: ${result.sdb.strNationality || "-"} ・ ${result.sdb.strPosition || "-"} ・ ${result.sdb.strTeam || "-"}${result.sdb.dateBorn ? " ・ 生年月日 " + result.sdb.dateBorn : ""}</div>`;
+    // 第8次監査(Medium)の修正: TheSportsDBはコミュニティ編集型のDBのため、
+    // 外部由来文字列は必ずエスケープしてから描画する(悪意ある編集によるXSS防止)。
+    html += `<div style="margin-bottom:10px; font-size:13px;"><b>TheSportsDB</b>: ${escapeHtml(result.sdb.strNationality || "-")} ・ ${escapeHtml(result.sdb.strPosition || "-")} ・ ${escapeHtml(result.sdb.strTeam || "-")}${result.sdb.dateBorn ? " ・ 生年月日 " + escapeHtml(result.sdb.dateBorn) : ""}</div>`;
   }
   if (result.wiki && result.wiki.extract) {
     const link = result.wiki.content_urls && result.wiki.content_urls.desktop ? result.wiki.content_urls.desktop.page : "#";
-    html += `<div style="font-size:13px; color:var(--text-secondary);"><b style="color:var(--text-primary);">Wikipedia(${result.wikiLang === "ja" ? "日本語版" : "英語版"})</b>: ${result.wiki.extract}<br><a href="${link}" target="_blank" rel="noopener" style="color:inherit;">→ 記事を読む</a></div>`;
+    html += `<div style="font-size:13px; color:var(--text-secondary);"><b style="color:var(--text-primary);">Wikipedia(${result.wikiLang === "ja" ? "日本語版" : "英語版"})</b>: ${escapeHtml(result.wiki.extract)}<br><a href="${escapeHtml(link)}" target="_blank" rel="noopener" style="color:inherit;">→ 記事を読む</a></div>`;
   }
   if (!result.sdb && !result.wiki) {
     html = `<p class="value-note">外部ソースでの照合情報が見つかりませんでした(データベース未収録、または検索名が一致しなかった可能性があります)。</p>`;
@@ -4415,8 +4417,8 @@ function fixtureRowHtml(f) {
     <div class="fixture-card" data-fixture-card="${f.id}">
       <div class="real-fixture-row${group === "live" ? " is-live" : ""}">
         <div>
-          <div class="teams">⚽ ${f.home.name} ${scoreStr} ${f.away.name}</div>
-          <div class="sub">${badge} ${timeStr}${f.venue ? " ・ " + f.venue : ""}</div>
+          <div class="teams">⚽ ${escapeHtml(f.home.name)} ${scoreStr} ${escapeHtml(f.away.name)}</div>
+          <div class="sub">${badge} ${timeStr}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}</div>
         </div>
         <button class="match-analyze-btn real-fixture-analyze-btn" data-fixture-id="${f.id}">${group === "finished" ? "答え合わせを見る ▶" : "AI分析を見る ▶"}</button>
       </div>
@@ -4438,7 +4440,7 @@ function fixturesByLeagueHtml(fixtures) {
   });
   return groups.map(g => `
     <div class="fixture-league-group">
-      <h3 class="fixture-league-header">🏆 ${g.league}${g.country ? `<span class="fixture-league-country">(${g.country})</span>` : ""}</h3>
+      <h3 class="fixture-league-header">🏆 ${escapeHtml(g.league)}${g.country ? `<span class="fixture-league-country">(${escapeHtml(g.country)})</span>` : ""}</h3>
       ${g.fixtures.map(fixtureRowHtml).join("")}
     </div>`).join("");
 }
@@ -4864,8 +4866,8 @@ function buildUpcomingPreviewHtml(analysis, level) {
 
   return `
     <div class="card">
-      <h2>🔮 試合前プレビュー: ${f.home.name} vs ${f.away.name}</h2>
-      <p class="value-note">${f.league || ""}${timeStr ? " ・ キックオフ " + timeStr : ""}${f.venue ? " ・ " + f.venue : ""}</p>
+      <h2>🔮 試合前プレビュー: ${escapeHtml(f.home.name)} vs ${escapeHtml(f.away.name)}</h2>
+      <p class="value-note">${escapeHtml(f.league || "")}${timeStr ? " ・ キックオフ " + timeStr : ""}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}</p>
       ${predictionHtml}
       <p class="value-note" style="margin-top:8px;">※これはAIによる展開予想であり、実際の試合結果を保証するものではありません。</p>
     </div>`;
@@ -4885,7 +4887,7 @@ function playerRatingRowHtml(p) {
   if (p.yellowCards) goalsAssists.push(`🟨×${p.yellowCards}`);
   if (p.redCards) goalsAssists.push(`🟥×${p.redCards}`);
   return `<div class="real-fixture-row" style="padding:6px 0;">
-    <div>${p.name}${p.position ? " (" + p.position + ")" : ""} ${goalsAssists.join(" ")}</div>
+    <div>${escapeHtml(p.name)}${p.position ? " (" + escapeHtml(p.position) + ")" : ""} ${goalsAssists.join(" ")}</div>
     <div style="font-weight:700; color:${ratingBadgeColor(p.rating)};">${p.rating ?? "-"}</div>
   </div>`;
 }
@@ -4908,7 +4910,9 @@ function eventsTimelineVisualHtml(events, homeName) {
     const side = e.team === homeName ? "上段(ホーム)" : "下段(アウェイ)";
     const label = `${e.minute}${e.extra ? "+" + e.extra : ""}分 ${e.team} ${e.player || ""}`;
     const topOffset = e.team === homeName ? "8px" : "28px";
-    return `<div class="match-timeline-marker" style="left:${pct}%; top:${topOffset};" title="${label}">${iconFor(e)}</div>`;
+    // 第8次監査(Medium)の修正: 選手名・チーム名(API由来)をtitle属性へ入れるため
+    // エスケープ必須(属性からの抜け出し=XSSを防ぐ)。
+    return `<div class="match-timeline-marker" style="left:${pct}%; top:${topOffset};" title="${escapeHtml(label)}">${iconFor(e)}</div>`;
   }).join("");
   return `
     <div class="match-timeline-track">
@@ -4929,7 +4933,7 @@ function eventsTimelineHtml(events, homeName) {
   return events.map(e => {
     const minStr = `${e.minute ?? "?"}${e.extra ? "+" + e.extra : ""}'`;
     const detail = e.type === "Goal" && e.assist ? `${e.player}(アシスト: ${e.assist})` : e.player;
-    return `<div class="value-note" style="margin:2px 0;">${iconFor(e)} ${minStr} [${e.team === homeName ? "H" : "A"}] ${detail || ""}</div>`;
+    return `<div class="value-note" style="margin:2px 0;">${iconFor(e)} ${minStr} [${e.team === homeName ? "H" : "A"}] ${detail ? escapeHtml(detail) : ""}</div>`;
   }).join("");
 }
 function computeTeamRatingAvgs(analysis) {
@@ -4994,8 +4998,8 @@ function buildLiveAnalysisHtml(analysis, level) {
   const elapsedStr = analysis.elapsed !== null && analysis.elapsed !== undefined ? `${analysis.elapsed}分経過` : "";
   return `
     <div class="card" style="border:1.5px solid var(--critical);">
-      <h2><span class="status-badge is-live" style="margin-right:6px;"><span class="live-dot"></span>LIVE</span>${f.home.name} ${scoreStr} ${f.away.name}</h2>
-      <p class="value-note">${f.league || ""}${f.venue ? " ・ " + f.venue : ""}${elapsedStr ? " ・ " + elapsedStr : ""}(API-Footballの実データに基づく、試合中の途中経過です。まだ結果は確定していません)</p>
+      <h2><span class="status-badge is-live" style="margin-right:6px;"><span class="live-dot"></span>LIVE</span>${escapeHtml(f.home.name)} ${scoreStr} ${escapeHtml(f.away.name)}</h2>
+      <p class="value-note">${escapeHtml(f.league || "")}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}${elapsedStr ? " ・ " + elapsedStr : ""}(API-Footballの実データに基づく、試合中の途中経過です。まだ結果は確定していません)</p>
       <div style="margin-top:8px;">${eventsTimelineVisualHtml(analysis.events, f.home.name)}</div>
       ${ratingBarHtml}
       <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:10px;">
@@ -5023,8 +5027,8 @@ function buildFinishedAnalysisHtml(analysis, level) {
     : "";
   return `
     <div class="card">
-      <h2>📝 試合後の振り返り: ${f.home.name} ${f.score.home} - ${f.score.away} ${f.away.name}</h2>
-      <p class="value-note">${f.league || ""}${f.venue ? " ・ " + f.venue : ""}(API-Footballの実データに基づく、試合終了後の振り返りです)</p>
+      <h2>📝 試合後の振り返り: ${escapeHtml(f.home.name)} ${f.score.home} - ${f.score.away} ${escapeHtml(f.away.name)}</h2>
+      <p class="value-note">${escapeHtml(f.league || "")}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}(API-Footballの実データに基づく、試合終了後の振り返りです)</p>
       <div style="margin-top:8px;">${eventsTimelineVisualHtml(analysis.events, f.home.name)}</div>
       <p class="value-note"><strong>🤖 何が勝敗を分けたか:</strong> ${buildDecisivePointsText(analysis, level)}</p>
       ${ratingBarHtml}
@@ -6227,7 +6231,9 @@ renderRealFixturesIfAvailable();
    MATCHUPS data — nothing is a fabricated stat or fake headline.
    ========================================================= */
 function todaySeed(salt) {
-  const dateStr = new Date().toISOString().slice(0, 10);
+  // 第8次監査(Low)の修正: UTC日付だと日替わりウィジェットが日本時間の朝9時に
+  // 切り替わっていた。サーバー(appDateKey)と同じ日本時間(UTC+9)基準に揃える。
+  const dateStr = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
   return hashString((salt || "dash") + "|" + dateStr);
 }
 function openPlayerFromDashboard(nameJa) {
@@ -6409,8 +6415,15 @@ async function renderAiAccuracyWidget() {
 
   const stats = await fetchAccuracyStats();
 
-  if (!stats || !stats.configured) {
-    // プロキシ未起動、またはUpstash未設定 — 架空の数字は出さず、準備中であることだけ伝える。
+  // 第8次監査(Low)の修正: 通信失敗(null)と未設定(configured:false)を区別する。
+  // タイムアウトしただけなのに「これから記録を開始します」と表示すると、
+  // 既に記録があるのに無いかのような誤解を与えるため。
+  if (!stats) {
+    summaryEl.innerHTML = `🤖 <strong>AI予測の実績</strong>: <span class="value-note">実績データを取得できませんでした(サーバー起動待ちの可能性があります。しばらくして再読み込みしてください)。</span>`;
+    return;
+  }
+  if (!stats.configured) {
+    // Upstash未設定 — 架空の数字は出さず、準備中であることだけ伝える。
     summaryEl.innerHTML = `🤖 <strong>AI予測の実績</strong>: これから記録を開始します。データが十分に集まり次第、ここに実際の予測正答率を表示します。`;
     return;
   }
@@ -6509,7 +6522,14 @@ async function renderGrowthLogWidget() {
 
   const log = await fetchGrowthLog();
 
-  if (!log || !log.configured) {
+  // 第8次監査(Medium)の修正: 「通信失敗(null)」と「Upstash未設定(configured:false)」は
+  // 全く別の状態なのに同じ文言で「未設定」と断定表示していた。Renderのスリープ復帰
+  // 待ちでタイムアウトしただけの利用者に、誤った原因(設定不備)を伝えない。
+  if (!log) {
+    summaryEl.innerHTML = `🧠 <strong>昨日学んだこと</strong>: <span class="value-note">学習記録を取得できませんでした(サーバー起動待ちの可能性があります。しばらくして再読み込みしてください)。</span>`;
+    return;
+  }
+  if (!log.configured) {
     summaryEl.innerHTML = `🧠 <strong>昨日学んだこと</strong>: 学習エンジンの記録先(Upstash)が未設定のため、まだ表示できません。`;
     return;
   }
