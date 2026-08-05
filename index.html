@@ -6870,6 +6870,23 @@ async function renderDailyReportWidget() {
     ? `<div class="value-note" style="margin-top:6px; opacity:.9;">🧾 ${escapeHtml(proof.noteJa || "")}</div>`
     : "";
 
+  // ---- AI知能計測(ご指示⑨): 「今日のAIは昨日より賢くなったか?」の自己評価 ----
+  const intel = data.intelligence || null;
+  const sa = intel && intel.selfAssessment;
+  let selfAssessHtml = "";
+  if (sa) {
+    const color = sa.verdict === "YES" ? "#1e8449" : sa.verdict === "NO" ? "#b3541e" : "#666";
+    const proofsList = (sa.proofs || []).map((pr) => `<li class="value-note">${escapeHtml(pr.axisJa)}: ${escapeHtml(pr.valueJa)}(${escapeHtml(pr.direction)})</li>`).join("");
+    selfAssessHtml = `
+      <div style="margin-top:6px; padding:8px; border-left:3px solid ${color}; background:rgba(0,0,0,.03); border-radius:4px;">
+        <strong>🧠 ${escapeHtml(sa.questionJa || "今日のAIは昨日より賢くなったか?")}</strong>
+        <span style="color:${color}; font-weight:bold; margin-left:6px;">${escapeHtml(sa.verdict || "")}</span>
+        <div class="value-note" style="margin-top:4px;">${escapeHtml(sa.answerJa || "")}</div>
+        ${proofsList ? `<ul style="margin:4px 0 0 1em; padding:0;">${proofsList}</ul>` : ""}
+        ${sa.tomorrowPlanJa ? `<div class="value-note" style="margin-top:4px;">📌 明日の改善: ${escapeHtml(sa.tomorrowPlanJa)}</div>` : ""}
+      </div>`;
+  }
+
   summaryEl.innerHTML = `
     <span class="value-note">(${escapeHtml(data.noteJa || "")})</span>
     <button class="more-details-btn" id="dailyReportToggleBtn" type="button" style="margin-left:8px; display:inline-block; width:auto; padding:4px 10px;">詳しく見る ▼</button>
@@ -6883,6 +6900,7 @@ async function renderDailyReportWidget() {
       📡 API使用: ${num(api.usedToday)}/${num(api.dailyBudget)}件${api.detectedPlan ? `(${escapeHtml(String(api.detectedPlan))}プラン)` : ""}
     </div>
     ${accuracyHtml}
+    ${selfAssessHtml}
     ${shiftHtml}
     ${proofHtml}
   `;
@@ -6918,8 +6936,63 @@ async function renderDailyReportWidget() {
         <ul style="margin:4px 0 0 1em; padding:0;">${u.universeSkipped.slice(0, 5).map((s) => `<li class="value-note">${escapeHtml(s.reasonJa || "")}</li>`).join("")}</ul>
       </div>`
     : "";
+
+  // ---- AI知能計測ラウンドの詳細(①⑤⑦⑧) ----
+  let intelDetailsHtml = "";
+  if (intel) {
+    // ⑧ エンジン別の成長率
+    const eg = intel.engineGrowth;
+    const egHtml = (eg && eg.rows && eg.rows.length)
+      ? `<div style="margin-top:8px;"><strong>📈 エンジン別の成長(前日比・実測)</strong>
+          <ul style="margin:4px 0 0 1em; padding:0;">${eg.rows.map((r) => `<li class="value-note">${escapeHtml(r.engine)}(${escapeHtml(r.metricJa)}): ${r.measurable ? `${r.today}${escapeHtml(r.unitJa)}(前日比${sign(r.delta)}${escapeHtml(r.unitJa)}${Number.isFinite(r.growthPct) ? `・${sign(r.growthPct)}%` : ""})` : "測定不能(今日/昨日のどちらかに記録がありません)"}</li>`).join("")}</ul>
+          <div class="value-note" style="opacity:.8;">${escapeHtml(eg.noteJa || "")}</div>
+        </div>`
+      : "";
+    // ③⑤ 考察の質・RAG使用率
+    const rt = intel.reasoningTrend;
+    const rtToday = rt && rt.today;
+    const rtHtml = rt
+      ? (rtToday && rtToday.measurable
+        ? `<div style="margin-top:8px;"><strong>🧠 考察の質・RAG使用率(本日${rtToday.samples}件の考察)</strong>
+            <div class="value-note">考察の質スコア: ${rtToday.avgReasoningScore}点/100${rt.vsYesterday && Number.isFinite(rt.vsYesterday.reasoningScoreDelta) ? `(前日比${sign(rt.vsYesterday.reasoningScoreDelta)}点)` : ""} ・ RAG使用率: ${rtToday.ragUtilizationPct !== null ? `${rtToday.ragUtilizationPct}%(取得${rtToday.ragPoolTotal}件中${rtToday.ragUsedTotal}件を回答に使用)` : "測定対象なし"}</div>
+            <div class="value-note">Memory利用率: ${rtToday.memoryAttachRatePct !== null ? `${rtToday.memoryAttachRatePct}%(前回の結論を思い出せた割合・対象${rtToday.memoryEligibleSamples}件)` : "対象となる考察がありませんでした"}</div>
+            <div class="value-note" style="opacity:.8;">${escapeHtml(rtToday.noteJa || "")}</div>
+          </div>`
+        : `<div class="value-note" style="margin-top:8px;">🧠 考察の質・RAG使用率: ${escapeHtml((rtToday && rtToday.reasonJa) || rt.reasonJa || "本日の考察の記録はまだ保存されていません(日次学習で保存されます)。")}</div>`)
+      : "";
+    // ① Knowledgeの寄与ランキング
+    const kc = intel.knowledgeContribution;
+    const kcHtml = kc
+      ? `<div style="margin-top:8px;"><strong>🏆 知識の寄与ランキング(毎日更新)</strong>
+          ${kc.contributionMeasurable
+            ? `<ul style="margin:4px 0 0 1em; padding:0;">${(kc.contributionRanking || []).slice(0, 5).map((r) => `<li class="value-note">${r.rank}位 ${escapeHtml(r.featureLabelJa)}(寄与${sign(r.contribution)})← 供給元: ${escapeHtml((r.knowledgeSourcesJa || []).join("、"))}</li>`).join("")}</ul>`
+            : `<div class="value-note">${escapeHtml(kc.contributionReasonJa || "")}</div>`}
+          ${(kc.usageRanking && kc.usageRanking.length)
+            ? `<div class="value-note" style="margin-top:4px;">📖 よく使われた知識: ${kc.usageRanking.slice(0, 3).map((r) => `「${escapeHtml(String(r.statement || "").slice(0, 40))}${String(r.statement || "").length > 40 ? "…" : ""}」(${r.usageCount}回)`).join(" / ")}</div>`
+            : ""}
+          <div class="value-note" style="opacity:.75; margin-top:4px;">${escapeHtml(kc.methodologyJa || "")}</div>
+        </div>`
+      : "";
+    // ⑦ 精度低下の自己分析
+    const diag = intel.accuracyDiagnosis;
+    const diagHtml = diag
+      ? `<div style="margin-top:8px;"><strong>🩺 AIによる自己分析(精度が落ちていないか)</strong>
+          <div class="value-note">${escapeHtml(diag.summaryJa || "")}</div>
+          ${(diag.causes && diag.causes.length) ? `<ul style="margin:4px 0 0 1em; padding:0;">${diag.causes.slice(0, 5).map((c) => `<li class="value-note">${escapeHtml(c.detailJa || "")}</li>`).join("")}</ul>` : ""}
+        </div>`
+      : "";
+    // 仮説的中率
+    const hs = intel.hypothesisStats;
+    const hsHtml = (hs && hs.measurable)
+      ? `<div class="value-note" style="margin-top:8px;">🔬 ${escapeHtml(hs.noteJa || "")}</div>`
+      : "";
+    intelDetailsHtml = `${egHtml}${rtHtml}${kcHtml}${diagHtml}${hsHtml}`;
+  } else {
+    intelDetailsHtml = `<div class="value-note" style="margin-top:8px; opacity:.85;">🧠 AI知能レポート(自己評価・エンジン別成長率・知識の寄与ランキング)は、次回の日次学習から保存されます。</div>`;
+  }
+
   if (detailsEl) {
-    detailsEl.innerHTML = `${feHtml}${agendaHtml}${appliedHtml}${legendHtml}${skippedHtml}
+    detailsEl.innerHTML = `${feHtml}${agendaHtml}${appliedHtml}${intelDetailsHtml}${legendHtml}${skippedHtml}
       <p class="value-note" style="margin-top:8px; opacity:.8;">※ このダッシュボードの数字はすべてサーバーが毎日の学習で実際に記録した実測値です。測定できない項目は理由つきで「測定できない」と表示します(推測で埋めることはありません)。</p>`;
   }
   const toggleBtn = document.getElementById("dailyReportToggleBtn");

@@ -62,6 +62,9 @@ const { getMetricsTrend } = require("./learning/dailyMetrics");
 // 2026年8月・「本当に毎日賢くなるAI」フェーズ(ご指示②⑨⑩):
 // 予測精度の毎日測定・学習計画・信頼度の説明をダッシュボードへ返す
 const { getAccuracyTrend } = require("./learning/accuracyTracker");
+// 2026年8月・AI知能計測ラウンド(ご指示③⑤): 考察の質とRAG使用率を、質問時は
+// メモリ集計のみ(応答速度への影響ゼロ)で記録する。日次保存はdailyJobが行う。
+const intelligenceMetrics = require("./learning/intelligenceMetrics");
 const { loadLatestAgenda } = require("./learning/learningAgenda");
 const { SOURCE_TRUST, HALF_LIFE_HOURS } = require("./learning/trustEngine");
 // /debug診断ページが「毎日学習エンジンが対象にしている全クラブ」を横断して
@@ -204,6 +207,9 @@ function perfSnapshot() {
       avgMs: Math.round(e.totalMs / e.count),
       p95Ms: percentileOf(e.ring, 95),
     })).sort((a, b) => b.count - a.count),
+    // AI知能計測ラウンド: まだ日次保存されていない考察サンプル数(メモリ集計中)。
+    // 質問時にRedisへ書かない設計が本番でも動いていることを外から確認できる。
+    intelligenceBuffer: { pendingSamples: intelligenceMetrics.pendingSampleCount() },
   };
 }
 
@@ -3586,6 +3592,49 @@ async function handleDiscuss(body, clientIp) {
     } catch (e) { /* ベストエフォート: Memory/Knowledge Engineへの保存失敗は回答自体に影響させない */ }
   }
 
+  // ---- 2026年8月・AI知能計測ラウンド(ご指示③⑤) ----
+  // 考察の質(機械的ルーブリック0〜100点)とRAG使用率(取得した知識のうち
+  // 実際に回答へ使われた割合)を測定する。ここで行うのはメモリ上の文字列照合
+  // (数ミリ秒)と配列への追加だけで、Redisへの書き込みは日次学習ジョブが
+  // 1日1回まとめて行う(最終方針⑥「質問した瞬間に重い処理を行う設計は禁止」)。
+  let intelligenceForMeta = null;
+  try {
+    const quality = intelligenceMetrics.scoreReasoningQuality({
+      facts,
+      answerFields: {
+        generalView: llmOut.generalView, aiOpinion: llmOut.aiOpinion,
+        counterArgument: llmOut.counterArgument, finalConclusion: llmOut.finalConclusion,
+        futureOutlook: llmOut.futureOutlook, mostImportantOpinion: llmOut.mostImportantOpinion,
+      },
+      confidenceStars: confidence && confidence.stars,
+      confidenceReasonJa: confidence && confidence.reasonJa,
+    });
+    intelligenceMetrics.recordDiscussSample({
+      at: new Date().toISOString(),
+      subjectType: subject.type || "general",
+      parsedOk: !!llmOut.parsedOk,
+      score: quality.total,
+      components: quality.components,
+      ragPool: quality.rag.poolCount,
+      ragUsed: quality.rag.usedCount,
+      // Memory Engineが結線されているのはクラブの質問だけ(上のStage E参照)。
+      // 「対象外の質問でメモリが使われなかった」ことを利用率の低下に数えないよう、
+      // 対象の質問かどうかを分けて記録する。
+      memoryEligible: subject.type === "club" && !!subject.labelEn,
+      memoryAttached: !!previousConclusion,
+      stars: confidence && Number.isFinite(confidence.stars) ? confidence.stars : null,
+    });
+    intelligenceForMeta = {
+      reasoningQualityScore: quality.total,
+      components: quality.components,
+      ragUtilization: {
+        poolCount: quality.rag.poolCount, usedCount: quality.rag.usedCount,
+        unusedCount: quality.rag.unusedCount, utilizationPct: quality.rag.utilizationPct,
+      },
+      noteJa: quality.noteJa,
+    };
+  } catch (e) { /* 計測は付加情報。失敗しても回答は返す */ }
+
   return {
     status: 200,
     body: {
@@ -3613,7 +3662,7 @@ async function handleDiscuss(body, clientIp) {
       mostImportantOpinion: llmOut.mostImportantOpinion,
       confidence,
       followUpQuestions: llmOut.followUpQuestions,
-      meta: { ...knowledgeMeta, llmProvider: currentProviderName(), parsedOk: llmOut.parsedOk },
+      meta: { ...knowledgeMeta, llmProvider: currentProviderName(), parsedOk: llmOut.parsedOk, intelligence: intelligenceForMeta },
     },
   };
 }
@@ -3969,10 +4018,13 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         const todayKey = appDateKey();
-        const [growthRaw, accuracyTrend, agenda, coverage] = await Promise.all([
+        const [growthRaw, accuracyTrend, agenda, intelReport, coverage] = await Promise.all([
           learningDeps.upstashGetJSON("learn:growthlog:latest").catch(() => null),
           getAccuracyTrend(learningDeps, todayKey).catch(() => ({ available: false })),
           loadLatestAgenda(learningDeps).catch(() => null),
+          // AI知能計測ラウンド(ご指示①〜⑨): 日次学習ジョブが保存した知能レポート
+          // (自己評価・エンジン別成長率・知識の寄与ランキング・精度低下の自己分析)
+          learningDeps.upstashGetJSON("learn:intel:report:latest").catch(() => null),
           // 第8次監査(Low)の修正: /api/knowledge/coverage と同じ5分キャッシュを共有し、
           // ホーム画面が両方を叩いたときに全クラブの読み出し(約100コマンド)が
           // 二重に走らないようにする。
@@ -4045,6 +4097,11 @@ const server = http.createServer(async (req, res) => {
           // ---- 最終方針「使用回数まで管理」: 実際によく使われている知識の上位 ----
           // (使用回数は応答速度を守るためメモリ集計→日次保存の近似値)
           topUsedKnowledge: await knowledgeStore.getTopUsedKnowledge(5).catch(() => []),
+          // ---- AI知能計測ラウンド(ご指示①〜⑨) ----
+          // AI自身の毎日の自己評価「今日のAIは昨日より賢くなったか?」、
+          // エンジン別成長率、Knowledgeの寄与ランキング、精度低下の自己分析、
+          // 考察の質・RAG使用率の推移。すべて日次学習ジョブ保存の実測値。
+          intelligence: intelReport || null,
         };
         cacheSet("learn:daily-report", body, 5 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
