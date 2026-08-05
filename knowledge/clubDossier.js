@@ -187,6 +187,20 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
     return (await upstashGetJSON(`kb:player:${playerId}`).catch(() => null)) || null;
   }
 
+  // ---- 第8次監査(Critical)の修正: 選手の「更新の古い順」インデックス ----
+  // 従来、日次収集の選手詳細ステージは「どの選手が最も古いか」を知るためだけに
+  // 候補全員(約2,500〜3,000人)の記録を毎日1件ずつ読んでいた(Upstash無料枠
+  // 1日10,000コマンドの3割前後を消費し、選手3万人規模では枠を単独で超える)。
+  // playerId→statsUpdatedAt の小さな索引を1キーに持ち、読み1回・書き1回にする。
+  async function getStatsIndex() {
+    if (!upstashEnabled) return {};
+    return (await upstashGetJSON("kb:player:statsIndex").catch(() => null)) || {};
+  }
+  async function saveStatsIndex(index) {
+    if (!upstashEnabled || !index) return false;
+    return (await upstashSetJSON("kb:player:statsIndex", index)) !== false;
+  }
+
   /**
    * 蓄積状況のまとめ(ご指示の最終確認「何クラブ・何選手・何件」に答えるための実測)。
    * 「実装しました」ではなく「実際に何件入っているか」を返す。
@@ -225,7 +239,7 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
     };
   }
 
-  return { getDossier, updateSection, savePlayer, getPlayer, getCoverageSummary, slugOf };
+  return { getDossier, updateSection, savePlayer, getPlayer, getStatsIndex, saveStatsIndex, getCoverageSummary, slugOf };
 }
 
 module.exports = { createClubDossier, UNAVAILABLE_FIELDS_JA, slugOf };

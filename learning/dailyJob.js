@@ -287,8 +287,18 @@ function mergeGrowthLogs(previous, current) {
     hypothesesDiscarded: sum(previous.hypothesesDiscarded, current.hypothesesDiscarded),
     reflectionsSaved: sum(previous.reflectionsSaved, current.reflectionsSaved),
     profilesGenerated: sum(previous.profilesGenerated, current.profilesGenerated),
-    aiViewsChanged: sum(previous.aiViewsChanged, current.aiViewsChanged),
-    aiViewsUnchanged: sum(previous.aiViewsUnchanged, current.aiViewsUnchanged),
+    // 第8次監査(Low)の修正: 「見解が変わった/変わらなかったクラブ数」は同じ11クラブを
+    // 実行のたびに数え直すため、sumすると14回実行で154クラブ分に水増しされていた。
+    // 同日の再実行では最大値を採用する(リーグ・選手と同じ規則)。
+    aiViewsChanged: Math.max(previous.aiViewsChanged || 0, current.aiViewsChanged || 0),
+    aiViewsUnchanged: Math.max(previous.aiViewsUnchanged || 0, current.aiViewsUnchanged || 0),
+    // 第8次監査(Medium)の修正: 同日の1回目で重みが更新され(true)、2回目が更新なし(false)
+    // だと、`...current`の上書きでtrueが消え、「重みを更新しました」の実績が
+    // メトリクスとダッシュボードから消えていた。その日一度でも更新されていれば残す。
+    weightsUpdated: !!(previous.weightsUpdated || current.weightsUpdated),
+    weightsUpdatedV2: !!(previous.weightsUpdatedV2 || current.weightsUpdatedV2),
+    v2AccuracyBefore: current.v2AccuracyBefore ?? previous.v2AccuracyBefore ?? null,
+    v2AccuracyAfter: current.v2AccuracyAfter ?? previous.v2AccuracyAfter ?? null,
     // 第5次監査で発見した「成長ログの肥大化」の修正。
     //   この3項目だけが重複排除も上限も無いまま単純連結されていた。
     //   API-Footballが落ちている日は1回の実行で約100件のエラー文字列が出るため、
@@ -885,6 +895,15 @@ async function runDailyLearning(deps) {
     try {
       const record = await upstashGetJSON(`learn:ownpred:${fixtureIdStr}`);
       if (!record || record.resolved) { await upstashCmd(["LREM", "learn:ownpred:pending", "0", fixtureIdStr]).catch(() => {}); continue; }
+      // ---- 第8次監査(High)の修正: 解決処理の多重実行ロック ----
+      // 再デプロイ時の新旧プロセス並走や実行ロック(10分)失効後の再突入で、
+      // 同じ試合を2つのプロセスが同時に解決すると、resolved/correctカウンタの
+      // 二重INCR・learn:ownpred:recentへの二重RPUSH(=学習データ汚染)・
+      // 精度記録(learn:accuracy)の加算マージ倍加が起きていた。
+      // server.js の pred:resolvelock(第7次監査)と同じ SET NX 方式で防ぐ。
+      // Upstash障害時は可用性を優先して通す(既存の実行ロックと同じ方針)。
+      const resolveLock = await upstashCmd(["SET", `learn:ownpred:resolvelock:${fixtureIdStr}`, runAt.toISOString(), "NX", "EX", "3600"]).catch(() => "OK");
+      if (resolveLock !== "OK") continue; // 別プロセスが処理中
       const data = await callApiFootball("/fixtures", { id: fixtureIdStr });
       const fx = (data && data.response && data.response[0]) || null;
       // 2026年8月・総点検で発見した重大な欠陥の修正:
@@ -922,16 +941,31 @@ async function runDailyLearning(deps) {
         }
         continue;
       }
-      if (shortStatus !== "FT") continue; // まだ終わっていない
-      const actualWinner = outcomeFromScore(fx.goals.home, fx.goals.away);
+      // ---- 第8次監査(High)の修正: 延長(AET)・PK決着(PEN)の試合が永久に未解決だった ----
+      // 従来は「FT以外はcontinue」だったため、カップ戦などで延長・PKまで行った
+      // 試合はUNRESOLVABLE(中止等)にも該当せず、保留キューに永遠に残った。
+      // キューは先頭10件しか処理しないため、PK決着が10件たまると**全予測の検証が
+      // 恒久停止し、重み学習への新データ供給が止まる**(過去にPST/CANCで修正したのと
+      // 同じバグクラスの残存。server.jsのFINISHED_STATUSES=FT/AET/PENと基準を揃える)。
+      const FINISHED_SHORT_STATUSES = ["FT", "AET", "PEN"];
+      if (!FINISHED_SHORT_STATUSES.includes(shortStatus)) continue; // まだ終わっていない
+      // AET/PENは「90分時点のスコア」(score.fulltime)で採点する。勝敗予測は90分の
+      // 結果を対象としており、延長・PKの決着を90分の勝敗として学習するとラベルが
+      // 濁るため。fulltimeが取れない応答形式では正直にgoals(延長込み)を使う。
+      const scoreForGrading = (shortStatus !== "FT"
+        && fx.score && fx.score.fulltime
+        && Number.isFinite(fx.score.fulltime.home) && Number.isFinite(fx.score.fulltime.away))
+        ? fx.score.fulltime : fx.goals;
+      const actualWinner = outcomeFromScore(scoreForGrading.home, scoreForGrading.away);
       if (!actualWinner) continue;
       record.resolved = true;
       record.actualWinner = actualWinner;
       record.correct = actualWinner === record.predictedWinner;
       record.resolvedAt = runAt.toISOString();
+      if (shortStatus !== "FT") record.finishedStatus = shortStatus; // 延長/PK決着だったことを正直に残す
       // 2026年8月・ご指示⑨: 実スコアを保存する(BTTS・Over/Under・スコア一致の
       // 採点に必要。従来は勝敗しか残しておらず、市場別の精度が測れなかった)。
-      record.actualScore = { home: fx.goals.home, away: fx.goals.away };
+      record.actualScore = { home: scoreForGrading.home, away: scoreForGrading.away };
       // 全市場の採点(Brier・LogLoss・的中)。予測時のポアソンλから機械的に導出。
       try {
         record.marketScores = scorePrediction(record);
@@ -981,12 +1015,21 @@ async function runDailyLearning(deps) {
           } catch (e) {
             errors.push(`lineup_fetch_failed:${fixtureIdStr}:${e.code || e.message}`);
           }
+        } else {
+          // 第8次監査(Low)の修正: 予算不足でラインナップ照合を見送った事実が
+          // どこにも残らず、「監督交代を検出できなかった」のか「交代が無かった」のか
+          // 区別できなかった。「黙って減らさない」方針(universeCollectorと同じ)に揃える。
+          errors.push(`lineup_check_skipped_budget:${fixtureIdStr}:予算残量が少ないため、外れ原因の文脈照合(監督交代・スタメン入替)を見送りました`);
         }
         contextualFailureReasons = classifyContextualFailureReasons(record, resolvedContext);
         record.contextualFailureReasons = contextualFailureReasons;
         record.resolvedContext = resolvedContext;
       }
       await upstashSetJSON(`learn:ownpred:${fixtureIdStr}`, record);
+      // 第8次監査(High)の修正: 解決済みの個別レコードは学習用の写し(learn:ownpred:recent)
+      // に引き継がれるため、本体は180日で自動失効させる(Redisキーの無限成長を止める。
+      // 未解決レコードは解決に必要なのでTTLを付けない)。
+      await upstashCmd(["EXPIRE", `learn:ownpred:${fixtureIdStr}`, String(180 * 86400)]).catch(() => {});
       await upstashCmd(["LREM", "learn:ownpred:pending", "0", fixtureIdStr]).catch(() => {});
       await upstashCmd(["INCR", "learn:ownpred:resolved"]).catch(() => {});
       if (record.correct) await upstashCmd(["INCR", "learn:ownpred:correct"]).catch(() => {});
@@ -1281,7 +1324,19 @@ async function runDailyLearning(deps) {
       const awayCtx = built.awayCtx;
       const features = built.features;
 
-      const storedWeightsRaw = (await upstashGetJSON("learn:weights")) || {};
+      // ---- 第8次監査の修正: 重みの読み取り失敗を「学習前の初期重み」と区別する ----
+      // upstashGetJSONは失敗を握りつぶしてnullを返すため、Upstash一時障害の日に
+      // 初期重み(未学習状態)で予測が記録され、learningProofの「必ず反映されます」
+      // という説明と食い違っていた。読み取れない日は正直に予測を見送る
+      // (/api/match-analysis側の第5次修正と同じ方針)。
+      let storedWeightsRaw = null;
+      try {
+        const rawStr = await upstashCmd(["GET", "learn:weights"]); // 失敗時はthrowする生コマンドで読む
+        storedWeightsRaw = rawStr ? JSON.parse(rawStr) : {}; // null=キー未作成(初回)は正当な初期状態
+      } catch (e) {
+        errors.push(`weights_read_failed_prediction_skipped:${team.nameEn}:保存済みの重みを読み出せなかったため、学習前の重みでの予測記録を避けて今回は見送りました`);
+        continue;
+      }
       const weights = { ...EXTENDED_DEFAULT_WEIGHTS, ...storedWeightsRaw }; // 過去バージョンの重みにも新しいキーを補完
       // 2026年8月・ご指示①③④の証明: 「昨日の学習が今日の予測に反映された」を
       // ログで示せるよう、今日の予測が実際に使った重みのversion/更新時刻を記録する。
@@ -1314,12 +1369,16 @@ async function runDailyLearning(deps) {
         predictedScoreline: mostLikelyScoreline(homeLambda, awayLambda),
         // ご指示③④の証明: この予測がどのversionの重みで行われたか。
         weightsVersion: weights.version ?? 0,
-        // ご指示⑤: この予測に使ったデータの信頼度(出所×鮮度)。すべて今取得した
-        // 実データのため取得直後の信頼度になる。重み学習はこの信頼度で強弱をつける。
+        // ご指示⑤: この予測に使ったデータの信頼度(出所×鮮度)。
+        // 第8次監査の修正: 取得できなかったデータを「信頼度0.95で使った」と
+        // 記録しないよう、両側の実値が取れている特徴量だけを計上する。
         featureTrust: buildFeatureTrust([
-          { key: "form", source: "derived", kind: "form", computedAt: runAt.toISOString() },
-          { key: "injuries", source: "api-football", kind: "injuries", computedAt: runAt.toISOString() },
-          { key: "standings", source: "api-football", kind: "standings", computedAt: runAt.toISOString() },
+          ...((homeCtx.formScore ?? null) !== null && (awayCtx.formScore ?? null) !== null
+            ? [{ key: "form", source: "derived", kind: "form", computedAt: runAt.toISOString() }] : []),
+          ...((homeCtx.injuryCount ?? null) !== null && (awayCtx.injuryCount ?? null) !== null
+            ? [{ key: "injuries", source: "api-football", kind: "injuries", computedAt: runAt.toISOString() }] : []),
+          ...((homeCtx.pointsPerGame ?? null) !== null && (awayCtx.pointsPerGame ?? null) !== null
+            ? [{ key: "standings", source: "api-football", kind: "standings", computedAt: runAt.toISOString() }] : []),
           ...(homeXg && homeXg.xgNet !== null && awayXg && awayXg.xgNet !== null
             ? [{ key: "xg", source: "api-football", kind: "xg", computedAt: runAt.toISOString() }] : []),
         ], runAt.getTime()),
@@ -1371,6 +1430,8 @@ async function runDailyLearning(deps) {
       knowledgeGraph, thoughtTimeline, computeFormScore,
       recordLearned: saveWithImportance,
       priorityClubs,
+      // 第8次監査: 同日再実行ガード(kb:universe:ran:<date>)の読み書きに使う
+      upstashCmd, upstashGetJSON, upstashSetJSON,
     }, runAt, dateKey);
     if (universeStats.errors && universeStats.errors.length) errors.push(...universeStats.errors);
   } catch (e) {
@@ -1430,10 +1491,12 @@ async function runDailyLearning(deps) {
   //   メトリクスまで丸ごと失われ、外からは「その日はジョブが動かなかった」と
   //   しか見えなくなる(健康診断も「GitHub Actionsが動いていない可能性」と
   //   誤った原因を表示する)。学習に失敗しても、その日の知識は必ず残す。
+  let recentRecordsShared = null; // 第8次監査: 二度読み防止のため、後段の失敗集計と共有する
   if (totalResolved >= MIN_RESOLVED_FOR_RECALIBRATION) {
     try {
       const recentRaw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "0", "-1"]).catch(() => [])) || [];
       const recentRecords = recentRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
+      recentRecordsShared = recentRecords;
       const storedWeights = await upstashGetJSON("learn:weights");
       const currentWeights = { ...EXTENDED_DEFAULT_WEIGHTS, ...DEFAULT_WEIGHTS, ...(storedWeights || {}) };
 
@@ -1521,10 +1584,12 @@ async function runDailyLearning(deps) {
         const fitted = fitWeightsGradientDescent(fitSet, currentWeights, trustOpts);
 
         // ---- 候補③(ご指示⑧): 実測で「有害」と出た特徴量を外した候補 ----
-        // 有効性の実測(featureEffectivenessToday)で損失を悪化させていた特徴量を
-        // 0にした候補。他の候補と同じホールドアウト関門を通るため、誤検出で
-        // 予測が悪化することはない(改善した場合だけ採用される)。
-        const ablationCandidates = buildAblationCandidates(featureEffectivenessToday, currentWeights);
+        // 第8次監査(Low)の修正: 候補の選定を全データ(検証用込み)で行うと、
+        // 検証用でたまたま悪く見えた特徴量の0化候補が同じ検証用の関門を通り
+        // やすくなる選択バイアスがあった。候補の選定は**学習用データのみ**で行い、
+        // 検証用データは関門(採否判定)でだけ使う(表示用のレポートは全データのまま)。
+        const effectivenessForCandidates = computeFeatureEffectiveness(fitSet, currentWeights, trustOpts);
+        const ablationCandidates = buildAblationCandidates(effectivenessForCandidates, currentWeights);
 
         const allCandidates = [
           ...gridCandidates.map((w) => ({ w, method: "grid_search_v1" })),
@@ -1677,8 +1742,12 @@ async function runDailyLearning(deps) {
   let topSuccessReasonsRecent = []; // 2026年8月: 最近うまくいっている判断基準
   let agendaToday = null; // ご指示⑩: AIが自分で決めた「次に学ぶテーマ」
   try {
-    const recentForFailuresRaw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "0", "-1"]).catch(() => [])) || [];
-    const recentForFailures = recentForFailuresRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
+    // 第8次監査(Medium)の修正: learn:ownpred:recent(最大300件×数KB)を同一実行内で
+    // 二度全件読みしていた。重み学習の段(④)で読んだ結果を再利用する。
+    const recentForFailures = recentRecordsShared || (
+      ((await upstashCmd(["LRANGE", "learn:ownpred:recent", "0", "-1"]).catch(() => [])) || [])
+        .map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean)
+    );
     topFailureReasonsRecent = summarizeFailureReasons(recentForFailures, 5);
     topSuccessReasonsRecent = summarizeSuccessReasons(recentForFailures, 5);
     // ---- 2026年8月・ご指示⑩: 次に何を学ぶかをAI自身が決める ----
@@ -1801,6 +1870,16 @@ async function runDailyLearning(deps) {
   const mergedGrowthLog = mergeGrowthLogs(existingToday, growthLog);
   await upstashSetJSON(`learn:growthlog:${dateKey}`, mergedGrowthLog);
   await upstashSetJSON("learn:growthlog:latest", mergedGrowthLog);
+  // 第8次監査(High)の修正: 日付つきキーは削除経路が無く無限成長していた。
+  // 比較・履歴表示に十分な120日で自動失効させる(learn:*:latest は残す)。
+  // (注: SETはTTLを消すため、EXPIREは必ず「そのキーの最後の書き込みの後」に置く。
+  //  metricsはこの後で書くため、EXPIREも書き込み直後に別途行う)
+  for (const k of [
+    `learn:growthlog:${dateKey}`, `learn:accuracy:${dateKey}`,
+    `learn:agenda:${dateKey}`, `learn:features:report:${dateKey}`,
+  ]) {
+    await upstashCmd(["EXPIRE", k, String(120 * 86400)]).catch(() => {});
+  }
 
   // 2026年8月・完全自動Learning Cycle ⑧「毎日賢くなっていることを証明する」:
   // 日をまたいで比較できる軽量な指標だけを別キーに保存する。growthLogは項目が
@@ -1829,6 +1908,7 @@ async function runDailyLearning(deps) {
     learningDurationMs: Date.now() - learningStartedAtMs,
   });
   await saveDailyMetrics({ upstashEnabled, upstashSetJSON }, metricsSnapshot);
+  await upstashCmd(["EXPIRE", `learn:metrics:${dateKey}`, String(120 * 86400)]).catch(() => {});
 
   return { ok: true, ...mergedGrowthLog };
 }

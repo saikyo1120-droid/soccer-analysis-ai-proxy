@@ -86,6 +86,23 @@ async function collectUniverse(deps, runAt, dateKey) {
   const canSpend = (n) => (apiBudget ? apiBudget.remainingForJob() >= BUDGET_FLOOR + n : true);
   const skip = (stage, reasonJa) => { stats.skipped.push({ stage, reasonJa }); };
 
+  // ---- 第8次監査(Medium)の修正: 同日の再実行ガード ----
+  // 輪番は日付で決まるため、同日に再実行すると全く同じ収集(コア約70クラブ×4
+  // リクエスト等)を丸ごと繰り返し、同じデータの取り直しにAPI予算を浪費していた
+  // (1日14回実行の実績あり)。同日2回目以降はコア/順位/名簿/xG/基本情報を見送り、
+  // 選手詳細(更新の古い順に前進する)だけを続行する。
+  let alreadyRanToday = false;
+  if (deps.upstashGetJSON) {
+    const ran = await deps.upstashGetJSON(`kb:universe:ran:${dateKey}`).catch(() => null);
+    if (ran && ran.ranAt) {
+      alreadyRanToday = true;
+      stats.sameDayRerun = true;
+      skip("core", `本日${String(ran.ranAt).slice(11, 16)}(UTC)に収集済みのため、コア更新・順位表・名簿・xG・基本情報の再取得を見送りました(選手詳細の輪番のみ続行)。`);
+    }
+  }
+  // 同一実行内での/fixtures二度取り防止(コア更新で取得した直近試合をxGステージが再利用)
+  const fixturesCache = new Map(); // teamId -> fixtures[]
+
   // ---- teamId の解決(調査ファイルに保存済みならAPIを呼ばない) ----
   async function resolveTeam(club) {
     const dossier = await clubDossier.getDossier(club.nameEn);
@@ -122,8 +139,8 @@ async function collectUniverse(deps, runAt, dateKey) {
   // ① コア更新(フォーム・怪我・監督/布陣・移籍)
   // ============================================================
   // 優先クラブを先頭に置く(予算切れで打ち切られる場合も優先クラブは必ず処理される)。
-  const coreRotation = clubsForCoreUpdate(dateKey);
-  const coreClubs = [
+  const coreRotation = alreadyRanToday ? [] : clubsForCoreUpdate(dateKey);
+  const coreClubs = alreadyRanToday ? [] : [
     ...priorityClubs.filter((p) => !coreRotation.includes(p)),
     ...coreRotation.sort((a, b) => {
       const ap = priorityClubs.includes(a) ? 0 : 1;
@@ -147,6 +164,7 @@ async function collectUniverse(deps, runAt, dateKey) {
       try {
         const fx = await callApiFootball("/fixtures", { team: teamId, last: 10 });
         fixtures = fx.response || [];
+        fixturesCache.set(teamId, fixtures); // xGステージが再利用(同一実行内の二度取り防止)
         const form = computeFormScore(fixtures, teamId);
         const goals = computeGoalRateFeatures(fixtures, teamId);
         const fatigue = computeFatigueFeature(fixtures, runAt.getTime());
@@ -270,7 +288,7 @@ async function collectUniverse(deps, runAt, dateKey) {
   // ============================================================
   // ③ 選手名簿(7日で全クラブ一巡)
   // ============================================================
-  const squadClubs = clubsForSquadSync(dateKey);
+  const squadClubs = alreadyRanToday ? [] : clubsForSquadSync(dateKey);
   stats.squadsPlanned = squadClubs.length;
   for (const club of squadClubs) {
     if (!canSpend(1)) { skip("squad", `予算残量が安全ラインを下回ったため、${club.nameJa}以降の名簿更新を見送りました。`); break; }
@@ -313,21 +331,28 @@ async function collectUniverse(deps, runAt, dateKey) {
       for (const p of squad) candidates.push({ club, playerId: p.id, name: p.name });
     }
     stats.playersPlanned = Math.min(cap, candidates.length);
-    // 更新の古い順に並べる(記録が無い選手を最優先)
-    const withAge = [];
-    for (const c of candidates) {
-      const rec = await clubDossier.getPlayer(c.playerId);
-      withAge.push({ ...c, updatedAt: rec && rec.statsUpdatedAt ? rec.statsUpdatedAt : "" });
-    }
+    // ---- 第8次監査(Critical)の修正 ----
+    // 従来は「更新の古い順」を知るためだけに候補全員(数千人)の記録を
+    // 1件ずつ読んでいた(1日数千Redisコマンド。選手3万人規模では無料枠を
+    // 単独で超過)。playerId→statsUpdatedAtの索引1キー(読み1回・書き1回)に変更。
+    const statsIndex = await clubDossier.getStatsIndex();
+    const withAge = candidates.map((c) => ({ ...c, updatedAt: statsIndex[c.playerId] || "" }));
     withAge.sort((a, b) => String(a.updatedAt).localeCompare(String(b.updatedAt)));
     let done = 0;
+    let indexDirty = false;
     for (const c of withAge) {
       if (done >= cap) break;
       if (!canSpend(1)) { skip("playerStats", `予算残量が安全ラインを下回ったため、選手の詳細成績の更新を${done}人で打ち切りました(残り${withAge.length - done}人は明日以降)。`); break; }
       try {
         const data = await callApiFootball("/players", { id: c.playerId, season });
         const entry = (data.response || [])[0];
-        if (!entry || !entry.statistics || !entry.statistics.length) { done++; continue; }
+        if (!entry || !entry.statistics || !entry.statistics.length) {
+          // 統計が無い選手(第3GK等)も輪番を前進させる(毎日同じ選手で空振りしないため)。
+          // 選手記録そのものには「無い統計」を書かない(でっち上げ防止)。
+          statsIndex[c.playerId] = runAt.toISOString();
+          indexDirty = true;
+          done++; continue;
+        }
         const best = entry.statistics.reduce((acc, cur) =>
           (((cur.games && cur.games.appearences) || 0) > ((acc.games && acc.games.appearences) || 0) ? cur : acc), entry.statistics[0]);
         const real = computePlayerRealStats(best) || {};
@@ -352,6 +377,8 @@ async function collectUniverse(deps, runAt, dateKey) {
           },
           statsUpdatedAt: runAt.toISOString(),
         });
+        statsIndex[c.playerId] = runAt.toISOString();
+        indexDirty = true;
         stats.playersUpdated++;
         done++;
       } catch (e) {
@@ -360,6 +387,7 @@ async function collectUniverse(deps, runAt, dateKey) {
         done++;
       }
     }
+    if (indexDirty) await clubDossier.saveStatsIndex(statsIndex);
   } catch (e) { stats.errors.push(`universe_players_failed:${e.message}`); }
 
   // ============================================================
@@ -367,8 +395,8 @@ async function collectUniverse(deps, runAt, dateKey) {
   // ============================================================
   // ご指示⑩: 学習計画の優先クラブは、tier Bでも輪番外でも今日のxG更新に加える
   // (xGは1クラブ5リクエストと高価なため、優先追加は最大3クラブに制限)。
-  const xgRotation = clubsForXgUpdate(dateKey);
-  const xgClubs = [
+  const xgRotation = alreadyRanToday ? [] : clubsForXgUpdate(dateKey);
+  const xgClubs = alreadyRanToday ? [] : [
     ...priorityClubs.filter((p) => !xgRotation.includes(p)).slice(0, 3),
     ...xgRotation,
   ];
@@ -377,8 +405,14 @@ async function collectUniverse(deps, runAt, dateKey) {
     try {
       const { teamId } = await resolveTeam(club);
       if (!teamId) continue;
-      const fx = await callApiFootball("/fixtures", { team: teamId, last: 10 });
-      const xg = await fetchTeamXgAverage(fx.response || [], teamId, callApiFootball, { limit: 5 });
+      // 第8次監査(Medium)の修正: xG対象(tier A)は同日のコア更新で/fixturesを取得済み。
+      // 同一実行内の二度取りをやめ、キャッシュを再利用する(無ければ取得)。
+      let xgFixtures = fixturesCache.get(teamId);
+      if (!xgFixtures) {
+        const fx = await callApiFootball("/fixtures", { team: teamId, last: 10 });
+        xgFixtures = fx.response || [];
+      }
+      const xg = await fetchTeamXgAverage(xgFixtures, teamId, callApiFootball, { limit: 5 });
       if (xg && xg.xgNet !== null) {
         await clubDossier.updateSection(club.nameEn, "xg", {
           xgNet: xg.xgNet, xgFor: xg.xgFor ?? null, xgAgainst: xg.xgAgainst ?? null,
@@ -393,12 +427,23 @@ async function collectUniverse(deps, runAt, dateKey) {
   // ⑥ 基本情報(28日で一巡。resolveTeamの/teams応答で自動更新されるため、
   //    ここでは「調査ファイルがまだ無いクラブ」を拾う役割)
   // ============================================================
-  for (const club of clubsForBasicInfo(dateKey)) {
+  for (const club of (alreadyRanToday ? [] : clubsForBasicInfo(dateKey))) {
     if (!canSpend(1)) { skip("basic", "予算残量が安全ラインを下回ったため、基本情報の更新を見送りました。"); break; }
     const d = await clubDossier.getDossier(club.nameEn);
     if (d && d.sections.basic) continue; // 既にある(resolveTeamで更新される)
     await resolveTeam(club).catch(() => {});
     stats.basicClubsUpdated++;
+  }
+
+  // 同日再実行ガード用の実施記録(2日で自動失効)。初回実行時のみ書く。
+  if (!alreadyRanToday) {
+    try {
+      if (deps.upstashCmd) {
+        await deps.upstashCmd(["SET", `kb:universe:ran:${dateKey}`, JSON.stringify({ ranAt: runAt.toISOString() }), "EX", "172800"]);
+      } else if (deps.upstashSetJSON) {
+        await deps.upstashSetJSON(`kb:universe:ran:${dateKey}`, { ranAt: runAt.toISOString() });
+      }
+    } catch (e) { /* 記録できなくても収集自体は完了している */ }
   }
 
   return stats;

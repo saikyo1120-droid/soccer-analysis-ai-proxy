@@ -431,7 +431,10 @@ function getApiPlanInfo() {
 // Upstash上に期限つきのロックを置いてプロセスをまたいで保護する。
 // SET key value NX EX <秒> は「まだ無いときだけ書き込む」ため、
 // これが失敗した=直近に別の実行が始まっている、と判断できる。
-const DAILY_RUN_LOCK_SECONDS = Number(process.env.DAILY_RUN_LOCK_SECONDS) || 600; // 既定10分
+// 第8次監査(Medium)の修正: Proプラン予算では1回のジョブが数百APIリクエスト+
+// LLM呼び出しで10分を超え得るため、既定10分ではロック失効後に別プロセスと
+// 並走し得た(解決の二重実行の引き金)。既定を30分に延長する。
+const DAILY_RUN_LOCK_SECONDS = Number(process.env.DAILY_RUN_LOCK_SECONDS) || 1800; // 既定30分
 
 // 第7次監査で発見した欠陥への対応:
 //   AUTO_COLLECT_SECRET を設定していない場合(手順書での既定)、
@@ -441,10 +444,20 @@ const DAILY_RUN_LOCK_SECONDS = Number(process.env.DAILY_RUN_LOCK_SECONDS) || 600
 //   デバッグ用の逃げ道は残したいので、禁止ではなく回数制限にする。
 const UNPROTECTED_FORCE_RUN_MAX = Number(process.env.UNPROTECTED_FORCE_RUN_MAX) || 3;
 let unprotectedForceRuns = { day: null, count: 0 };
-function consumeUnprotectedForceRun() {
+// 第8次監査(Medium)の修正: カウンタがプロセス内メモリだけだと、Render無料プランの
+// スリープ(15分)や再デプロイのたびに0へ戻り、「1日3回まで」が実質無制限だった。
+// Upstashへ永続化する(障害時はメモリ側のみで判断=可用性優先)。
+async function consumeUnprotectedForceRun() {
   const today = appDateKey();
   if (unprotectedForceRuns.day !== today) unprotectedForceRuns = { day: today, count: 0 };
   if (unprotectedForceRuns.count >= UNPROTECTED_FORCE_RUN_MAX) return false;
+  if (UPSTASH_ENABLED) {
+    try {
+      const n = await upstashCmd(["INCR", `learn:forceruns:${today}`]);
+      if (Number(n) === 1) await upstashCmd(["EXPIRE", `learn:forceruns:${today}`, "172800"]).catch(() => {});
+      if (Number(n) > UNPROTECTED_FORCE_RUN_MAX) return false;
+    } catch (e) { /* 永続側が読めない場合はメモリ側のみで判断 */ }
+  }
   unprotectedForceRuns.count++;
   return true;
 }
@@ -839,7 +852,12 @@ async function resolvePlayerId(name, teamHint, season, birthHint, teamEnglishHin
           // リーグIDがそのシーズンに存在しない等の「正常な空振り」と、
           // タイムアウト等の一時障害を区別する(後者は「見つからない」と
           // 断定してキャッシュしてはいけない)。
-          if (e && (e.code === "TIMEOUT" || e.code === "HTTP_ERROR" || /timeout|network|fetch/i.test(e.message || ""))) {
+          // 第8次監査(High)の修正: API_ERROR(API-Footballのクォータ超過等は
+          // HTTP 200+errorsで返るためこのコードになる)とNO_KEY(キー未設定)が
+          // 一時障害の判定から漏れており、「クォータを使い切った日の午後は実在の
+          // 選手が全員6時間『見つかりません』とキャッシュされる」状態だった。
+          // どちらも選手の不存在を意味しないので、断定キャッシュを禁止する。
+          if (e && (e.code === "TIMEOUT" || e.code === "HTTP_ERROR" || e.code === "API_ERROR" || e.code === "NO_KEY" || /timeout|network|fetch/i.test(e.message || ""))) {
             hadTransientError = true;
           }
           // this league/season combo errored (e.g. league id not valid for this season) — try the next one
@@ -1035,13 +1053,14 @@ function outcomeFromScore(homeGoals, awayGoals) {
 // 既に記録済みなら再取得・再カウントせず、そのまま既存の記録を返す(冪等性を担保)。
 // 予測データが取得できない(新規昇格チームなどでAPI側にデータが無い)場合は、
 // 架空の値を作らずnullを返し、その試合は正答率の集計対象にしない。
-async function getOrLogPrediction(fixtureId, meta) {
+async function getOrLogPrediction(fixtureId, meta, opts) {
   const key = `pred:${fixtureId}`;
   const existing = await upstashGetJSON(key);
   if (existing) return existing;
   if (!UPSTASH_ENABLED) return null;
   try {
-    const data = await callApiFootball("/predictions", { fixture: fixtureId });
+    // 第8次監査(Medium)の修正: cron(auto-collect)からの呼び出しはjobCallとして計上する
+    const data = await callApiFootball("/predictions", { fixture: fixtureId }, { jobCall: !!(opts && opts.jobCall) });
     const entry = (data.response || [])[0];
     const pct = entry && entry.predictions && entry.predictions.percent;
     if (!pct || !pct.home || !pct.draw || !pct.away) return null;
@@ -1151,7 +1170,14 @@ async function handleAccuracyStats() {
 // registered players are all senior men's footballers.
 const FIXTURE_NAME_DENYLIST = /\b(u1[5-9]|u2[0-3]|women|female|femenina|feminine|reserve|reserves|ii|youth|academy|futsal|beach soccer)\b/i;
 
-async function handleFixturesToday(query) {
+async function handleFixturesToday(query, opts) {
+  // 第8次監査(Medium)の修正×2:
+  //  (1) auto-collect(cron)から呼ばれた場合は jobCall として予算計上し、
+  //      利用者用の予約枠(USER_REQUEST_RESERVE)をcronが食い潰さないようにする。
+  //  (2) API-Footballの date= はUTC解釈のため、従来は「UTCでその日付」の窓
+  //      (JST 9:00〜翌8:59)になっており、日本の1日と一致していなかった。
+  //      timezone=Asia/Tokyo を併用して「日本時間のその日」の試合を取得する。
+  const fxCallOpts = { jobCall: !!(opts && opts.jobCall) };
   // A previous version of this looped over a fixed list of 5 European top-flight
   // leagues (DEFAULT_LEAGUES). That silently returns nothing for weeks at a time
   // during Europe's summer off-season (roughly June-August), since none of those
@@ -1189,7 +1215,7 @@ async function handleFixturesToday(query) {
       const season = guessSeason();
       const results = await Promise.all(leaguesParam.map(async (leagueId) => {
         try {
-          const data = await callApiFootball("/fixtures", { date: today, league: leagueId, season });
+          const data = await callApiFootball("/fixtures", { date: today, league: leagueId, season, timezone: "Asia/Tokyo" }, fxCallOpts);
           return data.response || [];
         } catch (e) {
           return [];
@@ -1198,7 +1224,7 @@ async function handleFixturesToday(query) {
       all = results.flat();
     } else {
       // Default: no league restriction at all — get everything scheduled today.
-      const data = await callApiFootball("/fixtures", { date: today });
+      const data = await callApiFootball("/fixtures", { date: today, timezone: "Asia/Tokyo" }, fxCallOpts);
       all = data.response || [];
     }
 
@@ -1541,7 +1567,7 @@ async function handleAutoCollectPredictions() {
   // handleFixturesToday()を再利用することで、キャッシュ・除外リーグ(ユース/女子など)の
   // ロジックを重複させない。
   try {
-    const todayResult = await handleFixturesToday(new URLSearchParams());
+    const todayResult = await handleFixturesToday(new URLSearchParams(), { jobCall: true });
     const fixtures = (todayResult.body && todayResult.body.fixtures) || [];
     const upcoming = fixtures.filter((f) => f.status === "NS");
     let attempted = 0;
@@ -1555,7 +1581,7 @@ async function handleAutoCollectPredictions() {
         homeName: f.home ? f.home.name : null,
         awayName: f.away ? f.away.name : null,
         kickoff: f.date,
-      });
+      }, { jobCall: true });
       if (rec) logged++;
     }
   } catch (e) {
@@ -2089,6 +2115,11 @@ async function handleMatchAnalysis(query, clientIp) {
     if ((src.injuries.error || !Number.isFinite(src.injuries.injuryCount)) && injSec && injAge !== null && injAge <= 72) {
       out.injuries = { injuryCount: injSec.injuryCount, injuredPlayers: injSec.injuredPlayers || [], suspendedPlayers: injSec.suspendedPlayers || [] };
       fills.push(`負傷者情報(${injAge}時間前に取得)`);
+      // 第8次監査(Low)の修正: 上流で積んだ「取得に失敗しました」と、ここで積む
+      // 「蓄積した実測値を使用しています」が同時に表示されて矛盾していた。
+      // 代打が効いた場合は失敗ノートを取り下げる(取り下げ後の注記が実態)。
+      const failNoteIdx = dataNotes.indexOf(`${sideJa}の負傷者情報の取得に失敗しました。`);
+      if (failNoteIdx !== -1) dataNotes.splice(failNoteIdx, 1);
     }
     // 順位(7日以内)
     const stSec = d.sections.standings;
@@ -2275,7 +2306,7 @@ async function handleMatchAnalysis(query, clientIp) {
   // 第7次監査での修正: 以前は per-IP を先に消費していたため、サイト全体の
   // 上限に達している日は、利用者の「1日10回」の枠がLLMを呼ばないまま減っていた。
   // 全体の枠を先に確認する。
-  if (typeof generateLLM === "function" && tryConsumeLlmBudget() && tryConsumeLlmBudgetForIp(clientIp)) {
+  if (typeof generateLLM === "function" && (await tryConsumeLlmBudget()) && tryConsumeLlmBudgetForIp(clientIp)) {
     try {
       const systemPrompt = [
         "あなたはサッカーの試合展開を予想するアナリストAIです。",
@@ -2542,7 +2573,15 @@ async function handleDebugStatus() {
     try {
       const status = await callApiFootball("/status");
       apiFootballInfo.reachable = true;
-      apiFootballInfo.accountInfo = status && status.response ? status.response : null;
+      // 第8次監査(Medium)の修正: /status応答には契約者の氏名・メールアドレスが
+      // 含まれ、AUTO_COLLECT_SECRET未設定(手順書の既定)だと誰でも閲覧できた。
+      // 診断に必要なプラン情報・リクエスト上限だけを返し、個人情報は返さない。
+      const acct = status && status.response ? status.response : null;
+      apiFootballInfo.accountInfo = acct ? {
+        subscription: acct.subscription ? { plan: acct.subscription.plan ?? null, end: acct.subscription.end ?? null, active: acct.subscription.active ?? null } : null,
+        requests: acct.requests ? { current: acct.requests.current ?? null, limit_day: acct.requests.limit_day ?? null } : null,
+        noteJa: "個人情報(氏名・メール)は表示しません(第8次監査での修正)。",
+      } : null;
     } catch (e) {
       apiFootballInfo.reachable = false;
       apiFootballInfo.error = e.message;
@@ -2777,10 +2816,23 @@ const MAX_LLM_CALLS_PER_DAY = parseInt(process.env.MAX_LLM_CALLS_PER_DAY, 10) ||
 let llmDailyBudget = { day: null, count: 0 };
 let llmIpDailyBudget = { day: null, counts: new Map() };
 
-function tryConsumeLlmBudget() {
-  const today = new Date().toISOString().slice(0, 10);
+// 第8次監査(Medium)の修正×2:
+//  (1) 日付キーがUTCのままで、per-IP側(appDateKey)と基準がずれていた取り残しを修正。
+//  (2) プロセス内メモリだけではRenderスリープのたびに上限がリセットされ、LLM実費の
+//      上限として機能しない時間帯が常態化していたため、Upstashへ永続化する
+//      (障害時はメモリ側のみで判断=可用性優先)。per-IP側はキーの数が多いため
+//      従来どおりメモリ管理(全体上限が永続化されていれば実費の天井は守られる)。
+async function tryConsumeLlmBudget() {
+  const today = appDateKey();
   if (llmDailyBudget.day !== today) llmDailyBudget = { day: today, count: 0 };
   if (llmDailyBudget.count >= MAX_LLM_CALLS_PER_DAY) return false;
+  if (UPSTASH_ENABLED) {
+    try {
+      const n = await upstashCmd(["INCR", `llm:budget:${today}`]);
+      if (Number(n) === 1) await upstashCmd(["EXPIRE", `llm:budget:${today}`, "172800"]).catch(() => {});
+      if (Number(n) > MAX_LLM_CALLS_PER_DAY) return false;
+    } catch (e) { /* 永続側が読めない場合はメモリ側のみで判断 */ }
+  }
   llmDailyBudget.count += 1;
   return true;
 }
@@ -3048,7 +3100,7 @@ async function handleDiscuss(body, clientIp) {
       },
     };
   }
-  if (!tryConsumeLlmBudget()) {
+  if (!(await tryConsumeLlmBudget())) {
     return {
       status: 200,
       body: {
@@ -3235,8 +3287,13 @@ async function handleDiscuss(body, clientIp) {
             || poolCategories.has("recentFormTrend") || poolCategories.has("goalRate"),
           standings: !!knowledge.standings
             || poolCategories.has("standings") || poolCategories.has("leagueStandings")
+            // 第8次監査(Medium)の修正: 順位の代打データにも鮮度上限(168時間)を課す。
+            // 従来は「positionが入っていれば何日前でも『揃っている』」と数えており、
+            // 収集が止まった古いdossierで自信度が下がらない(根拠なき自信過大)状態だった。
+            // xG(下)と同じ基準に揃える。
             || !!(dossierData && dossierData.sections && dossierData.sections.standings
-              && dossierData.sections.standings.position !== null),
+              && dossierData.sections.standings.position !== null
+              && (Date.now() - new Date(dossierData.sections.standings.computedAt || 0).getTime()) <= 168 * 3600000),
           // 「取得を試みて失敗しなかった」ことを条件にする。
           // 怪我人0人という結果と、取得失敗はまったく別のことなので区別する。
           injuries: (fetched.has("injuries") && !(knowledge.errors || []).includes("injuries_failed"))
@@ -3250,8 +3307,10 @@ async function handleDiscuss(body, clientIp) {
           coach: !!knowledge.coachName
             || poolCategories.has("coachChange") || poolCategories.has("coach") || poolCategories.has("managerHistory"),
           venue: !!knowledge.homeAwaySplit || poolCategories.has("homeAway")
+            // 第8次監査(Medium)の修正: ホーム/アウェイ成績の代打にも鮮度上限(168時間)。
             || !!(dossierData && dossierData.sections && dossierData.sections.form
-              && dossierData.sections.form.homeWinRate !== null),
+              && dossierData.sections.form.homeWinRate !== null
+              && (Date.now() - new Date(dossierData.sections.form.computedAt || 0).getTime()) <= 168 * 3600000),
         },
         // 第5次監査での修正: 質問に応じて「本当に必要なデータ」だけを点検する。
         //   従来は質問内容にかかわらず8種類すべてを必須としていたため、
@@ -3734,7 +3793,7 @@ const server = http.createServer(async (req, res) => {
         const forceRequested = parsed.searchParams.get("force") === "1";
         // シークレットを設定していない場合、?force=1 は1日あたりの回数を制限する
         // (デバッグ用の逃げ道は残しつつ、無制限の連続起動は防ぐ)。
-        if (forceRequested && !requiredSecret && !consumeUnprotectedForceRun()) {
+        if (forceRequested && !requiredSecret && !(await consumeUnprotectedForceRun())) {
           res.writeHead(429, { "Content-Type": "application/json; charset=utf-8" });
           res.end(JSON.stringify({
             ok: false, error: "force run limit reached",
@@ -3854,7 +3913,16 @@ const server = http.createServer(async (req, res) => {
           learningDeps.upstashGetJSON("learn:growthlog:latest").catch(() => null),
           getAccuracyTrend(learningDeps, todayKey).catch(() => ({ available: false })),
           loadLatestAgenda(learningDeps).catch(() => null),
-          clubDossier.getCoverageSummary().catch(() => null),
+          // 第8次監査(Low)の修正: /api/knowledge/coverage と同じ5分キャッシュを共有し、
+          // ホーム画面が両方を叩いたときに全クラブの読み出し(約100コマンド)が
+          // 二重に走らないようにする。
+          (async () => {
+            const covCached = cacheGet("kb:coverage");
+            if (covCached) return covCached;
+            const summary = await clubDossier.getCoverageSummary().catch(() => null);
+            if (summary) cacheSet("kb:coverage", { ok: true, generatedAt: new Date().toISOString(), ...summary }, 5 * 60 * 1000);
+            return summary;
+          })(),
         ]);
         const g = growthRaw || {};
         const body = {
@@ -3957,7 +4025,17 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ ok: false, error: "invalid or missing key" }));
           return;
         }
+        // 第8次監査(Medium)の修正: この診断は1回で数百のRedis読み出し+LLMの実呼び出し
+        // (実費)を伴うため、5分キャッシュする(壊れた状態の診断が5分遅れるより、
+        // ページを開くたびに実費と数百コマンドが発生する方が害が大きい)。
+        const dbgCached = cacheGet("debug:status");
+        if (dbgCached) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ...dbgCached, cachedNoteJa: "5分キャッシュされた診断結果です。" }));
+          return;
+        }
         const { status, body } = await handleDebugStatus();
+        if (status === 200) cacheSet("debug:status", body, 5 * 60 * 1000);
         res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
         return;

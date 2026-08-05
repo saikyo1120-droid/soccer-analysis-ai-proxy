@@ -95,8 +95,16 @@ function describeTrustJa(score, sourceLabelJa, ageHours) {
  */
 function sampleWeightOf(record) {
   const t = record && record.featureTrust;
-  if (!t || !Number.isFinite(t.avgScore)) return 1;
-  return Math.max(0.1, Math.min(1, t.avgScore));
+  if (!t) return 1;
+  // 第8次監査の修正: avgScore(出所の基礎点込み)をそのまま使うと、取得直後の
+  // 実データでも約0.94となり、信頼度記録の無い古いレコード(1.0)より弱く学習される
+  // 「逆転」が起きていた。学習の強弱に使うのは**鮮度(avgFreshness)**とする:
+  // 全データが取得直後なら1.0(古いレコードと同格)、古いデータで行った予測ほど
+  // 学習への影響が下がる — これが本来の意図。avgFreshnessを持たない移行期の
+  // レコードは、avgScoreを最高基礎点(0.95)で正規化して近似する。
+  if (Number.isFinite(t.avgFreshness)) return Math.max(0.1, Math.min(1, t.avgFreshness));
+  if (Number.isFinite(t.avgScore)) return Math.max(0.1, Math.min(1, t.avgScore / 0.95));
+  return 1;
 }
 
 /**
@@ -109,13 +117,16 @@ function buildFeatureTrust(parts, nowMs) {
     .filter((p) => p && p.key)
     .map((p) => {
       const t = trustOf({ ...p, nowMs });
-      return { key: p.key, score: t.score, ageHours: t.ageHours, sourceLabelJa: t.sourceLabelJa };
+      return { key: p.key, score: t.score, freshness: t.freshness, ageHours: t.ageHours, sourceLabelJa: t.sourceLabelJa };
     });
   if (!scored.length) return null;
   const avg = scored.reduce((s, x) => s + x.score, 0) / scored.length;
+  // 学習の強弱に使う鮮度の平均(sampleWeightOf参照。出所の基礎点を含めない)
+  const avgFreshness = scored.reduce((s, x) => s + (Number.isFinite(x.freshness) ? x.freshness : 0.5), 0) / scored.length;
   const low = scored.filter((x) => x.score < 0.5).map((x) => x.key);
   return {
     avgScore: Math.round(avg * 100) / 100,
+    avgFreshness: Math.round(avgFreshness * 100) / 100,
     parts: scored,
     noteJa: low.length
       ? `使用データの平均信頼度${Math.round(avg * 100)}%(信頼度が下がっているデータ: ${low.join("・")})`

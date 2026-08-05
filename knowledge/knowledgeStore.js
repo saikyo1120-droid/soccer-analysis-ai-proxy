@@ -139,7 +139,14 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
       try {
         const list = (await upstashCmd(["LRANGE", `knowledge:byTeam:${entity}`, "0", "-1"])) || [];
         if (!list.includes(hash)) {
-          await upstashCmd(["RPUSH", `knowledge:byTeam:${entity}`, hash]).catch(() => {});
+          const relinkLen = await upstashCmd(["RPUSH", `knowledge:byTeam:${entity}`, hash]).catch(() => null);
+          // 第8次監査: 載せ直しで上限から溢れる場合も、溢れた本体を孤児にしない
+          if (Number(relinkLen) > MAX_ITEMS_PER_TEAM) {
+            try {
+              const evicted = (await upstashCmd(["LRANGE", `knowledge:byTeam:${entity}`, "0", String(Number(relinkLen) - MAX_ITEMS_PER_TEAM - 1)])) || [];
+              for (const h of evicted) await upstashCmd(["DEL", `knowledge:item:${h}`]).catch(() => {});
+            } catch (e) { /* ベストエフォート */ }
+          }
           await upstashCmd(["LTRIM", `knowledge:byTeam:${entity}`, String(-MAX_ITEMS_PER_TEAM), "-1"]).catch(() => {});
           return { saved: false, reason: "DUPLICATE_RELINKED", hash };
         }
@@ -149,7 +156,18 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
 
     const record = { ...item, hash, firstSeenAt: item.computedAt, lastSeenAt: item.computedAt };
     await upstashSetJSON(`knowledge:item:${hash}`, record);
-    await upstashCmd(["RPUSH", `knowledge:byTeam:${entity}`, hash]).catch(() => {});
+    // 第8次監査(High)の修正: LTRIMで一覧から溢れた古い知識のhashは、本体
+    // (knowledge:item:*)が**どこからも参照されない孤児キー**として永久に残り、
+    // Redisが無限成長していた。溢れる分を先に読み取り、本体ごと削除する。
+    // 溢れ判定はRPUSHの戻り値(新しい長さ)を使い、負の範囲指定に頼らない
+    // (実装により端の解釈が異なり、誤って現役の知識を消す事故を防ぐため)。
+    const newLen = await upstashCmd(["RPUSH", `knowledge:byTeam:${entity}`, hash]).catch(() => null);
+    if (Number(newLen) > MAX_ITEMS_PER_TEAM) {
+      try {
+        const evicted = (await upstashCmd(["LRANGE", `knowledge:byTeam:${entity}`, "0", String(Number(newLen) - MAX_ITEMS_PER_TEAM - 1)])) || [];
+        for (const h of evicted) await upstashCmd(["DEL", `knowledge:item:${h}`]).catch(() => {});
+      } catch (e) { /* 掃除に失敗しても保存自体は成功している */ }
+    }
     await upstashCmd(["LTRIM", `knowledge:byTeam:${entity}`, String(-MAX_ITEMS_PER_TEAM), "-1"]).catch(() => {});
     // 2026年8月・「AIの成長レポート」ウィジェット(ご要望⑦)対応: 登録クラブ
     // 全件をループして数えるgetActiveKnowledge()はホーム画面が読み込まれる
@@ -209,10 +227,21 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
       const record = await upstashGetJSON(`knowledge:item:${h}`);
       if (record) items.push(record);
     }
-    const newItems = items.filter((i) => String(i.firstSeenAt || "").slice(0, 10) === dateKey);
+    // 第8次監査(Medium)の修正: dateKeyは日本時間基準(dailyJobのappDateKey)なのに、
+    // firstSeenAt/lastSeenAt(UTCのISO文字列)をUTCのまま日付切り出しして比較していた。
+    // 日次実行はUTC19時(=日本時間の朝4時)のため、その実行で保存した知識のUTC日付は
+    // 「前日」となり必ず不一致 → 「今日の新規知識」が主要実行時間帯で常に0件だった。
+    // ISO時刻を日本時間(既定UTC+9。dailyJobと同じAPP_TIMEZONE_OFFSET_HOURS)の日付に
+    // 変換してから比較する。
+    const tzOffsetHours = Number(process.env.APP_TIMEZONE_OFFSET_HOURS ?? 9);
+    const appDateOf = (iso) => {
+      const t = new Date(String(iso || "")).getTime();
+      return Number.isFinite(t) ? new Date(t + tzOffsetHours * 3600000).toISOString().slice(0, 10) : "";
+    };
+    const newItems = items.filter((i) => appDateOf(i.firstSeenAt) === dateKey);
     const updatedItems = items.filter((i) => {
-      const first = String(i.firstSeenAt || "").slice(0, 10);
-      const last = String(i.lastSeenAt || "").slice(0, 10);
+      const first = appDateOf(i.firstSeenAt);
+      const last = appDateOf(i.lastSeenAt);
       return last === dateKey && first !== dateKey;
     });
     const staleCount = items.filter((i) => isExpired(i, now)).length;
