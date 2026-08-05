@@ -24,8 +24,18 @@ const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || "").trim();
 // https://platform.claude.com/docs/en/about-claude/models で確認し、必要なら
 // .env の ANTHROPIC_MODEL で上書きしてください。
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5";
+// 2026年8月・精度証明ラウンド⑥: 「重い分析だけ高性能モデル」用の上位モデル。
+// 実データの根拠が十分に揃ったクラブ考察のときだけ使われる(llm/index.jsのtier参照)。
+// モデルIDは https://platform.claude.com/docs/en/about-claude/models で確認し、
+// .env の ANTHROPIC_MODEL_HEAVY で上書きできる。
+const ANTHROPIC_MODEL_HEAVY = process.env.ANTHROPIC_MODEL_HEAVY || "claude-sonnet-4-5";
 const ANTHROPIC_API_BASE = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION = "2023-06-01";
+
+/** tier("light"/"heavy")に応じて実際に使うモデルIDを返す(llm/index.jsが開示にも使う) */
+function resolveModel(tier) {
+  return tier === "heavy" ? ANTHROPIC_MODEL_HEAVY : ANTHROPIC_MODEL;
+}
 
 // 2026年8月・本番調査で発見された不具合の修正: fetch()にタイムアウトが無いと、
 // Anthropic APIの応答が万一止まった場合に日次学習ジョブ全体がフリーズしてしまう
@@ -50,7 +60,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = ANTHROPIC_TIMEOUT
   }
 }
 
-async function generate({ systemPrompt, userPrompt, maxTokens }) {
+async function generate({ systemPrompt, userPrompt, maxTokens, tier }) {
   if (!ANTHROPIC_API_KEY) {
     const err = new Error("ANTHROPIC_API_KEY が設定されていません(.envを確認してください)");
     err.code = "NO_KEY";
@@ -64,7 +74,7 @@ async function generate({ systemPrompt, userPrompt, maxTokens }) {
       "content-type": "application/json",
     },
     body: JSON.stringify({
-      model: ANTHROPIC_MODEL,
+      model: resolveModel(tier),
       max_tokens: maxTokens || 700,
       system: systemPrompt || "",
       messages: [{ role: "user", content: userPrompt || "" }],
@@ -87,4 +97,4 @@ async function generate({ systemPrompt, userPrompt, maxTokens }) {
   return text;
 }
 
-module.exports = { generate };
+module.exports = { generate, resolveModel };
