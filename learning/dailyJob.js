@@ -1910,6 +1910,10 @@ async function runDailyLearning(deps) {
   await saveDailyMetrics({ upstashEnabled, upstashSetJSON }, metricsSnapshot);
   await upstashCmd(["EXPIRE", `learn:metrics:${dateKey}`, String(120 * 86400)]).catch(() => {});
 
+  // 最終方針「Knowledge Engineは使用回数まで管理」: その日メモリに貯めた
+  // 知識の使用回数を1日1回まとめて保存する(質問時にはRedisへ書かない設計)。
+  try { await knowledgeStore.flushUsageCounters(); } catch (e) { /* ベストエフォート */ }
+
   return { ok: true, ...mergedGrowthLog };
 }
 

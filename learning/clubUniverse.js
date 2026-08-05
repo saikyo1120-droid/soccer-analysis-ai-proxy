@@ -23,7 +23,7 @@
  *
  * ■ 更新頻度の階層(ご指示の「追加のおすすめ」に対応)
  *   tier A(1〜40位)  : 毎日更新(フォーム・怪我・監督/布陣)
- *   tier B(41〜100位): 2日に1回の輪番で更新
+ *   tier B(41〜100位): 毎日更新(2026年8月・最終方針でtier Aと同格へ格上げ)
  *   選手名簿(squad)   : 全クラブを7日周期の輪番で更新
  *   選手の詳細成績     : 予算の許す範囲で毎日数百人ずつ輪番
  *   xG               : tier Aのみ7日周期の輪番(1クラブ5リクエストと高価なため)
@@ -157,8 +157,13 @@ function dayNumberOf(dateKey) {
  * tier Aは毎日、tier Bは2日に1回の輪番。
  */
 function clubsForCoreUpdate(dateKey) {
-  const day = dayNumberOf(dateKey);
-  return CLUB_UNIVERSE.filter((c) => tierOf(c) === "A" || (c.rank % 2) === (day % 2));
+  // 2026年8月・最終方針「データ取得量を減らすコスト削減は禁止/更新頻度の最適化」:
+  // tier B(41〜100位)を「2日に1回」から「毎日」へ格上げした。
+  // コスト: コア更新 100クラブ×4リクエスト=400/日。Proプラン(7,500/日)の
+  // 5.3%であり、既存の学習・利用者リクエストと合わせても十分な余裕がある。
+  // (旧実装: tier Aは毎日、tier Bは rank%2 の輪番 — 履歴としてここに記す)
+  void dayNumberOf(dateKey); // 署名は維持(将来、予算逼迫時に輪番へ戻せるように)
+  return CLUB_UNIVERSE.slice();
 }
 
 /**
