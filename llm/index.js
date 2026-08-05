@@ -22,14 +22,27 @@ function currentProviderName() {
   return String(process.env.LLM_PROVIDER || "anthropic").trim().toLowerCase();
 }
 
+// ---- 2026年8月・精度証明ラウンド⑥: AIモデルの自動切替(コスト最適化) ----
+// 「軽い質問は軽量モデル、重い分析だけ高性能モデル」というご指示への対応。
+//   ・tier未指定/"light" … 既定の軽量モデル(従来と同じ。バッチ処理・軽い質問)
+//   ・tier "heavy"        … 高性能モデル(実データの根拠が揃ったクラブ考察のみ)
+// どちらのモデルを使うかの判定は呼び出し側の機械的なルール(server.jsの
+// resolveLlmTier)で行い、使ったtier/モデル名は応答のmetaで開示する。
+// 環境変数 LLM_TIER_ROUTING=off で全リクエストを既定モデルに戻せる。
+function resolveTier(tier) {
+  if (String(process.env.LLM_TIER_ROUTING || "on").toLowerCase() === "off") return "light";
+  return tier === "heavy" ? "heavy" : "light";
+}
+
 /**
  * @param {object} opts
  * @param {string} opts.systemPrompt - LLMへの役割・ルール指定(事実の捏造禁止など)
  * @param {string} opts.userPrompt - RAGで取得した事実 + 利用者の質問を組み立てたプロンプト
  * @param {number} [opts.maxTokens] - 応答の最大トークン数(コスト上限のため既定値あり)
- * @returns {Promise<{text: string, provider: string}>}
+ * @param {"light"|"heavy"} [opts.tier] - モデルの重さ(未指定=light。従来呼び出しと完全互換)
+ * @returns {Promise<{text: string, provider: string, tier: string, model: string|null}>}
  */
-async function generateLLM({ systemPrompt, userPrompt, maxTokens }) {
+async function generateLLM({ systemPrompt, userPrompt, maxTokens, tier }) {
   const name = currentProviderName();
   const loader = PROVIDERS[name];
   if (!loader) {
@@ -38,8 +51,10 @@ async function generateLLM({ systemPrompt, userPrompt, maxTokens }) {
     throw err;
   }
   const provider = loader();
-  const text = await provider.generate({ systemPrompt: systemPrompt || "", userPrompt: userPrompt || "", maxTokens: maxTokens || 700 });
-  return { text, provider: name };
+  const usedTier = resolveTier(tier);
+  const text = await provider.generate({ systemPrompt: systemPrompt || "", userPrompt: userPrompt || "", maxTokens: maxTokens || 700, tier: usedTier });
+  const model = typeof provider.resolveModel === "function" ? provider.resolveModel(usedTier) : null;
+  return { text, provider: name, tier: usedTier, model };
 }
 
-module.exports = { generateLLM, currentProviderName, PROVIDERS };
+module.exports = { generateLLM, currentProviderName, resolveTier, PROVIDERS };
