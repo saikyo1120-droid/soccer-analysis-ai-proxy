@@ -3870,7 +3870,7 @@ async function renderExternalPanel(player) {
   photoCache[photoCacheKey(player)] = photo;
   if (photo) {
     const avatarEl = document.getElementById("playerAvatar");
-    if (avatarEl) avatarEl.innerHTML = `<img src="${escapeHtml(photo)}" alt="${escapeHtml(player.name)}" onerror="this.parentElement.textContent='${player.emoji}';">`;
+    if (avatarEl) avatarEl.innerHTML = `<img loading="lazy" decoding="async" src="${escapeHtml(photo)}" alt="${escapeHtml(player.name)}" onerror="this.parentElement.textContent='${player.emoji}';">`;
   }
   let html = "";
   if (result.sdb) {
@@ -3966,7 +3966,7 @@ function renderPlayerCard(player, level) {
 
     <div class="card">
       <div class="player-head">
-        <div class="avatar-lg" id="playerAvatar">${photoCache[photoCacheKey(player)] ? `<img src="${photoCache[photoCacheKey(player)]}" alt="${player.name}" onerror="this.parentElement.textContent='${player.emoji}';">` : player.emoji}</div>
+        <div class="avatar-lg" id="playerAvatar">${photoCache[photoCacheKey(player)] ? `<img loading="lazy" decoding="async" src="${photoCache[photoCacheKey(player)]}" alt="${player.name}" onerror="this.parentElement.textContent='${player.emoji}';">` : player.emoji}</div>
         <div>
           <div class="name-line">${player.emoji === "❔" ? "" : ""}${player.name}</div>
           <div style="font-size:13px; color:var(--text-secondary);">${player.nameJa}</div>
@@ -4233,12 +4233,12 @@ function renderComparison(player, otherKey) {
   wrapEl.innerHTML = `
     <div class="compare-cols">
       <div>
-        <div class="compare-head"><div class="avatar-lg" style="width:44px;height:44px;font-size:20px;">${photoA ? `<img src="${photoA}" alt="">` : player.emoji}</div><div class="name">${player.nameJa}</div></div>
+        <div class="compare-head"><div class="avatar-lg" style="width:44px;height:44px;font-size:20px;">${photoA ? `<img loading="lazy" decoding="async" src="${photoA}" alt="">` : player.emoji}</div><div class="name">${player.nameJa}</div></div>
         <div class="tag-row">${player.styleTags.map(t => `<span class="tag">🏷️ ${t}</span>`).join("")}</div>
         <p class="value-note" style="margin-top:8px;">${playstyleTagLine(tagA)}</p>
       </div>
       <div>
-        <div class="compare-head"><div class="avatar-lg" style="width:44px;height:44px;font-size:20px;">${photoB ? `<img src="${photoB}" alt="">` : other.emoji}</div><div class="name">${other.nameJa}</div></div>
+        <div class="compare-head"><div class="avatar-lg" style="width:44px;height:44px;font-size:20px;">${photoB ? `<img loading="lazy" decoding="async" src="${photoB}" alt="">` : other.emoji}</div><div class="name">${other.nameJa}</div></div>
         <div class="tag-row">${other.styleTags.map(t => `<span class="tag">🏷️ ${t}</span>`).join("")}</div>
         <p class="value-note" style="margin-top:8px;">${playstyleTagLine(tagB)}</p>
       </div>
@@ -4371,7 +4371,7 @@ function keyPlayersHtml(players, n) {
     const tag = computePlaystyleTag(p);
     const photo = photoCache[photoCacheKey(p)];
     return `<button class="chip match-player-chip" data-name="${p.nameJa}" style="margin:3px 4px 3px 0;">
-      <span class="chip-avatar">${photo ? `<img src="${photo}" alt="">` : p.emoji}</span>${p.nameJa} ${tag.emoji}
+      <span class="chip-avatar">${photo ? `<img loading="lazy" decoding="async" src="${photo}" alt="">` : p.emoji}</span>${p.nameJa} ${tag.emoji}
     </button>`;
   }).join("");
 }
@@ -4426,12 +4426,16 @@ function fixtureRowHtml(f) {
   const scoreStr = f.score && (f.score.home !== null && f.score.home !== undefined) ? `${f.score.home} - ${f.score.away}` : "vs";
   const badgeClass = group === "live" ? "is-live" : group === "finished" ? "is-finished" : group === "upcoming" ? "is-upcoming" : "is-other";
   const badge = `<span class="status-badge ${badgeClass}">${group === "live" ? '<span class="live-dot"></span>' : ""}${fixtureStatusLabel(f.status, group)}</span>`;
+  // UI/UX統一ラウンド: ホームの「今日のAI予想」と同じ情報(予想勝者・勝率・
+  // 答え合わせ)を一覧の各行にも1行で表示する。データは共有Map(通信ゼロ)。
+  const pred = predsByFixtureId.get(String(f.id));
   return `
     <div class="fixture-card" data-fixture-card="${f.id}">
       <div class="real-fixture-row${group === "live" ? " is-live" : ""}">
         <div>
           <div class="teams">⚽ ${escapeHtml(f.home.name)} ${scoreStr} ${escapeHtml(f.away.name)}</div>
           <div class="sub">${badge} ${timeStr}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}</div>
+          <div class="sub" id="fixturePred-${f.id}" style="${pred ? "" : "display:none;"}"${pred ? ' data-filled="1"' : ""}>${pred ? predStripHtml(pred) : ""}</div>
         </div>
         <button class="match-analyze-btn real-fixture-analyze-btn" data-fixture-id="${f.id}">${group === "finished" ? "答え合わせを見る ▶" : "AI分析を見る ▶"}</button>
       </div>
@@ -4671,6 +4675,10 @@ async function renderRealFixturesIfAvailable() {
   renderFixturesListInto(listEl, lastFixturesToday);
   cardEl.style.display = "block";
 
+  // UI/UX統一ラウンド: 予想データ(共有・通信1回)が届き次第、一覧の各行へ
+  // AI予想ストリップを差し込む(一覧描画が先に終わっていた場合の後追い)。
+  fetchTodayPredictionsShared().then(() => annotateFixtureRowsWithPredictions()).catch(() => {});
+
   // 利用者目線ラウンド: 「終了した試合しかない」ように見える状況の正直な説明。
   //   ・この一覧は「日本時間の今日」の試合。ヨーロッパの今夜の試合は日本時間では
   //     明日の日付になるため、夕方以降は終了済みばかりになるのが正常。
@@ -4896,10 +4904,14 @@ function buildUpcomingPreviewHtml(analysis, level) {
     predictionHtml = `<p class="value-note">🤖 <strong>AIの展開予想:</strong> 現時点では${f.home.name}・${f.away.name}どちらも登録選手データがないため、選手個別の予想は提供できません(実際の試合結果や選手データが揃い次第、対応クラブを拡大予定です)。試合が終了すると、実データに基づいた選手評価と振り返りをこの場所で見られます。</p>`;
   }
 
+  // UI/UX統一ラウンド: ホームと同じ「AIの予想(勝敗・勝率バー・根拠)」を
+  // 詳細画面でも最初に表示する(AI自身の予測モデルの保存値。通信ゼロの同期参照)。
+  const ownPred = predsByFixtureId.get(String(f.id));
   return `
     <div class="card">
       <h2>🔮 試合前プレビュー: ${escapeHtml(f.home.name)} vs ${escapeHtml(f.away.name)}</h2>
       <p class="value-note">${escapeHtml(f.league || "")}${timeStr ? " ・ キックオフ " + timeStr : ""}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}</p>
+      ${ownPred ? predictionSummaryBlockHtml(ownPred, "🤖 AIの予想") : ""}
       ${predictionHtml}
       <p class="value-note" style="margin-top:8px;">※これはAIによる展開予想であり、実際の試合結果を保証するものではありません。</p>
     </div>`;
@@ -5039,6 +5051,7 @@ function buildLiveAnalysisHtml(analysis, level) {
     <div class="card" style="border:1.5px solid var(--critical);">
       <h2><span class="status-badge is-live" style="margin-right:6px;"><span class="live-dot"></span>LIVE</span>${escapeHtml(f.home.name)} ${scoreStr} ${escapeHtml(f.away.name)}</h2>
       <p class="value-note">${escapeHtml(f.league || "")}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}${elapsedStr ? " ・ " + elapsedStr : ""}(API-Footballの実データに基づく、試合中の途中経過です。まだ結果は確定していません)</p>
+      ${(() => { const p = predsByFixtureId.get(String(f.id)); return p ? `<p class="value-note" style="margin:4px 0 0;">${predStripHtml(p)}(試合前の予想)</p>` : ""; })()}
       <div style="margin-top:8px;">${eventsTimelineVisualHtml(analysis.events, f.home.name)}</div>
       ${ratingBarHtml}
       <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:10px;">
@@ -5064,12 +5077,29 @@ function buildFinishedAnalysisHtml(analysis, level) {
   const ratingBarHtml = (homeAvg !== null && awayAvg !== null)
     ? `<div class="rating-bar-wrap">${strengthBarHtml("選手評価の平均値", 50 + (homeAvg - awayAvg) * 15, homeAvg.toFixed(2), awayAvg.toFixed(2))}</div>`
     : "";
+  // UI/UX統一ラウンド: 終了画面も「AIの予想はどうだったか」を最初に表示する。
+  // 優先: AI自身の予測モデルの保存値(共有Map・通信ゼロ)。無ければ、
+  // 記録済みのAI予測(このサイトの正答率カウントの対象)を表示する。
+  const ownPred = predsByFixtureId.get(String(f.id));
+  let verdictHtml = "";
+  if (ownPred) {
+    verdictHtml = predictionSummaryBlockHtml(ownPred, "🤖 試合前のAIの予想");
+  } else if (analysis.aiPredictionResult) {
+    const r = analysis.aiPredictionResult;
+    const label = r.predictedWinner === "home" ? `${f.home.name} 勝利` : r.predictedWinner === "away" ? `${f.away.name} 勝利` : "引き分け";
+    verdictHtml = `
+      <div style="margin:8px 0; padding:10px 12px; border-left:4px solid var(--series-2, #b3541e); background:rgba(0,0,0,.03); border-radius:6px;">
+        <div>🤖 試合前のAI予測記録: <strong>${escapeHtml(label)}</strong>(${Number(r.homePct)}% / ${Number(r.drawPct)}% / ${Number(r.awayPct)}%)
+        ${r.correct ? `<span style="color:#1c7c54; font-weight:bold; margin-left:6px;">✅ 的中</span>` : `<span style="color:#b3541e; font-weight:bold; margin-left:6px;">❌ 外れ</span>`}</div>
+      </div>`;
+  }
   return `
     <div class="card">
       <h2>📝 試合後の振り返り: ${escapeHtml(f.home.name)} ${f.score.home} - ${f.score.away} ${escapeHtml(f.away.name)}</h2>
       <p class="value-note">${escapeHtml(f.league || "")}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}(API-Footballの実データに基づく、試合終了後の振り返りです)</p>
-      <div style="margin-top:8px;">${eventsTimelineVisualHtml(analysis.events, f.home.name)}</div>
+      ${verdictHtml}
       <p class="value-note"><strong>🤖 何が勝敗を分けたか:</strong> ${buildDecisivePointsText(analysis, level)}</p>
+      <div style="margin-top:8px;">${eventsTimelineVisualHtml(analysis.events, f.home.name)}</div>
       ${ratingBarHtml}
       <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:10px;">
         <div style="flex:1; min-width:240px;">
@@ -6161,7 +6191,7 @@ function renderPlayerChips() {
     return true;
   }).sort((a, b) => ((b[1].overall || 0) - (a[1].overall || 0)) || String(a[1].nameJa).localeCompare(String(b[1].nameJa), "ja"));
   document.getElementById("playerChips").innerHTML = list.length
-    ? list.map(([key, p]) => `<button class="chip" data-name="${p.nameJa}"><span class="chip-avatar" id="chipAvatar-${key}">${photoCache[key] ? `<img src="${photoCache[key]}" alt="">` : p.emoji}</span>${p.nameJa}<span style="opacity:.6; font-size:.85em; margin-left:4px;">${fmt(p.overall, 1)}</span></button>`).join("")
+    ? list.map(([key, p]) => `<button class="chip" data-name="${p.nameJa}"><span class="chip-avatar" id="chipAvatar-${key}">${photoCache[key] ? `<img loading="lazy" decoding="async" src="${photoCache[key]}" alt="">` : p.emoji}</span>${p.nameJa}<span style="opacity:.6; font-size:.85em; margin-left:4px;">${fmt(p.overall, 1)}</span></button>`).join("")
     : `<p class="value-note">条件に合う登録選手がいません。</p>`;
   // lazily fetch real photos for whichever chips don't have one cached yet (capped concurrency)
   photoQueue.length = 0; // drop any stale pending jobs from a previous filter pass
@@ -6169,7 +6199,7 @@ function renderPlayerChips() {
     if (!photoCache[key]) {
       queuePhotoLoad(key, p, (url) => {
         const el = document.getElementById(`chipAvatar-${key}`);
-        if (el) el.innerHTML = `<img src="${url}" alt="">`;
+        if (el) el.innerHTML = `<img loading="lazy" decoding="async" src="${url}" alt="">`;
       });
     }
   });
@@ -6219,7 +6249,7 @@ function renderRanking(key) {
     return `
     <div class="similar-row" data-name="${r.p.nameJa}" style="cursor:pointer;">
       <span class="rank">${medals[i] || (i + 1) + "."}</span>
-      <span class="chip-avatar" style="margin-right:6px;">${photo ? `<img src="${photo}" alt="">` : r.p.emoji}</span>
+      <span class="chip-avatar" style="margin-right:6px;">${photo ? `<img loading="lazy" decoding="async" src="${photo}" alt="">` : r.p.emoji}</span>
       <span style="flex:1;">${r.p.nameJa}</span>
       <span class="pct">${fmt(r.score, 0)}</span>
     </div>`;
@@ -6292,7 +6322,7 @@ function renderDashFeaturedPlayer() {
   el.innerHTML = `
     <div class="match-row" style="cursor:pointer;" id="dashFeaturedPlayerRow">
       <div style="display:flex; align-items:center; gap:10px;">
-        <div class="chip-avatar" style="width:36px; height:36px; font-size:18px;">${photo ? `<img src="${photo}" alt="">` : p.emoji}</div>
+        <div class="chip-avatar" style="width:36px; height:36px; font-size:18px;">${photo ? `<img loading="lazy" decoding="async" src="${photo}" alt="">` : p.emoji}</div>
         <div>
           <div class="teams">${p.nameJa}</div>
           <div class="sub">${buildVerdictLine(p)}</div>
@@ -6342,7 +6372,7 @@ function renderDashTrending() {
   el.innerHTML = players.map(p => {
     const photo = photoCache[photoCacheKey(p)];
     return `<button class="chip" data-name="${p.nameJa}" style="margin:3px 4px 3px 0;">
-      <span class="chip-avatar">${photo ? `<img src="${photo}" alt="">` : p.emoji}</span>${p.nameJa}
+      <span class="chip-avatar">${photo ? `<img loading="lazy" decoding="async" src="${photo}" alt="">` : p.emoji}</span>${p.nameJa}
     </button>`;
   }).join("") + `<p class="value-note" style="margin-top:6px;">AIの「将来性」評価(年齢・能力値から算出)が高い選手を日替わりでピックアップしています。実際の移籍市場の評判とは異なります。</p>`;
   el.querySelectorAll("[data-name]").forEach(btn => btn.addEventListener("click", () => openPlayerFromDashboard(btn.dataset.name)));
@@ -6860,16 +6890,87 @@ renderGrowthLogWidget();
 // 毎日の学習ダッシュボード。サーバーの実測値のみを表示し、
 // 測定できない項目は「測定できない理由」をそのまま出す(でっち上げない)。
 // ============================================================
+// ---- 2026年8月・UI/UX統一ラウンド: AI予想の共通部品 ----
+// ホーム(ヒーロー)・試合一覧・試合詳細(これから/ライブ/終了)のすべてで
+// 同じデータ・同じデザインを使う。通信は全画面あわせて1回だけ
+// (Promiseを共有し、以後はメモリ上のMapを同期参照する=軽さ最優先)。
+let __todayPredictionsPromise = null;
+const predsByFixtureId = new Map(); // String(fixtureId) -> 予想エントリ
+function fetchTodayPredictionsShared() {
+  if (!__todayPredictionsPromise) {
+    __todayPredictionsPromise = (async () => {
+      try {
+        const data = await fetchJsonWithTimeout(`${API_PROXY_BASE}/predictions/today`, backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+        if (data && data.found && Array.isArray(data.predictions)) {
+          data.predictions.forEach((p) => predsByFixtureId.set(String(p.fixtureId), p));
+        }
+        return data;
+      } catch (e) { return null; }
+    })();
+  }
+  return __todayPredictionsPromise;
+}
+function predWinnerLabelJa(p) {
+  return p.predictedWinner === "home" ? `${(p.home && p.home.name) || "ホーム"} 勝利`
+    : p.predictedWinner === "away" ? `${(p.away && p.away.name) || "アウェイ"} 勝利`
+    : "引き分け";
+}
+// 3分割の勝率バー(ホームと同一デザイン。全画面共通)
+function predBarHtml(p) {
+  if (!p.probs) return "";
+  const homeName = escapeHtml((p.home && p.home.name) || "ホーム");
+  const awayName = escapeHtml((p.away && p.away.name) || "アウェイ");
+  return `
+      <div style="display:flex; height:14px; border-radius:7px; overflow:hidden; margin:6px 0 2px; font-size:10px; line-height:14px; color:#fff; text-align:center;">
+        <div style="width:${Number(p.probs.homeWinPct)}%; background:var(--series-home, #2563eb); min-width:28px;">${Number(p.probs.homeWinPct)}%</div>
+        <div style="width:${Number(p.probs.drawPct)}%; background:#8a97a3; min-width:24px;">${Number(p.probs.drawPct)}%</div>
+        <div style="width:${Number(p.probs.awayWinPct)}%; background:var(--series-away, #b3541e); min-width:28px;">${Number(p.probs.awayWinPct)}%</div>
+      </div>
+      <div class="value-note" style="display:flex; justify-content:space-between; font-size:11px;"><span>${homeName}勝利</span><span>引分</span><span>${awayName}勝利</span></div>`;
+}
+// 答え合わせバッジ(終了試合用。全画面共通)
+function predResultBadgeHtml(p) {
+  if (!p.resolved) return "";
+  return p.correct
+    ? `<span style="color:#1c7c54; font-weight:bold; margin-left:6px;">✅ 的中</span>`
+    : `<span style="color:#b3541e; font-weight:bold; margin-left:6px;">❌ 外れ</span>`;
+}
+// 予想の要約ブロック(予想勝者→バー→根拠→学習バージョンの順。詳細画面用)
+function predictionSummaryBlockHtml(p, titleJa) {
+  if (!p) return "";
+  return `
+    <div style="margin:8px 0; padding:10px 12px; border-left:4px solid var(--series-2, #b3541e); background:rgba(0,0,0,.03); border-radius:6px;">
+      <div>${escapeHtml(titleJa || "🤖 AIの予想")}: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predResultBadgeHtml(p)}</div>
+      ${predBarHtml(p)}
+      <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
+    </div>`;
+}
+// 一覧の行に足す1行の予想ストリップ(軽さ優先: バー無し・テキストのみ)
+function predStripHtml(p) {
+  if (!p) return "";
+  const winPct = p.probs ? (p.predictedWinner === "home" ? p.probs.homeWinPct : p.predictedWinner === "away" ? p.probs.awayWinPct : p.probs.drawPct) : null;
+  return `🤖 AI予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${winPct !== null ? ` <span style="color:var(--series-2, #b3541e); font-weight:700;">${Number(winPct)}%</span>` : ""}${predResultBadgeHtml(p)}`;
+}
+// 一覧描画後(または予想データ到着後)に、予想ストリップの空きスロットを埋める。
+// DOM走査は予想がある試合の件数ぶんだけ(数件)なので描画コストはごく小さい。
+function annotateFixtureRowsWithPredictions() {
+  predsByFixtureId.forEach((p, id) => {
+    const slot = document.getElementById(`fixturePred-${id}`);
+    if (slot && !slot.dataset.filled) {
+      slot.innerHTML = predStripHtml(p);
+      slot.style.display = "block";
+      slot.dataset.filled = "1";
+    }
+  });
+}
+
 // ---- 2026年8月・利用者目線ラウンド: 「🔮 今日のAI予想」ヒーローカード ----
 // サーバーの /api/predictions/today(保存済み予測の読み出しのみ)を表示する。
 // 予想が無い日は「なぜ無いのか」をサーバーの正直な説明そのままで表示する。
 async function renderTodayPredictionsHero() {
   const el = document.getElementById("todayPredictionsBody");
   if (!el) return;
-  let data = null;
-  try {
-    data = await fetchJsonWithTimeout(`${API_PROXY_BASE}/predictions/today`, backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
-  } catch (e) { /* 下のnull処理へ */ }
+  const data = await fetchTodayPredictionsShared();
   if (!data) {
     el.innerHTML = `<p class="value-note">AI予想を取得できませんでした(サーバー起動待ちの可能性があります。しばらくして再読み込みしてください)。</p>`;
     return;
@@ -6878,32 +6979,17 @@ async function renderTodayPredictionsHero() {
     el.innerHTML = `<p class="value-note">${escapeHtml(data.noteJa || "本日のAI予想はありません。")}</p>`;
     return;
   }
-  const winnerLabel = (p) => p.predictedWinner === "home" ? `${p.home && p.home.name ? p.home.name : "ホーム"} 勝利`
-    : p.predictedWinner === "away" ? `${p.away && p.away.name ? p.away.name : "アウェイ"} 勝利`
-    : "引き分け";
   const rows = data.predictions.slice(0, 5).map((p) => {
     const homeName = escapeHtml((p.home && p.home.name) || "ホーム");
     const awayName = escapeHtml((p.away && p.away.name) || "アウェイ");
     const kickoffStr = p.kickoff ? new Date(p.kickoff).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "";
-    const resultBadge = p.resolved
-      ? (p.correct
-        ? `<span style="color:#1c7c54; font-weight:bold; margin-left:6px;">✅ 的中</span>`
-        : `<span style="color:#b3541e; font-weight:bold; margin-left:6px;">❌ 外れ</span>`)
-      : "";
     const scoreStr = (p.score && p.score.home !== null && p.score.home !== undefined) ? ` <strong>${Number(p.score.home)} - ${Number(p.score.away)}</strong>` : "";
-    const probBar = p.probs ? `
-      <div style="display:flex; height:14px; border-radius:7px; overflow:hidden; margin:6px 0 2px; font-size:10px; line-height:14px; color:#fff; text-align:center;">
-        <div style="width:${Number(p.probs.homeWinPct)}%; background:var(--series-home, #2563eb); min-width:28px;">${Number(p.probs.homeWinPct)}%</div>
-        <div style="width:${Number(p.probs.drawPct)}%; background:#8a97a3; min-width:24px;">${Number(p.probs.drawPct)}%</div>
-        <div style="width:${Number(p.probs.awayWinPct)}%; background:var(--series-away, #b3541e); min-width:28px;">${Number(p.probs.awayWinPct)}%</div>
-      </div>
-      <div class="value-note" style="display:flex; justify-content:space-between; font-size:11px;"><span>${homeName}勝利</span><span>引分</span><span>${awayName}勝利</span></div>` : "";
     return `
       <div style="padding:10px 0; border-bottom:1px solid var(--border);">
-        <div><strong>${homeName} vs ${awayName}</strong>${scoreStr}${resultBadge}
+        <div><strong>${homeName} vs ${awayName}</strong>${scoreStr}${predResultBadgeHtml(p)}
           <span class="value-note" style="margin-left:8px;">${escapeHtml(p.league || "")}${kickoffStr ? " ・ " + kickoffStr : ""}</span></div>
-        <div style="margin-top:2px;">🤖 AIの予想: <strong>${escapeHtml(winnerLabel(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}</div>
-        ${probBar}
+        <div style="margin-top:2px;">🤖 AIの予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}</div>
+        ${predBarHtml(p)}
         <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
       </div>`;
   });
