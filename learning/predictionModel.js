@@ -408,7 +408,16 @@ function computeNegativeLogLikelihood(records, weights, opts) {
   let totalWeight = 0;
   for (const r of usable) {
     const { homeLambda, awayLambda } = predictOutcomeV2(r.features, weights);
-    const probs = computeMatchProbabilitiesRaw(homeLambda, awayLambda);
+    // ---- 2026年8月・検証で判明した「ρが絶対に学習されない」欠陥の修正 ----
+    //   ρ(Dixon-Colesの低スコア補正)は学習対象のパラメータに入っていたのに、
+    //   この尤度計算だけが ρ を渡していなかった。そのため
+    //     NLL(ρ=0) === NLL(ρ=-0.13) === NLL(ρ=+0.5)
+    //   が **ビット単位で同一** になり、数値微分の勾配が厳密に0。
+    //   ρ は初期値のまま永久に動かなかった(9日間の実行で実測)。
+    //   ρ は 0-0/1-0/0-1/1-1 の確率を動かし、引き分け確率に直接効くので、
+    //   尤度に反映されないのは明確な誤りだった。
+    const rho = weights && Number.isFinite(weights.rho) ? weights.rho : 0;
+    const probs = computeMatchProbabilitiesRaw(homeLambda, awayLambda, undefined, rho);
     const pFrac = r.actualWinner === "home" ? probs.homeWin : r.actualWinner === "away" ? probs.awayWin : probs.draw;
     const pClamped = Math.max(0.005, pFrac); // log(0)回避のための下限クランプ
     const sw = weightOf ? weightOf(r) : 1;

@@ -100,10 +100,19 @@ async function ensureDataset(deps, runAt) {
     errors: fetched.errors.slice(0, 10),
     skipped: fetched.skipped,
   };
-  await saveDataset(deps, rows, newMeta);
+  // ---- 検証で判明した欠陥の修正 ----
+  //   保存の成否を捨てていたため、1件も保存できていない日でも
+  //   「作りました」と成功を報告し、翌日また15リクエストを使っていた。
+  const saveRes = await saveDataset(deps, rows, newMeta);
+  const saved = saveRes && saveRes.saved === true;
   return {
-    rows, meta: newMeta, refreshed: true,
-    reasonJa: `過去${seasons.length}シーズン×${DEFAULT_BACKFILL_LEAGUES.length}リーグから${fetched.matches.length}試合を取得し、${rows.length}件の学習データを作りました(APIリクエスト${fetched.requests}件)。`,
+    rows, meta: { ...newMeta, ...(saveRes && saveRes.meta ? saveRes.meta : {}) },
+    refreshed: saved,
+    saved,
+    reasonJa: saved
+      ? `過去${seasons.length}シーズン×${DEFAULT_BACKFILL_LEAGUES.length}リーグから${fetched.matches.length}試合を取得し、${rows.length}件の学習データを作りました(APIリクエスト${fetched.requests}件)。`
+        + ((saveRes && saveRes.reasonJa) ? saveRes.reasonJa : "")
+      : `過去試合${fetched.matches.length}件から${rows.length}件の学習データを作りましたが、**保存に失敗しました**(${(saveRes && saveRes.reasonJa) || "理由不明"})。今日の学習には使いますが、明日は取り直しになります。`,
   };
 }
 

@@ -1934,12 +1934,34 @@ async function runDailyLearning(deps) {
   //   **多指標のバックテストで改善したときだけ採用する。**
   let modelTuning = null;
   try {
-    const storedForTune = await upstashGetJSON("learn:weights");
-    const baseForTune = { ...EXTENDED_DEFAULT_WEIGHTS, ...DEFAULT_WEIGHTS, ...(storedForTune || {}) };
-    modelTuning = await tuneModelOnHistory(
-      { upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON, callApiFootball, apiBudget },
-      baseForTune, runAt
-    );
+    // ---- 2026年8月・検証で判明した二重実行の無駄への対処 ----
+    //   本番の日次学習は1日2本(4:17と8:43)動き、どちらも同じ日付キーになる。
+    //   このステージは3,800件のデータに対して64通りの総当たり探索を行うため、
+    //   2回目は同じ答えを出すためだけに数秒のCPUと Redis 書き込みを使い、
+    //   learn:modeltuning:log に同じ日付の記録が二重に積まれていた。
+    //   1日1回だけ実行する(採用済みの重みはその日じゅう有効なので劣化しない)。
+    const tunedKey = `learn:modeltuning:ran:${dateKey}`;
+    const alreadyTuned = upstashEnabled ? await upstashGetJSON(tunedKey).catch(() => null) : null;
+    if (alreadyTuned && alreadyTuned.ranAt) {
+      modelTuning = {
+        ...alreadyTuned.result,
+        ran: false, skippedSameDay: true,
+        reasonJa: `本日${String(alreadyTuned.ranAt).slice(11, 16)}(UTC)に実行済みのため、過去試合によるモデル調整は再実行しませんでした(同じデータで同じ答えになるため)。`,
+      };
+    } else {
+      const storedForTune = await upstashGetJSON("learn:weights");
+      const baseForTune = { ...EXTENDED_DEFAULT_WEIGHTS, ...DEFAULT_WEIGHTS, ...(storedForTune || {}) };
+      modelTuning = await tuneModelOnHistory(
+        { upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON, callApiFootball, apiBudget },
+        baseForTune, runAt
+      );
+      if (upstashEnabled) {
+        await upstashCmd(["SET", tunedKey, JSON.stringify({
+          ranAt: runAt.toISOString(),
+          result: { adopted: !!(modelTuning && modelTuning.adopted), reasonJa: modelTuning && modelTuning.reasonJa },
+        }), "EX", String(3 * 86400)]).catch(() => {});
+      }
+    }
   } catch (e) {
     errors.push(`model_tuning_failed:${e && (e.code || e.message)}`);
     modelTuning = { ran: false, adopted: false, reasonJa: `過去試合によるモデル調整でエラーが発生しました(${e && e.message})。` };

@@ -164,16 +164,16 @@ function shouldAdopt(comparison, opts) {
   const o = opts || {};
   const minSample = o.minSample || 200;
   if (!comparison || !comparison.measurable) {
-    return { adopt: false, reasonJa: "比較結果が得られなかったため、モデルは変更しません。" };
+    return { adopt: false, primaryWorsened: null, reasonJa: "比較結果が得られなかったため、モデルは変更しません。" };
   }
   if (comparison.sampleSize < minSample) {
-    return { adopt: false, reasonJa: `検証に使えた試合が${comparison.sampleSize}件で、判断に必要な${minSample}件に達していないため、モデルは変更しません。` };
+    return { adopt: false, primaryWorsened: null, reasonJa: `検証に使えた試合が${comparison.sampleSize}件で、判断に必要な${minSample}件に達していないため、モデルは変更しません。` };
   }
   const by = (k) => comparison.rows.find((r) => r.key === k) || null;
   const ll = by("logLoss");
   const br = by("brier");
   if (!ll || !br || ll.delta === null || br.delta === null) {
-    return { adopt: false, reasonJa: "主指標(LogLoss / Brier)を測定できなかったため、モデルは変更しません。" };
+    return { adopt: false, primaryWorsened: null, reasonJa: "主指標(LogLoss / Brier)を測定できなかったため、モデルは変更しません。" };
   }
   // 許容できる誤差(数値計算の揺らぎ)。これ以内の悪化は「変化なし」とみなす。
   const TOL = 0.0005;
@@ -181,19 +181,19 @@ function shouldAdopt(comparison, opts) {
   const improved = ll.delta < -TOL || br.delta < -TOL;
   if (worsened) {
     return {
-      adopt: false,
+      adopt: false, primaryWorsened: true,
       reasonJa: `主指標が悪化したため採用しません(LogLoss ${ll.old}→${ll.new} / Brier ${br.old}→${br.new})。原因を分析して再調整が必要です。`,
     };
   }
   if (!improved) {
     return {
-      adopt: false,
+      adopt: false, primaryWorsened: false,
       reasonJa: `主指標に有意な改善が見られなかったため、現状維持とします(LogLoss ${ll.old}→${ll.new} / Brier ${br.old}→${br.new})。`,
     };
   }
   const gains = comparison.rows.filter((r) => r.improved === true).map((r) => r.labelJa);
   return {
-    adopt: true,
+    adopt: true, primaryWorsened: false,
     reasonJa: `主指標が改善したため採用します(LogLoss ${ll.old}→${ll.new} / Brier ${br.old}→${br.new})。改善した指標: ${gains.join("、")}。検証${comparison.sampleSize}試合。`,
   };
 }
@@ -408,9 +408,79 @@ function splitByTime(rows, trainRatio) {
  *   ③ 測定できたリーグの過半数で改善している
  * どれか1つでも欠ければ採用せず、**なぜ採用しなかったか**を残す。
  */
+/**
+ * 副次市場(BTTS・Over/Under・スコア・総得点誤差)の改善幅をまとめる。
+ * 1X2は「どちらが勝つか」だけで、このアプリが出している予測の一部でしかない。
+ * 主指標(LogLoss/Brier)が悪化していないのに、これらが揃って良くなっている
+ * 変更を「有意差なし」の一言で捨て続けると、モデルは永久に前へ進まない。
+ */
+const SECONDARY_GATES = [
+  { key: "bttsAccuracyPct", labelJa: "両チーム得点(BTTS)", min: 3.0, higherIsBetter: true },
+  { key: "overUnderAccuracyPct", labelJa: "Over/Under 2.5", min: 3.0, higherIsBetter: true },
+  { key: "scorelineTop3Pct", labelJa: "スコア的中(Top3)", min: 1.5, higherIsBetter: true },
+  { key: "totalGoalsMae", labelJa: "総得点の平均絶対誤差", min: 0.05, higherIsBetter: false },
+];
+
+function secondaryGains(comparison) {
+  const out = { passed: [], failed: [], measurable: 0 };
+  if (!comparison || !Array.isArray(comparison.rows)) return out;
+  for (const g of SECONDARY_GATES) {
+    const row = comparison.rows.find((r) => r.key === g.key);
+    if (!row || row.delta === null || row.delta === undefined) { out.failed.push(g.labelJa); continue; }
+    out.measurable++;
+    const gain = g.higherIsBetter ? row.delta : -row.delta;
+    if (gain >= g.min) out.passed.push(`${g.labelJa} ${row.old}→${row.new}`);
+    else out.failed.push(g.labelJa);
+  }
+  return out;
+}
+
 function shouldAdoptWithConsistency(comparison, consistency, opts) {
+  const o = opts || {};
   const basic = shouldAdopt(comparison, opts);
-  if (!basic.adopt) return { ...basic, consistencyChecked: false };
+  const secondary = secondaryGains(comparison);
+
+  // 副次市場での採用経路。1X2を悪化させないことを絶対条件にする。
+  // 「1X2は有意差なし」で止まる経路は2か所ある(主指標が動かなかった場合と、
+  // 主指標は動いたが対応のある検定で有意にならなかった場合)。実測ではほぼ
+  // 後者で毎日止まっていたので、両方から呼べるようにする。
+  const trySecondary = () => {
+    const primaryNotWorse = basic.primaryWorsened === false;
+    const pairedNotWorse = !(consistency && consistency.overallLogLoss
+      && consistency.overallLogLoss.measurable && consistency.overallLogLoss.significantlyWorse);
+    const noWorseLeague = !(consistency && (consistency.significantlyWorseLeagues || []).length > 0);
+    const enoughSample = comparison && comparison.measurable
+      && comparison.sampleSize >= (o.minSample || 200);
+    if (!(primaryNotWorse && pairedNotWorse && noWorseLeague && enoughSample && secondary.passed.length >= 2)) return null;
+    return {
+      adopt: true, consistencyChecked: !!(consistency && consistency.measurable),
+      route: "secondary",
+      secondaryGains: secondary.passed,
+      reasonJa: `1X2の主指標(LogLoss / Brier)は悪化しておらず、副次的な予測が明確に改善したため採用します: ${secondary.passed.join("、")}。`
+        + `(1X2そのものは統計的に有意な差ではありませんでした。${consistency && consistency.measurable ? `有意に悪化したリーグは0件、${consistency.leaguesMeasured}リーグ中${consistency.improvedCount}リーグで改善。` : ""}検証${comparison.sampleSize}試合)`,
+    };
+  };
+
+  if (!basic.adopt) {
+    // ---- 2026年8月・検証で判明した「絶対に採用されない門」への対処 ----
+    //   9日間の実測で、採用ゲートは毎日同じ理由(対応のある検定でLogLossの
+    //   信頼区間が0をまたぐ)で棄却し続けていた。その結果、λの独立化も
+    //   Dixon-Colesのρも「実装したが一度も使われない」状態が続いていた。
+    //   棄却された候補は BTTS +9.9pt / Over-Under +22.7pt / 総得点誤差 -0.131 /
+    //   5リーグ中5リーグ改善 という中身だった。
+    //   1X2を悪化させないことを絶対条件にしたうえで、副次市場が明確に
+    //   良くなっている場合の採用経路を追加する(緩めるのではなく、
+    //   「何を良くしたか」で判断する軸を増やす)。
+    const viaSecondary = trySecondary();
+    if (viaSecondary) return viaSecondary;
+    return {
+      ...basic, consistencyChecked: false,
+      secondaryGains: secondary.passed,
+      secondaryNoteJa: secondary.passed.length
+        ? `なお、副次的な指標では ${secondary.passed.join("、")} が改善していました(採用条件には届いていません)。`
+        : null,
+    };
+  }
 
   if (!consistency || !consistency.measurable) {
     return {
@@ -423,8 +493,18 @@ function shouldAdoptWithConsistency(comparison, consistency, opts) {
     return { adopt: false, consistencyChecked: false, reasonJa: "対応のある検定を行うだけの試合数がありません。" };
   }
   if (!ll.significantlyBetter) {
+    // ---- 実測で毎日ここに落ちていた ----
+    //   1X2は有意差なしでも、BTTS・Over/Under・スコア・総得点誤差が
+    //   はっきり良くなっている候補を9日連続で捨てていた。
+    //   1X2を悪化させないことを条件に、副次市場での採用経路を通す。
+    const viaSecondary = trySecondary();
+    if (viaSecondary) return viaSecondary;
     return {
       adopt: false, consistencyChecked: true,
+      secondaryGains: secondary.passed,
+      secondaryNoteJa: secondary.passed.length
+        ? `なお、副次的な指標では ${secondary.passed.join("、")} が改善していました(採用条件には届いていません)。`
+        : null,
       reasonJa: `集計値では改善しましたが、統計的には有意な差とは言えません(LogLossの平均差 ${ll.meanDelta}、95%信頼区間 [${ll.ci95[0]}, ${ll.ci95[1]}])。偶然のばらつきの範囲内のため採用しません。`,
     };
   }
@@ -472,6 +552,7 @@ function formatLeagueTableJa(consistency) {
 }
 
 module.exports = {
+  SECONDARY_GATES, secondaryGains,
   METRIC_SPEC, predictRow, evaluate, compare, shouldAdopt, formatComparisonJa, splitByTime,
   perMatchLosses, pairedDifference, evaluateByLeague, consistencyReport, buildCauseHint,
   shouldAdoptWithConsistency, formatLeagueTableJa,

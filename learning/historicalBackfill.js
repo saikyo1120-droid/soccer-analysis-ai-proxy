@@ -217,25 +217,75 @@ function timeDecayWeight(matchDateIso, referenceMs, xi) {
   return Math.exp(-xi * days);
 }
 
+// ---- 2026年8月・検証で判明した「保存できていないのに成功と報告する」欠陥 ----
+//   5リーグ×3シーズンの学習データは実測で約1.3MB(本物のシーズンなら約2MB)。
+//   これを1キーに入れると Upstash の1値/1リクエストの上限を超えて保存に失敗する。
+//   ところが保存関数の戻り値を捨てていたため、毎日
+//     「3,809件の学習データを作りました」と成功を報告しながら1件も保存されず、
+//     翌日また15リクエストを使って取り直す
+//   という自己強化ループになりうる状態だった(週1回のはずが毎日15件)。
+//   選手索引と同じくブロック分割で保存し、**保存できたかどうかを必ず返す**。
+const BACKFILL_SHARD_SIZE = 1200;                       // 1ブロックあたりの試合数
+const BACKFILL_MAX_SHARDS = 12;                          // 上限14,400件
+const backfillShardKey = (i) => `${BACKFILL_KEY}:s${i}`;
+
 async function saveDataset(deps, rows, meta) {
-  const { upstashEnabled, upstashSetJSON } = deps;
-  if (!upstashEnabled) return false;
+  const { upstashEnabled, upstashSetJSON, upstashCmd, upstashGetJSON } = deps;
+  if (!upstashEnabled) return { saved: false, reasonJa: "保存先(Upstash)が未設定のため、学習データを保存できません。" };
   // 保存サイズを抑えるため、学習に必要な項目だけを残す
   const slim = rows.map((r) => ({
     d: r.date, l: r.leagueId,
     h: r.homeCtx, a: r.awayCtx,
     hg: r.actualHomeGoals, ag: r.actualAwayGoals, w: r.actualWinner,
   }));
-  const okRows = (await upstashSetJSON(BACKFILL_KEY, slim)) !== false;
-  const okMeta = (await upstashSetJSON(BACKFILL_META_KEY, meta)) !== false;
-  return okRows && okMeta;
+  const shardCount = Math.min(BACKFILL_MAX_SHARDS, Math.max(1, Math.ceil(slim.length / BACKFILL_SHARD_SIZE)));
+  const stored = slim.slice(0, shardCount * BACKFILL_SHARD_SIZE);
+  const truncated = slim.length - stored.length;
+  const failed = [];
+  for (let i = 0; i < shardCount; i++) {
+    const chunk = stored.slice(i * BACKFILL_SHARD_SIZE, (i + 1) * BACKFILL_SHARD_SIZE);
+    if ((await upstashSetJSON(backfillShardKey(i), chunk)) === false) failed.push(i);
+  }
+  if (failed.length) {
+    return {
+      saved: false, failedShards: failed,
+      reasonJa: `学習データの保存に失敗しました(${failed.length}/${shardCount}ブロック)。次回の実行で作り直します。`,
+    };
+  }
+  // 前世代の余りブロックを片付ける
+  const prevMeta = upstashGetJSON ? await upstashGetJSON(BACKFILL_META_KEY).catch(() => null) : null;
+  const prevShards = prevMeta && Number.isFinite(prevMeta.shardCount) ? prevMeta.shardCount : 0;
+  if (upstashCmd) {
+    for (let i = shardCount; i < Math.min(BACKFILL_MAX_SHARDS, prevShards); i++) {
+      await upstashCmd(["DEL", backfillShardKey(i)]).catch(() => {});
+    }
+    // 旧形式(単一キー)が残っていると読み出しで混ざるので消す
+    await upstashCmd(["DEL", BACKFILL_KEY]).catch(() => {});
+  }
+  const fullMeta = { ...(meta || {}), shardCount, shardSize: BACKFILL_SHARD_SIZE, storedRows: stored.length, truncatedRows: truncated };
+  const okMeta = (await upstashSetJSON(BACKFILL_META_KEY, fullMeta)) !== false;
+  return {
+    saved: okMeta, shardCount, storedRows: stored.length, truncatedRows: truncated, meta: fullMeta,
+    reasonJa: okMeta
+      ? (truncated ? `上限を超えた${truncated}件は保存していません(直近${stored.length}件を保存)。` : null)
+      : "学習データの目次の保存に失敗しました。",
+  };
 }
 
 async function loadDataset(deps) {
   const { upstashEnabled, upstashGetJSON } = deps;
   if (!upstashEnabled) return { rows: [], meta: null };
-  const slim = (await upstashGetJSON(BACKFILL_KEY).catch(() => null)) || [];
   const meta = (await upstashGetJSON(BACKFILL_META_KEY).catch(() => null)) || null;
+  let slim = [];
+  if (meta && Number.isFinite(meta.shardCount) && meta.shardCount > 0) {
+    for (let i = 0; i < Math.min(BACKFILL_MAX_SHARDS, meta.shardCount); i++) {
+      const chunk = await upstashGetJSON(backfillShardKey(i)).catch(() => null);
+      if (Array.isArray(chunk)) slim.push(...chunk);
+    }
+  } else {
+    // 旧形式(単一キー)からの読み出し。移行期のみ通る。
+    slim = (await upstashGetJSON(BACKFILL_KEY).catch(() => null)) || [];
+  }
   const rows = slim.map((r) => ({
     date: r.d, leagueId: r.l,
     homeCtx: r.h, awayCtx: r.a,
@@ -246,6 +296,7 @@ async function loadDataset(deps) {
 
 module.exports = {
   DEFAULT_BACKFILL_LEAGUES, BACKFILL_KEY, BACKFILL_META_KEY, MAX_STORED_MATCHES,
+  BACKFILL_SHARD_SIZE, BACKFILL_MAX_SHARDS, backfillShardKey,
   fetchSeason, backfillSeasons, buildTrainingRows, timeDecayWeight,
   saveDataset, loadDataset,
 };
