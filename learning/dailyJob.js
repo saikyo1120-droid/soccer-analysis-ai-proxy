@@ -104,6 +104,8 @@ const {
 } = require("./selfImprovement");
 const { computeMarketProbs } = require("./accuracyTracker");
 const { CLUB_UNIVERSE, clubsForPrediction } = require("./clubUniverse");
+// 2026年8月: 過去試合を使ったモデル調整(λの独立化・Dixon-Coles・採用ゲート)
+const { tuneModelOnHistory, getTuningHistory } = require("./modelTuning");
 // ① 学習によって「予測がどう変わったか」の記録
 const { computePredictionShift } = require("./predictionShift");
 // ⑩ AIが自分で「次に何を学ぶか」を決める
@@ -298,6 +300,7 @@ function mergeGrowthLogs(previous, current) {
     //   2回目の実行でこれらが取れなかった日に前回の値まで消える。
     //   また実行中の重複削減の実測は「置き換え」ではなく「合算」が正しい。
     predictionCoverage: current.predictionCoverage || previous.predictionCoverage || null,
+    modelTuning: current.modelTuning || previous.modelTuning || null,
     apiRunMemo: (() => {
       const a = previous.apiRunMemo, b = current.apiRunMemo;
       if (!a) return b || null;
@@ -1921,6 +1924,27 @@ async function runDailyLearning(deps) {
     }
   }
 
+  // ---- ④-b 過去試合によるモデル調整(2026年8月・共同開発者レビュー対応) ----
+  //   上の重み学習は「自社が予測した試合」だけを使うため、本番でも36件しか
+  //   貯まらず、11特徴量のうち10個の重みが初期値0のままだった。
+  //   モデルの学習に必要なのは「自分が予測したか」ではなく
+  //   「特徴量と結果のペア」なので、過去シーズンの実試合を取得して使う
+  //   (Backfill / Historical Training)。5リーグ×3シーズン=約15リクエストで
+  //   数千試合。ここで λ の独立化(和の重み)と Dixon-Coles の ρ を学習し、
+  //   **多指標のバックテストで改善したときだけ採用する。**
+  let modelTuning = null;
+  try {
+    const storedForTune = await upstashGetJSON("learn:weights");
+    const baseForTune = { ...EXTENDED_DEFAULT_WEIGHTS, ...DEFAULT_WEIGHTS, ...(storedForTune || {}) };
+    modelTuning = await tuneModelOnHistory(
+      { upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON, callApiFootball, apiBudget },
+      baseForTune, runAt
+    );
+  } catch (e) {
+    errors.push(`model_tuning_failed:${e && (e.code || e.message)}`);
+    modelTuning = { ran: false, adopted: false, reasonJa: `過去試合によるモデル調整でエラーが発生しました(${e && e.message})。` };
+  }
+
   // ---- ⑤ 今日の知識ベース更新と成長ログ ----
   // Stage E以降: 「事実」の保存先はKnowledge Engine(knowledgeStore.js)に一本化。
   // 重複した内容(前日と全く同じ事実)は正直に「重複」として扱われ、二重に
@@ -2045,6 +2069,16 @@ async function runDailyLearning(deps) {
     // 2026年8月・「TOP100の試合が漏れていないか」への回答を、推測ではなく
     // 実測値で返すための集計(どのクラブが未予測かまで含む)
     predictionCoverage,
+    // 過去試合を使ったモデル調整の結果(採用/不採用と、その理由・比較表)
+    modelTuning: modelTuning ? {
+      ran: modelTuning.ran, adopted: modelTuning.adopted, reasonJa: modelTuning.reasonJa,
+      datasetSize: modelTuning.datasetSize ?? null,
+      datasetNoteJa: modelTuning.datasetNoteJa ?? null,
+      trainSize: modelTuning.trainSize ?? null, testSize: modelTuning.testSize ?? null,
+      oldEval: modelTuning.oldEval ?? null, newEval: modelTuning.newEval ?? null,
+      comparisonJa: modelTuning.comparisonJa ?? null,
+      newParams: modelTuning.newParams ?? null,
+    } : null,
     // 実行中の重複APIをどれだけ削れたか(実測)。データ量は減らしていない。
     apiRunMemo: {
       hits: runMemoHits, misses: runMemoMisses,
@@ -2455,4 +2489,5 @@ module.exports = {
   DEFAULT_WEIGHTS, REGISTERED_TEAMS,
   buildReflectionText, mergeGrowthLogs,
   MIN_RESOLVED_FOR_RECALIBRATION, OWN_PRED_RECENT_KEEP, OWN_PREDICT_LOG_CAP,
+  getTuningHistory,
 };

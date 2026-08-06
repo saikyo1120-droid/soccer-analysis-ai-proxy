@@ -37,8 +37,49 @@ const EXTENDED_DEFAULT_WEIGHTS = {
   suspensionSensitivity: 0, // 出場停止者数の差(怪我とは分けて評価する)
   xgSensitivity: 0, // xG(期待得点)- xGA(期待失点)の差
   topScorerSensitivity: 0, // 各チームの得点ランキング上位選手の得点数の差
+  // ---- λの独立化(2026年8月) ----
+  // これらは「試合の総得点」を動かす。初期値0=旧モデルと完全に同一。
+  attackSumSensitivity: 0,    // 両チームの得点力の合計
+  concededSumSensitivity: 0,  // 両チームの失点しやすさの合計
+  fatigueSumSensitivity: 0,   // 両チームの過密日程の合計(疲れた試合は点が減るか)
+  xgSumSensitivity: 0,        // 両チームのxG収支の合計
+  // ---- Dixon-Coles の低スコア補正(2026年8月) ----
+  // 0-0 / 1-0 / 0-1 / 1-1 は、独立ポアソンが仮定するより実際には
+  // 起こりやすい/にくい(得点が互いに独立ではない)。ρで補正する。
+  // **初期値0のときτ関数は恒等的に1**になり、素のポアソンと完全に一致する。
+  rho: 0,
   version: 0,
   updatedAt: null,
+};
+
+// ---- 2026年8月・共同開発者レビューを受けた構造改修(λの独立化) ----
+//   旧モデルは単一スカラー score を λH に足し λA から引くだけだったため、
+//     λH + λA = homeBase + awayBase = 2.50(定数)
+//   となり、**予想総得点があらゆる試合で2.50に固定**されていた。
+//   実測でも「互角」でも「わずかにホーム有利」でも合計2.50。
+//   その結果、
+//     ・スコア予想の精度に構造的な上限
+//     ・Over/Under、BTTS(両チーム得点)が原理的に表現不能
+//     ・引き分け確率はロースコアほど上がるのに、それを表現できない
+//   という問題があった。
+//   そこで「差(どちらが強いか)」と「和(どれだけ点が入る試合か)」を
+//   分離し、λH と λA が独立に動けるようにする。
+//   **Sum系の重みはすべて初期値0**なので、追加した時点では旧モデルと
+//   完全に同一の出力になる(最終方針①「劣化禁止」の実装)。
+const FEATURE_SUM_WEIGHT_MAP = {
+  attackSum: "attackSumSensitivity",
+  concededSum: "concededSumSensitivity",
+  fatigueSum: "fatigueSumSensitivity",
+  xgSum: "xgSumSensitivity",
+};
+
+// 和の特徴量は「リーグ平均からのズレ」に直す。生の値のままだと
+// homeBase/awayBase と役割が重なり、学習の収束が遅くなるため。
+const SUM_CENTERS = {
+  attackSum: 2.8,    // 1チームあたり平均約1.4得点 × 2
+  concededSum: 2.8,  // 同上(失点側)
+  fatigueSum: 2.0,   // 直近7日の試合数の合計の目安
+  xgSum: 0,          // xgNetは元々0中心
 };
 
 const FEATURE_WEIGHT_MAP = {
@@ -157,23 +198,61 @@ function computeMatchFeatures(homeCtx, awayCtx, h2h) {
     // topScorerDiff: 各チームのリーグ得点ランキング上位選手の得点数の差。
     //   「エースがいるか」を数値化する(架空のキーマン診断はしない)。
     topScorerDiff: diffOrZero(h.topScorerGoals, a.topScorerGoals),
+    // ---- 和の特徴量(λの独立化。2026年8月) ----
+    // 「どちらが強いか」ではなく「どれだけ点が入る試合か」を表す。
+    // 片方でも欠けていれば0(=総得点を動かさない)。推測で埋めない。
+    attackSum: sumOrZero(h.avgGoalsFor, a.avgGoalsFor, SUM_CENTERS.attackSum),
+    concededSum: sumOrZero(h.avgGoalsAgainst, a.avgGoalsAgainst, SUM_CENTERS.concededSum),
+    fatigueSum: sumOrZero(h.matchesLast7Days, a.matchesLast7Days, SUM_CENTERS.fatigueSum),
+    xgSum: sumOrZero(h.xgNet, a.xgNet, SUM_CENTERS.xgSum),
   };
+}
+
+/** 両方の値が取れている場合だけ「合計 − 中心値」を返す。片方でも欠ければ0。 */
+function sumOrZero(x, y, center) {
+  if ((x ?? null) === null || (y ?? null) === null) return 0;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return 0;
+  return (x + y) - (center || 0);
 }
 
 function predictOutcomeV2(features, weights) {
   const w = weights || EXTENDED_DEFAULT_WEIGHTS;
   const f = features || {};
+  // 差: どちらが強いか(λHを上げ、λAを下げる)
   let score = 0;
   for (const [fKey, wKey] of Object.entries(FEATURE_WEIGHT_MAP)) {
     score += (f[fKey] || 0) * (w[wKey] || 0);
   }
-  const homeLambda = Math.max(0.4, (w.homeBase ?? EXTENDED_DEFAULT_WEIGHTS.homeBase) + score);
-  const awayLambda = Math.max(0.4, (w.awayBase ?? EXTENDED_DEFAULT_WEIGHTS.awayBase) - score);
+  // 和: どれだけ点が入る試合か(λHとλAを**同じ向きに**動かす)。
+  // これが無いと λH+λA が定数になり、総得点を一切表現できない。
+  let openness = 0;
+  for (const [fKey, wKey] of Object.entries(FEATURE_SUM_WEIGHT_MAP)) {
+    openness += (f[fKey] || 0) * (w[wKey] || 0);
+  }
+  // 下限は0.15へ引き下げた。旧値0.4は「1試合で0.4点未満はあり得ない」という
+  // 強い仮定で、守備的な組み合わせを表現できずクランプが頻発していた。
+  const homeLambda = Math.max(0.15, (w.homeBase ?? EXTENDED_DEFAULT_WEIGHTS.homeBase) + score + openness);
+  const awayLambda = Math.max(0.15, (w.awayBase ?? EXTENDED_DEFAULT_WEIGHTS.awayBase) - score + openness);
   const lambdaDiff = homeLambda - awayLambda;
   let predictedWinner = "draw";
   if (lambdaDiff > 0.15) predictedWinner = "home";
   else if (lambdaDiff < -0.15) predictedWinner = "away";
   return { homeLambda, awayLambda, predictedWinner, score };
+}
+
+// ---- Dixon-Coles(1997)の低スコア補正 ----
+//   独立ポアソンは、実際のサッカーでは 0-0 / 1-0 / 0-1 / 1-1 の頻度を
+//   系統的に外す(両チームの得点は完全には独立ではない)。
+//   τ関数でその4マスだけを補正する。文献ではρ≈-0.13前後。
+//   **ρ=0のときτは恒等的に1**になり、素のポアソンと完全に一致するため、
+//   導入した時点では既存の挙動を1ミリも変えない(最終方針①「劣化禁止」)。
+function dixonColesTau(x, y, lambda, mu, rho) {
+  if (!rho) return 1; // ρ=0(既定)なら補正なし
+  if (x === 0 && y === 0) return 1 - lambda * mu * rho;
+  if (x === 0 && y === 1) return 1 + lambda * rho;
+  if (x === 1 && y === 0) return 1 + mu * rho;
+  if (x === 1 && y === 1) return 1 - rho;
+  return 1;
 }
 
 function poissonPmf(k, lambda) {
@@ -191,14 +270,40 @@ function poissonPmf(k, lambda) {
 // による確率の微小な変化を検出する必要があり、小数点1桁への丸めを挟むと
 // その変化が丸め誤差に埋もれて勾配が常に0になってしまう(実際に発生した
 // バグ。テストで発見・修正済み)。
-function computeMatchProbabilitiesRaw(homeLambda, awayLambda, maxGoals) {
+/**
+ * スコア(h,a)の同時確率の格子を返す。Dixon-Colesのτ補正を掛けたうえで
+ * 全体を1に正規化する(τは総和を1からわずかにずらすため)。
+ * rhoを渡さなければ従来どおりの独立ポアソン。
+ */
+function scoreGrid(homeLambda, awayLambda, maxGoals, rho) {
   const cap = maxGoals || 8;
+  const grid = [];
+  let total = 0;
+  for (let h = 0; h <= cap; h++) {
+    grid[h] = [];
+    for (let a = 0; a <= cap; a++) {
+      const p = poissonPmf(h, homeLambda) * poissonPmf(a, awayLambda)
+        * dixonColesTau(h, a, homeLambda, awayLambda, rho);
+      const safe = p > 0 ? p : 0; // τが負を作りうる極端なρでも確率を壊さない
+      grid[h][a] = safe;
+      total += safe;
+    }
+  }
+  if (total > 0) {
+    for (let h = 0; h <= cap; h++) for (let a = 0; a <= cap; a++) grid[h][a] /= total;
+  }
+  return grid;
+}
+
+function computeMatchProbabilitiesRaw(homeLambda, awayLambda, maxGoals, rho) {
+  const cap = maxGoals || 8;
+  const grid = scoreGrid(homeLambda, awayLambda, cap, rho);
   let pHome = 0;
   let pDraw = 0;
   let pAway = 0;
   for (let h = 0; h <= cap; h++) {
     for (let a = 0; a <= cap; a++) {
-      const p = poissonPmf(h, homeLambda) * poissonPmf(a, awayLambda);
+      const p = grid[h][a];
       if (h > a) pHome += p;
       else if (h < a) pAway += p;
       else pDraw += p;
@@ -209,8 +314,8 @@ function computeMatchProbabilitiesRaw(homeLambda, awayLambda, maxGoals) {
 }
 
 // 表示用(人間が読む%表記に丸めたもの)。
-function computeMatchProbabilities(homeLambda, awayLambda, maxGoals) {
-  const raw = computeMatchProbabilitiesRaw(homeLambda, awayLambda, maxGoals);
+function computeMatchProbabilities(homeLambda, awayLambda, maxGoals, rho) {
+  const raw = computeMatchProbabilitiesRaw(homeLambda, awayLambda, maxGoals, rho);
   return {
     homeWinPct: Math.round(raw.homeWin * 1000) / 10,
     drawPct: Math.round(raw.draw * 1000) / 10,
@@ -220,16 +325,42 @@ function computeMatchProbabilities(homeLambda, awayLambda, maxGoals) {
 
 // 最も確率の高いスコアライン(「2-1」のような最終予想スコア)をポアソン分布の
 // 格子から総当たりで探す。架空の数字ではなく、実際に計算した確率分布の最頻値。
-function mostLikelyScoreline(homeLambda, awayLambda, maxGoals) {
+function mostLikelyScoreline(homeLambda, awayLambda, maxGoals, rho) {
+  // 2026年8月: Dixon-Colesのτ補正を反映する。ρ=0(既定)なら従来と同一の結果。
   const cap = maxGoals || 6;
+  const grid = scoreGrid(homeLambda, awayLambda, cap, rho);
   let best = { h: 0, a: 0, p: -1 };
   for (let h = 0; h <= cap; h++) {
     for (let a = 0; a <= cap; a++) {
-      const p = poissonPmf(h, homeLambda) * poissonPmf(a, awayLambda);
-      if (p > best.p) best = { h, a, p };
+      if (grid[h][a] > best.p) best = { h, a, p: grid[h][a] };
     }
   }
   return `${best.h}-${best.a}`;
+}
+
+/** スコア予想の上位N件(Top1/Top3の精度計測に使う)。 */
+function topScorelinesFrom(homeLambda, awayLambda, maxGoals, rho, n) {
+  const cap = maxGoals || 6;
+  const grid = scoreGrid(homeLambda, awayLambda, cap, rho);
+  const all = [];
+  for (let h = 0; h <= cap; h++) for (let a = 0; a <= cap; a++) all.push({ scoreline: `${h}-${a}`, p: grid[h][a] });
+  all.sort((x, y) => y.p - x.p);
+  return all.slice(0, n || 3);
+}
+
+/** 総得点2.5超(Over)と、両チーム得点(BTTS)の確率。λが独立でないと表現できない指標。 */
+function marketProbabilities(homeLambda, awayLambda, maxGoals, rho) {
+  const cap = maxGoals || 8;
+  const grid = scoreGrid(homeLambda, awayLambda, cap, rho);
+  let over25 = 0, btts = 0;
+  for (let h = 0; h <= cap; h++) {
+    for (let a = 0; a <= cap; a++) {
+      const p = grid[h][a];
+      if (h + a > 2.5) over25 += p;
+      if (h > 0 && a > 0) btts += p;
+    }
+  }
+  return { over25, under25: 1 - over25, btts, noBtts: 1 - btts };
 }
 
 // この試合において、どの特徴量がどれだけ予測に効いたか(★1〜5)。
@@ -348,6 +479,9 @@ const LEARNABLE_KEYS = [
   "sensitivity", "goalRateSensitivity", "injurySensitivity",
   "standingsSensitivity", "headToHeadSensitivity", "fatigueSensitivity",
   "venueSensitivity", "suspensionSensitivity", "xgSensitivity", "topScorerSensitivity",
+  // λの独立化(和の重み)と Dixon-Coles の低スコア補正も学習対象にする
+  "attackSumSensitivity", "concededSumSensitivity", "fatigueSumSensitivity", "xgSumSensitivity",
+  "rho",
 ];
 
 // 数値微分(有限差分法)による勾配降下法。各パラメータをごくわずかに動かして
@@ -824,9 +958,10 @@ module.exports = {
   isSaneWeights,
   predictOutcomeV2,
   poissonPmf,
+  dixonColesTau, scoreGrid,
   computeMatchProbabilitiesRaw,
   computeMatchProbabilities,
-  mostLikelyScoreline,
+  mostLikelyScoreline, topScorelinesFrom, marketProbabilities,
   computeFactorImportance,
   backtestAccuracyV2,
   computeNegativeLogLikelihood,
