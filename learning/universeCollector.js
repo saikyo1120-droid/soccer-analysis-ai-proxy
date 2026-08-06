@@ -78,6 +78,13 @@ async function collectUniverse(deps, runAt, dateKey) {
     coreClubsPlanned: 0, coreClubsUpdated: 0,
     squadsPlanned: 0, squadsUpdated: 0,
     playersUpdated: 0, playersPlanned: 0,
+    playersIndexed: 0, // 画面の選手検索から引ける状態になった人数(実測)
+    // 2026年8月・第三者監査の指摘: playersUpdated は「名簿同期」と「詳細成績」の
+    //   両方が加算していたため、自己改善ループが playerDetailCap の効果を測るとき、
+    //   その日たまたま輪番に当たった名簿の人数(数百人)に完全に埋もれていた。
+    //   内訳を分け、効果測定には詳細成績ぶんだけを使う。
+    playersFromSquadSync: 0,
+    playersFromDetailStats: 0,
     xgClubsUpdated: 0, basicClubsUpdated: 0,
     standingsLeaguesUpdated: 0,
     changesDetected: [],
@@ -371,7 +378,7 @@ async function collectUniverse(deps, runAt, dateKey) {
           await clubDossier.savePlayer({
             id: p.id, name: p.name, teamEn: club.nameEn, teamJa: club.nameJa,
             position: p.position, age: p.age, number: p.number,
-          }).then((res) => { if (res.saved) stats.playersUpdated++; }).catch(() => {});
+          }).then((res) => { if (res.saved) { stats.playersUpdated++; stats.playersFromSquadSync++; } }).catch(() => {});
         }
       }
       stats.squadsUpdated++;
@@ -389,11 +396,30 @@ async function collectUniverse(deps, runAt, dateKey) {
       ? Math.max(150, Math.min(400, deps.tune.playerDetailCap))
       : PLAYER_CAP_DEFAULT;
     const candidates = [];
+    // ---- 2026年8月・「選手スカウティングへの登録」調査での追加 ----
+    // 収集済みの選手を画面から名前で引けるようにする索引をここで作る。
+    // 名簿(squad)は既に全クラブぶんこのループで読んでいるので、
+    // **追加のAPI呼び出しもRedis読み出しも一切増えない**。
+    const searchIndex = {};
     for (const club of CLUB_UNIVERSE) {
       const d = await clubDossier.getDossier(club.nameEn);
       const squad = d && d.sections.squad && d.sections.squad.players;
       if (!squad) continue;
-      for (const p of squad) candidates.push({ club, playerId: p.id, name: p.name });
+      for (const p of squad) {
+        candidates.push({ club, playerId: p.id, name: p.name });
+        if (p.id && p.name) {
+          // 圧縮形式 "name|teamEn|teamJa|position"(区切り文字は名前から除去済み)
+          searchIndex[p.id] = [
+            String(p.name).replace(/\|/g, " "),
+            club.nameEn, club.nameJa || "", p.position || "",
+          ].join("|");
+        }
+      }
+    }
+    stats.playersIndexed = Object.keys(searchIndex).length;
+    if (stats.playersIndexed > 0) {
+      const savedIdx = await clubDossier.saveSearchIndex(searchIndex);
+      if (!savedIdx) stats.errors.push("universe_player_index_save_failed");
     }
     stats.playersPlanned = Math.min(cap, candidates.length);
     // ---- 第8次監査(Critical)の修正 ----
@@ -445,6 +471,7 @@ async function collectUniverse(deps, runAt, dateKey) {
         statsIndex[c.playerId] = runAt.toISOString();
         indexDirty = true;
         stats.playersUpdated++;
+        stats.playersFromDetailStats++;
         done++;
       } catch (e) {
         if (e && e.code === "BUDGET_EXHAUSTED") { skip("playerStats", "APIの1日予算に達したため、選手の詳細成績の更新を打ち切りました。"); break; }

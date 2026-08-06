@@ -103,7 +103,7 @@ const {
   TUNABLE_KNOBS, EVAL_AFTER_DAYS,
 } = require("./selfImprovement");
 const { computeMarketProbs } = require("./accuracyTracker");
-const { CLUB_UNIVERSE } = require("./clubUniverse");
+const { CLUB_UNIVERSE, clubsForPrediction } = require("./clubUniverse");
 // ① 学習によって「予測がどう変わったか」の記録
 const { computePredictionShift } = require("./predictionShift");
 // ⑩ AIが自分で「次に何を学ぶか」を決める
@@ -112,8 +112,23 @@ const { buildLearningAgenda, priorityClubsOf, saveAgenda, loadLatestAgenda } = r
 const { sampleWeightOf, buildFeatureTrust } = require("./trustEngine");
 
 // ---- 調整可能な上限(API-Football無料プランの1日100リクエスト枠を守るため) ----
-const OWN_PREDICT_LOG_CAP = 5; // 1回の実行で新しく記録する自社予測の件数上限
-const OWN_PREDICT_RESOLVE_CAP = 10; // 1回の実行で解決を試みる保留中予測の件数上限
+// ---- 2026年8月・「TOP100の試合が漏れていないか」調査での引き上げ ----
+// 旧値5は、API-Football無料プラン(1日100リクエスト)時代の名残り。
+// 現在はProプラン(7,500件/日)で、日次学習の実測消費は約3,400件/日のため
+// 4,000件以上の余力がある。予測1件あたりの実測コストは概ね10〜20リクエスト
+// (次の試合・相手の直近10試合・怪我人×2・順位×2・過去対戦・xG・得点王)なので、
+// 20件でも最大400件程度。最終方針③「精度>コスト。無駄だけ削る」に沿って
+// **学習データの供給量を増やす**方向へ引き上げる。
+// 予算が逼迫している日は下のループ内で apiBudget を見て自動的に止まる。
+const OWN_PREDICT_LOG_CAP = Number(process.env.OWN_PREDICT_LOG_CAP) || 20; // 1回の実行で新しく記録する自社予測の件数上限
+// 予測を1件立てるのに必要な最低リクエスト数の目安。これを下回ったら打ち切る。
+const OWN_PREDICT_MIN_BUDGET = 25;
+// ---- 2026年8月・上の引き上げと必ずセットで直す必要がある値 ----
+// 記録を20件/日に増やしたのに解決が10件/日のままだと、保留キューが毎日
+// 10件ずつ伸び続け、**答え合わせが永久に追いつかない**(正答率が古い試合の
+// ものしか反映されなくなる)。記録上限を上回る値にし、溜まった分も消化できる
+// ようにする。解決1件=/fixtures 1リクエストなので費用はごく小さい。
+const OWN_PREDICT_RESOLVE_CAP = Math.max(30, OWN_PREDICT_LOG_CAP * 1.5); // 1回の実行で解決を試みる保留中予測の件数上限
 const MIN_RESOLVED_FOR_RECALIBRATION = 10; // これ未満の検証データしかない場合は再調整しない(過学習防止)
 const FORM_FACT_DELTA_THRESHOLD = 0.3; // このゲーム差分以上変化した場合だけ「事実」として記録する
 // 2026年8月・監査で発見された「頭打ち」の直接原因のひとつを修正:
@@ -356,6 +371,11 @@ function mergeGrowthLogs(previous, current) {
         standingsLeaguesUpdated: Math.max(p.standingsLeaguesUpdated || 0, c.standingsLeaguesUpdated || 0),
         changesDetected: changes,
         skipped: capList([...(p.skipped || []), ...(c.skipped || [])]),
+        errors: capList([...(p.errors || []), ...(c.errors || [])]),
+        errorCount: (p.errorCount || 0) + (c.errorCount || 0),
+        playersIndexed: Math.max(p.playersIndexed || 0, c.playersIndexed || 0),
+        playersFromSquadSync: Math.max(p.playersFromSquadSync || 0, c.playersFromSquadSync || 0),
+        playersFromDetailStats: Math.max(p.playersFromDetailStats || 0, c.playersFromDetailStats || 0),
         agendaClubsApplied: Array.from(new Set([...(p.agendaClubsApplied || []), ...(c.agendaClubsApplied || [])])),
         unresolvedClubs: (() => {
           const seen = new Set(); const out = [];
@@ -476,7 +496,7 @@ function capList(list, cap = GROWTH_LOG_LIST_CAP) {
 
 async function runDailyLearning(deps) {
   const {
-    callApiFootball, resolveTeamId,
+    callApiFootball: rawCallApiFootball, resolveTeamId,
     upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON,
     now, generateLLM, getApiPlanInfo, getSharedApiBudget,
     // 第7次監査で追加: 日付キーの基準となるタイムゾーンを呼び出し側から渡す。
@@ -490,6 +510,41 @@ async function runDailyLearning(deps) {
     //   thoughtTimeline … 見立て→きっかけ→予測→結果→学び を1本の線として記録する
     knowledgeGraph, thoughtTimeline,
   } = deps;
+  // ---- 2026年8月・全機能監査での実測にもとづく無駄の削減 ----
+  //   1回の日次学習で同じAPIを同じ引数で何度も呼んでいた(実測: 1,063回のうち
+  //   ユニークは832回 = **231回・22%が完全な重複**)。特に
+  //   /standings は42回、/players/topscorers は22回、同一試合の
+  //   /fixtures/statistics は各20回、同じ引数で呼ばれていた。
+  //   予測対象をTOP100へ広げたことで、この重複はさらに増えていた。
+  //
+  //   1回の実行(数分)の中では、これらの応答は変化しない。
+  //   **実行中だけ有効な記憶**を挟むことで、取得するデータ量・鮮度・
+  //   更新頻度は一切減らさずに、無駄な通信だけを消す
+  //   (最終方針③「精度>コスト。無駄だけ削る」に沿う)。
+  const RUN_MEMO_ENDPOINTS = new Set([
+    "/standings", "/players/topscorers", "/players/topassists",
+    "/injuries", "/fixtures/statistics", "/fixtures/headtohead",
+    "/teams", "/players/squads", "/leagues", "/coachs", "/fixtures/lineups",
+    // /fixtures も1回の実行の中では変わらない(直近10試合・次の試合・特定ID)。
+    // フォーム計算ループと予測ループが同じクラブを二度取りに行っていた。
+    "/fixtures",
+  ]);
+  const RUN_MEMO_MAX = 4000; // 暴走時の安全弁(1回の実行でこれを超えることは無い想定)
+  const runMemo = new Map();
+  let runMemoHits = 0, runMemoMisses = 0;
+  const callApiFootball = async (endpoint, params, opts) => {
+    if (!RUN_MEMO_ENDPOINTS.has(endpoint) || runMemo.size >= RUN_MEMO_MAX) {
+      return rawCallApiFootball(endpoint, params, opts);
+    }
+    const key = endpoint + "?" + JSON.stringify(params || {});
+    if (runMemo.has(key)) { runMemoHits++; return runMemo.get(key); }
+    runMemoMisses++;
+    // 失敗はキャッシュしない(次の呼び出しでちゃんと再試行させる)
+    const result = await rawCallApiFootball(endpoint, params, opts);
+    runMemo.set(key, result);
+    return result;
+  };
+
   const nowFn = typeof now === "function" ? now : () => new Date();
   const runAt = nowFn();
   const dateKey = typeof appDateKeyFn === "function"
@@ -1279,13 +1334,20 @@ async function runDailyLearning(deps) {
     return recentRecordsShared;
   }
 
-  // ---- ③ 登録クラブの直近の試合について、新しく自社予測を立てる ----
-  // 日付ベースでどのクラブから調べ始めるかをずらし、特定のクラブだけ毎回
-  // リクエストが偏らないようにする(単純なローテーション)。
-  const startOffset = Math.abs(dateKey.split("-").join("") % REGISTERED_TEAMS.length) || 0;
-  const rotated = REGISTERED_TEAMS.slice(startOffset).concat(REGISTERED_TEAMS.slice(0, startOffset));
-  for (const team of rotated) {
-    if (newPredictionsLogged >= OWN_PREDICT_LOG_CAP) break;
+  // ---- ③ TOP100クラブの直近の試合について、新しく自社予測を立てる ----
+  // 2026年8月の調査で修正: 旧実装はここを REGISTERED_TEAMS(11クラブ)で回して
+  // いたため、知識収集は毎日100クラブ回っているのに **予測はTOP100のうち9クラブ
+  // にしか立たない**(残り91クラブは構造上、永久に予測対象外)状態だった。
+  // TOP100 + 利用者が登録した TOP100外クラブ を、日付で安定的に回転させる。
+  const predictionPool = clubsForPrediction(dateKey, REGISTERED_TEAMS, OWN_PREDICT_LOG_CAP);
+  const predictionClubsSeen = [];
+  let predictionPoolScanned = 0;
+  let predictionStoppedReason = null;
+  for (const team of predictionPool) {
+    if (newPredictionsLogged >= OWN_PREDICT_LOG_CAP) { predictionStoppedReason = "cap"; break; }
+    // 予算が尽きかけている日は、ここで打ち切って利用者向けの余力を守る
+    if (apiBudget && !apiBudget.canAfford(OWN_PREDICT_MIN_BUDGET)) { predictionStoppedReason = "budget"; break; }
+    predictionPoolScanned++;
     try {
       const cached = teamFormCache.get(team.nameEn);
       const teamId = cached ? cached.teamId : await resolveTeamId(team.nameEn);
@@ -1300,18 +1362,37 @@ async function runDailyLearning(deps) {
       const isHome = fx.teams.home.id === teamId;
       const opponentName = isHome ? fx.teams.away.name : fx.teams.home.name;
       const opponentId = isHome ? fx.teams.away.id : fx.teams.home.id;
-      let opponentForm = teamFormCache.get(opponentName);
-      let opponentFixtures = null;
-      if (!opponentForm) {
-        const oppData = await callApiFootball("/fixtures", { team: opponentId, last: 10 });
-        opponentFixtures = (oppData && oppData.response) || [];
-        const form = computeFormScore(opponentFixtures, opponentId);
-        const goalRates = computeGoalRateFeatures(opponentFixtures, opponentId);
-        const fatigue = computeFatigueFeature(opponentFixtures, runAt.getTime());
-        opponentForm = { teamId: opponentId, ...form, ...goalRates, ...fatigue, fixtures: opponentFixtures };
+      // ---- 2026年8月・第三者監査が発見した重大な欠陥の修正 ----
+      //   teamFormCache は上流のループ①(REGISTERED_TEAMS=11クラブ)でしか
+      //   埋められない。予測対象をTOP100へ広げた際、それ以外のクラブでは
+      //   subjectForm が undefined のまま `.teamId` を参照して TypeError となり、
+      //   loop の catch に飲まれていた。つまり
+      //   **「TOP100に広げた」はずが、実際には11クラブのままだった**
+      //   (しかも失敗するたびに /fixtures を2回ぶん無駄に消費していた)。
+      //   相手チームと同じ方法で、対象クラブのフォームもその場で計算する。
+      const formOf = async (name, id) => {
+        // 検証での指摘: teamFormCache には「このアプリの英語名」と
+        // 「API-Football側の表記」の2系統が入るため、表示名がたまたま同じで
+        // 中身が別クラブ、という取り違えが起こり得る。IDまで一致した時だけ使う。
+        const hit = teamFormCache.get(name);
+        if (hit && hit.teamId === id) return hit;
+        const data = await callApiFootball("/fixtures", { team: id, last: 10 });
+        const list = (data && data.response) || [];
+        const form = computeFormScore(list, id);
+        const goalRates = computeGoalRateFeatures(list, id);
+        const fatigue = computeFatigueFeature(list, runAt.getTime());
+        const built = { teamId: id, ...form, ...goalRates, ...fatigue, fixtures: list };
+        teamFormCache.set(name, built); // 同じ実行内で同じクラブを二度取りに行かない
+        return built;
+      };
+      const subjectForm = cached || await formOf(team.nameEn, teamId);
+      const opponentForm = await formOf(opponentName, opponentId);
+      if (!subjectForm || !opponentForm) {
+        errors.push(`predict_skipped_no_form:${team.nameEn}`);
+        continue;
       }
-      const homeForm = isHome ? cached || teamFormCache.get(team.nameEn) : opponentForm;
-      const awayForm = isHome ? opponentForm : cached || teamFormCache.get(team.nameEn);
+      const homeForm = isHome ? subjectForm : opponentForm;
+      const awayForm = isHome ? opponentForm : subjectForm;
       // 第6次監査の修正: `|| 0` だと、実際に得失点差が0だった場合と
       // データが取れなかった場合を区別できず、後者を「0」として記録に残していた。
       // 記録には正直にnullを入れる(v1バックテストは typeof === "number" で
@@ -1320,7 +1401,7 @@ async function runDailyLearning(deps) {
       const awayFormScore = (awayForm && Number.isFinite(awayForm.currentFormScore)) ? awayForm.currentFormScore : null;
 
       // ---- Prediction Engine v2: 追加特徴量(怪我人・順位・過去対戦)を取得する ----
-      // このループはOWN_PREDICT_LOG_CAP(既定5)件/回に絞られているため、ここで
+      // このループはOWN_PREDICT_LOG_CAP(既定20)件/回に絞られているため、ここで
       // 追加のAPI呼び出しが発生してもAPI-Footballの利用上限への影響は限定的。
       const homeTeamId = homeForm.teamId;
       const awayTeamId = awayForm.teamId;
@@ -1437,7 +1518,14 @@ async function runDailyLearning(deps) {
             marketEdgePt = Math.round((ourPct - mktPct) * 10) / 10;
           }
         }
-      } catch (e) { /* オッズはベストエフォート(予算切れ・提供なし等) */ }
+      } catch (e) {
+        // 2026年8月・第三者監査の指摘: ここだけ例外を完全に捨てていたため、
+        //   「この試合にオッズが無い」と「APIが失敗している/プランに含まれない」が
+        //   区別できず、ROIの説明が永久に
+        //   「オッズつきで答え合わせできた予測がまだありません」のままになる。
+        //   他のステージと同じく理由を残す(件数は capList で抑制される)。
+        errors.push(`odds_failed:${fixtureId}:${e.code || e.message}`);
+      }
 
       // ---- 精度証明ラウンド①: 「似た試合」の検索(答え合わせ済みの実結果から) ----
       // 特徴量の距離で似た過去試合を探し、予測記録に添える(でっち上げ無しの実測)。
@@ -1494,9 +1582,43 @@ async function runDailyLearning(deps) {
       await upstashCmd(["RPUSH", "learn:ownpred:pending", String(fixtureId)]).catch(() => {});
       await upstashCmd(["INCR", "learn:ownpred:total"]).catch(() => {});
       newPredictionsLogged++;
+      predictionClubsSeen.push(team.nameEn);
+      // 「どのクラブがいつ予測されたか」を残し、TOP100のカバー率を後から実測できるようにする
+      // (説明責任: 「漏れていないか」を推測ではなく数字で答えられるようにするため)
+      await upstashCmd(["HSET", "learn:ownpred:clubcoverage", team.nameEn, dateKey]).catch(() => {});
     } catch (e) {
       errors.push(`predict_failed:${team.nameEn}:${e.message}`);
     }
+  }
+
+  // ---- 予測カバー率の実測(推測ではなく数字で説明できるようにする) ----
+  let predictionCoverage = null;
+  try {
+    const cov = (await upstashCmd(["HGETALL", "learn:ownpred:clubcoverage"]).catch(() => null)) || [];
+    // UpstashのHGETALLは [field, value, field, value, ...] 形式で返る
+    const map = new Map();
+    if (Array.isArray(cov)) {
+      for (let i = 0; i + 1 < cov.length; i += 2) map.set(String(cov[i]), String(cov[i + 1]));
+    } else if (cov && typeof cov === "object") {
+      for (const k of Object.keys(cov)) map.set(k, String(cov[k]));
+    }
+    const top100Covered = CLUB_UNIVERSE.filter((c) => map.has(c.nameEn));
+    const never = CLUB_UNIVERSE.filter((c) => !map.has(c.nameEn)).map((c) => c.nameEn);
+    predictionCoverage = {
+      poolSize: predictionPool.length,
+      scannedToday: predictionPoolScanned,
+      loggedToday: newPredictionsLogged,
+      clubsToday: predictionClubsSeen,
+      stoppedReason: predictionStoppedReason,
+      top100Covered: top100Covered.length,
+      top100Total: CLUB_UNIVERSE.length,
+      top100CoveredPct: CLUB_UNIVERSE.length ? Math.round((top100Covered.length / CLUB_UNIVERSE.length) * 1000) / 10 : null,
+      neverPredictedSample: never.slice(0, 10),
+      neverPredictedCount: never.length,
+      noteJa: `予測の対象は全${predictionPool.length}クラブ(UEFA上位100 + 登録クラブ)。本日は${predictionPoolScanned}クラブを確認し${newPredictionsLogged}件を新規記録。上位100のうち${top100Covered.length}クラブは過去に1回以上予測済み(${never.length}クラブは未実施)。`,
+    };
+  } catch (e) {
+    predictionCoverage = { error: e.message, noteJa: "予測カバー率を取得できませんでした(Upstashの読み出しに失敗)" };
   }
 
   // ---- ③-b UEFA上位100クラブの知識収集(2026年8月・知識拡大フェーズ) ----
@@ -1900,6 +2022,17 @@ async function runDailyLearning(deps) {
     },
     matchesResolvedToday,
     newPredictionsLogged,
+    // 2026年8月・「TOP100の試合が漏れていないか」への回答を、推測ではなく
+    // 実測値で返すための集計(どのクラブが未予測かまで含む)
+    predictionCoverage,
+    // 実行中の重複APIをどれだけ削れたか(実測)。データ量は減らしていない。
+    apiRunMemo: {
+      hits: runMemoHits, misses: runMemoMisses,
+      savedRequests: runMemoHits,
+      noteJa: runMemoHits > 0
+        ? `1回の実行の中で同じ問い合わせが${runMemoHits}回発生したため、実際のAPIリクエストを${runMemoHits}件節約しました(取得したデータの量・鮮度は変わりません)。`
+        : "実行中の重複した問い合わせはありませんでした。",
+    },
     hypothesesConfirmed, hypothesesDiscarded,
     reflectionsSaved, // Layer4: 当たり/外れ問わず保存した振り返りの件数
     failureReasonsToday, // Failure Learning: 今日外れた予測それぞれの理由(配列)
@@ -1929,6 +2062,16 @@ async function runDailyLearning(deps) {
       standingsLeaguesUpdated: universeStats.standingsLeaguesUpdated,
       changesDetected: (universeStats.changesDetected || []).slice(0, 20),
       skipped: universeStats.skipped || [],
+      // ---- 2026年8月・全機能監査で判明した開示漏れ ----
+      //   収集中に発生したエラー(universe_squad_failed など)は
+      //   universeStats.errors に貯まっていたのに、**この報告に含まれておらず**
+      //   利用者にも運用にも一切見えなかった。他のステージと同じく開示する。
+      errors: (universeStats.errors || []).slice(0, 20),
+      errorCount: (universeStats.errors || []).length,
+      // 選手の内訳(自己改善ループの効果測定が名簿同期に埋もれないよう分離した値)
+      playersIndexed: universeStats.playersIndexed ?? null,
+      playersFromSquadSync: universeStats.playersFromSquadSync ?? null,
+      playersFromDetailStats: universeStats.playersFromDetailStats ?? null,
       agendaClubsApplied: universeStats.agendaClubsApplied || [],
       // 本番エラー調査: 名前を照合できず収集できなかったクラブ(正直に開示)
       unresolvedClubs: universeStats.unresolvedClubs || [],
@@ -2115,7 +2258,14 @@ async function runDailyLearning(deps) {
       const xgGapEntry = (diagnosis.dataGaps || []).find((g) => g.key === "xg");
       const metricsNow = {
         xgMissingRatePct: xgGapEntry ? xgGapEntry.missingRatePct : null,
-        playersUpdatedToday: universeStats ? universeStats.playersUpdated : null,
+        // 2026年8月・第三者監査の指摘への対応:
+        //   playersUpdated には「名簿同期(7日輪番で数百人)」が混ざるため、
+        //   playerDetailCap という*詳細成績の上限*の効果を測る指標としては
+        //   その日の輪番の当たり外れに完全に埋もれていた。
+        //   効果測定には詳細成績ぶんの実測値だけを使う。
+        playersUpdatedToday: universeStats
+          ? (Number.isFinite(universeStats.playersFromDetailStats) ? universeStats.playersFromDetailStats : universeStats.playersUpdated)
+          : null,
         budgetUsagePct,
         hit7dPct: diagnosis.hit7dPct,
       };
@@ -2284,5 +2434,5 @@ module.exports = {
   computeFormScore, predictOutcome, backtestAccuracy, outcomeFromScore,
   DEFAULT_WEIGHTS, REGISTERED_TEAMS,
   buildReflectionText, mergeGrowthLogs,
-  MIN_RESOLVED_FOR_RECALIBRATION, OWN_PRED_RECENT_KEEP,
+  MIN_RESOLVED_FOR_RECALIBRATION, OWN_PRED_RECENT_KEEP, OWN_PREDICT_LOG_CAP,
 };

@@ -194,6 +194,48 @@ function clubsForBasicInfo(dateKey) {
   return CLUB_UNIVERSE.filter((c) => (c.rank % 28) === (day % 28));
 }
 
+/**
+ * 「今日どのクラブの“次の試合”に自社予測を立てるか」の順番を返す。
+ *
+ * ---- 2026年8月・「TOP100の試合が漏れていないか」調査で判明した重大な穴 ----
+ * 知識収集(clubsForCoreUpdate)は毎日100クラブを回っているのに、**予測を立てる
+ * 対象だけが REGISTERED_TEAMS(11クラブ)のまま**だった。しかも1回の実行で
+ * 記録する上限があるため、TOP100のうち91クラブは
+ * **構造上、永久に一度も予測されない**状態だった。
+ * (「毎日賢くなる」の学習データがこの11クラブに偏るため、精度の観点でも問題。)
+ *
+ * ここでは TOP100 に「TOP100外だが利用者が明示的に登録したクラブ」
+ * (インテル・マイアミ / アル・ナスルなど)を足した集合を、日付で安定的に
+ * 回転させて返す。乱数は使わないので、同じ日に再実行しても同じ順番になる。
+ *
+ * @param {string} dateKey 例 "2026-08-06"
+ * @param {Array<{nameEn:string,nameJa?:string}>} extraClubs TOP100外の追加クラブ
+ * @param {number} strideSize 1日に処理する件数。**開始位置はこの幅ずつ進める**。
+ *   自分で書いたテストが見つけた欠陥: 開始位置を1クラブずつしか進めないと、
+ *   翌日の対象の大半が前日と同じになり、全クラブが一巡するのに
+ *   (クラブ数)日かかっていた(102日)。幅ぶん進めれば6日で一巡する。
+ */
+function clubsForPrediction(dateKey, extraClubs, strideSize) {
+  const seen = new Set();
+  const pool = [];
+  for (const c of CLUB_UNIVERSE) {
+    const k = normalizeTeamName(c.nameEn);
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    pool.push({ nameEn: c.nameEn, nameJa: c.nameJa, rank: c.rank, inTop100: true });
+  }
+  for (const c of extraClubs || []) {
+    const k = normalizeTeamName(c && c.nameEn);
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    pool.push({ nameEn: c.nameEn, nameJa: c.nameJa || null, rank: null, inTop100: false });
+  }
+  if (!pool.length) return [];
+  const stride = Number.isFinite(strideSize) && strideSize > 0 ? Math.floor(strideSize) : 1;
+  const offset = (((dayNumberOf(dateKey) * stride) % pool.length) + pool.length) % pool.length;
+  return pool.slice(offset).concat(pool.slice(0, offset));
+}
+
 // ---- 2026年8月・本番エラー調査で判明した「クラブ名が照合できない」問題への対処 ----
 // 実際に本番で発生した3件:
 //   ・Bodo/Glimt        … 検索文字列の "/" をAPI-Football側が受け付けずAPI_ERROR
@@ -272,6 +314,7 @@ module.exports = {
   clubsForSquadSync,
   clubsForXgUpdate,
   clubsForBasicInfo,
+  clubsForPrediction,
   findClub,
   dayNumberOf,
   searchVariantsOf, pickBestTeamMatch, normalizeTeamName, sanitizeSearchTerm,

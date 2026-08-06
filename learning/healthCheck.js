@@ -289,6 +289,40 @@ function buildEngineStatuses(ctx) {
       "Renderの環境変数 UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN を設定してください。");
   }
 
+  // ---- 2026年8月・「AI予測の正答率が何日も変わらない」調査を受けて追加 ----
+  //   この監視は自社予測(learn:ownpred)だけを見ており、ホーム画面に大きく出る
+  //   「AI予測の正答率」(API-Football予測 = pred:* 系)は**どこからも監視されて
+  //   いなかった**。そのため答え合わせが止まっていても、誰かが気づいて指摘するまで
+  //   何日でも見過ごされる状態だった。同じ見落としを繰り返さないための項目。
+  const pa = (ctx && ctx.predictionAccuracy) || null;
+  if (!pa || pa.configured === false) {
+    push("predictionAccuracy", "AI予測の正答率(答え合わせが進んでいるか)", "unknown",
+      "正答率の記録を読み出せませんでした。");
+  } else if (!pa.resolved) {
+    push("predictionAccuracy", "AI予測の正答率(答え合わせが進んでいるか)", "unknown",
+      `まだ1件も答え合わせが終わっていません(記録済み${pa.total || 0}件・答え合わせ待ち${pa.pending == null ? "不明" : pa.pending}件)。`);
+  } else {
+    const ageDays = pa.lastResolvedAt
+      ? Math.floor((Date.now() - new Date(pa.lastResolvedAt).getTime()) / 86400000)
+      : null;
+    const pending = Number.isFinite(pa.pending) ? pa.pending : null;
+    // 「答え合わせ待ちが溜まっているのに、何日も1件も確定していない」= 詰まっている
+    const stalled = ageDays !== null && ageDays >= 3 && pending !== null && pending > 0;
+    const queueBig = pending !== null && pending >= 30;
+    if (stalled) {
+      push("predictionAccuracy", "AI予測の正答率(答え合わせが進んでいるか)", "error",
+        `答え合わせ待ちが${pending}件あるのに、最後に確定したのは${ageDays}日前です。正答率が実質的に止まっています。`,
+        "予測の自動収集(predictions-auto-collect)が動いているか、保留リストの先頭に「結果が出ない試合」が溜まっていないかを /api/auto-collect-predictions の pendingLenBefore / evicted で確認してください。");
+    } else if (queueBig) {
+      push("predictionAccuracy", "AI予測の正答率(答え合わせが進んでいるか)", "warn",
+        `答え合わせ待ちが${pending}件たまっています(最後の確定: ${ageDays === null ? "不明" : ageDays + "日前"})。`,
+        "1回あたりの答え合わせ件数を上回るペースで予測が増えていないか確認してください。");
+    } else {
+      push("predictionAccuracy", "AI予測の正答率(答え合わせが進んでいるか)", "ok",
+        `${pa.resolved}件の答え合わせが完了し、的中率${pa.accuracyPct}%として集計されています(答え合わせ待ち${pending === null ? "不明" : pending + "件"}、最後の確定: ${ageDays === null ? "不明" : ageDays + "日前"})。`);
+    }
+  }
+
   // APIキー
   push("apiFootball", "API-Football(実データの取得元)",
     apiKeyConfigured ? "ok" : "error",

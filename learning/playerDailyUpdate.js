@@ -542,9 +542,32 @@ async function collectPlayerKnowledge(deps, runAt, dateKey) {
 
       const statement = formatPlayerStatement(player, fieldStatus);
       if (statement) {
+        // ---- 2026年8月・第三者監査が発見したキー不一致の修正 ----
+        //   ここは `player:<手書きのスラッグ>`(例 player:messi)へ保存していたが、
+        //   読み出す側(server.js の選手プロフィール生成・playerProfileEngine)は
+        //   すべて `player:<API-Footballの数値ID>`(例 player:154)を使っている。
+        //   そのため **毎日集めた選手知識は一度も回答に使われず**、
+        //   「今日の知識件数」を水増しするだけになっていた。
+        //   数値IDが解決できているならそちらを正とし、解決できない日だけ
+        //   従来のスラッグへ退避する(取りこぼしを増やさないため)。
+        // 検証での指摘: 数値IDが解決できなかった日にスラッグへ退避すると、
+        //   そのキーは誰も読まないのに「今日の知識件数」だけが増え、
+        //   まさに直そうとした水増しが残る。
+        //   **読めない場所には保存せず、理由を残して数えない**方針に統一する。
+        // fieldStatus は「項目ごとの取得可否」を持つオブジェクトで、
+        // 別の場所で全キーを走査して f.ok を見る。文字列を混ぜると壊れるので、
+        // ここではローカル変数として持つ。
+        const knowledgeSkippedJa = playerId
+          ? null
+          : "選手IDを解決できなかったため、この選手の知識は保存していません(保存しても回答時に読み出せないため)。";
+        const knowledgeKey = playerId ? `player:${playerId}` : null;
+        if (!knowledgeKey) {
+          unavailableReasonsToday.push({ playerJa: player.nameJa, fieldJa: "知識の保存", permanent: false, reason: knowledgeSkippedJa });
+          continue;
+        }
         playersUpdatedToday++;
         const result = await knowledgeStore.saveKnowledgeItem({
-          teamEn: `player:${player.key}`, teamJa: player.nameJa,
+          teamEn: knowledgeKey, teamJa: player.nameJa,
           category: "playerDaily", type: "fact", statement,
           detail: { fieldStatus, counts },
           computedAt: runAt.toISOString(),

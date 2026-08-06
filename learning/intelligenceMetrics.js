@@ -423,7 +423,8 @@ function buildKnowledgeContributionRanking(input) {
     contributionReasonJa,
     contributionRanking,
     usageRanking: (Array.isArray(topUsedKnowledge) ? topUsedKnowledge : []).map((k, i) => ({
-      rank: i + 1, statement: k.statement, usageCount: k.usageCount, teamJa: k.teamJa || null, category: k.category || null,
+      // 監査の指摘: getTopUsedKnowledge が返すのは `type` で、`category` は存在しない
+      rank: i + 1, statement: k.statement, usageCount: k.usageCount, teamJa: k.teamJa || null, category: k.category || k.type || null,
     })),
     methodologyJa: "【この測定の方法論(でっち上げ防止のための明示)】予測は知識の文章ではなく特徴量(フォーム差・怪我人差など)を消費する設計のため、『この知識1件で精度が+◯%』という因果は現設計では直接測定できません。代わりに(a)特徴量ごとの寄与を毎日ablation(その特徴量を外すと損失がどれだけ悪化するか)で実測し、その特徴量に材料を供給している知識の種類へ対応付けたランキングと、(b)個々の知識が実際に考察の根拠候補として読まれた回数のランキング、の2つの実測を組み合わせて示します。",
   };
@@ -472,8 +473,12 @@ function buildAccuracyDiagnosis(input) {
       }
     }
     // 原因候補3: 学習計画が特定した弱点クラブ
-    if (agenda && Array.isArray(agenda.priorities)) {
-      for (const p of agenda.priorities.slice(0, 3)) {
+    // 2026年8月・第三者監査の指摘: buildLearningAgenda が返すのは `items` であり
+    // `priorities` というフィールドは存在しない。そのためこの分岐は**一度も実行
+    // されず**、「学習計画が特定した弱点」が原因候補に出たことが無かった。
+    const agendaItems = (agenda && (agenda.items || agenda.priorities)) || null;
+    if (Array.isArray(agendaItems)) {
+      for (const p of agendaItems.slice(0, 3)) {
         if (p && p.reasonJa) causes.push({ kind: "weak_area", detailJa: `学習計画が特定した弱点: ${p.reasonJa}` });
       }
     }
@@ -553,8 +558,11 @@ function buildSelfAssessment(input) {
   if (verdict === "NO") {
     const planParts = [];
     for (const a of regressed) planParts.push(`「${a.axisJa}」の悪化(${a.valueJa})の原因を明日の学習で分析する`);
-    if (agenda && Array.isArray(agenda.priorities) && agenda.priorities.length) {
-      planParts.push(`学習計画の優先テーマ(${agenda.priorities.slice(0, 2).map((p) => p.labelJa || p.reasonJa || "").filter(Boolean).join("、")})のデータ収集を強化する`);
+    // 同上(フィールド名の取り違え)。items の要素は targetJa/reasonJa/actionJa を持つ。
+    const planAgendaItems = (agenda && (agenda.items || agenda.priorities)) || null;
+    if (Array.isArray(planAgendaItems) && planAgendaItems.length) {
+      const themes = planAgendaItems.slice(0, 2).map((p) => p.targetJa || p.labelJa || p.reasonJa || "").filter(Boolean).join("、");
+      if (themes) planParts.push(`学習計画の優先テーマ(${themes})のデータ収集を強化する`);
     }
     if (!planParts.length) planParts.push("明日の学習で新しい試合データ・知識の取得を継続し、測定可能な指標を増やす");
     tomorrowPlanJa = planParts.join("。") + "。";

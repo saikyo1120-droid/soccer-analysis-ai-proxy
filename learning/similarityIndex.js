@@ -18,6 +18,14 @@ const SIMILAR_CLUBS_KEY = "kb:similar:clubs";
 
 // 各次元の「1.0の距離」に相当するスケール(実データの typical range に基づく固定値)
 // 成長可視化ラウンド③: 怪我状況(injuryCount)と過密日程(fatigueDiff)も比較次元に追加
+// 2026年8月・第三者監査が発見した単位の取り違えの修正:
+//   homeWinRate は features.js の computeHomeAwaySplit が返す **0〜1の比率**
+//   (例 0.6 = 60%)なのに、目盛りだけ「30ポイント」= 0〜100の百分率のつもりで
+//   置かれていた。そのためこの次元の寄与は最大でも 1/30 = 0.033 しかなく、
+//   実質的に無視されたまま平均の分母だけを増やし、
+//   「比較できる軸が少ないクラブほど似ている」と誤判定させていた。
+//   目盛り(30ポイント差で距離1.0)は名前どおり「百分率」の想定で正しいので、
+//   直すのは**入れる値の単位**の方(下の clubVectorFromDossier で百分率に変換する)。
 const CLUB_SCALES = { position: 10, xgNet: 1.0, homeWinRatePct: 30, injuryCount: 4 };
 const MATCH_FEATURE_SCALES = { formDiff: 40, goalRateDiff: 1.5, standingsDiff: 1.0, xgDiff: 1.2, injuryDiff: 4, fatigueDiff: 3 };
 
@@ -27,7 +35,10 @@ function clubVectorFromDossier(dossier) {
   return {
     position: secs.standings && Number.isFinite(secs.standings.position) ? secs.standings.position : null,
     xgNet: secs.xg && Number.isFinite(secs.xg.xgNet) ? secs.xg.xgNet : null,
-    homeWinRatePct: secs.form && Number.isFinite(secs.form.homeWinRate) ? secs.form.homeWinRate : null,
+    // features.js の computeHomeAwaySplit が返す homeWinRate は **0〜1の比率**
+    // (0.6 = 勝率60%)。フィールド名(…Pct)と目盛り(30)は百分率の想定なので、
+    // ここで百分率へ揃える。揃えないとこの軸の寄与が実質ゼロになる(第三者監査の指摘)。
+    homeWinRatePct: secs.form && Number.isFinite(secs.form.homeWinRate) ? Math.round(secs.form.homeWinRate * 1000) / 10 : null,
     injuryCount: secs.injuries && Number.isFinite(secs.injuries.injuryCount) ? secs.injuries.injuryCount : null,
   };
 }
