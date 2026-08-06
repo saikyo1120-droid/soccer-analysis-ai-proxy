@@ -1348,7 +1348,17 @@ async function handleAccuracyStats() {
     } else if (pendingDetail && pendingDetail.dueForCheck === 0 && pending > 0) {
       stalledReasonJa = "答え合わせ待ちの試合はすべて『まだ終わっていない』状態です。試合が終われば自動的に正答率へ反映されます(異常ではありません)。";
     } else if (pendingDetail && pendingDetail.dueForCheck > 0 && sinceLastRunH !== null && sinceLastRunH < 9) {
-      stalledReasonJa = `終了しているはずの試合が${pendingDetail.dueForCheck}件、答え合わせ待ちのまま残っています。1回の実行で照合できるのは${AUTO_COLLECT_RESOLVE_CAP}件までのため、順次消化されます。`;
+      // 直前の実行で「見たのに1件も解決しなかった」場合は、その理由を状態別に出す
+      const tally = (lastRun && lastRun.statusTally) || null;
+      const sawNothingResolvable = lastRun && lastRun.resolved === 0 && lastRun.evicted === 0
+        && tally && Object.keys(tally).length > 0;
+      if (sawNothingResolvable) {
+        const parts = Object.entries(tally).map(([k, v]) => `${STATUS_LABELS_JA[k] || k} ${v}件`).join(" / ");
+        stalledReasonJa = `直前の自動照合で${parts}を確認しましたが、まだ結果が確定していないため答え合わせできませんでした`
+          + `(日程変更などで「未開始」に戻った試合が含まれます)。これらは列の最後尾へ回すので、次回は別の試合を確認します。`;
+      } else {
+        stalledReasonJa = `終了しているはずの試合が${pendingDetail.dueForCheck}件、答え合わせ待ちのまま残っています。1回の実行で照合できるのは${AUTO_COLLECT_RESOLVE_CAP}件までのため、順次消化されます。`;
+      }
     }
     return {
       status: 200,
@@ -1356,6 +1366,7 @@ async function handleAccuracyStats() {
         configured: true, total, resolved, correct, accuracyPct, since: since || null,
         pending, lastResolvedAt, recent,
         lastAutoCollect: lastRun || null,
+        statusLabelsJa: STATUS_LABELS_JA,
         hoursSinceLastAutoCollect: sinceLastRunH,
         hoursSinceLastResolved: hoursSince(lastResolvedAt),
         pendingDetail,
@@ -1805,6 +1816,14 @@ const FINISHED_STATUSES = new Set(["FT", "AET", "PEN"]);
 // 結果(スコア)が永久に確定しない状態。保留キューに残すと先頭詰まりの原因になる。
 // 延期・中止・放棄・裁定勝ち・不戦勝。dailyJob.js の UNRESOLVABLE_STATUSES と同じ基準。
 const UNRESOLVABLE_STATUSES = new Set(["PST", "CANC", "ABD", "AWD", "WO"]);
+// 画面に「なぜ答え合わせできないのか」を日本語で出すための対応表
+const STATUS_LABELS_JA = {
+  NS: "未開始", TBD: "日時未定", "1H": "前半", HT: "ハーフタイム", "2H": "後半",
+  ET: "延長", BT: "延長前の休憩", P: "PK戦", SUSP: "一時中断", INT: "中断",
+  LIVE: "進行中", FT: "終了", AET: "延長終了", PEN: "PK戦終了",
+  PST: "延期", CANC: "中止", ABD: "放棄", AWD: "裁定勝ち", WO: "不戦勝",
+  unknown: "状態不明",
+};
 // 2026年8月・優先順位④: 試合中(ライブ)のステータス一覧。フロントエンド
 // (index.html)のFIXTURE_LIVE_STATUSESと意味を揃えてある。
 const LIVE_STATUSES = new Set(["1H", "HT", "2H", "ET", "BT", "P", "SUSP", "INT", "LIVE"]);
@@ -2025,6 +2044,9 @@ async function handleFixtureAnalysis(query) {
 const AUTO_COLLECT_LOG_CAP = 3; // 1回の実行で新規に記録する試合数の上限
 const AUTO_COLLECT_RESOLVE_CAP = 8; // 1回の実行で解決を試みる保留中予測の上限
 const AUTO_COLLECT_RESOLVE_MIN_AGE_MS = 2 * 60 * 60 * 1000; // キックオフから2時間経っていない試合は「まだ終わっていない可能性が高い」としてスキップ
+// 記録上のキックオフからこれだけ経っても結果が確定しない試合は諦める
+// (延期の繰り返し・データ提供元での取り消しなど。列に永久に居座らせない)
+const PENDING_MAX_AGE_MS = Number(process.env.PENDING_MAX_AGE_MS) || 14 * 24 * 60 * 60 * 1000;
 
 async function handleAutoCollectPredictions(opts) {
   if (!UPSTASH_ENABLED) {
@@ -2037,6 +2059,8 @@ async function handleAutoCollectPredictions(opts) {
   let skippedNoData = 0;
   let pendingLenBefore = null;
   let pendingLenAfter = null;
+  let rotated = 0;
+  const statusTally = {};   // どの状態の試合が何件あったか(なぜ解決しないのかの証拠)
   const notes = [];
   const startedAt = new Date().toISOString();
 
@@ -2118,10 +2142,44 @@ async function handleAutoCollectPredictions(opts) {
           notes.push(`pending evicted (fixture ${idStr} ${statusShort})`);
           continue;
         }
+        statusTally[statusShort || "unknown"] = (statusTally[statusShort || "unknown"] || 0) + 1;
         if (FINISHED_STATUSES.has(statusShort) && entry.goals) {
           const r = await resolvePrediction(idStr, entry.goals.home, entry.goals.away);
           if (r) resolved++;
+          continue;
         }
+        // ---- 2026年8月7日・本番の実測で発見した2度目の「先頭詰まり」の修正 ----
+        //   実測: 照合8件を試して resolved 0 / evicted 0、エラー注記も0。
+        //   つまり8件すべてが「終了(FT/AET/PEN)でもなく、結果が出ない
+        //   状態(PST/CANC/ABD/AWD/WO)でもない」= まだ終わっていない試合だった。
+        //   一番古い記録のキックオフは28時間前。試合が再設定(日程変更)されると
+        //   API側の状態は NS に戻るため、記録上のキックオフはとうに過ぎているのに
+        //   永久に「終わっていない」ままになる。
+        //   そういう試合が列の先頭に8件たまると、**毎回その8件だけを見て終わり**、
+        //   後ろに並ぶ試合は二度と検証されない(=正答率が凍る)。
+        //   以前に修正した「解決済み・記録なし・中止」の詰まりとは別の経路だった。
+        //
+        //   ①日程が変更されていれば、記録のキックオフを更新する
+        //   ②列の最後尾へ回す(次回は別の試合を見る)
+        //   ③記録上のキックオフから14日経っても解決しなければ諦める
+        const apiDate = entry.fixture.date ? Date.parse(entry.fixture.date) : NaN;
+        const recordedKick = record.kickoff ? Date.parse(record.kickoff) : NaN;
+        if (Number.isFinite(apiDate) && Number.isFinite(recordedKick) && apiDate > recordedKick + 60 * 1000) {
+          record.kickoff = entry.fixture.date;   // 日程変更を反映(次回は「まだ先」として扱われる)
+          await upstashSetJSON(`pred:${idStr}`, record).catch(() => {});
+          notes.push(`fixture ${idStr} rescheduled to ${entry.fixture.date} (${statusShort})`);
+        }
+        const ageMs = Number.isFinite(recordedKick) ? Date.now() - recordedKick : 0;
+        if (ageMs > PENDING_MAX_AGE_MS) {
+          await upstashCmd(["LREM", "pred:pending", "0", String(idStr)]).catch(() => {});
+          evicted++;
+          notes.push(`pending evicted (fixture ${idStr} still ${statusShort} after ${Math.round(ageMs / 86400000)} days)`);
+          continue;
+        }
+        // 最後尾へ回して、次回は列の別の試合を見られるようにする
+        await upstashCmd(["LREM", "pred:pending", "0", String(idStr)]).catch(() => {});
+        await upstashCmd(["RPUSH", "pred:pending", String(idStr)]).catch(() => {});
+        rotated++;
       } catch (e) {
         notes.push(`resolve check failed for fixture ${idStr}: ${e.message}`);
       }
@@ -2200,7 +2258,10 @@ async function handleAutoCollectPredictions(opts) {
   const runRecord = {
     at: new Date().toISOString(), startedAt,
     trigger: opts && opts.trigger ? opts.trigger : "request",
-    ok: !hadFatalError, logged, resolved, evicted, skippedNoData,
+    ok: !hadFatalError, logged, resolved, evicted, skippedNoData, rotated,
+    // どの状態の試合を何件見たか。これが無かったせいで
+    //「8件見て0件解決」の理由を突き止めるのに丸1往復かかった。
+    statusTally,
     pendingLenBefore, pendingLenAfter,
     notes: notes.slice(0, 20),
   };
@@ -2213,7 +2274,7 @@ async function handleAutoCollectPredictions(opts) {
       ok: !hadFatalError, upstashConfigured: true, logged, resolved,
       // 2026年8月の調査で追加した可観測性。「正答率が動かない」ときに
       // 保留キューが詰まっているのかどうかを、外から数字で確認できるようにする。
-      evicted, skippedNoData, pendingLenBefore, pendingLenAfter,
+      evicted, skippedNoData, rotated, statusTally, pendingLenBefore, pendingLenAfter,
       ranAt: runRecord.at,
       notes,
     },
