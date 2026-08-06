@@ -4750,6 +4750,11 @@ const server = http.createServer(async (req, res) => {
           date: g.date || todayKey,
           // 学習が実際に予測を変えた記録(実測)
           weightsImpact,
+          // 2026年8月・本番確認で判明: 予測カバー率と無駄削減の実測を
+          //   日次学習では保存していたのに、このレポートに載せていなかったため
+          //   「TOP100に漏れがないか」を利用者が数字で確認できなかった。
+          predictionCoverage: g.predictionCoverage || null,
+          apiRunMemo: g.apiRunMemo || null,
           isToday: g.date === todayKey,
           noteJa: g.date
             ? (g.date === todayKey ? "本日の学習実行の実測値です。" : `最新の学習記録は${g.date}のものです(本日分はまだ実行されていません)。`)
