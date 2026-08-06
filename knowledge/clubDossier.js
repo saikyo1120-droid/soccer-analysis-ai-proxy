@@ -213,8 +213,22 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
     if (!upstashEnabled || !player || !player.id) return { saved: false };
     const key = `kb:player:${player.id}`;
     const existing = await upstashGetJSON(key).catch(() => null);
+    // ---- 2026年8月の検証で判明した既存の欠陥 ----
+    // ここは常に「渡された内容でキーごと上書き」していた。名簿同期のように
+    // 基本情報だけを渡す呼び出しが、前日に取得した成績・国籍・身長を
+    // **まるごと消していた**。渡されなかった項目は前回の実測を残す。
+    const merged = { ...(existing || {}) };
+    for (const [k, v] of Object.entries(player || {})) {
+      if (v !== null && v !== undefined && v !== "") merged[k] = v;
+    }
+    if (existing && existing.stats && player && player.stats) {
+      merged.stats = { ...existing.stats };
+      for (const [k, v] of Object.entries(player.stats)) {
+        if (v !== null && v !== undefined) merged.stats[k] = v;
+      }
+    }
     const record = {
-      ...player,
+      ...merged,
       unavailableJa: {
         marketValue: UNAVAILABLE_FIELDS_JA.marketValue,
         contractUntil: UNAVAILABLE_FIELDS_JA.contractUntil,
