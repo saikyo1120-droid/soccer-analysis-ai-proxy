@@ -4755,6 +4755,10 @@ const server = http.createServer(async (req, res) => {
           //   「TOP100に漏れがないか」を利用者が数字で確認できなかった。
           predictionCoverage: g.predictionCoverage || null,
           apiRunMemo: g.apiRunMemo || null,
+          // 2026年8月・共同開発者レビュー対応:
+          //   過去試合による旧モデル vs 新モデルの多指標比較と、採用/不採用の理由。
+          //   「精度が上がったこと」を数字で示すための中核。
+          modelTuning: g.modelTuning || null,
           isToday: g.date === todayKey,
           noteJa: g.date
             ? (g.date === todayKey ? "本日の学習実行の実測値です。" : `最新の学習記録は${g.date}のものです(本日分はまだ実行されていません)。`)
