@@ -266,6 +266,10 @@ function mergeGrowthLogs(previous, current) {
     const seen = new Set((a || []).map((f) => f && f.statement));
     return [...(a || []), ...(b || []).filter((f) => !(f && seen.has(f.statement)))];
   };
+  // 2026年8月・アップロード後の実機確認で判明: 同じ日に2回実行されると
+  //   (日次学習は4:17と、取りこぼし用の8:43の2本立て)この合算処理が
+  //   明示した項目しか引き継がないため、**新しく足した項目が消えていた**。
+  //   予測カバー率と、無駄削減の実測値を引き継ぐ。
   const mergedFacts = dedupeByStatement(previous.facts, current.facts);
   const mergedOtherFacts = dedupeByStatement(previous.otherFactsToday, current.otherFactsToday);
   const mergedLeagueFacts = dedupeByStatement(previous.leagueFactsToday, current.leagueFactsToday);
@@ -290,6 +294,22 @@ function mergeGrowthLogs(previous, current) {
     ranAt: current.ranAt,
     firstRanAt: previous.firstRanAt || previous.ranAt,
     runsToday: (previous.runsToday || 1) + 1,
+    // 2026年8月・本番確認で気づいた取りこぼし: ...current の展開だけだと、
+    //   2回目の実行でこれらが取れなかった日に前回の値まで消える。
+    //   また実行中の重複削減の実測は「置き換え」ではなく「合算」が正しい。
+    predictionCoverage: current.predictionCoverage || previous.predictionCoverage || null,
+    apiRunMemo: (() => {
+      const a = previous.apiRunMemo, b = current.apiRunMemo;
+      if (!a) return b || null;
+      if (!b) return a;
+      const hits = (a.hits || 0) + (b.hits || 0);
+      return {
+        hits, misses: (a.misses || 0) + (b.misses || 0), savedRequests: hits,
+        noteJa: hits > 0
+          ? `本日の実行で同じ問い合わせが${hits}回発生したため、APIリクエストを${hits}件節約しました(取得データの量・鮮度は変わりません)。`
+          : "重複した問い合わせはありませんでした。",
+      };
+    })(),
     facts: mergedFacts,
     factsAddedToday: mergedFacts.length,
     otherFactsToday: mergedOtherFacts,
