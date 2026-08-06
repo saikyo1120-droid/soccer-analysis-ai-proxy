@@ -6350,6 +6350,25 @@ function renderDiscussReplyHtml(resp) {
     }</ul>${kg.truncated ? `<p class="value-note">※ 関連が多いため一部のみ表示しています。</p>` : ""}</details>`
     : "";
 
+  // ---- 2026年8月・全機能監査で判明した「実装済みなのに画面に出ていない」もの ----
+  //   ① 6段階の熟考(deliberation)は毎回の質問で実際に走っていたのに、
+  //      画面が一切読んでおらず、確信度の星を1つ抑えるためだけに使われていた。
+  //   ② RAGがその回答で実際にどれだけ根拠を使ったか(ragUtilization)も
+  //      サーバーは毎回返していたが、画面に出ていなかった。
+  //   どちらも「なぜそう答えたのか」を利用者が確かめるための情報なので出す。
+  const del = resp.meta && resp.meta.deliberation;
+  const deliberationHtml = (del && Array.isArray(del.stages) && del.stages.length)
+    ? `<details class="discuss-facts"><summary>🧭 この結論に至るまでの検討(${del.stages.length}段階)</summary><ol style="margin:4px 0 0 1.2em; padding:0;">${
+        del.stages.map((st) => `<li class="value-note"><strong>${escapeHtml(st.labelJa || st.name || "")}</strong>${st.summaryJa ? `: ${escapeHtml(st.summaryJa)}` : ""}</li>`).join("")
+      }</ol>${del.counterArgumentJa ? `<p class="value-note" style="margin-top:4px;">🔄 反論の検討: ${escapeHtml(del.counterArgumentJa)}</p>` : ""}${
+        del.changedFromPrevious ? `<p class="value-note">※ 前回の結論から変更しています。</p>` : ""}</details>`
+    : "";
+  const ragU = resp.meta && resp.meta.intelligence && resp.meta.intelligence.ragUtilization;
+  const ragNum = (v) => (Number.isFinite(Number(v)) ? Number(v) : "—");
+  const ragHtml = ragU
+    ? `<div class="value-note" style="margin-top:4px;">🔍 根拠の利用: 候補${ragNum(ragU.candidates ?? ragU.retrieved)}件のうち <strong>${ragNum(ragU.used ?? ragU.usedCount)}件</strong>を回答に使いました${Number.isFinite(ragU.utilizationPct) ? `(${ragU.utilizationPct}%)` : ""}${ragU.noteJa ? ` — ${escapeHtml(ragU.noteJa)}` : ""}</div>`
+    : "";
+
   // 監査(全ボタン走査)で実際に再現したクラッシュの修正:
   // confidence を持たない応答で TypeError となり、回答が一切表示されず
   // 吹き出しが「🧠 AIが考えています…」のまま固まっていた。
@@ -6358,7 +6377,7 @@ function renderDiscussReplyHtml(resp) {
   const followupsHtml = resp.followUpQuestions && resp.followUpQuestions.length
     ? `<div class="followup-chip-row">${resp.followUpQuestions.map(q => `<button class="chat-followup-btn" data-q="${escapeHtml(q)}">・${escapeHtml(q)}</button>`).join("")}</div>`
     : "";
-  return { text: body + thoughtChangeHtml, extras: `${confidenceHtml}${graphHtml}${timelineHtml}${factsHtml}${followupsHtml}` };
+  return { text: body + thoughtChangeHtml, extras: `${confidenceHtml}${ragHtml}${deliberationHtml}${graphHtml}${timelineHtml}${factsHtml}${followupsHtml}` };
 }
 
 // hero chat・選手個別チャット共通の議論モードフロー。
@@ -6904,11 +6923,28 @@ async function renderAiAccuracyWidget() {
 
   const lowSample = stats.resolved < MIN_SAMPLE_FOR_CONFIDENT_STAT;
   const sinceText = stats.since ? `記録開始: ${formatDateJa(stats.since)}` : "";
+  // ---- 2026年8月・「正答率が何日も変わらない」への回答責任 ----
+  //   これまで画面には的中率しか出ておらず、数字が動かないときに
+  //   「正常なのか壊れているのか」を利用者が判断する材料が一切なかった。
+  //   サーバーが実測から判定した理由と、答え合わせ待ちの内訳を必ず出す。
+  const stalled = stats.stalledReasonJa
+    ? `<div class="value-note" style="margin-top:4px;">🔎 ${escapeHtml(stats.stalledReasonJa)}</div>` : "";
+  const pd = stats.pendingDetail;
+  const pendingLine = (Number.isFinite(stats.pending) && stats.pending > 0)
+    ? `<div class="value-note" style="margin-top:4px;">答え合わせ待ち <strong>${stats.pending}件</strong>`
+      + (pd && Number.isFinite(pd.awaitingKickoff) ? `(まだ終わっていない ${pd.awaitingKickoff}件 / 終了済みで照合待ち ${pd.dueForCheck}件)` : "")
+      + (Number.isFinite(stats.hoursSinceLastResolved) ? ` ・ 最後の答え合わせ ${stats.hoursSinceLastResolved}時間前` : "")
+      + (Number.isFinite(stats.hoursSinceLastAutoCollect) ? ` ・ 自動照合の最終実行 ${stats.hoursSinceLastAutoCollect}時間前` : (stats.lastAutoCollect === null ? " ・ 自動照合の実行記録なし" : ""))
+      + `</div>`
+    : "";
   summaryEl.innerHTML = `
     🤖 <strong>AI予測の正答率: ${stats.accuracyPct}%</strong>
     <span class="value-note">(${stats.correct}/${stats.resolved}件的中${lowSample ? "・サンプル数が少ないため参考値です" : ""})</span>
     <button class="more-details-btn" id="aiAccuracyToggleBtn" type="button" style="margin-left:8px; display:inline-block; width:auto; padding:4px 10px;">詳しく見る ▼</button>
     <div class="value-note" style="margin-top:4px;">${sinceText}</div>
+    ${pendingLine}
+    ${stalled}
+    ${stats.noteJa ? `<div class="value-note" style="margin-top:4px; opacity:.85;">${escapeHtml(stats.noteJa)}</div>` : ""}
   `;
 
   const toggleBtn = document.getElementById("aiAccuracyToggleBtn");
@@ -7737,8 +7773,90 @@ async function renderDailyReportWidget() {
     intelDetailsHtml = `<div class="value-note" style="margin-top:8px; opacity:.85;">🧠 AI知能レポート(自己評価・エンジン別成長率・知識の寄与ランキング)は、次回の日次学習から保存されます。</div>`;
   }
 
+  // =====================================================================
+  // 2026年8月・全機能監査で判明した「計算しているのに画面に出ていない」項目
+  // ---------------------------------------------------------------------
+  //   サーバーは毎日これらを計算して保存し、APIでも返していたのに、
+  //   画面がどれ一つ読んでいなかった(=作った意味が無い状態だった)。
+  //   ・weightsImpact      重みの変更が予測をどう変えたか
+  //   ・modelTuning        過去試合バックテストと採用可否
+  //   ・predictionCoverage TOP100のうち何クラブを予測できているか
+  //   ・universe           TOP100収集の実績・エラー・照合できないクラブ
+  //   ・roi / calibration  賭け収支と自信の較正
+  // =====================================================================
+  const wi = data.weightsImpact;
+  const weightsImpactHtml = wi
+    ? `<div style="margin-top:8px;"><strong>⚖️ 重みの変更が予測に与えた影響</strong>
+        <div class="value-note">${escapeHtml(wi.noteJa || wi.reasonJa || "")}</div>
+        ${Array.isArray(wi.changes) && wi.changes.length
+          ? `<ul style="margin:4px 0 0 1em; padding:0;">${wi.changes.slice(0, 6).map((c) => `<li class="value-note">${escapeHtml(c.labelJa || c.key || "")}: ${escapeHtml(String(c.before))} → <strong>${escapeHtml(String(c.after))}</strong></li>`).join("")}</ul>`
+          : ""}
+      </div>`
+    : "";
+
+  const mt = data.modelTuning;
+  const modelTuningHtml = mt
+    ? `<div style="margin-top:8px;"><strong>🧬 過去試合によるモデル調整(バックテスト)</strong>
+        <div class="value-note">${escapeHtml(mt.reasonJa || "")}</div>
+        ${mt.datasetSize ? `<div class="value-note">学習に使った過去試合: <strong>${num(mt.datasetSize)}件</strong>${mt.datasetNoteJa ? `(${escapeHtml(mt.datasetNoteJa)})` : ""}</div>` : ""}
+        ${mt.adopted === true ? `<div class="value-note" style="color:var(--good);">✅ 新しいパラメータを採用しました。</div>`
+          : mt.adopted === false ? `<div class="value-note">⏸️ 今回は採用を見送りました(現状のモデルを維持)。</div>` : ""}
+        ${mt.secondaryGains && mt.secondaryGains.length ? `<div class="value-note">副次的な改善: ${mt.secondaryGains.map((g) => escapeHtml(g)).join("、")}</div>` : ""}
+        ${mt.leagueTableJa ? `<pre class="value-note" style="white-space:pre-wrap; overflow-x:auto; margin:4px 0 0;">${escapeHtml(mt.leagueTableJa)}</pre>` : ""}
+      </div>`
+    : "";
+
+  const pc = data.predictionCoverage;
+  const coverageHtml = pc
+    ? `<div style="margin-top:8px;"><strong>🎯 予測できているクラブの範囲</strong>
+        <div class="value-note">上位100クラブのうち <strong>${num(pc.top100Covered)}クラブ</strong>${Number.isFinite(pc.top100CoveredPct) ? `(${pc.top100CoveredPct}%)` : ""} を予測済み${Number.isFinite(pc.neverPredictedCount) ? ` / 未予測 ${pc.neverPredictedCount}クラブ` : ""}</div>
+        ${Array.isArray(pc.neverPredictedSample) && pc.neverPredictedSample.length
+          ? `<div class="value-note" style="opacity:.85;">まだ予測していないクラブの例: ${pc.neverPredictedSample.slice(0, 8).map((n) => escapeHtml(n)).join("、")}</div>` : ""}
+        ${pc.stoppedReason ? `<div class="value-note">打ち切りの理由: ${escapeHtml(pc.stoppedReason)}</div>` : ""}
+        ${pc.noteJa ? `<div class="value-note" style="opacity:.85;">${escapeHtml(pc.noteJa)}</div>` : ""}
+      </div>`
+    : "";
+
+  // TOP100収集の実績・エラー・照合できないクラブ(⑥⑦の可視化)
+  //   日次レポートAPIは universe を updates.* に平らにして返すため、
+  //   両方の形に対応する(成長ログAPIをそのまま渡された場合も動く)。
+  const uni = data.universe || null;
+  const upd = data.updates || {};
+  const uRan = uni ? true : (upd.universeRan === true);
+  const uGet = (flatKey, nestedKey) => {
+    if (uni && uni[nestedKey] !== undefined && uni[nestedKey] !== null) return uni[nestedKey];
+    return upd[flatKey];
+  };
+  const uErrors = (uni && uni.errors) || upd.universeErrors || [];
+  const uErrorCount = (uni && uni.errorCount) ?? upd.universeErrorCount ?? uErrors.length;
+  const uUnresolved = (uni && uni.unresolvedClubs) || upd.unresolvedClubs || [];
+  const universeHtml = uRan
+    ? `<div style="margin-top:8px;"><strong>🌍 上位100クラブの収集(本日)</strong>
+        <div class="value-note">
+          コア更新 <strong>${num(uGet("universeClubsUpdated", "coreClubsUpdated"))}</strong>/${num(uGet("universeClubsPlanned", "coreClubsPlanned"))}クラブ ・
+          名簿 ${num(uGet("universeSquadsUpdated", "squadsUpdated"))} ・ 順位表 ${num(uGet("universeStandingsLeagues", "standingsLeaguesUpdated"))}リーグ ・ xG ${num(uGet("universeXgClubsUpdated", "xgClubsUpdated"))}
+        </div>
+        <div class="value-note">
+          選手 更新 <strong>${num(uGet("universePlayersUpdated", "playersUpdated"))}</strong>人
+          (名簿から ${num(uGet("universePlayersFromSquadSync", "playersFromSquadSync"))} / 詳細成績から ${num(uGet("universePlayersFromDetailStats", "playersFromDetailStats"))})
+          ・ 検索できる状態 <strong>${num(uGet("universePlayersIndexed", "playersIndexed"))}</strong>人
+        </div>
+        ${uErrorCount ? `<div class="value-note" style="color:var(--critical);">⚠️ 収集エラー ${uErrorCount}件: ${uErrors.slice(0, 3).map((e) => escapeHtml(String(e))).join(" / ")}</div>` : `<div class="value-note" style="opacity:.8;">収集エラーはありませんでした。</div>`}
+        ${uUnresolved.length ? `<div class="value-note">🔎 名前を照合できなかったクラブ ${uUnresolved.length}件: ${uUnresolved.slice(0, 4).map((c) => escapeHtml(c.nameJa || c.nameEn || String(c))).join("、")}</div>` : ""}
+      </div>`
+    : `<div class="value-note" style="margin-top:8px;">🌍 上位100クラブの収集: この日の記録がありません(日次学習が走ると表示されます)。</div>`;
+
+  const roi = data.intelligence && data.intelligence.roi;
+  const cal = data.intelligence && data.intelligence.calibration;
+  const roiCalHtml = (roi || cal)
+    ? `<div style="margin-top:8px;"><strong>📐 自信の較正と収支</strong>
+        ${cal ? `<div class="value-note">${escapeHtml(cal.noteJa || cal.reasonJa || "較正の状況を計算できませんでした。")}</div>` : ""}
+        ${roi ? `<div class="value-note">${escapeHtml(roi.noteJa || roi.reasonJa || "")}</div>` : ""}
+      </div>`
+    : "";
+
   if (detailsEl) {
-    detailsEl.innerHTML = `${selfImproveHtml}${categoriesHtml}${qualityHtml}${answerabilityHtml}${feHtml}${agendaHtml}${appliedHtml}${intelDetailsHtml}${legendHtml}${skippedHtml}
+    detailsEl.innerHTML = `${selfImproveHtml}${categoriesHtml}${qualityHtml}${answerabilityHtml}${feHtml}${weightsImpactHtml}${modelTuningHtml}${coverageHtml}${universeHtml}${roiCalHtml}${agendaHtml}${appliedHtml}${intelDetailsHtml}${legendHtml}${skippedHtml}
       <p class="value-note" style="margin-top:8px; opacity:.8;">※ このダッシュボードの数字はすべてサーバーが毎日の学習で実際に記録した実測値です。測定できない項目は理由つきで「測定できない」と表示します(推測で埋めることはありません)。</p>`;
   }
   const toggleBtn = document.getElementById("dailyReportToggleBtn");

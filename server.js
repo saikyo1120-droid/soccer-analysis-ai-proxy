@@ -1292,6 +1292,35 @@ async function handleAccuracyStats() {
       // 答え合わせ待ちの行列が伸び続けているのかどうかを外から確認できるようにする。
       upstashCmd(["LLEN", "pred:pending"]).catch(() => null),
     ]);
+    // ---- 2026年8月・「正答率が何日も動かない」への回答責任 ----
+    //   これまで、外から見て分かるのは「保留15件」だけだった。
+    //   ・自動照合(6時間ごとのcron)がそもそも走っているのか
+    //   ・保留の試合はまだ終わっていないのか、終わったのに照合できないのか
+    //   が誰にも分からず、「正常です」としか答えられない状態だった。
+    //   実行の記録と、保留リストの中身の内訳を返す。
+    const lastRun = await upstashGetJSON("pred:autocollect:lastrun").catch(() => null);
+    let pendingDetail = null;
+    try {
+      const ids = (await upstashCmd(["LRANGE", "pred:pending", "0", "40"])) || [];
+      const now = Date.now();
+      let awaitingKickoff = 0, dueForCheck = 0, unreadable = 0, oldestKickoff = null;
+      for (const idStr of ids) {
+        const rec = await upstashGetJSON(`pred:${idStr}`).catch(() => null);
+        if (!rec) { unreadable++; continue; }
+        const ko = rec.kickoff ? new Date(rec.kickoff).getTime() : null;
+        if (ko && (!oldestKickoff || ko < oldestKickoff)) oldestKickoff = ko;
+        if (ko && (now - ko) < AUTO_COLLECT_RESOLVE_MIN_AGE_MS) awaitingKickoff++;
+        else dueForCheck++;
+      }
+      pendingDetail = {
+        sampled: ids.length,
+        awaitingKickoff,     // まだ試合中・未開催(照合できなくて当然)
+        dueForCheck,         // 試合は終わっているはずなのに照合されていない
+        unreadable,          // 記録本体が読めない(3回で自動的に外れる)
+        oldestKickoff: oldestKickoff ? new Date(oldestKickoff).toISOString() : null,
+        resolveCapPerRun: AUTO_COLLECT_RESOLVE_CAP,
+      };
+    } catch (e) { pendingDetail = { error: e.message }; }
     const total = parseInt(totalRaw, 10) || 0;
     const resolved = parseInt(resolvedRaw, 10) || 0;
     const correct = parseInt(correctRaw, 10) || 0;
@@ -1302,7 +1331,38 @@ async function handleAccuracyStats() {
       .filter(Boolean)
       .reverse();
     const lastResolvedAt = recent.length ? (recent[0].resolvedAt || null) : null;
-    return { status: 200, body: { configured: true, total, resolved, correct, accuracyPct, since: since || null, pending, lastResolvedAt, recent } };
+    // 「なぜ数字が動かないのか」を、推測ではなく実測から言い切る
+    // 時計のずれや未来日時で「-2時間前」のような表示にならないよう0で止める
+    const hoursSince = (iso) => {
+      if (!iso) return null;
+      const t = new Date(iso).getTime();
+      if (!Number.isFinite(t)) return null;
+      return Math.max(0, Math.round((Date.now() - t) / 3600000));
+    };
+    const sinceLastRunH = lastRun ? hoursSince(lastRun.at) : null;
+    let stalledReasonJa = null;
+    if (!lastRun) {
+      stalledReasonJa = "自動照合(6時間ごと)が一度も実行を記録していません。GitHub Actions の predictions-auto-collect ワークフローが動いているかご確認ください。";
+    } else if (sinceLastRunH !== null && sinceLastRunH >= 9) {
+      stalledReasonJa = `自動照合の最後の実行が${sinceLastRunH}時間前です(本来は6時間ごと)。定期実行が止まっている可能性があります。`;
+    } else if (pendingDetail && pendingDetail.dueForCheck === 0 && pending > 0) {
+      stalledReasonJa = "答え合わせ待ちの試合はすべて『まだ終わっていない』状態です。試合が終われば自動的に正答率へ反映されます(異常ではありません)。";
+    } else if (pendingDetail && pendingDetail.dueForCheck > 0 && sinceLastRunH !== null && sinceLastRunH < 9) {
+      stalledReasonJa = `終了しているはずの試合が${pendingDetail.dueForCheck}件、答え合わせ待ちのまま残っています。1回の実行で照合できるのは${AUTO_COLLECT_RESOLVE_CAP}件までのため、順次消化されます。`;
+    }
+    return {
+      status: 200,
+      body: {
+        configured: true, total, resolved, correct, accuracyPct, since: since || null,
+        pending, lastResolvedAt, recent,
+        lastAutoCollect: lastRun || null,
+        hoursSinceLastAutoCollect: sinceLastRunH,
+        hoursSinceLastResolved: hoursSince(lastResolvedAt),
+        pendingDetail,
+        stalledReasonJa,
+        noteJa: "この正答率は API-Football が提供する予測の的中率です(自社モデルの実力ではありません)。自社モデルの検証結果は学習ダッシュボードをご覧ください。",
+      },
+    };
   } catch (e) {
     return { status: 200, body: { configured: true, error: e.message, reasonJa: `予測実績の読み出しに失敗しました(${e.message})。0件という意味ではなく、集計できなかったという意味です。`, total: 0, resolved: 0, correct: 0, accuracyPct: null, since: null, pending: null, lastResolvedAt: null, recent: [] } };
   }
@@ -1978,6 +2038,7 @@ async function handleAutoCollectPredictions() {
   let pendingLenBefore = null;
   let pendingLenAfter = null;
   const notes = [];
+  const startedAt = new Date().toISOString();
 
   // フェーズ1: 保留中(まだ結果が確定していない)の予測を、実際の試合結果と突き合わせる。
   // 「今日の試合」一覧のスイープでは対応できない“前日以前にキックオフした試合”もここで拾える。
@@ -2130,6 +2191,21 @@ async function handleAutoCollectPredictions() {
   //   ここで報告すべきは「処理そのものが立ち上がらなかった」ことだけにする。
   //   個々の試合の失敗は notes に残るので、情報が消えるわけではない。
   const hadFatalError = notes.some((n) => /^(resolve|log) phase error:/.test(n));
+  // ---- 2026年8月・「正答率が何日も動かない」への回答責任 ----
+  //   これまで、この処理が実際に走ったかどうかを外から確かめる方法が
+  //   まったく無かった(GitHub Actionsのログを見るしかない)。
+  //   実行のたびに記録を残し、/api/accuracy-stats から見えるようにする。
+  //   これで「cronが止まっている」のか「試合がまだ終わっていない」のかを
+  //   推測ではなく実測で区別できる。
+  const runRecord = {
+    at: new Date().toISOString(), startedAt,
+    ok: !hadFatalError, logged, resolved, evicted, skippedNoData,
+    pendingLenBefore, pendingLenAfter,
+    notes: notes.slice(0, 20),
+  };
+  await upstashSetJSON("pred:autocollect:lastrun", runRecord).catch(() => {});
+  await upstashCmd(["LPUSH", "pred:autocollect:log", JSON.stringify(runRecord)]).catch(() => {});
+  await upstashCmd(["LTRIM", "pred:autocollect:log", "0", "29"]).catch(() => {});
   return {
     status: 200,
     body: {
@@ -2137,6 +2213,7 @@ async function handleAutoCollectPredictions() {
       // 2026年8月の調査で追加した可観測性。「正答率が動かない」ときに
       // 保留キューが詰まっているのかどうかを、外から数字で確認できるようにする。
       evicted, skippedNoData, pendingLenBefore, pendingLenAfter,
+      ranAt: runRecord.at,
       notes,
     },
   };
@@ -5142,6 +5219,18 @@ const server = http.createServer(async (req, res) => {
             universeSkipped: (g.universe && g.universe.skipped) || [],
             // 本番エラー調査: データ提供元の表記差で照合できなかったクラブ
             unresolvedClubs: (g.universe && g.universe.unresolvedClubs) || [],
+            // ---- 2026年8月・全機能監査で判明した開示漏れ ----
+            //   収集エラーは件数(failures)だけが出ていて中身が出ていなかったため、
+            //   「何が失敗したのか」を画面から一切追えなかった。
+            universeErrors: (g.universe && g.universe.errors) || [],
+            universeErrorCount: (g.universe && g.universe.errorCount) ?? ((g.universe && g.universe.errors) || []).length,
+            universeSquadsUpdated: (g.universe && g.universe.squadsUpdated) ?? null,
+            universeXgClubsUpdated: (g.universe && g.universe.xgClubsUpdated) ?? null,
+            universeStandingsLeagues: (g.universe && g.universe.standingsLeaguesUpdated) ?? null,
+            universePlayersIndexed: (g.universe && g.universe.playersIndexed) ?? null,
+            universePlayersFromSquadSync: (g.universe && g.universe.playersFromSquadSync) ?? null,
+            universePlayersFromDetailStats: (g.universe && g.universe.playersFromDetailStats) ?? null,
+            universeRan: !!(g.universe),
           },
           // ---- ② API使用数 ----
           apiUsage: g.apiBudget ? {
