@@ -2026,7 +2026,7 @@ const AUTO_COLLECT_LOG_CAP = 3; // 1回の実行で新規に記録する試合�
 const AUTO_COLLECT_RESOLVE_CAP = 8; // 1回の実行で解決を試みる保留中予測の上限
 const AUTO_COLLECT_RESOLVE_MIN_AGE_MS = 2 * 60 * 60 * 1000; // キックオフから2時間経っていない試合は「まだ終わっていない可能性が高い」としてスキップ
 
-async function handleAutoCollectPredictions() {
+async function handleAutoCollectPredictions(opts) {
   if (!UPSTASH_ENABLED) {
     return { status: 200, body: { ok: true, upstashConfigured: false, logged: 0, resolved: 0, note: "Upstash未設定のため何もしていません" } };
   }
@@ -2199,6 +2199,7 @@ async function handleAutoCollectPredictions() {
   //   推測ではなく実測で区別できる。
   const runRecord = {
     at: new Date().toISOString(), startedAt,
+    trigger: opts && opts.trigger ? opts.trigger : "request",
     ok: !hadFatalError, logged, resolved, evicted, skippedNoData,
     pendingLenBefore, pendingLenAfter,
     notes: notes.slice(0, 20),
@@ -2217,6 +2218,69 @@ async function handleAutoCollectPredictions() {
       notes,
     },
   };
+}
+
+// ============================================================================
+// 2026年8月7日・予測の答え合わせを GitHub Actions に依存させないための自己修復
+// ----------------------------------------------------------------------------
+// 実際に起きたこと:
+//   手動実行した Predictions Auto-Collect が
+//     「The job was not acquired by Runner of type hosted even after
+//       multiple attempts」
+//     「Internal server error. Correlation ID: ...」
+//   で15分待たされた末に失敗した。**GitHub側で実行機が確保できなかった**ため、
+//   ワークフローの中身(curl)は一行も動いていない。
+//   設定ミスでもコードのバグでもなく、こちらから直せない外部要因である。
+//
+// つまり「毎日必ず起きなければならない処理」を、こちらで制御できない
+// 外部のスケジューラ1本に預けていたことが、そもそもの設計上の弱点だった。
+// (これ以前にも、定時実行が3時間42分遅れた実測がある)
+//
+// 対処: サーバー自身が「最後に答え合わせをしてから何時間経ったか」を見て、
+// 古すぎる場合だけ、利用者のリクエストのついでに **裏で** 実行する。
+//   ・利用者を待たせない(応答を返してから走る)
+//   ・1回あたりの処理量は従来と同じ上限(照合8件・記録3件)なのでAPI消費は増えない
+//   ・複数インスタンスでも二重に走らないよう Redis の NX ロックで守る
+//   ・GitHub Actions が動いている間は「まだ新しい」ので何もしない(二重実行しない)
+// ============================================================================
+let autoSweepInFlight = false;
+let autoSweepLastCheckedAt = 0;
+// 何分おきに「古くなっていないか」を確認するか(Redis読み出しを増やしすぎない)
+const AUTO_SWEEP_CHECK_INTERVAL_MS = Number(process.env.AUTO_SWEEP_CHECK_INTERVAL_MS) || 10 * 60 * 1000;
+// 最後の実行からこれだけ経っていたら、自分で走る(cronは6時間おきなので、その1.5倍)
+const AUTO_SWEEP_STALE_MS = Number(process.env.AUTO_SWEEP_STALE_MS) || 9 * 60 * 60 * 1000;
+
+async function maybeSelfHealAutoCollect() {
+  if (!UPSTASH_ENABLED) return;
+  if (autoSweepInFlight) return;
+  const now = Date.now();
+  if (now - autoSweepLastCheckedAt < AUTO_SWEEP_CHECK_INTERVAL_MS) return;
+  autoSweepLastCheckedAt = now;
+  try {
+    const last = await upstashGetJSON("pred:autocollect:lastrun").catch(() => null);
+    const lastMs = last && last.at ? new Date(last.at).getTime() : null;
+    const age = Number.isFinite(lastMs) ? now - lastMs : Infinity;
+    if (age < AUTO_SWEEP_STALE_MS) return; // まだ新しい(cronが動いている)
+    // 複数プロセス・複数インスタンスで同時に走らせない(NXロック・1時間)
+    const gotLock = await upstashCmd([
+      "SET", "pred:autocollect:selfheallock", new Date().toISOString(), "NX", "EX", "3600",
+    ]).catch(() => null);
+    if (!gotLock) return;
+    autoSweepInFlight = true;
+    // 応答は既に返しているので、ここから先は利用者を待たせない
+    handleAutoCollectPredictions({ trigger: "self-heal" })
+      .then((r) => {
+        const b = (r && r.body) || {};
+        console.log("[self-heal auto-collect]", JSON.stringify({
+          logged: b.logged, resolved: b.resolved, evicted: b.evicted,
+          pendingLenBefore: b.pendingLenBefore, pendingLenAfter: b.pendingLenAfter,
+        }));
+      })
+      .catch((e) => console.error("[self-heal auto-collect failed]", e && e.message))
+      .finally(() => { autoSweepInFlight = false; });
+  } catch (e) {
+    autoSweepInFlight = false;
+  }
 }
 
 // ---- 試合分析AI: 予測ロジックAPI化(Stage B) ----
@@ -4591,6 +4655,9 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ found: false, error: "レート制限に達しました。しばらく待ってから再試行してください。" }));
       return;
     }
+    // 答え合わせが止まっていないかを確認する(古すぎる場合だけ裏で走る)。
+    // await しない = 利用者のリクエストは1ミリ秒も遅くならない。
+    maybeSelfHealAutoCollect().catch(() => {});
 
     try {
       if (pathname === "/api/health") {
