@@ -161,6 +161,50 @@
 
   footer.note { font-size: 12px; color: var(--text-muted); margin-top: 24px; padding-top: 14px; border-top: 1px solid var(--gridline); }
 
+  /* ---- 2026年8月: 全選手データベース検索(選手スカウティング刷新) ---- */
+  .ghost-btn { background: transparent; color: var(--text-secondary); border: 1px solid var(--border); padding: 9px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .ghost-btn:hover { color: var(--text-primary); border-color: var(--text-muted); }
+  .scout-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  .scout-label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-secondary); font-weight: 600; flex: 1 1 180px; min-width: 150px; }
+  .scout-label input, .scout-label select { padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text-primary); font-size: 13px; font-weight: 400; width: 100%; }
+  .scout-range { display: flex; align-items: center; gap: 6px; }
+  .scout-range span { color: var(--text-muted); font-weight: 400; }
+  .scout-block { margin: 6px 0 10px; }
+  .scout-block-title { font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; }
+  .chip-row { display: flex; gap: 6px; flex-wrap: wrap; }
+  .pos-chip { border: 1px solid var(--border); background: var(--surface-2); color: var(--text-secondary); padding: 5px 12px; border-radius: 999px; font-size: 12.5px; cursor: pointer; }
+  .pos-chip[aria-pressed="true"] { background: var(--text-primary); color: var(--surface-1); border-color: var(--text-primary); }
+  .pos-chip .cnt { opacity: .7; font-size: 11px; margin-left: 4px; }
+  .scout-advanced { margin-top: 8px; border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; background: var(--surface-2); }
+  .scout-advanced > summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+  .scout-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; margin-top: 12px; }
+  .sd-card { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--surface-2); display: flex; flex-direction: column; gap: 6px; }
+  .sd-card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .sd-card, .sd-card-head, .sd-card-head > div { text-align: left; }
+  .sd-card-head { display: flex; gap: 8px; align-items: center; }
+  .sd-card-head > div { flex: 1 1 auto; }
+  .sd-photo { width: 40px; height: 40px; border-radius: 50%; background: var(--surface-1); border: 1px solid var(--border); object-fit: cover; flex: none; }
+  .sd-name { font-weight: 700; font-size: 14px; line-height: 1.25; cursor: pointer; text-align: left; background: none; border: none; color: var(--text-primary); padding: 0; }
+  .sd-name:hover { text-decoration: underline; }
+  .sd-club { font-size: 12px; color: var(--text-secondary); background: none; border: none; padding: 0; cursor: pointer; text-align: left; }
+  .sd-club:hover { text-decoration: underline; color: var(--text-primary); }
+  .sd-stats { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: var(--text-secondary); }
+  .sd-stats b { color: var(--text-primary); font-size: 13px; }
+  .sd-badge { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-secondary); }
+  .sd-badge.warn { border-color: var(--critical); color: var(--critical); }
+  .sd-badge.up { border-color: var(--good); color: var(--good); }
+  .sd-badge.down { border-color: var(--critical); color: var(--critical); }
+  .scout-tray { position: sticky; bottom: 0; z-index: 30; margin-top: 12px; }
+  .scout-tray-inner { display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; box-shadow: 0 -2px 12px rgba(0,0,0,.12); }
+  .scout-tray-items { display: flex; gap: 6px; flex-wrap: wrap; font-size: 12.5px; }
+  .scout-tray-items .tray-chip { border: 1px solid var(--border); border-radius: 999px; padding: 3px 8px; display: inline-flex; gap: 6px; align-items: center; }
+  .scout-tray-items .tray-chip button { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 13px; padding: 0 2px; }
+  .sd-table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  .sd-table th, .sd-table td { padding: 6px 8px; border-bottom: 1px solid var(--gridline); text-align: left; }
+  .sd-table td.best { font-weight: 700; color: var(--good); }
+  .sd-bar { height: 6px; border-radius: 4px; background: var(--surface-2); overflow: hidden; min-width: 70px; }
+  .sd-bar > i { display: block; height: 100%; background: var(--accent); }
+
   /* Player scouting card */
   .chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text-secondary); padding: 4px 12px 4px 4px; border-radius: 999px; font-size: 12.5px; cursor: pointer; }
   .chip:hover { color: var(--text-primary); }
@@ -524,6 +568,127 @@
       <div style="display:flex; gap:8px; flex-wrap:wrap;" id="playerChips"></div>
       <p class="level-hint" id="playerLevelHint" style="margin-top:10px;"></p>
     </div>
+
+    <!-- =====================================================================
+         2026年8月・選手スカウティング全面刷新(ご要望①〜⑩)
+         毎日の学習でTOP100クラブから収集した全所属選手を、
+         複数条件で検索・比較・分析できるようにする。
+         検索はサーバーのメモリ上の索引に対して行われ、
+         1回の検索でデータベース・外部APIへのアクセスは発生しない。
+         ===================================================================== -->
+    <div class="card" id="scoutDbCard" style="margin-top:14px;">
+      <h2>🗂️ 全選手データベース検索</h2>
+      <p class="value-note" id="scoutDbLead" style="margin-bottom:10px;">読み込み中…</p>
+
+      <div class="scout-form">
+        <div class="scout-row">
+          <label class="scout-label">選手名
+            <input type="text" id="sdName" placeholder="例: Saka / 久保" autocomplete="off">
+          </label>
+          <label class="scout-label">クラブ
+            <input type="text" id="sdClub" list="sdClubList" placeholder="例: Arsenal と入力" autocomplete="off">
+            <datalist id="sdClubList"></datalist>
+          </label>
+          <label class="scout-label">国籍
+            <input type="text" id="sdNationality" list="sdNatList" placeholder="例: Japan / Brazil" autocomplete="off">
+            <datalist id="sdNatList"></datalist>
+          </label>
+          <label class="scout-label">リーグ
+            <select id="sdLeague"><option value="">すべて</option></select>
+          </label>
+        </div>
+
+        <div class="scout-block">
+          <div class="scout-block-title">ポジション(複数選択できます)</div>
+          <div id="sdPositions" class="chip-row"></div>
+          <div class="scout-block-title" style="margin-top:8px;">細かいポジション <span class="muted" style="font-weight:400;font-size:12px;" id="sdDetailedNote"></span></div>
+          <div id="sdDetailedPositions" class="chip-row"></div>
+        </div>
+
+        <details class="scout-advanced">
+          <summary>詳細な条件(年齢・身長・出場時間・得点・アシスト・平均評価・調子・怪我)</summary>
+          <div class="scout-row" style="margin-top:10px;">
+            <label class="scout-label">年齢
+              <span class="scout-range"><input type="number" id="sdAgeMin" placeholder="下限" min="14" max="50"><span>〜</span><input type="number" id="sdAgeMax" placeholder="上限" min="14" max="50"></span>
+            </label>
+            <label class="scout-label">身長(cm)
+              <span class="scout-range"><input type="number" id="sdHeightMin" placeholder="下限" min="140" max="220"><span>〜</span><input type="number" id="sdHeightMax" placeholder="上限" min="140" max="220"></span>
+            </label>
+            <label class="scout-label">出場時間(分)
+              <span class="scout-range"><input type="number" id="sdMinutesMin" placeholder="下限" min="0"><span>〜</span><input type="number" id="sdMinutesMax" placeholder="上限" min="0"></span>
+            </label>
+          </div>
+          <div class="scout-row">
+            <label class="scout-label">得点
+              <span class="scout-range"><input type="number" id="sdGoalsMin" placeholder="下限" min="0"><span>〜</span><input type="number" id="sdGoalsMax" placeholder="上限" min="0"></span>
+            </label>
+            <label class="scout-label">アシスト
+              <span class="scout-range"><input type="number" id="sdAssistsMin" placeholder="下限" min="0"><span>〜</span><input type="number" id="sdAssistsMax" placeholder="上限" min="0"></span>
+            </label>
+            <label class="scout-label">平均評価
+              <span class="scout-range"><input type="number" id="sdRatingMin" placeholder="下限" step="0.1" min="0" max="10"><span>〜</span><input type="number" id="sdRatingMax" placeholder="上限" step="0.1" min="0" max="10"></span>
+            </label>
+          </div>
+          <div class="scout-row">
+            <label class="scout-label">調子(平均評価の前回比)
+              <select id="sdForm">
+                <option value="">指定しない</option>
+                <option value="up">上向き(+0.15以上)</option>
+                <option value="down">下向き(-0.15以下)</option>
+              </select>
+            </label>
+            <label class="scout-label">怪我の有無
+              <select id="sdInjured">
+                <option value="">指定しない</option>
+                <option value="false">出場できる状態</option>
+                <option value="true">負傷者リストに掲載中</option>
+              </select>
+            </label>
+            <label class="scout-label">並び替え
+              <select id="sdSort">
+                <option value="rating">平均評価が高い順</option>
+                <option value="goals">得点が多い順</option>
+                <option value="assists">アシストが多い順</option>
+                <option value="minutes">出場時間が長い順</option>
+                <option value="appearances">出場試合が多い順</option>
+                <option value="form">調子が良い順</option>
+                <option value="age">年齢が高い順</option>
+                <option value="name">名前順</option>
+              </select>
+            </label>
+            <label class="scout-label">順序
+              <select id="sdOrder"><option value="desc">大きい順</option><option value="asc">小さい順</option></select>
+            </label>
+          </div>
+          <p class="muted" style="font-size:12px;margin:8px 0 0;" id="sdUnavailableNote"></p>
+        </details>
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center;">
+          <button class="apply-btn" id="sdSearchBtn" style="margin-top:0;width:auto;padding:9px 22px;">この条件で検索</button>
+          <button class="ghost-btn" id="sdResetBtn" type="button">条件をリセット</button>
+          <span class="muted" style="font-size:12px;" id="sdTiming"></span>
+        </div>
+      </div>
+
+      <div id="sdSummary" class="muted" style="font-size:13px;margin-top:12px;"></div>
+      <div id="sdResults" class="scout-results"></div>
+      <div id="sdMore" style="text-align:center;margin-top:12px;"></div>
+      <div id="sdSentinel" style="height:1px;"></div>
+    </div>
+
+    <!-- 比較トレイ(2〜4人)。選手を選ぶと画面下に出る。 -->
+    <div id="sdCompareTray" class="scout-tray" style="display:none;">
+      <div class="scout-tray-inner">
+        <div id="sdTrayItems" class="scout-tray-items"></div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button class="apply-btn" id="sdCompareBtn" style="margin-top:0;width:auto;padding:8px 18px;">比較する</button>
+          <button class="ghost-btn" id="sdClearCompareBtn" type="button">クリア</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="sdDetailWrap"></div>
+    <div id="sdCompareWrap"></div>
 
     <div class="card" id="aiRankingsCard">
       <h2>🏆 AIオリジナルランキング</h2>
@@ -7590,6 +7755,667 @@ renderTodayPredictionsHero();
 // スカウト速報は選手スカウティング画面でのみ使う情報なので、
 // ホーム表示の邪魔をしないよう遅延して読み込む(初回描画を重くしない)。
 setTimeout(() => { renderScoutFeed(); }, 1200);
+
+/* =========================================================
+   2026年8月・全選手データベース検索(選手スカウティング刷新)
+   ---------------------------------------------------------
+   ご要望①〜⑩への画面側の対応。
+   ・条件はすべてサーバーへ渡し、**絞り込みはサーバーのメモリ上の索引**で行う
+     (⑩ サーバー側絞り込み。画面が全件を受け取って絞る作りにはしない)
+   ・結果は24件ずつのページで受け取り、下端に来たら次を継ぎ足す(無限スクロール)
+   ・選手の写真は遅延読み込み(loading="lazy")
+   ・クラブ名・国籍の候補はファセットAPIから1回だけ取得してキャッシュする
+   ========================================================= */
+const sdEsc = (v) => String(v == null ? "" : v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const sdNum = (v, unit, digits) => {
+  if (v === null || v === undefined || v === "") return '<span class="muted">未取得</span>';
+  const n = Number(v);
+  const shown = Number.isFinite(n) && digits !== undefined ? n.toFixed(digits) : v;
+  return sdEsc(shown) + (unit || "");
+};
+const sdState = {
+  facets: null,
+  positions: new Set(),
+  detailedPositions: new Set(),
+  page: 1, perPage: 24,
+  total: 0, totalPages: 1,
+  loading: false,
+  lastQuery: null,
+  items: [],
+  compare: [],           // {id, name}
+  requestToken: 0,       // 遅い応答が新しい検索を上書きしないようにする
+  panelToken: 0,         // 詳細・クラブのパネル(同じ場所に描くので共有する)
+  comparePanelToken: 0,  // 比較パネルは別の場所に描くので別勘定にする
+  listGeneration: 0,     // 検索条件の世代(古い条件の応答を連結しないため)
+  autoLoadDisabled: false,
+  suppressAutoLoad: false,
+  legacyNoteJa: null,
+  indexedCount: 0,
+};
+
+/** 画面内スクロールで無限スクロールが誤発火しないようにする */
+function sdScrollTo(el) {
+  if (!el) return;
+  sdState.suppressAutoLoad = true;
+  try { el.scrollIntoView({ behavior: "smooth", block: "start" }); } catch (e) {}
+  setTimeout(() => { sdState.suppressAutoLoad = false; }, 1200);
+}
+
+function sdVal(id) { const el = document.getElementById(id); return el ? el.value.trim() : ""; }
+function sdSetVal(id, v) { const el = document.getElementById(id); if (el) el.value = v; }
+
+/** 画面の入力 → サーバーへ渡すクエリ文字列 */
+function sdBuildParams(page) {
+  const p = new URLSearchParams();
+  const put = (k, v) => { if (v !== "" && v !== null && v !== undefined) p.set(k, v); };
+  put("name", sdVal("sdName"));
+  put("club", sdVal("sdClub"));
+  put("nationality", sdVal("sdNationality"));
+  put("leagues", sdVal("sdLeague"));
+  if (sdState.positions.size) put("positions", [...sdState.positions].join(","));
+  if (sdState.detailedPositions.size) put("detailedPositions", [...sdState.detailedPositions].join(","));
+  for (const [id, key] of [
+    ["sdAgeMin", "ageMin"], ["sdAgeMax", "ageMax"],
+    ["sdHeightMin", "heightMin"], ["sdHeightMax", "heightMax"],
+    ["sdMinutesMin", "minutesMin"], ["sdMinutesMax", "minutesMax"],
+    ["sdGoalsMin", "goalsMin"], ["sdGoalsMax", "goalsMax"],
+    ["sdAssistsMin", "assistsMin"], ["sdAssistsMax", "assistsMax"],
+    ["sdRatingMin", "ratingMin"], ["sdRatingMax", "ratingMax"],
+  ]) put(key, sdVal(id));
+  const form = sdVal("sdForm");
+  if (form === "up") put("formMin", "0.15");
+  if (form === "down") put("formMax", "-0.15");
+  put("injured", sdVal("sdInjured"));
+  put("sort", sdVal("sdSort") || "rating");
+  put("order", sdVal("sdOrder") || "desc");
+  put("page", String(page || 1));
+  put("perPage", String(sdState.perPage));
+  return p;
+}
+
+/** クラブ・国籍・リーグ・ポジションの候補(③④⑤)。1回だけ取得する。 */
+async function sdLoadFacets() {
+  const lead = document.getElementById("scoutDbLead");
+  let data = null;
+  try {
+    data = await fetchJsonWithTimeout(`${API_PROXY_BASE}/knowledge/player-facets`,
+      backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { data = null; }
+  if (!data || !data.ok) {
+    if (lead) lead.textContent = "サーバーに接続できないため、収集済みの選手データベースを読み込めませんでした。時間をおいて再度お試しください。";
+    return null;
+  }
+  sdState.facets = data;
+  sdState.indexedCount = Number(data.indexedCount) || 0;
+
+  // クラブ候補: TOP100すべて(選手がまだ0人のクラブも理由つきで出す)
+  const clubList = document.getElementById("sdClubList");
+  if (clubList) {
+    clubList.innerHTML = (data.clubs || []).map((c) => {
+      const label = `${c.teamJa || c.teamEn}(${c.playerCount}人)`;
+      return `<option value="${sdEsc(c.teamEn)}">${sdEsc(label)}</option>`;
+    }).join("");
+  }
+  const natList = document.getElementById("sdNatList");
+  if (natList) {
+    natList.innerHTML = (data.nationalities || []).map((n) =>
+      `<option value="${sdEsc(n.name)}">${sdEsc(n.name)}(${n.count}人)</option>`).join("");
+  }
+  const leagueSel = document.getElementById("sdLeague");
+  if (leagueSel) {
+    const names = { 39: "プレミアリーグ", 140: "ラ・リーガ", 78: "ブンデスリーガ", 135: "セリエA", 61: "リーグ・アン", 94: "プリメイラ・リーガ", 88: "エールディヴィジ", 203: "スュペル・リグ", 218: "オーストリア・ブンデスリーガ", 197: "スーパーリーグ・ギリシャ", 179: "スコティッシュ・プレミアシップ", 106: "エクストラクラサ", 119: "スーペルリーガ", 113: "アリエクスプレスリーグ", 144: "ジュピラー・プロ・リーグ", 207: "スーパーリーグ(スイス)", 210: "プルヴァHNL", 235: "ロシア・プレミアリーグ", 271: "NBIリーグ", 283: "リーガ1", 345: "チェコ・ファーストリーグ", 333: "ウクライナ・プレミアリーグ", 286: "スーパーリーガ(セルビア)", 172: "パルヴァ・リーガ" };
+    leagueSel.innerHTML = `<option value="">すべて</option>` + (data.leagues || []).map((l) =>
+      `<option value="${sdEsc(l.leagueId)}">${sdEsc(names[l.leagueId] || `リーグID ${l.leagueId}`)}(${l.count}人)</option>`).join("");
+  }
+  // ポジション(④ 複数選択)
+  const posWrap = document.getElementById("sdPositions");
+  if (posWrap) {
+    const all = (data.positions && data.positions.length) ? data.positions
+      : Object.keys(data.positionLabelsJa || {}).map((code) => ({ code, labelJa: data.positionLabelsJa[code], count: null }));
+    posWrap.innerHTML = all.map((p) =>
+      `<button type="button" class="pos-chip" data-kind="broad" data-code="${sdEsc(p.code)}" aria-pressed="false">${sdEsc(p.labelJa)}${p.count !== null && p.count !== undefined ? `<span class="cnt">${p.count}</span>` : ""}</button>`).join("");
+  }
+  const detWrap = document.getElementById("sdDetailedPositions");
+  if (detWrap) {
+    const det = data.detailedPositions || [];
+    detWrap.innerHTML = det.length
+      ? det.map((p) => `<button type="button" class="pos-chip" data-kind="detailed" data-code="${sdEsc(p.code)}" aria-pressed="false">${sdEsc(p.labelJa)}<span class="cnt">${p.count}</span></button>`).join("")
+      : `<span class="muted" style="font-size:12px">まだ推定できている選手がいません(スタメンの配置データが3試合ぶん貯まると表示されます)。</span>`;
+  }
+  const detNote = document.getElementById("sdDetailedNote");
+  if (detNote) detNote.textContent = data.detailedPositionNoteJa || "";
+  const unav = document.getElementById("sdUnavailableNote");
+  if (unav && data.unavailableFieldsJa) {
+    unav.textContent = "検索条件にできない項目: " + Object.values(data.unavailableFieldsJa).join(" ");
+  }
+  if (lead) {
+    lead.innerHTML = data.available
+      ? `毎日の学習でUEFA上位100クラブから収集した <b>${sdState.indexedCount.toLocaleString()}人</b> の実測データを、条件を組み合わせて検索できます(クラブ ${(data.clubs || []).length}件 / 国籍 ${(data.nationalities || []).length}種類)。手動での選手登録は不要で、新加入・移籍・怪我・成績は毎日の学習の翌日に自動で反映されます。`
+      : sdEsc(data.reasonJa || "選手の索引がまだ作られていません。");
+  }
+  return data;
+}
+
+/** 検索の実行(②〜⑤⑩) */
+async function sdSearch(page, append) {
+  // 以前は `if (sdState.loading) return;` で新しい検索そのものを捨てていた。
+  // その結果、検索中にポジションのチップを押すと、**チップは選択状態になるのに
+  // 結果は前の条件のまま**という食い違いが起きて直らなかった(監査での指摘)。
+  // 新しい検索は必ず受け付け、古い応答のほうを捨てる。
+  // 追加読み込み(無限スクロール)だけは、多重に走らないよう抑制する。
+  if (append && sdState.loading) return;
+  // 利用者の新しい検索は必ず受け付ける。ただし、そのときに走っている
+  // 追加読み込み(無限スクロール)の結果は **別の条件の結果** なので、
+  // あとから連結されないよう世代を進めて無効化する。
+  if (!append) sdState.listGeneration = (sdState.listGeneration || 0) + 1;
+  const generation = sdState.listGeneration || 0;
+  sdState.loading = true;
+  const token = ++sdState.requestToken;
+  const results = document.getElementById("sdResults");
+  const summary = document.getElementById("sdSummary");
+  const more = document.getElementById("sdMore");
+  if (!append && results) {
+    // 一覧を1行に縮めると、下端の見張り(sdSentinel)が画面内に入って
+    // 追加読み込みが誤発火する。読み込み中は自動継続を止める。
+    sdState.suppressAutoLoad = true;
+    results.innerHTML = `<div class="muted" style="grid-column:1/-1">検索中…</div>`;
+  }
+  if (more) more.innerHTML = "";
+  const params = sdBuildParams(page);
+  let data = null;
+  const t0 = performance.now();
+  try {
+    data = await fetchJsonWithTimeout(`${API_PROXY_BASE}/knowledge/players?${params.toString()}`,
+      backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { data = null; }
+  const roundTrip = Math.round(performance.now() - t0);
+  // 条件が変わっていたら、この応答は捨てる(loading は触らない。
+  // 触ると、まだ走っている新しい検索の排他が壊れる)
+  if (generation !== (sdState.listGeneration || 0)) return;
+  if (token !== sdState.requestToken) return;   // より新しい同条件の応答が来ている
+  sdState.loading = false;
+  if (!data || !data.ok) {
+    // 失敗を黙って飲み込むと、無限スクロールが同じ失敗を延々と繰り返す(監査での指摘)。
+    // 追加読み込みの自動継続を止め、理由と再試行ボタンを出す。
+    sdState.autoLoadDisabled = true;
+    const msg = sdEsc((data && (data.reasonJa || data.error)) || "サーバーに接続できませんでした。");
+    if (more) more.innerHTML = `<div class="muted" style="font-size:13px">${msg}</div>
+      <button class="ghost-btn" id="sdRetryBtn" type="button" style="margin-top:6px">もう一度試す</button>`;
+    const rb = document.getElementById("sdRetryBtn");
+    if (rb) rb.addEventListener("click", () => { sdState.autoLoadDisabled = false; sdSearch(append ? sdState.page + 1 : 1, append); });
+    if (results && !append) results.innerHTML = `<div class="muted" style="grid-column:1/-1">${msg}</div>`;
+    sdState.suppressAutoLoad = false;
+    return;
+  }
+  if (data.available === false) {
+    sdState.autoLoadDisabled = true;
+    sdState.totalPages = 1;
+    if (!append && results) results.innerHTML = `<div class="muted" style="grid-column:1/-1">${sdEsc(data.reasonJa || "索引がまだ作られていません。")}</div>`;
+    if (!append && summary) summary.textContent = "";
+    if (more) more.innerHTML = `<div class="muted" style="font-size:13px">${sdEsc(data.reasonJa || "")}</div>`;
+    sdState.suppressAutoLoad = false;
+    return;
+  }
+  sdState.autoLoadDisabled = false;
+  // 旧方式(名前索引)で応答している間は、その旨をそのまま伝える
+  if (data.legacyIndex && summary) {
+    sdState.legacyNoteJa = data.noteJa || null;
+  } else {
+    sdState.legacyNoteJa = null;
+  }
+  sdState.page = data.page || 1;
+  sdState.total = data.total || 0;
+  sdState.totalPages = data.totalPages || 1;
+  const incoming = data.items || [];
+  sdState.items = append ? sdState.items.concat(incoming) : incoming;
+  const timing = document.getElementById("sdTiming");
+  if (timing) {
+    timing.textContent = Number.isFinite(data.tookMs)
+      ? `サーバー側の絞り込み ${data.tookMs}ミリ秒 / 通信を含めて ${roundTrip}ミリ秒`
+      : `通信を含めて ${roundTrip}ミリ秒`;
+  }
+  if (summary) {
+    summary.innerHTML = sdState.total
+      ? `<b>${sdState.total.toLocaleString()}人</b> が条件に一致しました(索引 ${Number(data.indexedCount || 0).toLocaleString()}人中)。${sdState.items.length}人を表示中。`
+        + (data.indexBuiltAt ? ` <span class="muted">最終更新: ${sdEsc(String(data.indexBuiltAt).slice(0, 16).replace("T", " "))}(UTC)</span>` : "")
+      : `条件に一致する選手はいませんでした。条件をゆるめてお試しください。<span class="muted">(未取得の項目に下限を指定すると、その項目がまだ測れていない選手は除外されます)</span>`;
+    if (sdState.legacyNoteJa) {
+      summary.innerHTML += `<div class="muted" style="font-size:12px;margin-top:4px">${sdEsc(sdState.legacyNoteJa)}</div>`;
+    }
+    if (data.reasonJa && data.total) {
+      summary.innerHTML += `<div class="muted" style="font-size:12px;margin-top:4px">${sdEsc(data.reasonJa)}</div>`;
+    }
+  }
+  sdRenderResults(append, incoming.length);
+  sdState.suppressAutoLoad = false;
+}
+
+function sdRenderResults(append, addedCount) {
+  const results = document.getElementById("sdResults");
+  if (!results) return;
+  // 追加読み込みのたびに innerHTML を丸ごと入れ替えると、
+  // 既に表示済みの写真がすべて再ダウンロードされ、読んでいる位置も飛ぶ
+  // (監査での指摘)。追加ぶんだけを末尾に足す。
+  if (append && Number.isFinite(addedCount) && addedCount > 0 && results.children.length) {
+    const added = sdState.items.slice(sdState.items.length - addedCount);
+    results.insertAdjacentHTML("beforeend", added.map((p) => sdCardHtml(p)).join(""));
+  } else {
+    results.innerHTML = sdState.items.map((p) => sdCardHtml(p)).join("");
+  }
+  const more = document.getElementById("sdMore");
+  if (more) {
+    more.innerHTML = sdState.page < sdState.totalPages
+      ? `<button class="ghost-btn" id="sdMoreBtn" type="button">もっと見る(${sdState.page}/${sdState.totalPages}ページ)</button>`
+      : (sdState.total > 0 ? `<span class="muted" style="font-size:12px">すべて表示しました(${sdState.total.toLocaleString()}人)</span>` : "");
+    const btn = document.getElementById("sdMoreBtn");
+    if (btn) btn.addEventListener("click", () => sdSearch(sdState.page + 1, true));
+  }
+}
+
+function sdCardHtml(p) {
+  const selected = sdState.compare.some((c) => c.id === p.id);
+  const badges = [];
+  if (p.injured) badges.push(`<span class="sd-badge warn">負傷者リスト</span>`);
+  const fd = Number(p.formDelta);
+  if (Number.isFinite(fd)) {
+    if (fd >= 0.15) badges.push(`<span class="sd-badge up">調子↑ ${sdEsc(fd.toFixed(2))}</span>`);
+    else if (fd <= -0.15) badges.push(`<span class="sd-badge down">調子↓ ${sdEsc(fd.toFixed(2))}</span>`);
+  }
+  if (p.injuryChecked === false && p.injuryNoteJa) badges.push(`<span class="sd-badge">怪我の有無は未確認</span>`);
+  if (p.detailedPositionJa) badges.push(`<span class="sd-badge">${sdEsc(p.detailedPositionJa)}</span>`);
+  return `<div class="sd-card${selected ? " selected" : ""}" data-id="${sdEsc(p.id)}">
+    <div class="sd-card-head">
+      <img class="sd-photo" loading="lazy" alt="" src="${sdEsc(p.photo || "")}" onerror="this.style.visibility='hidden'">
+      <div style="min-width:0">
+        <button class="sd-name" data-act="detail" data-id="${sdEsc(p.id)}">${sdEsc(p.name || "-")}</button>
+        <div><button class="sd-club" data-act="club" data-club="${sdEsc(p.teamEn || "")}">${sdEsc(p.teamJa || p.teamEn || "-")}</button>
+        <span class="muted" style="font-size:12px"> ${sdEsc(p.positionJa || p.position || "")}</span></div>
+      </div>
+    </div>
+    <div class="sd-stats">
+      <span>評価 <b>${sdNum(p.rating, "", 2)}</b></span>
+      <span>得点 <b>${sdNum(p.goals)}</b></span>
+      <span>アシスト <b>${sdNum(p.assists)}</b></span>
+      <span>出場 <b>${sdNum(p.minutes, "分")}</b></span>
+    </div>
+    <div class="sd-stats">
+      <span>${p.age !== null && p.age !== undefined ? sdEsc(p.age) + "歳" : '<span class="muted">年齢未取得</span>'}</span>
+      <span>${p.heightCm ? sdEsc(p.heightCm) + "cm" : '<span class="muted">身長未取得</span>'}</span>
+      <span>${sdEsc(p.nationality || "国籍未取得")}</span>
+    </div>
+    ${badges.length ? `<div class="sd-stats">${badges.join(" ")}</div>` : ""}
+    <div style="display:flex;gap:6px;margin-top:2px">
+      <button class="ghost-btn" style="padding:4px 10px;font-size:12px" data-act="detail" data-id="${sdEsc(p.id)}">分析を見る</button>
+      <button class="ghost-btn" style="padding:4px 10px;font-size:12px" data-act="compare" data-id="${sdEsc(p.id)}" data-name="${sdEsc(p.name || "")}">${selected ? "比較から外す" : "比較に追加"}</button>
+    </div>
+  </div>`;
+}
+
+/* ---- ⑨ 比較トレイ ---- */
+function sdRenderTray() {
+  const tray = document.getElementById("sdCompareTray");
+  const items = document.getElementById("sdTrayItems");
+  if (!tray || !items) return;
+  if (!sdState.compare.length) { tray.style.display = "none"; return; }
+  tray.style.display = "";
+  items.innerHTML = `<span class="muted">比較する選手(2〜4人):</span>` + sdState.compare.map((c) =>
+    `<span class="tray-chip">${sdEsc(c.name)}<button type="button" data-act="untray" data-id="${sdEsc(c.id)}" aria-label="${sdEsc(c.name)}を比較から外す">×</button></span>`).join("");
+  const btn = document.getElementById("sdCompareBtn");
+  if (btn) {
+    btn.disabled = sdState.compare.length < 2;
+    btn.style.opacity = sdState.compare.length < 2 ? "0.5" : "1";
+    btn.textContent = sdState.compare.length < 2 ? "あと1人以上選んでください" : `${sdState.compare.length}人を比較する`;
+  }
+}
+function sdToggleCompare(id, name) {
+  const i = sdState.compare.findIndex((c) => c.id === id);
+  if (i >= 0) sdState.compare.splice(i, 1);
+  else {
+    if (sdState.compare.length >= 4) {
+      alert("比較できるのは4人までです。どれかを外してから追加してください。");
+      return;
+    }
+    sdState.compare.push({ id, name });
+  }
+  sdRenderTray();
+  sdRenderResults(false);
+}
+
+/* ---- ⑧ 選手1人の詳細+AI分析 ---- */
+async function sdOpenDetail(id) {
+  const wrap = document.getElementById("sdDetailWrap");
+  if (!wrap) return;
+  // 詳細とクラブ一覧は同じ場所に描くため、遅い応答が新しい表示を上書きしていた
+  // (クラブを開いた直後に選手を開くと、あとから届いたクラブ一覧で選手の分析が
+  //  消える。監査での指摘)。トークンで古い応答を捨てる。
+  const token = ++sdState.panelToken;
+  wrap.innerHTML = `<div class="card"><p class="muted">分析を読み込み中…</p></div>`;
+  sdScrollTo(wrap);
+  let data = null;
+  try {
+    data = await fetchJsonWithTimeout(`${API_PROXY_BASE}/knowledge/player?id=${encodeURIComponent(id)}`,
+      backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { data = null; }
+  if (token !== sdState.panelToken) return;
+  if (!data || !data.ok) {
+    wrap.innerHTML = `<div class="card"><p class="muted">${sdEsc((data && data.reasonJa) || "この選手の分析を取得できませんでした。")}</p></div>`;
+    return;
+  }
+  const p = data.player;
+  const a = data.analysis || {};
+  const pctBar = (v) => `<span class="sd-bar" style="display:inline-block;width:80px;vertical-align:middle"><i style="width:${Math.max(2, Math.min(100, v))}%"></i></span>`;
+  const listOr = (arr, empty) => (arr && arr.length)
+    ? `<ul style="margin:4px 0 0 18px;padding:0">${arr.join("")}</ul>`
+    : `<div class="muted" style="font-size:13px">${sdEsc(empty)}</div>`;
+
+  const metricLi = (s) =>
+    `<li style="margin:3px 0">${sdEsc(s.labelJa)} <b>${sdEsc(s.displayValue != null ? s.displayValue : s.value)}${sdEsc(s.unitJa || "")}</b> ${pctBar(s.percentile)} <span class="muted" style="font-size:12px">${sdEsc(s.noteJa)}</span></li>`;
+  const strengths = (a.strengths || []).map(metricLi);
+  const weaknesses = (a.weaknesses || []).map(metricLi);
+  const tactics = (a.tactics || []).map((t) =>
+    `<li style="margin:3px 0">${sdEsc(t.labelJa)} <span class="muted" style="font-size:12px">${sdEsc(t.whyJa)}</span></li>`);
+  const similar = (a.similar && a.similar.available)
+    ? `<div class="scout-results" style="margin-top:6px">${a.similar.items.map((s) => sdCardHtml(s)).join("")}</div>
+       <div class="muted" style="font-size:12px;margin-top:6px">${sdEsc(a.similar.basisJa)}</div>`
+    : `<div class="muted" style="font-size:13px">${sdEsc((a.similar && a.similar.reasonJa) || "類似選手を出せる状態ではありません。")}</div>`;
+  const fit = (a.fitClubs && a.fitClubs.available)
+    ? `<ul style="margin:4px 0 0 18px;padding:0">${a.fitClubs.items.map((c) =>
+        `<li style="margin:3px 0"><button class="sd-club" data-act="club" data-club="${sdEsc(c.teamEn)}">${sdEsc(c.teamJa || c.teamEn)}</button> <span class="muted" style="font-size:12px">${sdEsc(c.noteJa)}</span></li>`).join("")}</ul>
+       <div class="muted" style="font-size:12px;margin-top:6px">${sdEsc(a.fitClubs.basisJa)}</div>`
+    : `<div class="muted" style="font-size:13px">${sdEsc((a.fitClubs && a.fitClubs.reasonJa) || "比較できるクラブがまだ揃っていません。")}</div>`;
+  const growth = a.growth && a.growth.measurable
+    ? `<b>${sdEsc(a.growth.trendJa)}</b> <span class="muted" style="font-size:13px">${sdEsc(a.growth.noteJa)}</span>`
+    : `<span class="muted" style="font-size:13px">${sdEsc((a.growth && a.growth.reasonJa) || "まだ測定できません。")}</span>`;
+  const cond = a.condition
+    ? `<b>${sdEsc(a.condition.labelJa)}</b>${a.condition.reasonJa ? ` <span class="muted" style="font-size:13px">${sdEsc(a.condition.reasonJa)}</span>` : ""}`
+    : `<span class="muted">未取得</span>`;
+  const styleTags = (a.styleTags || []).length
+    ? (a.styleTags || []).map((t) => `<span class="sd-badge">${sdEsc(t)}</span>`).join(" ")
+    : `<span class="muted" style="font-size:13px">実測できている項目が少ないため、プレースタイルをまだ言えません。</span>`;
+
+  const rows = [
+    ["所属", `<button class="sd-club" data-act="club" data-club="${sdEsc(p.teamEn || "")}">${sdEsc(p.teamJa || p.teamEn || "-")}</button>`],
+    ["ポジション", sdEsc(p.positionJa || p.position || "-") + (p.detailedPositionJa ? `(${sdEsc(p.detailedPositionJa)})` : "")],
+    ["国籍", sdEsc(p.nationality || "未取得")],
+    ["怪我の有無", p.injuryChecked === false
+      ? `<span class="muted">${sdEsc(p.injuryNoteJa || "未確認")}</span>`
+      : `${p.injured ? "負傷者リストに掲載中" : "負傷者リストに掲載なし"}`
+        + (p.injuryCheckedAt ? `<span class="muted" style="font-size:12px">(${sdEsc(p.injuryCheckedAt)}時点)</span>` : "")
+        + (p.injuryNoteJa ? `<div class="muted" style="font-size:12px">${sdEsc(p.injuryNoteJa)}</div>` : "")],
+    ["年齢", p.age !== null && p.age !== undefined ? sdEsc(p.age) + "歳" : '<span class="muted">未取得</span>'],
+    ["身長", p.heightCm ? sdEsc(p.heightCm) + "cm" : '<span class="muted">未取得</span>'],
+    ["背番号", sdNum(p.number)],
+    ["今季 出場", sdNum(p.appearances, "試合")],
+    ["今季 出場時間", sdNum(p.minutes, "分")],
+    ["今季 得点", sdNum(p.goals, "点")],
+    ["今季 アシスト", sdNum(p.assists, "本")],
+    ["平均評価", sdNum(p.rating, "", 2)],
+    ["キーパス", sdNum(p.keyPasses)],
+    ["パス成功率", sdNum(p.passAccuracyPct, "%")],
+    ["ドリブル成功率", sdNum(p.dribbleSuccessRatePct, "%")],
+    ["守備アクション", sdNum(p.defensiveActions)],
+    ["デュエル勝率", sdNum(p.duelWinRatePct, "%")],
+  ].map(([k, v]) => `<tr><th style="white-space:nowrap">${sdEsc(k)}</th><td>${v}</td></tr>`).join("");
+
+  wrap.innerHTML = `<div class="card" style="margin-top:14px;border-left:4px solid var(--accent)">
+    <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+      <img class="sd-photo" style="width:64px;height:64px" loading="lazy" alt="" src="${sdEsc(p.photo || "")}" onerror="this.style.visibility='hidden'">
+      <div>
+        <h2 style="margin:0">${sdEsc(p.name || "-")}</h2>
+        <div class="muted" style="font-size:13px">${sdEsc(p.teamJa || p.teamEn || "")} / ${sdEsc(p.positionJa || "")}</div>
+      </div>
+      <div style="margin-left:auto;display:flex;gap:6px">
+        <button class="ghost-btn" data-act="compare" data-id="${sdEsc(p.id)}" data-name="${sdEsc(p.name || "")}">比較に追加</button>
+        <button class="ghost-btn" data-act="closeDetail" type="button">閉じる</button>
+      </div>
+    </div>
+
+    <div class="grid-2" style="margin-top:12px">
+      <div>
+        <h3 class="sim-subhead">📊 実測データ</h3>
+        <table class="sd-table">${rows}</table>
+      </div>
+      <div>
+        <h3 class="sim-subhead">🟢 長所(同ポジション内の順位)</h3>
+        ${listOr(strengths, "同じポジションの中で上位30%に入る項目はまだありません(実測が足りない場合や、同じ値の選手が多くて順位に意味が無い場合も含みます)。")}
+        <h3 class="sim-subhead" style="margin-top:12px">🔴 課題</h3>
+        ${listOr(weaknesses, "同じポジションの中で下位30%に入る項目はありません。")}
+        <h3 class="sim-subhead" style="margin-top:12px">🎯 向いている戦術</h3>
+        ${listOr(tactics, "戦術を言い切れるだけの実測がまだ揃っていません。")}
+        <h3 class="sim-subhead" style="margin-top:12px">🏷️ プレースタイル</h3>
+        <div>${styleTags}</div>
+        <h3 class="sim-subhead" style="margin-top:12px">📈 成長傾向</h3>
+        <div>${growth}</div>
+        <h3 class="sim-subhead" style="margin-top:12px">🩺 現在の調子</h3>
+        <div>${cond}</div>
+      </div>
+    </div>
+
+    <h3 class="sim-subhead" style="margin-top:16px">🏟️ 出場機会を得やすいクラブ</h3>
+    ${fit}
+
+    <h3 class="sim-subhead" style="margin-top:16px">👥 似ているタイプの選手</h3>
+    ${similar}
+
+    <p class="muted" style="font-size:12px;margin-top:14px">${sdEsc(a.methodJa || "")}</p>
+    <p class="muted" style="font-size:12px;margin-top:4px">${sdEsc(Object.values(data.unavailableFieldsJa || {}).join(" "))}</p>
+    ${data.indexBuiltAt ? `<p class="muted" style="font-size:12px;margin-top:4px">データの最終更新: ${sdEsc(String(data.indexBuiltAt).slice(0, 16).replace("T", " "))}(UTC)</p>` : ""}
+  </div>`;
+}
+
+/* ---- ⑨ 比較の表示 ---- */
+async function sdOpenCompare() {
+  if (sdState.compare.length < 2) return;
+  const wrap = document.getElementById("sdCompareWrap");
+  if (!wrap) return;
+  const token = ++sdState.comparePanelToken;
+  wrap.innerHTML = `<div class="card"><p class="muted">比較を読み込み中…</p></div>`;
+  const ids = sdState.compare.map((c) => c.id).join(",");
+  let data = null;
+  try {
+    data = await fetchJsonWithTimeout(`${API_PROXY_BASE}/knowledge/player-compare?ids=${encodeURIComponent(ids)}`,
+      backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { data = null; }
+  if (token !== sdState.comparePanelToken) return;
+  if (!data || !data.ok) {
+    wrap.innerHTML = `<div class="card"><p class="muted">${sdEsc((data && data.reasonJa) || "比較を取得できませんでした。")}</p></div>`;
+    return;
+  }
+  const players = data.players || [];
+  const head = players.map((p, i) =>
+    `<th><button class="sd-name" data-act="detail" data-id="${sdEsc(p.id)}">${sdEsc(p.name)}</button>
+      <div class="muted" style="font-size:12px;font-weight:400">${sdEsc(p.teamJa || p.teamEn || "")} / ${sdEsc(p.positionJa || "")}</div>
+      <div class="muted" style="font-size:12px;font-weight:400">項目別で最も良い数値: ${sdEsc(data.winCounts[i])}件</div></th>`).join("");
+  const body = (data.metrics || []).map((m) => {
+    const cells = m.values.map((v, i) => {
+      const isBest = m.bestIndex === i;
+      const shown = (v === null || v === undefined) ? '<span class="muted">未取得</span>'
+        : sdEsc(m.digits ? Number(v).toFixed(m.digits) : v);
+      return `<td class="${isBest ? "best" : ""}">${shown}${isBest ? " ★" : ""}</td>`;
+    }).join("");
+    const note = m.comparableJa ? `<div class="muted" style="font-size:11px">${sdEsc(m.comparableJa)}</div>` : "";
+    const partial = (!m.comparableJa && m.missingCount > 0)
+      ? `<div class="muted" style="font-size:11px">${sdEsc(players.length - m.missingCount)}人ぶんのみ実測</div>` : "";
+    return `<tr><th style="white-space:nowrap">${sdEsc(m.labelJa)}${note}${partial}</th>${cells}</tr>`;
+  }).join("");
+  const analyses = (data.analyses || []).map((an, i) => {
+    const p = players[i];
+    const s = (an.strengths || []).map((x) => sdEsc(x.labelJa)).join("、") || "実測が足りず判定できません";
+    const w = (an.weaknesses || []).map((x) => sdEsc(x.labelJa)).join("、") || "特にありません";
+    const t = (an.tactics || []).map((x) => sdEsc(x.labelJa)).join("、") || "判定できません";
+    const g = an.growth && an.growth.measurable ? sdEsc(an.growth.trendJa) : "まだ測定できません";
+    const c = an.condition ? sdEsc(an.condition.labelJa) : "未取得";
+    return `<div style="border:1px solid var(--border);border-radius:8px;padding:10px 12px">
+      <strong>${sdEsc(p.name)}</strong>
+      <div style="font-size:13px;margin-top:4px">🟢 長所: ${s}</div>
+      <div style="font-size:13px">🔴 課題: ${w}</div>
+      <div style="font-size:13px">🎯 向いている戦術: ${t}</div>
+      <div style="font-size:13px">📈 成長傾向: ${g}</div>
+      <div style="font-size:13px">🩺 調子: ${c}</div>
+    </div>`;
+  }).join("");
+
+  wrap.innerHTML = `<div class="card" style="margin-top:14px">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap">
+      <h2 style="margin:0">⚖️ ${players.length}人の比較</h2>
+      <button class="ghost-btn" data-act="closeCompare" type="button">閉じる</button>
+    </div>
+    ${data.samePosition ? "" : `<p class="value-note" style="margin-top:8px">ポジションが異なる選手が含まれています。同じ項目を比べても意味が薄い場合があります。</p>`}
+    ${data.missingNoteJa ? `<p class="value-note">${sdEsc(data.missingNoteJa)}</p>` : ""}
+    <div style="overflow-x:auto;margin-top:10px"><table class="sd-table"><thead><tr><th></th>${head}</tr></thead><tbody>${body}</tbody></table></div>
+    <h3 class="sim-subhead" style="margin-top:16px">🤖 それぞれのAI分析</h3>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:6px">${analyses}</div>
+    <p class="muted" style="font-size:12px;margin-top:12px">${sdEsc(data.cautionJa || "")}</p>
+  </div>`;
+  sdScrollTo(wrap);
+}
+
+/* ---- ⑥ クラブ → 所属選手 ---- */
+async function sdOpenClub(teamEn) {
+  if (!teamEn) return;
+  const wrap = document.getElementById("sdDetailWrap");
+  if (!wrap) return;
+  const token = ++sdState.panelToken;
+  wrap.innerHTML = `<div class="card"><p class="muted">クラブの所属選手を読み込み中…</p></div>`;
+  sdScrollTo(wrap);
+  let data = null;
+  try {
+    data = await fetchJsonWithTimeout(`${API_PROXY_BASE}/knowledge/club-players?club=${encodeURIComponent(teamEn)}`,
+      backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { data = null; }
+  if (token !== sdState.panelToken) return;
+  if (!data || !data.ok) {
+    wrap.innerHTML = `<div class="card"><p class="muted">クラブの所属選手を取得できませんでした。</p></div>`;
+    return;
+  }
+  const club = data.club || {};
+  const groups = Object.keys(data.byPosition || {}).map((code) => {
+    const list = data.byPosition[code];
+    return `<h3 class="sim-subhead" style="margin-top:14px">${sdEsc((data.positionLabelsJa || {})[code] || code)}(${list.length}人)</h3>
+      <div class="scout-results">${list.map((p) => sdCardHtml(p)).join("")}</div>`;
+  }).join("");
+  const unknown = (data.unknownPosition || []).length
+    ? `<h3 class="sim-subhead" style="margin-top:14px">ポジション未取得(${data.unknownPosition.length}人)</h3>
+       <div class="scout-results">${data.unknownPosition.map((p) => sdCardHtml(p)).join("")}</div>`
+    : "";
+  wrap.innerHTML = `<div class="card" style="margin-top:14px;border-left:4px solid var(--series-2)">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap">
+      <h2 style="margin:0">🏟️ ${sdEsc(club.teamJa || club.teamEn || teamEn)} の所属選手</h2>
+      <div style="display:flex;gap:6px">
+        <button class="ghost-btn" data-act="filterClub" data-club="${sdEsc(club.teamEn || teamEn)}" type="button">このクラブで絞り込む</button>
+        <button class="ghost-btn" data-act="closeDetail" type="button">閉じる</button>
+      </div>
+    </div>
+    <div class="muted" style="font-size:13px;margin-top:4px">
+      ${sdEsc(club.country || "")}${club.rank ? ` / UEFAクラブランキング ${sdEsc(club.rank)}位` : ""} — 索引に入っている所属選手 ${sdEsc(data.count)}人
+    </div>
+    ${data.count ? groups + unknown : `<p class="muted" style="margin-top:10px">${sdEsc(data.emptyReasonJa || "")}</p>`}
+  </div>`;
+}
+
+/* ---- 画面のイベント配線 ---- */
+function sdWire() {
+  const card = document.getElementById("scoutDbCard");
+  if (!card) return;
+
+  // ポジションのチップ(複数選択)
+  card.addEventListener("click", (e) => {
+    const chip = e.target.closest(".pos-chip");
+    if (!chip) return;
+    const set = chip.dataset.kind === "detailed" ? sdState.detailedPositions : sdState.positions;
+    const code = chip.dataset.code;
+    if (set.has(code)) { set.delete(code); chip.setAttribute("aria-pressed", "false"); }
+    else { set.add(code); chip.setAttribute("aria-pressed", "true"); }
+    sdSearch(1, false);
+  });
+
+  const searchBtn = document.getElementById("sdSearchBtn");
+  if (searchBtn) searchBtn.addEventListener("click", () => sdSearch(1, false));
+  const resetBtn = document.getElementById("sdResetBtn");
+  if (resetBtn) resetBtn.addEventListener("click", () => {
+    ["sdName", "sdClub", "sdNationality", "sdAgeMin", "sdAgeMax", "sdHeightMin", "sdHeightMax",
+      "sdMinutesMin", "sdMinutesMax", "sdGoalsMin", "sdGoalsMax", "sdAssistsMin", "sdAssistsMax",
+      "sdRatingMin", "sdRatingMax"].forEach((id) => sdSetVal(id, ""));
+    ["sdLeague", "sdForm", "sdInjured"].forEach((id) => sdSetVal(id, ""));
+    sdSetVal("sdSort", "rating"); sdSetVal("sdOrder", "desc");
+    sdState.positions.clear(); sdState.detailedPositions.clear();
+    card.querySelectorAll(".pos-chip").forEach((c) => c.setAttribute("aria-pressed", "false"));
+    sdSearch(1, false);
+  });
+
+  // Enterキーでも検索できるようにする
+  ["sdName", "sdClub", "sdNationality"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); sdSearch(1, false); } });
+  });
+  ["sdLeague", "sdForm", "sdInjured", "sdSort", "sdOrder"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", () => sdSearch(1, false));
+  });
+
+  // 結果カード・詳細・比較のクリックを1か所でさばく(再描画してもハンドラが外れない)
+  document.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-act]");
+    if (!btn) return;
+    const act = btn.dataset.act;
+    if (act === "detail") { sdOpenDetail(Number(btn.dataset.id)); }
+    else if (act === "compare") { sdToggleCompare(Number(btn.dataset.id), btn.dataset.name || `ID ${btn.dataset.id}`); }
+    else if (act === "untray") { sdToggleCompare(Number(btn.dataset.id), ""); }
+    else if (act === "club") { sdOpenClub(btn.dataset.club); }
+    else if (act === "filterClub") {
+      sdSetVal("sdClub", btn.dataset.club || "");
+      document.getElementById("scoutDbCard").scrollIntoView({ behavior: "smooth", block: "start" });
+      sdSearch(1, false);
+    } else if (act === "closeDetail") {
+      sdState.panelToken++;   // 閉じたあとに届いた応答で開き直さない
+      const w = document.getElementById("sdDetailWrap"); if (w) w.innerHTML = "";
+    } else if (act === "closeCompare") {
+      sdState.comparePanelToken++;
+      const w = document.getElementById("sdCompareWrap"); if (w) w.innerHTML = "";
+    }
+  });
+
+  const cmpBtn = document.getElementById("sdCompareBtn");
+  if (cmpBtn) cmpBtn.addEventListener("click", sdOpenCompare);
+  const clearBtn = document.getElementById("sdClearCompareBtn");
+  if (clearBtn) clearBtn.addEventListener("click", () => {
+    sdState.compare = []; sdRenderTray(); sdRenderResults(false);
+    sdState.comparePanelToken++;
+    const w = document.getElementById("sdCompareWrap"); if (w) w.innerHTML = "";
+  });
+
+  // ⑩ 無限スクロール: 一覧の下端が見えたら次のページを継ぎ足す
+  const sentinel = document.getElementById("sdSentinel");
+  if (sentinel && "IntersectionObserver" in window) {
+    const io = new IntersectionObserver((entries) => {
+      for (const en of entries) {
+        if (en.isIntersecting && !sdState.loading && !sdState.autoLoadDisabled
+          && !sdState.suppressAutoLoad && sdState.page < sdState.totalPages) {
+          sdSearch(sdState.page + 1, true);
+        }
+      }
+    }, { rootMargin: "200px" });
+    io.observe(sentinel);
+  }
+}
+
+// 選手スカウティングのタブを最初に開いたときに読み込む(ホームの初回描画を重くしない)
+let sdInitialised = false;
+async function sdInitOnce() {
+  if (sdInitialised) return;
+  sdInitialised = true;
+  sdWire();
+  const facets = await sdLoadFacets();
+  if (facets && facets.available) sdSearch(1, false);
+}
+document.getElementById("modeSwitch").addEventListener("click", (e) => {
+  const btn = e.target.closest("button");
+  if (btn && btn.dataset.mode === "player") sdInitOnce();
+});
+// 直接「選手スカウティング」で開始された場合にも備える
+if (document.getElementById("playerSection") && document.getElementById("playerSection").style.display !== "none") {
+  setTimeout(sdInitOnce, 1500);
+}
 </script>
 </body>
 </html>

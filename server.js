@@ -2400,6 +2400,184 @@ const clubDossier = createClubDossier({
   upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
 });
 
+// ---- 2026年8月・選手スカウティングの全面刷新(ご要望①〜⑩) ----
+// 夜間バッチ(universeCollector)が作った索引を、サーバー起動後に一度だけ読み、
+// 以後はメモリ上で検索する。最終方針⑥「利用者が質問した瞬間に重い処理を
+// 行う設計は禁止」に従い、検索1回あたりの Redis / API アクセスは 0 回。
+const playerSearch = require("./knowledge/playerSearch");
+const { CLUB_UNIVERSE } = require("./learning/clubUniverse");
+const playerSearchDeps = {
+  upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
+};
+// 索引の再読み込み間隔。夜間バッチは1日1回しか索引を書き換えないため、
+// 30分ごとに確認すれば十分(それでもRedis読み出しは1日150回程度で収まる)。
+const PLAYER_INDEX_TTL_MS = Number(process.env.PLAYER_INDEX_TTL_MS) || 30 * 60 * 1000;
+// 読み出しに失敗したときまで30分待つと、一瞬の通信断で機能が30分止まる。
+// 失敗したときだけ短い間隔で再挑戦する。
+const PLAYER_INDEX_RETRY_MS = Number(process.env.PLAYER_INDEX_RETRY_MS) || 60 * 1000;
+const playerIndexState = {
+  rows: [], meta: null, loadedAt: 0, loading: null,
+  available: false, reasonJa: null, loadMs: null, facets: null,
+  partial: false, lastError: null,
+};
+
+async function loadPlayerIndex(force) {
+  const now = Date.now();
+  const ttl = (playerIndexState.available && !playerIndexState.partial) ? PLAYER_INDEX_TTL_MS : PLAYER_INDEX_RETRY_MS;
+  if (!force && playerIndexState.loadedAt && (now - playerIndexState.loadedAt) < ttl) {
+    return playerIndexState;
+  }
+  // 同時アクセスで多重に読み込まないよう、進行中の読み込みを共有する
+  if (playerIndexState.loading) return playerIndexState.loading;
+  playerIndexState.loading = (async () => {
+    const t0 = Date.now();
+    try {
+      const r = await playerSearch.loadIndex(playerSearchDeps);
+      const gotRows = (r.rows || []).length;
+      // ---- 2026年8月の監査で発見した2つの穴への対処 ----
+      // ① 一部のブロックだけ読めなかったとき、以前は「少ない件数の完全な結果」
+      //    として返していた。不完全であることを必ず伝える。
+      // ② 一時的な失敗で0件になったとき、以前は手元の正しい索引を捨てて
+      //    「索引はまだ作られていません」と答えていた。前回読めた内容を保持する。
+      if (gotRows === 0 && playerIndexState.rows.length > 0 && r.available !== true) {
+        playerIndexState.partial = true;
+        playerIndexState.lastError = r.reasonJa || "索引の読み出しに失敗しました。";
+        playerIndexState.reasonJa = `索引の再読み込みに失敗したため、前回読み込んだ${playerIndexState.rows.length}人ぶんの内容を表示しています(${r.reasonJa || "原因不明"})。`;
+      } else {
+        playerIndexState.rows = r.rows || [];
+        playerIndexState.meta = r.meta || null;
+        playerIndexState.available = r.available !== false;
+        playerIndexState.partial = r.partial === true;
+        playerIndexState.reasonJa = r.reasonJa || null;
+        playerIndexState.lastError = r.partial ? r.reasonJa : null;
+        playerIndexState.facets = playerIndexState.rows.length ? playerSearch.facetsOf(playerIndexState.rows) : null;
+      }
+    } catch (e) {
+      playerIndexState.available = false;
+      playerIndexState.partial = true;
+      playerIndexState.lastError = e.message;
+      playerIndexState.reasonJa = `選手索引の読み出しに失敗しました: ${e.message}`;
+    }
+    playerIndexState.loadMs = Date.now() - t0;
+    playerIndexState.loadedAt = Date.now();
+    playerIndexState.loading = null;
+    return playerIndexState;
+  })();
+  return playerIndexState.loading;
+}
+
+/** クエリ文字列 → playerSearch が理解する検索条件 */
+function parsePlayerQuery(sp) {
+  const num = (k) => {
+    const v = sp.get(k);
+    if (v === null || v === "") return undefined;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  // 監査での指摘: 上限が無いと、URLいっぱいに詰めたリスト(数千件)と
+  // 索引の全行の総当たりになり、1リクエストでイベントループを数百ミリ秒占有できる。
+  const MAX_LIST_ITEMS = 60;
+  const list = (k) => {
+    const v = sp.get(k);
+    if (!v) return [];
+    return v.split(",").map((x) => x.trim()).filter(Boolean).slice(0, MAX_LIST_ITEMS);
+  };
+  const injuredRaw = sp.get("injured");
+  return {
+    name: (sp.get("name") || sp.get("q") || "").trim(),
+    club: (sp.get("club") || "").trim(),
+    clubs: list("clubs"),
+    nationality: (sp.get("nationality") || "").trim(),
+    nationalities: list("nationalities"),
+    leagueIds: list("leagues"),
+    positions: list("positions"),
+    detailedPositions: list("detailedPositions"),
+    injured: injuredRaw === "true" ? true : injuredRaw === "false" ? false : undefined,
+    ageMin: num("ageMin"), ageMax: num("ageMax"),
+    heightMin: num("heightMin"), heightMax: num("heightMax"),
+    minutesMin: num("minutesMin"), minutesMax: num("minutesMax"),
+    goalsMin: num("goalsMin"), goalsMax: num("goalsMax"),
+    assistsMin: num("assistsMin"), assistsMax: num("assistsMax"),
+    ratingMin: num("ratingMin"), ratingMax: num("ratingMax"),
+    formMin: num("formMin"), formMax: num("formMax"),
+    sort: sp.get("sort") || "rating",
+    order: sp.get("order") === "asc" ? "asc" : "desc",
+  };
+}
+
+const PLAYER_NOT_INCLUDED_JA = "総合点・能力値・ヒートマップはAPI-Footballでは提供されないため、収集済みデータには含まれません(実測の出場・得点・アシスト・平均評価などのみ)。";
+
+/** 索引が空のときに返す、正直な理由つきの応答 */
+function playerIndexUnavailableBody(state) {
+  return {
+    ok: true,
+    available: false,
+    indexedCount: 0,
+    reasonJa: state.reasonJa
+      || "選手の検索索引がまだ作られていません。毎日の学習(日次ジョブ)が次に実行されたときに作成され、その直後から検索できるようになります。",
+    players: [], items: [], total: 0, page: 1, perPage: 24, totalPages: 1, hasNext: false, hasPrev: false,
+    notIncludedJa: PLAYER_NOT_INCLUDED_JA,
+    unavailableFieldsJa: playerSearch.UNAVAILABLE_SEARCH_FIELDS_JA,
+  };
+}
+
+/**
+ * 新しい索引がまだ無い間(=このコードを上げてから夜間バッチが1回走るまで)、
+ * 旧世代の名前索引(kb:player:searchIndex)で従来どおり名前検索ができるようにする。
+ * 最終方針①「劣化禁止」への対応: 新機能を入れた日に、既にできていたことが
+ * 一時的にでもできなくなるのを避ける。
+ */
+async function legacyPlayerNameSearch(query, limit) {
+  const found = await clubDossier.searchPlayers(query, { limit });
+  const players = [];
+  for (const hit of found.results || []) {
+    const rec = await clubDossier.getPlayer(hit.id);
+    if (!rec) {
+      players.push({ ...hit, recordUnavailableJa: "選手記録の読み出しに失敗しました(索引にはあります)。" });
+      continue;
+    }
+    // 記録ファイルは stats を入れ子で持つが、画面は索引と同じ「平ら」な形を期待する。
+    // ここで揃えないと、値があるのに全部「未取得」と表示される(監査での指摘)。
+    const st = rec.stats || {};
+    players.push({
+      ...rec,
+      matchedName: hit.name,
+      positionJa: playerSearch.BROAD_POSITION_JA[rec.position] || rec.position || null,
+      heightCm: playerSearch.parseHeightCm(rec.height),
+      appearances: st.appearances ?? null,
+      minutes: st.minutes ?? null,
+      goals: st.goals ?? null,
+      assists: st.assists ?? null,
+      rating: st.rating ?? null,
+      keyPasses: st.keyPasses ?? null,
+      passAccuracyPct: st.passAccuracyPct ?? null,
+      dribbleSuccessRatePct: st.dribbleSuccessRatePct ?? null,
+      defensiveActions: st.defensiveActions ?? null,
+      duelWinRatePct: st.duelWinRatePct ?? null,
+      injured: false,
+      injuryChecked: false,
+      injuryNoteJa: "旧方式の名前検索では怪我の有無を判定していません。",
+      formDelta: null,
+      detailedPosition: null, detailedPositionJa: null,
+      photo: rec.id ? `https://media.api-sports.io/football/players/${rec.id}.png` : null,
+    });
+  }
+  return {
+    ok: true,
+    available: found.available !== false,
+    legacyIndex: true,
+    reasonJa: found.reasonJa || null,
+    noteJa: "新しい複数条件の索引はまだ作られていないため、従来の名前検索(前日までに収集した名簿)で応答しています。次の日次学習が走ると、複数条件での絞り込みが使えるようになります。",
+    query, indexedCount: found.indexedCount ?? null,
+    players, items: players,
+    total: players.length, page: 1, perPage: limit, totalPages: 1, hasNext: false, hasPrev: false,
+    tookMs: null,
+    notIncludedJa: PLAYER_NOT_INCLUDED_JA,
+    unavailableFieldsJa: playerSearch.UNAVAILABLE_SEARCH_FIELDS_JA,
+    sourceJa: "毎日の学習でAPI-Footballから収集し保存した実測値です。",
+  };
+}
+
 const learningDeps = {
   // 2026年8月・欠陥Aの修正: 日次ジョブ(バッチ)の呼び出しであることを明示し、
   // 利用者用の予約枠を食い潰さないようにする。
@@ -4581,7 +4759,28 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         const summary = await clubDossier.getCoverageSummary();
-        const body = { ok: true, generatedAt: new Date().toISOString(), ...summary };
+        // 2026年8月・選手スカウティング刷新: 検索索引の実測状態も同梱する
+        // (「作りました」ではなく「実際に何件入っているか」を確認するため)。
+        const idxState = await loadPlayerIndex(false).catch(() => null);
+        const C = playerSearch.COL;
+        const rows = (idxState && idxState.rows) || [];
+        const playerIndex = {
+          available: rows.length > 0,
+          partial: !!(idxState && idxState.partial),
+          reasonJa: (idxState && idxState.reasonJa) || (rows.length ? null : "索引がまだ作られていません。"),
+          count: rows.length,
+          builtAt: (idxState && idxState.meta && idxState.meta.builtAt) || null,
+          shardCount: (idxState && idxState.meta && idxState.meta.shardCount) || null,
+          sources: (idxState && idxState.meta && idxState.meta.sources) || null,
+          loadMs: idxState ? idxState.loadMs : null,
+          withRating: rows.filter((r) => r[C.rating] !== null && r[C.rating] !== undefined).length,
+          withDetailedPosition: rows.filter((r) => r[C.detailedPos]).length,
+          withNationality: rows.filter((r) => r[C.nationality]).length,
+          injured: rows.filter((r) => r[C.injured] === 1).length,
+          clubs: new Set(rows.map((r) => r[C.teamEn]).filter(Boolean)).size,
+          nationalities: new Set(rows.map((r) => r[C.nationality]).filter(Boolean)).size,
+        };
+        const body = { ok: true, generatedAt: new Date().toISOString(), ...summary, playerIndex };
         cacheSet("kb:coverage", body, 5 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
@@ -4592,40 +4791,206 @@ const server = http.createServer(async (req, res) => {
       //   それを読み出すエンドポイントが1つも無く、画面の選手検索は
       //   index.html に直書きされた107人だけを対象にしていた。
       //   収集済みの全選手を名前で引けるようにする。
+      //   ---- 2026年8月・全面刷新 ----
+      //   名前1本の検索から、複数条件+ページネーション+ファセットへ。
+      //   夜間バッチが作った索引をメモリで絞り込むため、
+      //   このリクエストの中では Redis も API も呼ばない(索引の再読み込み時を除く)。
       if (pathname === "/api/knowledge/players") {
-        const q = (parsed.searchParams.get("q") || "").trim();
-        const limit = Math.max(1, Math.min(20, parseInt(parsed.searchParams.get("limit"), 10) || 8));
-        if (!q) {
-          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
-          res.end(JSON.stringify({ ok: false, reasonJa: "検索したい選手名(q)を指定してください。" }));
-          return;
-        }
-        const cacheKey = `kb:players:${q.toLowerCase()}:${limit}`;
-        const cached = cacheGet(cacheKey);
-        if (cached) {
+        const t0 = Date.now();
+        const state = await loadPlayerIndex(false);
+        if (!state.rows.length) {
+          // 索引がまだ無い間は、旧世代の名前索引で従来どおり応答する(劣化禁止)
+          const nameOnly = (parsed.searchParams.get("name") || parsed.searchParams.get("q") || "").trim();
+          const legacyLimit = Math.max(1, Math.min(50, parseInt(parsed.searchParams.get("limit"), 10)
+            || parseInt(parsed.searchParams.get("perPage"), 10) || 10));
+          const body = nameOnly
+            ? await legacyPlayerNameSearch(nameOnly, legacyLimit).catch(() => playerIndexUnavailableBody(state))
+            : playerIndexUnavailableBody(state);
           res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-          res.end(JSON.stringify(cached));
+          res.end(JSON.stringify(body));
           return;
         }
-        const found = await clubDossier.searchPlayers(q, { limit });
-        const players = [];
-        for (const hit of found.results || []) {
-          const rec = await clubDossier.getPlayer(hit.id);
-          // 記録本体が読めなかった場合も索引の情報だけは返す(名前と所属は確かな実測)
-          players.push(rec ? { ...rec, matchedName: hit.name } : { ...hit, recordUnavailableJa: "選手記録の読み出しに失敗しました(索引にはあります)。" });
+        const query = parsePlayerQuery(parsed.searchParams);
+        const page = Math.max(1, parseInt(parsed.searchParams.get("page"), 10) || 1);
+        const perPage = Math.max(1, Math.min(100, parseInt(parsed.searchParams.get("perPage"), 10)
+          || parseInt(parsed.searchParams.get("limit"), 10) || 24));
+        const matched = playerSearch.searchIndex(state.rows, query);
+        const pageData = playerSearch.paginate(matched, page, perPage);
+        const tookMs = Date.now() - t0;
+        const body = {
+          ok: true,
+          available: true,
+          query,
+          indexedCount: state.rows.length,
+          indexBuiltAt: state.meta && state.meta.builtAt ? state.meta.builtAt : null,
+          ...pageData,
+          // 旧クライアント(名前検索だけを見ていた版)との互換
+          players: pageData.items,
+          tookMs,
+          performanceJa: `索引${state.rows.length}件をメモリ上で絞り込みました(${tookMs}ミリ秒)。この検索でのデータベース・外部APIへのアクセスは0回です。`,
+          unavailableFieldsJa: playerSearch.UNAVAILABLE_SEARCH_FIELDS_JA,
+          notIncludedJa: PLAYER_NOT_INCLUDED_JA,
+          sourceJa: "毎日の学習でAPI-Footballから収集し保存した実測値です。",
+        };
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
+      // 絞り込みの候補一覧(クラブ・国籍・リーグ・ポジション)。
+      // クラブはTOP100の全クラブを返す(索引にまだ選手がいないクラブも
+      // 「0人」として出し、なぜ0人なのかが分かるようにする)。
+      if (pathname === "/api/knowledge/player-facets") {
+        const state = await loadPlayerIndex(false);
+        const facets = state.facets || { clubs: [], nationalities: [], leagues: [], positions: [], detailedPositions: [] };
+        const byEn = new Map(facets.clubs.map((c) => [c.teamEn, c]));
+        const clubs = CLUB_UNIVERSE.map((c) => {
+          const hit = byEn.get(c.nameEn);
+          return {
+            teamEn: c.nameEn, teamJa: c.nameJa, country: c.country,
+            leagueId: c.leagueId ?? (hit ? hit.leagueId : null),
+            rank: c.rank,
+            playerCount: hit ? hit.count : 0,
+            noteJa: hit ? null : "このクラブの選手はまだ索引に入っていません(名簿の取得が輪番待ち、またはクラブ名の照合に失敗しています)。",
+          };
+        });
+        // 索引にあるがTOP100の表記と一致しないクラブも落とさずに出す
+        for (const c of facets.clubs) {
+          if (!CLUB_UNIVERSE.some((u) => u.nameEn === c.teamEn)) {
+            clubs.push({ teamEn: c.teamEn, teamJa: c.teamJa, country: null, leagueId: c.leagueId, rank: null, playerCount: c.count, noteJa: null });
+          }
         }
         const body = {
           ok: true,
-          available: found.available !== false,
-          reasonJa: found.reasonJa || null,
-          query: q,
-          indexedCount: found.indexedCount ?? null,
-          players,
-          // でっち上げ防止: この応答に含まれない項目は「無い」と明記する
-          notIncludedJa: "総合点・能力値・ヒートマップはAPI-Footballでは提供されないため、収集済みデータには含まれません(実測の出場・得点・アシスト・平均評価のみ)。",
-          sourceJa: "毎日の学習でAPI-Footballから収集し保存した実測値です。",
+          available: state.rows.length > 0,
+          reasonJa: state.rows.length ? null : (state.reasonJa || "索引がまだ作られていません。"),
+          indexedCount: state.rows.length,
+          indexBuiltAt: state.meta && state.meta.builtAt ? state.meta.builtAt : null,
+          clubs,
+          totalClubs: clubs.length,
+          nationalities: facets.nationalities,
+          leagues: facets.leagues,
+          positions: facets.positions,
+          detailedPositions: facets.detailedPositions,
+          positionLabelsJa: playerSearch.BROAD_POSITION_JA,
+          detailedPositionLabelsJa: playerSearch.DETAILED_POSITION_JA,
+          detailedPositionNoteJa: "API-Footballが返すポジションは GK / DF / MF / FW の4分類だけです。CB・SB・DMF・CMF・AMF・WG・CF は、毎日取得しているスタメンの配置データ(3試合以上)から推定したもので、左右の別(RB/LBやRW/LW)は座標系の向きが確定できないため断定していません。",
+          unavailableFieldsJa: playerSearch.UNAVAILABLE_SEARCH_FIELDS_JA,
         };
-        cacheSet(cacheKey, body, 5 * 60 * 1000);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
+      // 選手1人の詳細 + AI分析(⑧)。索引はメモリ、記録本体だけ1回読む。
+      if (pathname === "/api/knowledge/player") {
+        const id = parseInt(parsed.searchParams.get("id"), 10);
+        if (!Number.isFinite(id)) {
+          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, reasonJa: "選手ID(id)を指定してください。" }));
+          return;
+        }
+        const t0 = Date.now();
+        const state = await loadPlayerIndex(false);
+        const row = state.rows.find((r) => Number(r[playerSearch.COL.id]) === id);
+        if (!row) {
+          res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({
+            ok: false, available: state.rows.length > 0,
+            reasonJa: state.rows.length
+              ? "この選手は索引に入っていません(TOP100クラブの所属選手のみを収集しています)。"
+              : (state.reasonJa || "索引がまだ作られていません。"),
+          }));
+          return;
+        }
+        const analysis = playerSearch.analyzePlayer(state.rows, row);
+        // 記録本体(kb:player:<id>)は詳細ページを開いたときだけ読む(Lazy Load)
+        const record = await clubDossier.getPlayer(id).catch(() => null);
+        const body = {
+          ok: true, available: true,
+          player: playerSearch.fromIndexRow(row),
+          analysis,
+          record: record || null,
+          recordNoteJa: record ? null : "個別の記録ファイルはまだ作られていません(索引の実測値のみ表示しています)。",
+          indexBuiltAt: state.meta && state.meta.builtAt ? state.meta.builtAt : null,
+          tookMs: Date.now() - t0,
+          unavailableFieldsJa: playerSearch.UNAVAILABLE_SEARCH_FIELDS_JA,
+        };
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
+      // 2〜4人の比較(⑨)
+      if (pathname === "/api/knowledge/player-compare") {
+        const ids = (parsed.searchParams.get("ids") || "")
+          .split(",").map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite);
+        if (ids.length < 2 || ids.length > 4) {
+          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, reasonJa: "比較する選手のIDを2〜4人ぶん、ids=1,2,3 の形式で指定してください。" }));
+          return;
+        }
+        const t0 = Date.now();
+        const state = await loadPlayerIndex(false);
+        const rows = [];
+        const missing = [];
+        for (const id of ids) {
+          const row = state.rows.find((r) => Number(r[playerSearch.COL.id]) === id);
+          if (row) rows.push(row); else missing.push(id);
+        }
+        if (rows.length < 2) {
+          res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({
+            ok: false, missing,
+            reasonJa: state.rows.length
+              ? `指定された選手のうち索引にあるのは${rows.length}人でした。比較には2人以上必要です。`
+              : (state.reasonJa || "索引がまだ作られていません。"),
+          }));
+          return;
+        }
+        const result = playerSearch.comparePlayers(state.rows, rows);
+        const body = {
+          ok: true, available: true, ...result, missing,
+          missingNoteJa: missing.length ? `ID ${missing.join(", ")} は索引に見つからなかったため比較から外しました。` : null,
+          indexBuiltAt: state.meta && state.meta.builtAt ? state.meta.builtAt : null,
+          tookMs: Date.now() - t0,
+        };
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
+      // クラブ→所属選手(⑥ クラブページ⇄選手ページの相互遷移)
+      if (pathname === "/api/knowledge/club-players") {
+        const club = (parsed.searchParams.get("club") || "").trim();
+        if (!club) {
+          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, reasonJa: "クラブ名(club)を英語表記で指定してください。" }));
+          return;
+        }
+        const t0 = Date.now();
+        const state = await loadPlayerIndex(false);
+        const target = CLUB_UNIVERSE.find((c) => c.nameEn.toLowerCase() === club.toLowerCase()
+          || (c.nameJa && c.nameJa === club));
+        const teamEn = target ? target.nameEn : club;
+        const rows = state.rows.filter((r) => r[playerSearch.COL.teamEn] === teamEn);
+        const sorted = playerSearch.sortRows(rows, { sort: parsed.searchParams.get("sort") || "rating", order: "desc" });
+        const byPosition = {};
+        for (const code of playerSearch.BROAD_POSITIONS) {
+          const list = sorted.filter((r) => r[playerSearch.COL.position] === code).map(playerSearch.fromIndexRow);
+          if (list.length) byPosition[code] = list;
+        }
+        const unknownPos = sorted.filter((r) => !playerSearch.BROAD_POSITIONS.includes(r[playerSearch.COL.position])).map(playerSearch.fromIndexRow);
+        const body = {
+          ok: true,
+          available: state.rows.length > 0,
+          reasonJa: state.rows.length ? null : (state.reasonJa || "索引がまだ作られていません。"),
+          club: target ? { teamEn: target.nameEn, teamJa: target.nameJa, country: target.country, leagueId: target.leagueId, rank: target.rank } : { teamEn, teamJa: null },
+          count: sorted.length,
+          players: sorted.map(playerSearch.fromIndexRow),
+          byPosition,
+          unknownPosition: unknownPos,
+          positionLabelsJa: playerSearch.BROAD_POSITION_JA,
+          emptyReasonJa: sorted.length ? null : "このクラブの選手はまだ索引に入っていません(名簿の取得が輪番待ち、またはクラブ名の照合に失敗しています)。",
+          indexBuiltAt: state.meta && state.meta.builtAt ? state.meta.builtAt : null,
+          tookMs: Date.now() - t0,
+        };
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
         return;
