@@ -53,8 +53,16 @@ function computePlayerRealStats(statsBlock) {
   const dribbleSuccess = toNum(dribbles.success);
   const duelsTotal = toNum(duels.total);
   const duelsWon = toNum(duels.won);
-  const tacklesTotal = toNum(tackles.total) || 0;
-  const interceptions = toNum(tackles.interceptions) || 0;
+  // ---- 2026年8月の監査で発見した「0のでっち上げ」の修正 ----
+  // 以前は `|| 0` としていたため、**タックル・インターセプトが1つも
+  // 取得できていない選手も「守備アクション0回」という実測値**として
+  // 保存されていた。0は「やっていない」であって「取得できていない」ではない。
+  // 両方とも取得できない場合は null(=測れていない)を返す。
+  const tacklesTotalRaw = toNum(tackles.total);
+  const interceptionsRaw = toNum(tackles.interceptions);
+  const tacklesTotal = tacklesTotalRaw === null ? 0 : tacklesTotalRaw;
+  const interceptions = interceptionsRaw === null ? 0 : interceptionsRaw;
+  const defensiveMeasured = tacklesTotalRaw !== null || interceptionsRaw !== null;
 
   return {
     position: games.position || null,
@@ -67,15 +75,19 @@ function computePlayerRealStats(statsBlock) {
     passAccuracyPct: toNum(passes.accuracy), // API-Football上は数値(%相当)またはnull
     dribbleAttempts,
     dribbleSuccessCount: dribbleSuccess,
-    dribbleSuccessRatePct: dribbleAttempts ? Math.round((dribbleSuccess / dribbleAttempts) * 1000) / 10 : null,
+    // 試行はあるのに成功数が取得できていない場合、0%は「1度も成功しなかった」
+    // という実測の主張になってしまう。取得できていないなら null を返す。
+    dribbleSuccessRatePct: (dribbleAttempts && dribbleSuccess !== null)
+      ? Math.round((dribbleSuccess / dribbleAttempts) * 1000) / 10 : null,
     // 「守備指標」= タックル+インターセプトの合計(プレス成功率の代替。正直な注記はファイル冒頭参照)
-    defensiveActions: tacklesTotal + interceptions,
-    tacklesTotal,
-    interceptions,
+    defensiveActions: defensiveMeasured ? tacklesTotal + interceptions : null,
+    tacklesTotal: tacklesTotalRaw,
+    interceptions: interceptionsRaw,
     duelsTotal,
     duelsWon,
     // 「空中戦」ではなく正直に「デュエル(競り合い全体)勝率」
-    duelWinRatePct: duelsTotal ? Math.round((duelsWon / duelsTotal) * 1000) / 10 : null,
+    duelWinRatePct: (duelsTotal && duelsWon !== null)
+      ? Math.round((duelsWon / duelsTotal) * 1000) / 10 : null,
     yellowCards: toNum((statsBlock.cards || {}).yellow),
     redCards: toNum((statsBlock.cards || {}).red),
   };

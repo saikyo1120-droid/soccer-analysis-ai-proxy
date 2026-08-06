@@ -42,15 +42,47 @@ const {
 } = require("./features");
 const { computePlayerRealStats } = require("./playerFeatures");
 const { summarizeTransfers } = require("../rag/knowledgeSource");
+const playerSearch = require("../knowledge/playerSearch");
 
 // 予算の安全弁: 残りがこの件数を下回ったら、その日の宇宙収集は打ち切る
 // (既存の学習ジョブや利用者のリクエストを圧迫しないため)。
 const BUDGET_FLOOR = Number(process.env.UNIVERSE_BUDGET_FLOOR) || 150;
 const PLAYER_CAP_DEFAULT = Number(process.env.UNIVERSE_PLAYER_CAP) || 300;
 
+// ---- 2026年8月・「取得した選手をすべて選手スカウティングへ」への対応 ----
+// クラブ単位の一括取得 /players?team=&season=&page= は、1リクエストで20人ぶんの
+// **成績つき**の選手情報を返す。1クラブ2〜3ページ(=2〜3リクエスト)で
+// 全所属選手の成績が揃うため、従来の「1人1リクエスト・1日300人」に比べて
+// 桁違いに効率が良い(100クラブ ≒ 250リクエストで約2,500人)。
+// 従来の1人ずつの詳細取得は**残したまま**併用する
+// (最終方針①劣化禁止・③データ取得量の削減は禁止)。
+const BULK_PAGE_LIMIT = Number(process.env.UNIVERSE_BULK_PAGE_LIMIT) || 4;   // 1クラブあたり最大ページ数(=最大80人)
+const BULK_CLUB_LIMIT = Number(process.env.UNIVERSE_BULK_CLUB_LIMIT) || 100; // 1日あたり一括取得するクラブ数
+
 function seasonOf(runAt) {
   const m = runAt.getMonth() + 1;
   return m >= 7 ? runAt.getFullYear() : runAt.getFullYear() - 1;
+}
+
+// 索引の2行が「実質的に同じ」か。updatedAt など毎日必ず変わる列は無視する。
+// ここで differ と判定されたものだけを保存・速報の対象にするため、判定を
+// 誤ると Redis のコマンド数がそのまま増える(=判定は保守的に厳密にする)。
+const ROW_COMPARE_COLS = (() => {
+  const C = playerSearch.COL;
+  return [C.name, C.teamEn, C.teamJa, C.leagueId, C.nationality, C.position,
+    C.age, C.heightCm, C.minutes, C.goals, C.assists, C.rating, C.injured,
+    C.detailedPos, C.appearances, C.number, C.keyPasses, C.passAccuracyPct,
+    C.dribbleSuccessRatePct, C.defensiveActions, C.duelWinRatePct,
+    C.yellowCards, C.redCards];
+})();
+function rowsEquivalent(a, b) {
+  if (!a || !b) return false;
+  for (const c of ROW_COMPARE_COLS) {
+    const av = a[c] === undefined ? null : a[c];
+    const bv = b[c] === undefined ? null : b[c];
+    if (av !== bv) return false;
+  }
+  return true;
 }
 
 // dailyJob.js の computeFormScore と同じ計算(依存の向きの都合でここに複製せず、
@@ -113,6 +145,18 @@ async function collectUniverse(deps, runAt, dateKey) {
   // 同一実行内での/fixtures二度取り防止(コア更新で取得した直近試合をxGステージが再利用)
   const fixturesCache = new Map(); // teamId -> fixtures[]
 
+  // ---- 2026年8月・選手スカウティング刷新のための「ただ乗り」収集 ----
+  //  以下の2つは、**既に毎日取得しているレスポンスの中に入っているのに
+  //  捨てていた情報**である。拾うだけなので追加のAPIコールは0件。
+  //   ・/injuries    → 負傷者の playerId(これまで名前しか使っていなかった)
+  //   ・/fixtures/lineups → スタメンの grid(配置)。細かいポジションの推定に使う
+  const injuredIds = new Set();          // 今日、負傷者リストに載っていた選手ID
+  const injuryCheckedClubs = new Set();  // 今日、負傷者リストを実際に確認できたクラブ(nameEn)
+  const gridUpdates = new Map();         // playerId -> { grid, maxRow }(今日ぶん)
+  const savedTodayIds = new Set();       // 今日 savePlayer を通した選手(速報の二重計上を防ぐ)
+  const squadOnlyPending = [];           // 名簿で見つけた選手(一括取得で拾えなければ後で保存する)
+  const emittedByPlayer = new Map();     // playerId -> savePlayer が実際に出した速報の種類
+
   // ---- teamId の解決(調査ファイルに保存済みならAPIを呼ばない) ----
   // ---- 2026年8月・本番エラー調査で判明した欠陥の修正(+第三者監査での再修正) ----
   //   従来は club.nameEn をそのまま1回だけ /teams?search= に渡し、結果の先頭を
@@ -131,9 +175,21 @@ async function collectUniverse(deps, runAt, dateKey) {
     stats.unresolvedClubs.push({ nameEn: club.nameEn, nameJa: club.nameJa, reasonJa });
   }
 
+  // ---- 2026年8月の監査で発見: 同じクラブの調査ファイルを1回の実行で何度も読んでいた ----
+  // resolveTeam は コア更新・一括取得・名簿・xG・基本情報 の各ステージから
+  // 呼ばれ、そのたびに getDossier(=Redis GET 1回)を発行していた。
+  // 100クラブ×5ステージ = 500コマンドが、同じ内容の読み直しに使われていた。
+  // 1回の実行の中でクラブの teamId は変わらないので、実行内で覚えておく。
+  const teamResolveMemo = new Map(); // nameEn -> { teamId, dossier }
   async function resolveTeam(club) {
+    const memo = teamResolveMemo.get(club.nameEn);
+    if (memo) return memo;
     const dossier = await clubDossier.getDossier(club.nameEn);
-    if (dossier && dossier.teamId) return { teamId: dossier.teamId, dossier };
+    if (dossier && dossier.teamId) {
+      const hit = { teamId: dossier.teamId, dossier };
+      teamResolveMemo.set(club.nameEn, hit);
+      return hit;
+    }
 
     // 否定キャッシュ(直近7日以内に全候補で照合できなかったクラブは再試行しない)
     const failKey = `kb:club:resolvefail:${club.nameEn}`;
@@ -141,7 +197,9 @@ async function collectUniverse(deps, runAt, dateKey) {
       const failed = await deps.upstashGetJSON(failKey).catch(() => null);
       if (failed) {
         markUnresolved(club, "直近7日以内に名前を照合できなかったため、今日は再試行を見送りました(7日後に自動で再挑戦します)。");
-        return { teamId: null, dossier, unresolved: true };
+        const miss = { teamId: null, dossier, unresolved: true };
+        teamResolveMemo.set(club.nameEn, miss);
+        return miss;
       }
     }
 
@@ -167,7 +225,9 @@ async function collectUniverse(deps, runAt, dateKey) {
           venueCapacity: (row.venue && row.venue.capacity) || null,
           logo: row.team.logo || null,
         }, metaOf(club, row.team.id, runAt));
-        return { teamId: row.team.id, dossier };
+        const hit = { teamId: row.team.id, dossier };
+        teamResolveMemo.set(club.nameEn, hit);
+        return hit;
       } catch (e) {
         lastError = e;
         if (e && e.code === "BUDGET_EXHAUSTED") {
@@ -181,7 +241,9 @@ async function collectUniverse(deps, runAt, dateKey) {
       // 一度も検索が成立しなかった = 通信・API側の一時的な問題。
       // 否定キャッシュには入れない(次回そのまま再挑戦して自己修復する)。
       stats.errors.push(`universe_resolve_failed:${club.nameEn}:${(lastError && (lastError.code || lastError.message)) || "unknown"}`);
-      return { teamId: null, dossier };
+      const miss = { teamId: null, dossier };
+      teamResolveMemo.set(club.nameEn, miss);
+      return miss;
     }
     // 検索は成立したのに一致が無い = データ提供元の表記差。エラーではなく
     // 「照合できないクラブ」として明示し、7日間は再試行しない。
@@ -191,7 +253,9 @@ async function collectUniverse(deps, runAt, dateKey) {
       // 「7日後に再挑戦」の約束が守られない(監査での指摘)。必ず一括で書く。
       await deps.upstashCmd(["SET", failKey, JSON.stringify({ failedAt: runAt.toISOString(), nameEn: club.nameEn }), "EX", String(7 * 86400)]).catch(() => {});
     }
-    return { teamId: null, dossier, unresolved: true };
+    const miss = { teamId: null, dossier, unresolved: true };
+    teamResolveMemo.set(club.nameEn, miss);
+    return miss;
   }
 
   function metaOf(club, teamId, at) {
@@ -273,6 +337,12 @@ async function collectUniverse(deps, runAt, dateKey) {
       try {
         const inj = await callApiFootball("/injuries", { team: teamId, season });
         const injuryInfo = computeInjuryCountFeature(inj.response);
+        // 追加コスト0: 同じレスポンスから選手IDを拾い、検索の「怪我の有無」に使う
+        injuryCheckedClubs.add(club.nameEn);
+        for (const r of (inj.response || [])) {
+          const pid = r && r.player && r.player.id;
+          if (pid) injuredIds.add(Number(pid));
+        }
         const prevDossier = await clubDossier.getDossier(club.nameEn);
         const prevCount = prevDossier && prevDossier.sections.injuries
           ? prevDossier.sections.injuries.injuryCount : null;
@@ -295,6 +365,34 @@ async function collectUniverse(deps, runAt, dateKey) {
           const lu = await callApiFootball("/fixtures/lineups", { fixture: finished.fixture.id });
           const mine = (lu.response || []).find((row) => row.team && row.team.id === teamId);
           if (mine) {
+            // 追加コスト0: スタメンの配置(grid "行:列")を拾う。
+            // API-Footballのポジションは Goalkeeper/Defender/Midfielder/Attacker の
+            // 4分類しか無いため、CB/SB/DMF/CMF/AMF/WG/CF の細分はここからしか作れない。
+            const startXI = Array.isArray(mine.startXI) ? mine.startXI : [];
+            let maxRow = 0;
+            const colsByRow = new Map();  // 行 -> その行に並んだ列番号
+            for (const s of startXI) {
+              const g = s && s.player && s.player.grid;
+              const m = g ? String(g).match(/^(\d+)\s*:\s*(\d+)$/) : null;
+              if (!m) continue;
+              const r = Number(m[1]), c = Number(m[2]);
+              maxRow = Math.max(maxRow, r);
+              const arr = colsByRow.get(r) || [];
+              arr.push(c);
+              colsByRow.set(r, arr);
+            }
+            for (const s of startXI) {
+              const pid = s && s.player && s.player.id;
+              const g = s && s.player && s.player.grid;
+              const m = g ? String(g).match(/^(\d+)\s*:\s*(\d+)$/) : null;
+              if (!pid || !m) continue;
+              const r = Number(m[1]), c = Number(m[2]);
+              const cols = colsByRow.get(r) || [c];
+              // 「端」= その行の最小列か最大列。ただし2人しか並んでいない行は
+              // 全員が端になってしまうので判定しない(CBの2枚をSBにしないため)。
+              const isEdge = cols.length >= 3 && (c === Math.min(...cols) || c === Math.max(...cols));
+              gridUpdates.set(Number(pid), { grid: String(g), maxRow, isEdge, fixtureId: finished.fixture.id });
+            }
             const r = await clubDossier.updateSection(club.nameEn, "coach", {
               coachName: (mine.coach && mine.coach.name) || null,
               formation: mine.formation || null,
@@ -373,12 +471,21 @@ async function collectUniverse(deps, runAt, dateKey) {
       if (players.length) {
         const r = await clubDossier.updateSection(club.nameEn, "squad", { players, count: players.length }, metaOf(club, teamId, runAt));
         await noteChanges(club, r.changesJa, "transferImpact", {});
-        // 名簿の基本情報(ポジション・年齢)を選手記録にも反映する
+        // 名簿の基本情報(ポジション・年齢)を選手記録にも反映する。
+        // ---- 2026年8月の監査を受けた変更 ----
+        // ここで即座に savePlayer を呼ぶと、直後のクラブ単位一括取得(③-b)が
+        // **同じ選手をより多くの情報で上書きする** ため、1人あたり
+        // 「読み+書き」が二重に発生していた(名簿輪番だけで1日約1,300コマンド)。
+        // 保存自体はやめず、③-b の結果が出てから「一括取得で拾えなかった選手だけ」
+        // を保存する。取得する情報は一切減らしていない。
         for (const p of players) {
-          await clubDossier.savePlayer({
-            id: p.id, name: p.name, teamEn: club.nameEn, teamJa: club.nameJa,
-            position: p.position, age: p.age, number: p.number,
-          }).then((res) => { if (res.saved) { stats.playersUpdated++; stats.playersFromSquadSync++; } }).catch(() => {});
+          if (p && p.id) {
+            squadOnlyPending.push({
+              id: p.id, name: p.name, teamEn: club.nameEn, teamJa: club.nameJa,
+              leagueId: club.leagueId || null,
+              position: p.position, age: p.age, number: p.number,
+            });
+          }
         }
       }
       stats.squadsUpdated++;
@@ -386,10 +493,130 @@ async function collectUniverse(deps, runAt, dateKey) {
   }
 
   // ============================================================
+  // ③-b 全所属選手の成績を「クラブ単位で一括取得」(2026年8月・新設)
+  // ============================================================
+  // ご要望①「毎日取得している選手データをすべて選手スカウティングへ自動登録」
+  // への対応の中心。従来は /players?id=<選手> を1人1リクエストで回していたため、
+  // 1日300人=全選手(約2,500人)を一巡するのに8〜9日かかっていた。
+  // /players?team=<クラブ>&season=&page= は **1リクエストで20人ぶんの成績** を返す。
+  // 100クラブ × 2〜3ページ ≒ 250リクエストで、全所属選手の成績が**毎日**揃う。
+  //
+  // ※ 従来の1人ずつの詳細取得(④)は削除せず併用する。
+  //    最終方針③「データ取得量・更新頻度・学習量の削減は禁止」に従い、
+  //    これは**置き換えではなく追加**である。
+  const bulkPlayers = new Map(); // playerId -> { record, club }
+  stats.bulkClubsPlanned = 0;
+  stats.bulkClubsFetched = 0;
+  stats.bulkPlayersFetched = 0;
+  stats.bulkRequests = 0;
+  const bulkClubs = alreadyRanToday ? [] : CLUB_UNIVERSE.slice(0, Math.max(1, BULK_CLUB_LIMIT));
+  stats.bulkClubsPlanned = bulkClubs.length;
+  for (const club of bulkClubs) {
+    if (!canSpend(2)) {
+      skip("bulkPlayers", `予算残量が安全ラインを下回ったため、${club.nameJa}以降の「クラブ単位の選手一括取得」を見送りました(見送ったぶんは翌日に回ります)。`);
+      break;
+    }
+    try {
+      const { teamId } = await resolveTeam(club);
+      if (!teamId) continue;
+      let page = 1;
+      let totalPages = 1;
+      let fetchedForClub = 0;
+      let stoppedReason = null;
+      while (page <= Math.min(totalPages, BULK_PAGE_LIMIT)) {
+        if (!canSpend(1)) { stoppedReason = "budget"; break; }
+        const data = await callApiFootball("/players", { team: teamId, season, page });
+        stats.bulkRequests++;
+        const paging = data && data.paging;
+        const t = paging && Number(paging.total);
+        if (Number.isFinite(t) && t > 0) totalPages = t;
+        const rows = (data && data.response) || [];
+        if (!rows.length) break;
+        for (const entry of rows) {
+          const pl = entry && entry.player;
+          if (!pl || !pl.id) continue;
+          const list = Array.isArray(entry.statistics) ? entry.statistics : [];
+          // 出場数が最も多い大会の成績を代表値にする(既存④と同じ基準)
+          const best = list.length
+            ? list.reduce((acc, cur) =>
+              (((cur.games && cur.games.appearences) || 0) > ((acc.games && acc.games.appearences) || 0) ? cur : acc), list[0])
+            : null;
+          const real = best ? (computePlayerRealStats(best) || {}) : {};
+          bulkPlayers.set(Number(pl.id), {
+            id: Number(pl.id),
+            name: pl.name || null,
+            teamEn: club.nameEn, teamJa: club.nameJa,
+            leagueId: club.leagueId || null,
+            nationality: pl.nationality || null,
+            height: pl.height || null,
+            birthDate: (pl.birth && pl.birth.date) || null,
+            age: Number.isFinite(Number(pl.age)) ? Number(pl.age) : null,
+            position: real.position || (best && best.games && best.games.position) || null,
+            // 成績が1件も無い選手(新加入で未出場など)も **登録はする**。
+            // 数値は0で埋めず null のままにして「まだ出場していない/取得できていない」
+            // ことが分かるようにする(でっち上げ防止)。
+            stats: best ? {
+              appearances: (best.games && best.games.appearences) ?? null,
+              minutes: (best.games && best.games.minutes) ?? null,
+              rating: best.games && best.games.rating ? Math.round(parseFloat(best.games.rating) * 100) / 100 : null,
+              goals: (best.goals && best.goals.total) ?? null,
+              assists: (best.goals && best.goals.assists) ?? null,
+              keyPasses: real.keyPasses ?? null,
+              passAccuracyPct: real.passAccuracyPct ?? null,
+              dribbleSuccessRatePct: real.dribbleSuccessRatePct ?? null,
+              defensiveActions: real.defensiveActions ?? null,
+              duelWinRatePct: real.duelWinRatePct ?? null,
+              yellowCards: (best.cards && best.cards.yellow) ?? null,
+              redCards: (best.cards && best.cards.red) ?? null,
+              season,
+            } : null,
+          });
+          fetchedForClub++;
+        }
+        page++;
+      }
+      if (fetchedForClub > 0) {
+        stats.bulkClubsFetched++;
+        stats.bulkPlayersFetched += fetchedForClub;
+      }
+      // 「黙って減らさない」: 途中で打ち切ったクラブは必ず理由を残す
+      if (stoppedReason === "budget") {
+        skip("bulkPlayers", `APIの残り予算が不足したため、${club.nameJa}の選手一括取得を${page - 1}ページで打ち切りました(全${totalPages}ページ中)。残りは翌日に回ります。`);
+      } else if (totalPages > BULK_PAGE_LIMIT) {
+        skip("bulkPlayers", `${club.nameJa}は登録選手が多く(${totalPages}ページ)、1クラブあたりの上限${BULK_PAGE_LIMIT}ページを超えたため、${BULK_PAGE_LIMIT * 20}人目までを取得しました。`);
+      }
+    } catch (e) {
+      if (e && e.code === "BUDGET_EXHAUSTED") {
+        skip("bulkPlayers", "APIの1日予算に達したため、クラブ単位の選手一括取得を打ち切りました。");
+        break;
+      }
+      stats.errors.push(`universe_bulk_players_failed:${club.nameEn}:${e.code || e.message}`);
+    }
+  }
+
+  // ---- 名簿でしか見つからなかった選手の保存 ----
+  // 一括取得(③-b)で成績つきで拾えた選手は、そちらの保存に任せる。
+  // ここで保存するのは「名簿にはいるが一括取得の対象外だった選手」だけ。
+  stats.squadOnlySaved = 0;
+  for (const p of squadOnlyPending) {
+    if (bulkPlayers.has(Number(p.id))) continue;   // 一括取得のほうが情報量が多い
+    try {
+      const res = await clubDossier.savePlayer(p);
+      if (res && res.saved) {
+        stats.playersUpdated++; stats.playersFromSquadSync++; stats.squadOnlySaved++;
+        savedTodayIds.add(Number(p.id));
+        emittedByPlayer.set(Number(p.id), new Set((res.events || []).map((ev) => ev.type)));
+      }
+    } catch (e) { /* 1人の失敗で名簿全体を止めない */ }
+  }
+
+  // ============================================================
   // ④ 選手の詳細成績(名簿から輪番。予算内で1日あたり上限N人)
   // ============================================================
   // 保存済みの名簿から、更新が最も古い選手を優先して選ぶ。
   // 1人=1リクエスト。UNIVERSE_PLAYER_CAP(既定300)まで。
+  const detailPlayers = new Map(); // playerId -> 保存した記録(索引づくりで再利用)
+  const squadByClub = new Map();   // nameEn -> { club, players[] }(索引づくりで再利用)
   try {
     // 自己改善ループ: 上限はAI自身が150〜400の安全範囲で調整できる(既定300)
     const cap = (deps.tune && Number.isFinite(deps.tune.playerDetailCap))
@@ -403,8 +630,9 @@ async function collectUniverse(deps, runAt, dateKey) {
     const searchIndex = {};
     for (const club of CLUB_UNIVERSE) {
       const d = await clubDossier.getDossier(club.nameEn);
-      const squad = d && d.sections.squad && d.sections.squad.players;
+      const squad = d && d.sections && d.sections.squad && d.sections.squad.players;
       if (!squad) continue;
+      squadByClub.set(club.nameEn, { club, players: squad });
       for (const p of squad) {
         candidates.push({ club, playerId: p.id, name: p.name });
         if (p.id && p.name) {
@@ -447,11 +675,13 @@ async function collectUniverse(deps, runAt, dateKey) {
         const best = entry.statistics.reduce((acc, cur) =>
           (((cur.games && cur.games.appearences) || 0) > ((acc.games && acc.games.appearences) || 0) ? cur : acc), entry.statistics[0]);
         const real = computePlayerRealStats(best) || {};
-        await clubDossier.savePlayer({
+        const detailRecord = {
           id: c.playerId, name: c.name, teamEn: c.club.nameEn, teamJa: c.club.nameJa,
+          leagueId: c.club.leagueId || null,
           nationality: (entry.player && entry.player.nationality) || null,
           height: (entry.player && entry.player.height) || null,
           birthDate: (entry.player && entry.player.birth && entry.player.birth.date) || null,
+          age: Number.isFinite(Number(entry.player && entry.player.age)) ? Number(entry.player.age) : null,
           position: real.position || null,
           stats: {
             appearances: (best.games && best.games.appearences) ?? null,
@@ -464,10 +694,16 @@ async function collectUniverse(deps, runAt, dateKey) {
             dribbleSuccessRatePct: real.dribbleSuccessRatePct ?? null,
             defensiveActions: real.defensiveActions ?? null,
             duelWinRatePct: real.duelWinRatePct ?? null,
+            yellowCards: (best.cards && best.cards.yellow) ?? null,
+            redCards: (best.cards && best.cards.red) ?? null,
             season,
           },
           statsUpdatedAt: runAt.toISOString(),
-        });
+        };
+        const detailRes = await clubDossier.savePlayer(detailRecord);
+        detailPlayers.set(Number(c.playerId), detailRecord);
+        savedTodayIds.add(Number(c.playerId));
+        emittedByPlayer.set(Number(c.playerId), new Set(((detailRes && detailRes.events) || []).map((ev) => ev.type)));
         statsIndex[c.playerId] = runAt.toISOString();
         indexDirty = true;
         stats.playersUpdated++;
@@ -481,6 +717,233 @@ async function collectUniverse(deps, runAt, dateKey) {
     }
     if (indexDirty) await clubDossier.saveStatsIndex(statsIndex);
   } catch (e) { stats.errors.push(`universe_players_failed:${e.message}`); }
+
+  // ============================================================
+  // ④-b 選手スカウティング用の検索索引を作る(2026年8月・全面刷新)
+  // ============================================================
+  // ご要望②〜⑤⑦⑩への土台。画面の検索は「この1本の索引をメモリで絞り込む」
+  // だけになるため、検索1回あたりの Redis / API アクセスは **0回** になる。
+  //
+  // 情報源(すべて今日この関数の中で既に取得済み。追加のAPIコールは0件):
+  //   ・③-b クラブ単位の一括取得 … 全所属選手の成績(最も新しい)
+  //   ・④   1人ずつの詳細成績   … 輪番で深掘りしたぶん
+  //   ・③   名簿(squad)        … 成績がまだ無い選手も必ず載せる
+  //   ・①   /injuries           … 怪我の有無(選手ID)
+  //   ・①   /fixtures/lineups   … スタメン配置(細かいポジションの推定)
+  stats.playerIndex = { built: false };
+  try {
+    const psDeps = {
+      upstashEnabled: !!(deps.upstashGetJSON && deps.upstashSetJSON),
+      upstashGetJSON: deps.upstashGetJSON,
+      upstashSetJSON: deps.upstashSetJSON,
+      upstashCmd: deps.upstashCmd,
+    };
+    if (!psDeps.upstashEnabled) {
+      stats.playerIndex = { built: false, reasonJa: "保存先(Upstash)が未設定のため、選手検索の索引を作成できません。" };
+    } else {
+      const todayKey = playerSearch.dateKeyNum(runAt.toISOString());
+      const prevLoaded = await playerSearch.loadIndex(psDeps);
+      const prevMap = new Map();
+      for (const r of prevLoaded.rows) prevMap.set(Number(r[playerSearch.COL.id]), r);
+      const isFirstBuild = prevMap.size === 0;
+
+      // スタメン配置の累積(GET1回・SET1回)。今日ぶんを足す。
+      const grid = (await playerSearch.loadGrid(psDeps)) || {};
+      for (const [pid, g] of gridUpdates) {
+        grid[pid] = playerSearch.accumulateGrid(grid[pid], g.grid, g.maxRow, g.isEdge, g.fixtureId);
+      }
+
+      // ---- 情報源をマージする。null では上書きしない(古い実測を消さない) ----
+      const mergeInto = (base, next) => {
+        const out = { ...(base || {}) };
+        for (const [k, v] of Object.entries(next || {})) {
+          if (k === "stats") continue;
+          if (v !== null && v !== undefined && v !== "") out[k] = v;
+        }
+        if (next && next.stats) {
+          out.stats = { ...(out.stats || {}) };
+          for (const [k, v] of Object.entries(next.stats)) {
+            if (v !== null && v !== undefined) out.stats[k] = v;
+          }
+        }
+        return out;
+      };
+      const merged = new Map();
+      const put = (id, rec) => { merged.set(id, mergeInto(merged.get(id), rec)); };
+      for (const [, entry] of squadByClub) {
+        for (const p of entry.players) {
+          if (!p || !p.id) continue;
+          put(Number(p.id), {
+            id: Number(p.id), name: p.name, teamEn: entry.club.nameEn, teamJa: entry.club.nameJa,
+            leagueId: entry.club.leagueId || null, position: p.position, age: p.age, number: p.number,
+          });
+        }
+      }
+      for (const [id, rec] of detailPlayers) put(id, rec);
+      for (const [id, rec] of bulkPlayers) put(id, rec);   // 最も新しいので最後
+
+      // ---- 索引の行を作る ----
+      const rows = [];
+      const changed = [];  // { row, prev } — 変化があった選手(速報と保存の対象)
+      for (const [id, rec] of merged) {
+        const prev = prevMap.get(id) || null;
+        const gridStats = playerSearch.gridStatsFrom(grid[id]);
+        // 怪我の有無は「今日そのクラブの負傷者リストを実際に確認できた」場合だけ
+        // 0/1 を更新する。確認できていないクラブの選手は前回値を維持する
+        // (確認していないのに「怪我していない」と書くのはでっち上げになる)。
+        const injured = injuryCheckedClubs.has(rec.teamEn) ? injuredIds.has(id) : undefined;
+        const row = playerSearch.toIndexRow(rec, { leagueId: rec.leagueId, injured, gridStats, todayKey }, runAt.getTime(), prev);
+        rows.push(row);
+        if (prev && !rowsEquivalent(prev, row)) changed.push({ row, prev });
+        else if (!prev) changed.push({ row, prev: null });
+      }
+      // 今日どの情報源にも現れなかった選手は、前回の行をそのまま残す
+      // (クラブの名簿更新が輪番待ちのときに、索引から人が消えないようにする)。
+      // ただし60日以上更新が無い行は退団などとみなして落とす。
+      let carried = 0, dropped = 0;
+      for (const [id, prev] of prevMap) {
+        if (merged.has(id)) continue;
+        const age = playerSearch.daysBetweenKeys(prev[playerSearch.COL.updatedAt], todayKey);
+        if (age !== null && age > 60) { dropped++; continue; }
+        rows.push(prev); carried++;
+      }
+
+      const C = playerSearch.COL;
+
+      // ---- 選手個別の記録(kb:player:<id>)の更新 ----
+      // 全員ぶん書くと Upstash のコマンド数が跳ね上がる。
+      // savePlayer 1回のコストは **GET + SET + 速報のLPUSH + LTRIM = 最大4コマンド**
+      // (監査で「2コマンド」と見積もっていたのが誤りだった)。
+      // そのため上限は控えめにし、優先順位も見直す:
+      //   ・移籍(所属クラブが変わった)          … 最優先。事実として重要
+      //   ・更新が古い選手                        … 同じ選手ばかり保存して他が
+      //                                            永久に取り残されるのを防ぐ
+      //   ・平均評価の変化が大きい選手            … 変化の説明として価値が高い
+      // 保存しきれなかったぶんも **索引には反映済み**(画面の検索・分析は最新)。
+      // 遅れるのは個別ページの「記録ファイル」だけ。
+      const SAVE_CAP = Number(process.env.UNIVERSE_INDEX_SAVE_CAP) || 150;
+      const savable = changed
+        .filter((x) => x.prev && !savedTodayIds.has(Number(x.row[C.id])) && bulkPlayers.has(Number(x.row[C.id])))
+        .map((x) => {
+          const teamChanged = x.prev[C.teamEn] !== x.row[C.teamEn] ? 100000 : 0;
+          // 何日ぶん更新が止まっているか(古いほど優先)
+          const staleDays = Math.min(60, playerSearch.daysBetweenKeys(x.prev[C.updatedAt], todayKey) || 0);
+          const dr = Math.abs((x.row[C.rating] || 0) - (x.prev[C.rating] || 0));
+          return { ...x, priority: teamChanged + staleDays * 100 + dr * 10 };
+        })
+        .sort((a, b) => b.priority - a.priority);
+      let savedFromBulk = 0;
+      for (const s2 of savable) {
+        if (savedFromBulk >= SAVE_CAP) break;
+        const rec = bulkPlayers.get(Number(s2.row[C.id]));
+        if (!rec) continue;
+        const r = await clubDossier.savePlayer({ ...rec, statsUpdatedAt: runAt.toISOString() }).catch(() => ({ saved: false }));
+        if (r && r.saved) {
+          savedFromBulk++;
+          // ---- 検証で判明した取りこぼしへの対処 ----
+          // 以前は「savePlayer を通した選手」を丸ごと速報の対象から外していた。
+          // ところが savePlayer 側の検知は **保存済みの記録** との比較なので、
+          // 記録に成績が入っていない選手(名簿だけで作られた記録)ではフォーム
+          // 変化を検知できず、索引側の検知も抑制されて、結果として誰も気づけなかった。
+          // 実際に出たイベントの種類だけを覚えて、それ以外は索引の差分から出す。
+          const kinds = new Set((r.events || []).map((ev) => ev.type));
+          emittedByPlayer.set(Number(s2.row[C.id]), kinds);
+        }
+      }
+      const savableDeferred = Math.max(0, savable.length - savedFromBulk);
+      if (savableDeferred > 0) {
+        skip("playerRecords", `保存先のコマンド数を抑えるため、個別の選手記録の更新は${savedFromBulk}人までとし、${savableDeferred}人は翌日以降に回しました(検索・分析に使う索引には全員ぶん反映済みです)。`);
+      }
+
+      // ---- スカウト速報(移籍・フォーム急変・若手有望株)----
+      // **必ず savePlayer より後に行う。** savePlayer も同じリストへ LPUSH し、
+      // 最後に300件へ LTRIM するため、先に積むと全部押し出されて消えていた
+      // (監査で「索引由来の速報が1件も残らない」ことが実測された)。
+      let feedPushed = 0;
+      const FEED_CAP = 60;
+      for (const { row, prev } of changed) {
+        if (feedPushed >= FEED_CAP) break;
+        const id = Number(row[C.id]);
+        const already = emittedByPlayer.get(id) || new Set();
+        if (!prev) continue;                   // 初回は「新規登録」を大量に出さない
+        const events = [];
+        if (prev[C.teamEn] && row[C.teamEn] && prev[C.teamEn] !== row[C.teamEn]) {
+          events.push({ type: "transfer", labelJa: "移籍", detailJa: `${prev[C.teamJa] || prev[C.teamEn]} → ${row[C.teamJa] || row[C.teamEn]}` });
+        }
+        const pr = prev[C.rating], nr = row[C.rating];
+        if (Number.isFinite(pr) && Number.isFinite(nr) && pr > 0) {
+          const d = Math.round((nr - pr) * 100) / 100;
+          if (d >= 0.15) events.push({ type: "formUp", labelJa: "フォーム急上昇", detailJa: `平均評価が ${pr} → ${nr}(+${d})`, delta: d });
+          else if (d <= -0.15) events.push({ type: "formDown", labelJa: "フォーム急下降", detailJa: `平均評価が ${pr} → ${nr}(${d})`, delta: d });
+        }
+        const age = row[C.age], mins = row[C.minutes], prevMins = prev[C.minutes];
+        if (Number.isFinite(age) && age <= 21 && Number.isFinite(mins) && mins >= 450
+          && Number.isFinite(nr) && nr >= 6.8 && (!Number.isFinite(prevMins) || mins > prevMins)) {
+          events.push({ type: "prospect", labelJa: "若手有望株", detailJa: `${age}歳・出場${mins}分・平均評価${nr}`, age, minutes: mins, rating: nr });
+        }
+        for (const ev of events) {
+          if (feedPushed >= FEED_CAP) break;
+          if (already.has(ev.type)) continue;   // savePlayer 側で同じ種類を既に出した
+          await deps.upstashCmd(["LPUSH", "kb:player:scoutfeed", JSON.stringify({
+            ...ev, playerId: id, name: row[C.name] || null,
+            teamEn: row[C.teamEn] || null, teamJa: row[C.teamJa] || null,
+            position: row[C.position] || null, at: runAt.toISOString(),
+          })]).catch(() => {});
+          feedPushed++;
+        }
+      }
+      if (feedPushed > 0) await deps.upstashCmd(["LTRIM", "kb:player:scoutfeed", "0", "299"]).catch(() => {});
+
+      // ---- 保存 ----
+      // grid は索引に載っている選手ぶんだけに刈り込む(退団者で膨らませない)
+      const liveIds = new Set(rows.map((r) => Number(r[C.id])));
+      const prunedGrid = {};
+      for (const [pid, entry] of Object.entries(grid)) {
+        if (liveIds.has(Number(pid))) prunedGrid[pid] = entry;
+      }
+      await playerSearch.saveGrid(psDeps, prunedGrid);
+      const saveRes = await playerSearch.saveIndex(psDeps, rows, {
+        builtAt: runAt.toISOString(), dateKey,
+        sources: {
+          bulkPlayers: bulkPlayers.size, detailPlayers: detailPlayers.size,
+          squadClubs: squadByClub.size, injuryCheckedClubs: injuryCheckedClubs.size,
+          gridSamplesToday: gridUpdates.size,
+        },
+      });
+      stats.playerIndex = {
+        built: saveRes.saved === true,
+        count: rows.length,
+        shardCount: saveRes.shardCount,
+        newRows: rows.filter((r) => !prevMap.has(Number(r[C.id]))).length,
+        carriedOver: carried,
+        droppedStale: dropped,
+        changedToday: changed.filter((x) => x.prev).length,
+        savedPlayerRecords: savedFromBulk,
+        deferredPlayerRecords: savableDeferred,
+        scoutFeedPushed: feedPushed,
+        detailedPositionCount: rows.filter((r) => r[C.detailedPos]).length,
+        injuredCount: rows.filter((r) => r[C.injured] === 1).length,
+        withRating: rows.filter((r) => r[C.rating] !== null && r[C.rating] !== undefined).length,
+        firstBuild: isFirstBuild,
+        // saveIndex がシャードごとに計測した実サイズ(ここで再度JSON化しない)
+        approxBytes: (saveRes.meta && Array.isArray(saveRes.meta.bytesPerShard))
+          ? saveRes.meta.bytesPerShard.reduce((a, b) => a + b, 0) : null,
+        truncated: saveRes.truncated || 0,
+        saveReasonJa: saveRes.reasonJa || null,
+      };
+      if (saveRes.refused) {
+        skip("playerIndex", saveRes.reasonJa);
+      }
+      if (saveRes.truncated) {
+        skip("playerIndex", (saveRes.meta && saveRes.meta.truncatedReasonJa) || `索引の上限を超えたため${saveRes.truncated}人を保存できませんでした。`);
+      }
+      stats.playersIndexed = rows.length;
+      if (!saveRes.saved) stats.errors.push("universe_player_rich_index_save_failed");
+    }
+  } catch (e) {
+    stats.errors.push(`universe_player_index_failed:${e.message}`);
+    stats.playerIndex = { built: false, reasonJa: `索引の作成中にエラーが発生しました: ${e.message}` };
+  }
 
   // ============================================================
   // ⑤ xG(tier Aのみ・7日で一巡。1クラブ5リクエストと高価)

@@ -212,6 +212,182 @@ function formatComparisonJa(comparison) {
   return lines.join("\n");
 }
 
+// ============================================================
+// 2026年8月・共同開発者からの追加要求への対応
+//   「リーグごとに比較し、改善が統計的に一貫しているか確認すること。
+//    リーグによって悪化する場合は原因を分析すること。」
+// ============================================================
+
+/**
+ * 1試合ごとの損失を返す。集計値の比較より、こちらの方が検定に使える。
+ * 同じ試合を両モデルが見るため **対応のある比較(paired)** ができ、
+ * 試合の難易度のばらつきに影響されずに差を検出できる。
+ */
+function perMatchLosses(rows, weights) {
+  const EPS = 1e-12;
+  const out = [];
+  for (const r of rows || []) {
+    if (!r || !r.actualWinner) continue;
+    const pred = predictRow(r, weights);
+    let brier = 0;
+    for (const o of OUTCOMES) {
+      const actual = r.actualWinner === o ? 1 : 0;
+      brier += Math.pow(pred.probs[o] - actual, 2);
+    }
+    out.push({
+      leagueId: r.leagueId ?? null,
+      logLoss: -Math.log(Math.max(EPS, pred.probs[r.actualWinner])),
+      brier,
+      correct: pred.predicted === r.actualWinner ? 1 : 0,
+    });
+  }
+  return out;
+}
+
+/**
+ * 対応のある差の検定(正規近似)。
+ * d_i = 新モデルの損失 − 旧モデルの損失。損失なので **負が改善**。
+ * 95%信頼区間の上限が0を下回れば「偶然ではなく改善している」と言える。
+ */
+function pairedDifference(oldLosses, newLosses, key) {
+  const n = Math.min(oldLosses.length, newLosses.length);
+  if (n < 30) {
+    return { measurable: false, n, reasonJa: `対応のある比較には最低30試合必要です(現在${n}件)。` };
+  }
+  const diffs = [];
+  for (let i = 0; i < n; i++) diffs.push(newLosses[i][key] - oldLosses[i][key]);
+  const mean = diffs.reduce((a, b) => a + b, 0) / n;
+  const variance = diffs.reduce((a, d) => a + Math.pow(d - mean, 2), 0) / (n - 1);
+  const se = Math.sqrt(variance / n);
+  const z = se > 0 ? mean / se : 0;
+  const ci95 = [mean - 1.96 * se, mean + 1.96 * se];
+  const round = (x) => Math.round(x * 100000) / 100000;
+  return {
+    measurable: true, n,
+    meanDelta: round(mean),
+    stdError: round(se),
+    z: round(z),
+    ci95: [round(ci95[0]), round(ci95[1])],
+    // 損失なので「上限 < 0」= 有意に改善、「下限 > 0」= 有意に悪化
+    significantlyBetter: ci95[1] < 0,
+    significantlyWorse: ci95[0] > 0,
+    verdictJa: ci95[1] < 0 ? "有意に改善" : ci95[0] > 0 ? "有意に悪化" : "有意差なし",
+  };
+}
+
+/** リーグごとに評価を分けて返す。 */
+function evaluateByLeague(rows, weights, leagueNames) {
+  const byLeague = new Map();
+  for (const r of rows || []) {
+    const id = r.leagueId ?? 0;
+    if (!byLeague.has(id)) byLeague.set(id, []);
+    byLeague.get(id).push(r);
+  }
+  const out = [];
+  for (const [leagueId, list] of byLeague) {
+    const ev = evaluate(list, weights);
+    out.push({
+      leagueId,
+      leagueJa: (leagueNames && leagueNames[leagueId]) || `リーグ${leagueId}`,
+      ...ev,
+    });
+  }
+  return out.sort((a, b) => (b.sampleSize || 0) - (a.sampleSize || 0));
+}
+
+/**
+ * リーグ別の一貫性レポート。
+ * 「全体では改善したが、特定のリーグだけ悪化している」を検出する。
+ * 悪化しているリーグには、原因分析のための実測値(試合数・引き分け率・平均得点)を添える。
+ */
+function consistencyReport(testRows, oldWeights, newWeights, leagueNames) {
+  const oldByLeague = evaluateByLeague(testRows, oldWeights, leagueNames);
+  const newByLeague = evaluateByLeague(testRows, newWeights, leagueNames);
+  const newMap = new Map(newByLeague.map((x) => [x.leagueId, x]));
+
+  const leagues = [];
+  for (const o of oldByLeague) {
+    const nv = newMap.get(o.leagueId);
+    if (!nv || !o.measurable || !nv.measurable) continue;
+    const rowsOfLeague = testRows.filter((r) => (r.leagueId ?? 0) === o.leagueId);
+    const oldL = perMatchLosses(rowsOfLeague, oldWeights);
+    const newL = perMatchLosses(rowsOfLeague, newWeights);
+    const pairedLogLoss = pairedDifference(oldL, newL, "logLoss");
+    const pairedBrier = pairedDifference(oldL, newL, "brier");
+
+    // 原因分析用の実測値(そのリーグがどういうリーグか)
+    const totalGoals = rowsOfLeague.reduce((s, r) => s + r.actualHomeGoals + r.actualAwayGoals, 0);
+    const draws = rowsOfLeague.filter((r) => r.actualWinner === "draw").length;
+    const diagnostics = {
+      sampleSize: rowsOfLeague.length,
+      avgTotalGoals: rowsOfLeague.length ? Math.round((totalGoals / rowsOfLeague.length) * 100) / 100 : null,
+      drawRatePct: rowsOfLeague.length ? Math.round((draws / rowsOfLeague.length) * 1000) / 10 : null,
+    };
+
+    leagues.push({
+      leagueId: o.leagueId, leagueJa: o.leagueJa,
+      old: o, new: nv,
+      comparison: compare(o, nv),
+      pairedLogLoss, pairedBrier,
+      diagnostics,
+      improved: pairedLogLoss.measurable ? pairedLogLoss.meanDelta < 0 : null,
+      significantlyWorse: !!pairedLogLoss.significantlyWorse,
+    });
+  }
+
+  const measurable = leagues.filter((l) => l.pairedLogLoss.measurable);
+  const improvedCount = measurable.filter((l) => l.improved).length;
+  const worseCount = measurable.filter((l) => l.improved === false).length;
+  const sigWorse = measurable.filter((l) => l.significantlyWorse);
+
+  // 全体(全リーグまとめて)の対応のある検定
+  const overallOld = perMatchLosses(testRows, oldWeights);
+  const overallNew = perMatchLosses(testRows, newWeights);
+  const overallLogLoss = pairedDifference(overallOld, overallNew, "logLoss");
+  const overallBrier = pairedDifference(overallOld, overallNew, "brier");
+
+  return {
+    measurable: measurable.length > 0,
+    leagues,
+    leaguesMeasured: measurable.length,
+    improvedCount, worseCount,
+    significantlyWorseLeagues: sigWorse.map((l) => ({
+      leagueJa: l.leagueJa,
+      meanDelta: l.pairedLogLoss.meanDelta,
+      diagnostics: l.diagnostics,
+      causeHintJa: buildCauseHint(l),
+    })),
+    overallLogLoss, overallBrier,
+    consistent: measurable.length > 0 && sigWorse.length === 0 && improvedCount >= Math.ceil(measurable.length / 2),
+    noteJa: measurable.length
+      ? `測定できた${measurable.length}リーグ中、${improvedCount}リーグで改善、${worseCount}リーグで悪化。統計的に有意に悪化したリーグは${sigWorse.length}件。`
+      : "リーグ別に比較できるだけの試合数がありませんでした。",
+  };
+}
+
+/**
+ * 悪化したリーグの原因の当たりをつける。
+ * **断定はしない**(実測値から言えることだけを示し、判断は人間に委ねる)。
+ */
+function buildCauseHint(league) {
+  const d = league.diagnostics;
+  const hints = [];
+  if (d.sampleSize < 200) {
+    hints.push(`検証試合が${d.sampleSize}件と少なく、偶然のばらつきの影響が大きい可能性があります`);
+  }
+  if (d.avgTotalGoals !== null && d.avgTotalGoals > 3.0) {
+    hints.push(`平均総得点が${d.avgTotalGoals}点と高く、和の重みが他リーグ向けに寄っている可能性があります`);
+  }
+  if (d.avgTotalGoals !== null && d.avgTotalGoals < 2.3) {
+    hints.push(`平均総得点が${d.avgTotalGoals}点と低く、和の重みが他リーグ向けに寄っている可能性があります`);
+  }
+  if (d.drawRatePct !== null && d.drawRatePct > 28) {
+    hints.push(`引き分け率が${d.drawRatePct}%と高く、Dixon-Colesのρがこのリーグに合っていない可能性があります`);
+  }
+  if (!hints.length) hints.push("実測値からは明確な原因を特定できませんでした。リーグ別に重みを分ける検討が必要かもしれません");
+  return hints.join("。") + "。";
+}
+
 /**
  * 時系列分割。前半を学習用、後半を検証用にする。
  * ランダム分割は「未来で学習して過去を当てる」リークになるため使わない。
@@ -223,6 +399,80 @@ function splitByTime(rows, trainRatio) {
   return { train: sorted.slice(0, cut), test: sorted.slice(cut) };
 }
 
+/**
+ * ---- 統計的一貫性まで見る採用ゲート(共同開発者の追加要求) ----
+ * 集計値の比較(shouldAdopt)に加えて、次の3条件をすべて満たす場合だけ採用する。
+ *   ① 全体の対応のある検定で、LogLossが **有意に** 改善している
+ *      (95%信頼区間の上限が0未満。偶然のばらつきでは説明できない)
+ *   ② 統計的に有意に悪化したリーグが1つも無い
+ *   ③ 測定できたリーグの過半数で改善している
+ * どれか1つでも欠ければ採用せず、**なぜ採用しなかったか**を残す。
+ */
+function shouldAdoptWithConsistency(comparison, consistency, opts) {
+  const basic = shouldAdopt(comparison, opts);
+  if (!basic.adopt) return { ...basic, consistencyChecked: false };
+
+  if (!consistency || !consistency.measurable) {
+    return {
+      adopt: false, consistencyChecked: false,
+      reasonJa: "集計値では改善しましたが、リーグ別に比較できるだけの試合数が無く、改善が一貫しているか確認できないため採用しません。",
+    };
+  }
+  const ll = consistency.overallLogLoss;
+  if (!ll.measurable) {
+    return { adopt: false, consistencyChecked: false, reasonJa: "対応のある検定を行うだけの試合数がありません。" };
+  }
+  if (!ll.significantlyBetter) {
+    return {
+      adopt: false, consistencyChecked: true,
+      reasonJa: `集計値では改善しましたが、統計的には有意な差とは言えません(LogLossの平均差 ${ll.meanDelta}、95%信頼区間 [${ll.ci95[0]}, ${ll.ci95[1]}])。偶然のばらつきの範囲内のため採用しません。`,
+    };
+  }
+  if (consistency.significantlyWorseLeagues.length > 0) {
+    const names = consistency.significantlyWorseLeagues.map((l) => l.leagueJa).join("、");
+    const causes = consistency.significantlyWorseLeagues.map((l) => `${l.leagueJa}: ${l.causeHintJa}`).join(" / ");
+    return {
+      adopt: false, consistencyChecked: true,
+      reasonJa: `全体では改善していますが、${names}で統計的に有意に悪化しているため採用しません。原因の手がかり: ${causes}`,
+      worseLeagues: consistency.significantlyWorseLeagues,
+    };
+  }
+  const half = Math.ceil(consistency.leaguesMeasured / 2);
+  if (consistency.improvedCount < half) {
+    return {
+      adopt: false, consistencyChecked: true,
+      reasonJa: `改善したリーグが${consistency.improvedCount}/${consistency.leaguesMeasured}と過半数に届かないため、一貫した改善とは言えず採用しません。`,
+    };
+  }
+  return {
+    adopt: true, consistencyChecked: true,
+    reasonJa: `${basic.reasonJa} さらに統計的にも有意(LogLossの平均差 ${ll.meanDelta}、95%信頼区間 [${ll.ci95[0]}, ${ll.ci95[1]}])で、${consistency.leaguesMeasured}リーグ中${consistency.improvedCount}リーグで改善、有意に悪化したリーグはありませんでした。`,
+  };
+}
+
+/** リーグ別の比較表(日次レポートやREADMEにそのまま載せられる形) */
+function formatLeagueTableJa(consistency) {
+  if (!consistency || !consistency.measurable) {
+    return (consistency && consistency.noteJa) || "リーグ別の比較はできませんでした。";
+  }
+  const lines = ["| リーグ | 試合数 | LogLoss(旧→新) | Brier(旧→新) | 1X2 | 引分再現 | BTTS | O/U | 総得点誤差 | 判定 |",
+    "|---|---|---|---|---|---|---|---|---|---|"];
+  for (const l of consistency.leagues) {
+    const o = l.old, n = l.new;
+    const v = l.pairedLogLoss.measurable ? l.pairedLogLoss.verdictJa : "判定不可";
+    lines.push(`| ${l.leagueJa} | ${o.sampleSize} | ${o.logLoss}→${n.logLoss} | ${o.brier}→${n.brier} | ${o.accuracyPct}%→${n.accuracyPct}% | ${o.drawRecallPct}%→${n.drawRecallPct}% | ${o.bttsAccuracyPct}%→${n.bttsAccuracyPct}% | ${o.overUnderAccuracyPct}%→${n.overUnderAccuracyPct}% | ${o.totalGoalsMae}→${n.totalGoalsMae} | ${v} |`);
+  }
+  lines.push("");
+  lines.push(consistency.noteJa);
+  if (consistency.overallLogLoss.measurable) {
+    const ll = consistency.overallLogLoss;
+    lines.push(`全体の対応のある検定: LogLossの平均差 ${ll.meanDelta}(95%信頼区間 [${ll.ci95[0]}, ${ll.ci95[1]}])→ ${ll.verdictJa}`);
+  }
+  return lines.join("\n");
+}
+
 module.exports = {
   METRIC_SPEC, predictRow, evaluate, compare, shouldAdopt, formatComparisonJa, splitByTime,
+  perMatchLosses, pairedDifference, evaluateByLeague, consistencyReport, buildCauseHint,
+  shouldAdoptWithConsistency, formatLeagueTableJa,
 };

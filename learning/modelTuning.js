@@ -23,10 +23,17 @@
  *   データが1万件を超えてから検討する(共同開発者と合意済みの方針)。
  */
 
-const { evaluate, compare, shouldAdopt, splitByTime, formatComparisonJa } = require("./modelBacktest");
+const {
+  evaluate, compare, shouldAdopt, splitByTime, formatComparisonJa,
+  consistencyReport, shouldAdoptWithConsistency, formatLeagueTableJa,
+} = require("./modelBacktest");
 const { backfillSeasons, buildTrainingRows, saveDataset, loadDataset, DEFAULT_BACKFILL_LEAGUES } = require("./historicalBackfill");
 
 const TUNING_LOG_KEY = "learn:modeltuning:log";
+// 採用後も「最初のモデルと比べてどれだけ良くなったか」を毎日残すための基準。
+// 一度だけ保存し、以後は上書きしない(基準が動くと比較の意味が無くなる)。
+const BASELINE_KEY = "learn:model:baseline";
+const LEAGUE_NAMES_JA = { 39: "プレミアリーグ", 140: "ラ・リーガ", 78: "ブンデスリーガ", 135: "セリエA", 61: "リーグ・アン" };
 const TUNING_LOG_KEEP = 60;
 // データセットを作り直す間隔。毎日15リクエスト使う必要はない(過去試合は増えない)。
 const REFRESH_DAYS = 7;
@@ -147,11 +154,38 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   }
 
   const base = { ...currentWeights };
+
+  // ---- 基準モデルの固定(共同開発者の要求:採用後も毎日、旧モデルと比較し続ける) ----
+  //   一度だけ「改修前のモデル」を保存し、以後この基準と比べ続ける。
+  //   基準を毎日更新すると「昨日比」しか分からず、
+  //   「最初と比べてどれだけ良くなったか」が永久に分からなくなる。
+  let baseline = upstashEnabled ? await (deps.upstashGetJSON(BASELINE_KEY).catch(() => null)) : null;
+  if (!baseline) {
+    // 和の重みとρを0にしたもの = λ独立化より前の挙動と完全に同一
+    baseline = {
+      ...base,
+      attackSumSensitivity: 0, concededSumSensitivity: 0,
+      fatigueSumSensitivity: 0, xgSumSensitivity: 0, rho: 0,
+    };
+    if (upstashEnabled) await upstashSetJSON(BASELINE_KEY, baseline);
+  }
+
   const found = searchParams(train, base);
   const oldEval = evaluate(test, base);
   const newEval = evaluate(test, found.weights);
   const cmp = compare(oldEval, newEval);
-  const decision = shouldAdopt(cmp, { minSample: 200 });
+
+  // ---- リーグ別・統計的一貫性の検証 ----
+  const consistency = consistencyReport(test, base, found.weights, LEAGUE_NAMES_JA);
+  const decision = shouldAdoptWithConsistency(cmp, consistency, { minSample: 200 });
+
+  // ---- 基準モデルとの比較(採用の可否にかかわらず毎日記録する) ----
+  //   「今日のモデルは、改修前と比べてどれだけ良いか」を継続的に残す。
+  const adoptedWeights = decision.adopt ? found.weights : base;
+  const baselineEval = evaluate(test, baseline);
+  const currentEval = evaluate(test, adoptedWeights);
+  const vsBaseline = compare(baselineEval, currentEval);
+  const vsBaselineConsistency = consistencyReport(test, baseline, adoptedWeights, LEAGUE_NAMES_JA);
 
   const record = {
     date: runAt.toISOString().slice(0, 10),
@@ -161,9 +195,23 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     testSize: test.length,
     combinationsEvaluated: found.evaluated,
     adopted: decision.adopt,
+    consistencyChecked: decision.consistencyChecked,
     reasonJa: decision.reasonJa,
     oldEval, newEval,
     comparisonJa: formatComparisonJa(cmp),
+    leagueTableJa: formatLeagueTableJa(consistency),
+    leaguesMeasured: consistency.leaguesMeasured,
+    leaguesImproved: consistency.improvedCount,
+    significantlyWorseLeagues: consistency.significantlyWorseLeagues,
+    overallPairedLogLoss: consistency.overallLogLoss,
+    // 改修前の基準モデルとの比較(毎日記録)
+    vsBaseline: {
+      baselineEval, currentEval,
+      comparisonJa: formatComparisonJa(vsBaseline),
+      leagueTableJa: formatLeagueTableJa(vsBaselineConsistency),
+      overallPairedLogLoss: vsBaselineConsistency.overallLogLoss,
+      noteJa: "改修前のモデルと現在のモデルの比較です。採用の可否にかかわらず毎日記録しています。",
+    },
     newParams: decision.adopt
       ? {
         attackSumSensitivity: found.weights.attackSumSensitivity,
@@ -189,6 +237,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   return {
     ran: true,
     adopted: record.adopted,
+    consistencyChecked: record.consistencyChecked,
     reasonJa: record.reasonJa,
     datasetSize: ds.rows.length,
     datasetNoteJa: ds.reasonJa,
@@ -197,6 +246,12 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     oldEval, newEval,
     comparison: cmp,
     comparisonJa: record.comparisonJa,
+    leagueTableJa: record.leagueTableJa,
+    leaguesMeasured: record.leaguesMeasured,
+    leaguesImproved: record.leaguesImproved,
+    significantlyWorseLeagues: record.significantlyWorseLeagues,
+    overallPairedLogLoss: record.overallPairedLogLoss,
+    vsBaseline: record.vsBaseline,
     newParams: record.newParams,
   };
 }
@@ -215,6 +270,6 @@ async function getTuningHistory(deps, limit) {
 }
 
 module.exports = {
-  TUNING_LOG_KEY, REFRESH_DAYS, COARSE_GRID,
+  TUNING_LOG_KEY, BASELINE_KEY, LEAGUE_NAMES_JA, REFRESH_DAYS, COARSE_GRID,
   seasonsToFetch, ensureDataset, searchParams, tuneModelOnHistory, getTuningHistory,
 };

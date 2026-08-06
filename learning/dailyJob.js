@@ -2077,6 +2077,14 @@ async function runDailyLearning(deps) {
       trainSize: modelTuning.trainSize ?? null, testSize: modelTuning.testSize ?? null,
       oldEval: modelTuning.oldEval ?? null, newEval: modelTuning.newEval ?? null,
       comparisonJa: modelTuning.comparisonJa ?? null,
+      // 共同開発者の追加要求: リーグ別の比較・統計的一貫性・基準モデルとの継続比較
+      consistencyChecked: modelTuning.consistencyChecked ?? null,
+      leagueTableJa: modelTuning.leagueTableJa ?? null,
+      leaguesMeasured: modelTuning.leaguesMeasured ?? null,
+      leaguesImproved: modelTuning.leaguesImproved ?? null,
+      significantlyWorseLeagues: modelTuning.significantlyWorseLeagues ?? null,
+      overallPairedLogLoss: modelTuning.overallPairedLogLoss ?? null,
+      vsBaseline: modelTuning.vsBaseline ?? null,
       newParams: modelTuning.newParams ?? null,
     } : null,
     // 実行中の重複APIをどれだけ削れたか(実測)。データ量は減らしていない。
