@@ -49,7 +49,7 @@ const { deliberate } = require("./reasoning/deliberation");
 // 毎日学習エンジン(Learning Engine)。実体は server/learning/dailyJob.js。
 // 依存(callApiFootball/resolveTeamId/Upstashアクセス関数)は、このファイル自身が
 // 定義した後にまとめて注入する(利用箇所は下の方の「Stage D」セクションを参照)。
-const { runDailyLearning, getGrowthLog, getRecentFactsForTeam, computeFormScore } = require("./learning/dailyJob");
+const { runDailyLearning, getGrowthLog, getRecentFactsForTeam, computeFormScore, OWN_PREDICT_LOG_CAP: OWN_PREDICT_LOG_CAP_DISPLAY } = require("./learning/dailyJob");
 // 2026年8月・優先順位⑨: 「今日追加した知識0件」が正常な0件(前回から変化なし)
 // なのか、異常な0件(未実行・キー未設定・予算切れ等)なのかを実データから判定する。
 const { diagnoseZeroKnowledge, diagnoseZeroVerification, getRunHistory, buildEngineStatuses } = require("./learning/healthCheck");
@@ -1170,10 +1170,43 @@ async function getOrLogPrediction(fixtureId, meta, opts) {
       kickoff: meta.kickoff || null, homePct, drawPct, awayPct, predictedWinner,
       loggedAt: new Date().toISOString(), resolved: false, actualWinner: null, correct: null, resolvedAt: null,
     };
-    await upstashSetJSON(key, record);
-    await upstashCmd(["RPUSH", "pred:pending", String(fixtureId)]).catch(() => {});
-    await upstashCmd(["INCR", "pred:total"]).catch(() => {});
-    await upstashCmd(["SET", "pred:since", record.loggedAt, "NX"]).catch(() => {});
+    // ---- 2026年8月・調査で見つけた二重計上の穴 ----
+    //   upstashGetJSON は「まだ無い」ときも「読み出しに失敗した」ときも
+    //   同じ null を返す。つまりUpstashが一瞬詰まった隙に同じ試合をもう一度
+    //   記録し、pred:total を二重に数え、pred:pending にも同じIDが2つ並んでいた。
+    //   「この試合を数えてよいのは最初の1回だけ」を SET NX で保証する
+    //   (resolvePrediction 側の pred:resolvelock と同じ考え方)。
+    // ---- 検証で発見した順序の誤りの修正 ----
+    //   従来は「本体を保存 → NXで印を付ける」の順だった。ところが
+    //   upstashSetJSON は失敗しても false を返すだけ(例外を投げない)なので、
+    //   本体の保存に一度でも失敗すると
+    //     ・pred:logged の印だけが残り(TTLも無い)
+    //     ・pred:total(正答率の分母)だけが増え
+    //     ・次に同じ試合を記録できても firstTime=false のため
+    //       **pred:pending に二度と載らず、永久に答え合わせされない**
+    //   という、分母だけが水増しされる最悪の状態になっていた。
+    //   本体が確実に保存できたときだけ数える順序に直し、印にもTTLを付ける。
+    const savedOk = (await upstashSetJSON(key, record)) !== false;
+    if (!savedOk) return null; // 保存できていないものを「記録した」とは数えない
+    let firstTime = true;
+    try {
+      // 印は90日で自然に消える(試合の記録より長く残す意味は無い)
+      const claim = await upstashCmd(["SET", `pred:logged:${fixtureId}`, record.loggedAt, "NX", "EX", "7776000"]);
+      firstTime = claim === "OK" || claim === true;
+    } catch (e) { firstTime = true; } // 判定できない場合は記録する側に倒す
+    if (firstTime) {
+      await upstashCmd(["RPUSH", "pred:pending", String(fixtureId)]).catch(() => {});
+      await upstashCmd(["INCR", "pred:total"]).catch(() => {});
+      await upstashCmd(["SET", "pred:since", record.loggedAt, "NX"]).catch(() => {});
+    } else {
+      // 印はあるのに保留リストに載っていない = 過去の障害の取り残し。ここで復旧する。
+      try {
+        const pending = (await upstashCmd(["LRANGE", "pred:pending", "0", "-1"])) || [];
+        if (!pending.includes(String(fixtureId))) {
+          await upstashCmd(["RPUSH", "pred:pending", String(fixtureId)]).catch(() => {});
+        }
+      } catch (e) { /* 復旧は best effort。失敗しても本体の記録は残る */ }
+    }
     return record;
   } catch (e) {
     return null; // API側で予測データが無い/エラー時は、架空の予測を作らず記録しない
@@ -1202,14 +1235,19 @@ async function resolvePrediction(fixtureId, homeGoals, awayGoals) {
   //   二重に並ぶ状態だった。
   //   Redisの SET ... NX(まだ無いときだけ書ける)を鍵にして、
   //   **カウンターを増やしてよいのは最初の1つだけ**にする。
+  // 2026年8月・正答率が更新されない調査での修正:
+  //   従来は「ロックのSETが例外を投げたら数えない(mayCount=false)」としつつ、
+  //   その直後で record.resolved = true を保存し、pred:pending からも削除していた。
+  //   つまりUpstashが一瞬詰まっただけで、その試合は**二度と数えられない**
+  //   (次回は resolved=true で早期returnする)。正答率が動かない原因の一つ。
+  //   自社予測側(dailyJob.js)は既に .catch(() => "OK") で「取りこぼすより
+  //   二重計上を避ける」ではなく「数える側」に倒しており、そちらに揃える。
   let mayCount = true;
   try {
     const claim = await upstashCmd(["SET", `pred:resolvelock:${fixtureId}`, new Date().toISOString(), "NX", "EX", "86400"]);
     mayCount = claim === "OK" || claim === true;
   } catch (e) {
-    // ロックを取れなくても検証自体は進める(取りこぼすより二重計上を避ける方が
-    // 大事なので、判定できないときは数えない側に倒す)
-    mayCount = false;
+    mayCount = true; // ロックの可否を判定できない=数える側に倒す(恒久的な取りこぼしを防ぐ)
   }
 
   record.resolved = true;
@@ -1232,27 +1270,41 @@ async function resolvePrediction(fixtureId, homeGoals, awayGoals) {
 // 正直に「記録なし」を返す(架空の数字は絶対に出さない)。
 async function handleAccuracyStats() {
   if (!UPSTASH_ENABLED) {
-    return { status: 200, body: { configured: false, total: 0, resolved: 0, correct: 0, accuracyPct: null, since: null, recent: [] } };
+    // 2026年8月・全機能監査の指摘: 0を返すだけで**理由が付いていなかった**。
+    // 「まだ0件」と「保存先が無いので永久に0」を利用者が区別できない。
+    return {
+      status: 200,
+      body: {
+        configured: false, total: 0, resolved: 0, correct: 0, accuracyPct: null,
+        since: null, pending: null, lastResolvedAt: null, recent: [],
+        reasonJa: "予測の記録先(Upstash Redis)が設定されていないため、AI予測の実績を記録・集計できません。Renderの環境変数 UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN を設定すると記録が始まります。",
+      },
+    };
   }
   try {
-    const [totalRaw, resolvedRaw, correctRaw, since, recentRaw] = await Promise.all([
+    const [totalRaw, resolvedRaw, correctRaw, since, recentRaw, pendingRaw] = await Promise.all([
       upstashCmd(["GET", "pred:total"]),
       upstashCmd(["GET", "pred:resolved"]),
       upstashCmd(["GET", "pred:correct"]),
       upstashCmd(["GET", "pred:since"]),
       upstashCmd(["LRANGE", "pred:recent", "-10", "-1"]),
+      // 2026年8月の調査で追加: 「正答率が何日も動かない」ときに、
+      // 答え合わせ待ちの行列が伸び続けているのかどうかを外から確認できるようにする。
+      upstashCmd(["LLEN", "pred:pending"]).catch(() => null),
     ]);
     const total = parseInt(totalRaw, 10) || 0;
     const resolved = parseInt(resolvedRaw, 10) || 0;
     const correct = parseInt(correctRaw, 10) || 0;
+    const pending = Number.isFinite(Number(pendingRaw)) ? Number(pendingRaw) : null;
     const accuracyPct = resolved > 0 ? Math.round((correct / resolved) * 1000) / 10 : null;
     const recent = (recentRaw || [])
       .map((s) => { try { return JSON.parse(s); } catch (e) { return null; } })
       .filter(Boolean)
       .reverse();
-    return { status: 200, body: { configured: true, total, resolved, correct, accuracyPct, since: since || null, recent } };
+    const lastResolvedAt = recent.length ? (recent[0].resolvedAt || null) : null;
+    return { status: 200, body: { configured: true, total, resolved, correct, accuracyPct, since: since || null, pending, lastResolvedAt, recent } };
   } catch (e) {
-    return { status: 200, body: { configured: true, error: e.message, total: 0, resolved: 0, correct: 0, accuracyPct: null, since: null, recent: [] } };
+    return { status: 200, body: { configured: true, error: e.message, reasonJa: `予測実績の読み出しに失敗しました(${e.message})。0件という意味ではなく、集計できなかったという意味です。`, total: 0, resolved: 0, correct: 0, accuracyPct: null, since: null, pending: null, lastResolvedAt: null, recent: [] } };
   }
 }
 
@@ -1260,7 +1312,15 @@ async function handleAccuracyStats() {
 // API-Football includes them in an unrestricted /fixtures?date=... response —
 // youth, reserve, and women's competitions clutter a fan-facing app whose
 // registered players are all senior men's footballers.
-const FIXTURE_NAME_DENYLIST = /\b(u1[5-9]|u2[0-3]|women|female|femenina|feminine|reserve|reserves|ii|youth|academy|futsal|beach soccer)\b/i;
+// 2026年8月・「TOP100の試合が漏れていないか」調査で発見した誤検出の修正:
+//   `ii` を単独の語として除外していたため、"Liga II"(ルーマニア2部)、
+//   "II liga"(ポーランド3部)、"Prva II HNL" など**トップリーグ直下の
+//   実在リーグが丸ごと消えていた**。除外したかったのは "Arsenal II" のような
+//   リザーブチーム表記なので、チーム名側で判定する(SECONDARY_SQUAD_REと同じ考え方)。
+//   リーグ名の除外からは `ii` を外す。
+const FIXTURE_NAME_DENYLIST = /\b(u1[5-9]|u2[0-3]|women|female|femenina|feminine|reserve|reserves|youth|academy|futsal|beach soccer)\b/i;
+// チーム名の末尾が " II" / " B" のものはリザーブ(2軍)。リーグ名ではなくチーム名で判定する。
+const FIXTURE_TEAM_RESERVE_RE = /(\bII\b|\bB\b)\s*$/;
 
 async function handleFixturesToday(query, opts) {
   // 第8次監査(Medium)の修正×2:
@@ -1322,6 +1382,11 @@ async function handleFixturesToday(query, opts) {
 
     const mapped = all
       .filter((f) => !FIXTURE_NAME_DENYLIST.test((f.league && f.league.name) || ""))
+      // リザーブ(2軍)チーム同士の試合はチーム名で除外する。
+      // リーグ名の `ii` 除外を外した代わりの、より正確な判定。
+      .filter((f) => !(f.teams && f.teams.home && f.teams.away
+        && FIXTURE_TEAM_RESERVE_RE.test(String(f.teams.home.name || ""))
+        && FIXTURE_TEAM_RESERVE_RE.test(String(f.teams.away.name || ""))))
       .map((f) => ({
         id: f.fixture.id,
         date: f.fixture.date,
@@ -1366,6 +1431,9 @@ async function handleFixturesToday(query, opts) {
       // 正直な開示: この日に実際に存在した試合数と、表示枠(80)の都合で省略した件数
       totalToday: prioritized.totalToday,
       omittedCount: prioritized.omittedCount,
+      // 未終了(ライブ中・これから)の試合を切り捨てた件数。通常は0だが、
+      // 大会が重なる日は0にならない。画面はこの値を見て文言を変える。
+      omittedUnfinishedCount: prioritized.omittedUnfinishedCount || 0,
     };
     cacheSet(cacheKey, payload, 15 * 60 * 1000);
     return { status: 200, body: payload };
@@ -1393,11 +1461,15 @@ function prioritizeFixturesForDisplay(fixtures, cap) {
   const byDate = (a, b) => new Date(a.date) - new Date(b.date);
   live.sort(byDate); upcoming.sort(byDate); finished.sort(byDate);
   let kept = [...live, ...upcoming].slice(0, cap);
+  // 2026年8月の調査で発見: 画面には「ライブ中・これからの試合は省略されません」と
+  // 断言していたが、未終了の試合が上限(80)を超える日はここで実際に切り捨てていた。
+  // 何件切ったかを数えて返し、画面が嘘をつかないようにする。
+  const omittedUnfinishedCount = Math.max(0, live.length + upcoming.length - kept.length);
   const room = cap - kept.length;
   if (room > 0 && finished.length) kept = kept.concat(finished.slice(-room)); // 終了済みは新しい(遅い)ものを優先して残す
   kept.sort(byDate); // 表示は従来どおり時系列
   const total = (fixtures || []).length;
-  return { fixtures: kept, totalToday: total, omittedCount: Math.max(0, total - kept.length) };
+  return { fixtures: kept, totalToday: total, omittedCount: Math.max(0, total - kept.length), omittedUnfinishedCount };
 }
 
 // ---- 2026年8月・利用者目線ラウンド: 「今日のAI予想」を開いた瞬間に見せる ----
@@ -1459,6 +1531,26 @@ function buildTodayPredictionEntry(fixture, record, calibrationMap) {
   };
 }
 
+/**
+ * 保留中の予測記録から「次の試合」として表示できるものを選ぶ(純関数・テスト対象)。
+ * 監査での指摘への対応:
+ *   ・中止された試合の保留分が残り続けるため、直近14日以内に限定する
+ *   ・日付が壊れている記録(パースできない)は除外する
+ *   ・答え合わせ済みは対象外。キックオフの近い順・最大5件。
+ */
+const UPCOMING_WINDOW_DAYS = 14;
+const UPCOMING_MAX = 5;
+function selectUpcomingPredictionRecords(records, nowMs) {
+  return (records || [])
+    .filter((r) => {
+      if (!r || r.resolved || !r.kickoff) return false;
+      const t = new Date(r.kickoff).getTime();
+      return Number.isFinite(t) && t > nowMs && t < nowMs + UPCOMING_WINDOW_DAYS * 86400000;
+    })
+    .sort((a, b) => new Date(a.kickoff).getTime() - new Date(b.kickoff).getTime())
+    .slice(0, UPCOMING_MAX);
+}
+
 async function handlePredictionsToday() {
   const cacheKey = `predictions-today:${appDateKey()}`;
   const cached = cacheGet(cacheKey);
@@ -1479,11 +1571,38 @@ async function handlePredictionsToday() {
   if (UPSTASH_ENABLED && fixtures.length) {
     // Redisの読み取りのみ(1試合1コマンド+較正マップ1コマンド・上限60・結果は5分キャッシュ)
     calibrationMap = await upstashGetJSON("learn:calibration:map").catch(() => null);
-    const target = fixtures.slice(0, 60);
+    // 監査での指摘: 一覧は最大80件返るのに予想の照合は先頭60件だけだったため、
+    // 夜の試合が61番目以降に来た日は「本日は対象試合がない」と誤って断定していた。
+    // 表示上限と揃える(読み取りは5分キャッシュの内側なので実害のあるコスト増は無い)。
+    const target = fixtures.slice(0, 80);
     const records = await Promise.all(target.map((f) => upstashGetJSON(`learn:ownpred:${f.id}`).catch(() => null)));
     predictions = target.map((f, i) => buildTodayPredictionEntry(f, records[i], calibrationMap)).filter(Boolean);
     predictions.sort((a, b) => new Date(a.kickoff || 0) - new Date(b.kickoff || 0));
   }
+  // ---- 2026年8月・利用者からの指摘への対応: 「今日のAI予想が空」問題 ----
+  //   予想はAIが追跡しているクラブの「次の試合」に対して作られるため、その試合が
+  //   今日でない日(オフシーズンは特に多い)はカードが空になっていた。
+  //   本来AIは予想を持っているのに何も見えないのは、利用者にとって
+  //   「AIが何もしていない」ように見える。今日の対象試合が無い日は、
+  //   AIが予想している「次の試合」を代わりに表示する(でっち上げではなく、
+  //   すでに保存済みの予想をそのまま出すだけ)。
+  //   コスト: 今日ぶんが空のときだけ、保留リストの読み出し+最大40件のGET。
+  let upcomingPredictions = [];
+  if (!predictions.length && UPSTASH_ENABLED) {
+    try {
+      // calibrationMapは上で取得済みの場合がある(未取得のときだけ読む)
+      if (!fixtures.length) calibrationMap = await upstashGetJSON("learn:calibration:map").catch(() => null);
+      const pendingIds = (await upstashCmd(["LRANGE", "learn:ownpred:pending", "-40", "-1"]).catch(() => [])) || [];
+      const recs = await Promise.all(pendingIds.map((id) => upstashGetJSON(`learn:ownpred:${id}`).catch(() => null)));
+      upcomingPredictions = selectUpcomingPredictionRecords(recs, Date.now())
+        .map((r) => buildTodayPredictionEntry({
+          id: r.fixtureId, date: r.kickoff, status: "NS", league: r.league || null,
+          home: { name: r.homeTeamEn }, away: { name: r.awayTeamEn }, score: null,
+        }, r, calibrationMap))
+        .filter(Boolean);
+    } catch (e) { /* 付加情報。失敗しても本日ぶんの表示は返す */ }
+  }
+
   // ---- 精度証明ラウンド③: 今日のベスト予想 ----
   // まだ始まっていない試合のうち、(補正後があれば補正後の)勝率が最も高い1試合。
   // 機械的な選定であり、選定基準もそのまま開示する。該当が無ければ出さない。
@@ -1508,14 +1627,22 @@ async function handlePredictionsToday() {
     generatedAt: new Date().toISOString(),
     totalFixturesToday: fixtures.length,
     predictions,
+    // 今日の対象試合が無い日に表示する「AIが予想している次の試合」
+    upcomingPredictions,
     bestPick,
     calibrationAvailable: !!(calibrationMap && calibrationMap.available),
     // 予想が無い日も、その理由を正直に表示する(推測で予想をでっち上げない)
     noteJa: predictions.length
       ? "AI自身の予測モデル(実データで毎日学習した重み)による予想です。予想は毎朝の学習時に生成・保存され、試合終了後に必ず答え合わせされて学習に使われます。"
-      : (fixtures.length
-        ? `本日の試合${fixtures.length}件の中に、AIが予想を保存している試合はまだありません。予想は毎朝4時の学習で、AIが毎日追跡しているクラブ(欧州上位クラブ)の試合について生成されます。オフシーズン中は対象試合が少ないのが正常です。`
-        : "本日は対象となる試合がありません。シーズン中は毎朝の学習で、ここにAI予想が並びます。"),
+      : (upcomingPredictions.length
+        ? `本日はAIが追跡しているクラブの試合がないため、AIがすでに予想している「次の試合」を表示しています(${upcomingPredictions.length}件)。予想は毎朝の学習で生成・保存され、試合終了後に必ず答え合わせされます。`
+        : (fixtures.length
+          // 2026年8月の調査で修正: 旧文言は「AIが毎日追跡しているクラブ」とだけ書いており、
+          // 知識収集の対象(UEFA上位100クラブ)全部で予想が出ると読めた。
+          // 実際には1回の学習で新規記録するのは上限件数までなので、
+          // 「今日は順番が回ってこなかった」場合があることを正直に書く。
+          ? `本日の試合${fixtures.length}件の中に、AIが予想を保存している試合はまだありません。AIはUEFA上位100クラブ+登録クラブを日替わりの順番で回り、毎朝の学習で1回あたり最大${OWN_PREDICT_LOG_CAP_DISPLAY}件の予想を新しく作ります。そのため「今日はまだ順番が回っていない」ことがあります。オフシーズン中は対象試合そのものが少ないのも正常です。`
+          : "本日は対象となる試合がありません。シーズン中は毎朝の学習で、ここにAI予想が並びます。")),
   };
   cacheSet(cacheKey, payload, 5 * 60 * 1000);
   return { status: 200, body: payload };
@@ -1615,6 +1742,9 @@ async function handleCoachSearch(query) {
 // Statuses API-Football uses to mark a fixture as fully finished (as opposed to
 // not-yet-started, in-play, postponed, cancelled, etc.).
 const FINISHED_STATUSES = new Set(["FT", "AET", "PEN"]);
+// 結果(スコア)が永久に確定しない状態。保留キューに残すと先頭詰まりの原因になる。
+// 延期・中止・放棄・裁定勝ち・不戦勝。dailyJob.js の UNRESOLVABLE_STATUSES と同じ基準。
+const UNRESOLVABLE_STATUSES = new Set(["PST", "CANC", "ABD", "AWD", "WO"]);
 // 2026年8月・優先順位④: 試合中(ライブ)のステータス一覧。フロントエンド
 // (index.html)のFIXTURE_LIVE_STATUSESと意味を揃えてある。
 const LIVE_STATUSES = new Set(["1H", "HT", "2H", "ET", "BT", "P", "SUSP", "INT", "LIVE"]);
@@ -1843,24 +1973,90 @@ async function handleAutoCollectPredictions() {
 
   let logged = 0;
   let resolved = 0;
+  let evicted = 0;
+  let skippedNoData = 0;
+  let pendingLenBefore = null;
+  let pendingLenAfter = null;
   const notes = [];
 
   // フェーズ1: 保留中(まだ結果が確定していない)の予測を、実際の試合結果と突き合わせる。
   // 「今日の試合」一覧のスイープでは対応できない“前日以前にキックオフした試合”もここで拾える。
   try {
     const pendingIds = (await upstashCmd(["LRANGE", "pred:pending", "0", "-1"])) || [];
+    pendingLenBefore = pendingIds.length;
     let checked = 0;
     for (const idStr of pendingIds) {
       if (checked >= AUTO_COLLECT_RESOLVE_CAP) { notes.push(`resolve cap reached (${AUTO_COLLECT_RESOLVE_CAP})`); break; }
       const record = await upstashGetJSON(`pred:${idStr}`);
-      if (!record || record.resolved) continue;
+      // ---- 2026年8月・「正答率が何日も変わらない」調査で発見した先頭詰まりの修正(1/3) ----
+      //   pred:pending は先頭から最大8件(AUTO_COLLECT_RESOLVE_CAP)しか見ない。
+      //   ところが「本体の記録が消えたID」「解決済みなのに消し残ったID」は
+      //   これまで一度も LREM されず、`continue` で素通りするだけだった。
+      //   そうした死んだIDが先頭に8件たまると、その後ろに並ぶ試合は
+      //   **二度と検証されない**=pred:resolved / pred:correct が増えない
+      //   =ホーム画面の「AI予測の正答率」が凍結する。
+      //   自社予測側(dailyJob.js:947-981)には同じ修正が入っていたが、
+      //   pred:* 系(API-Football予測)には移植されていなかった。
+      if (record && record.resolved) {
+        // 解決済みなのに残っている=LREMの取りこぼし。ここで確実に外す(APIは使わない)
+        await upstashCmd(["LREM", "pred:pending", "0", String(idStr)]).catch(() => {});
+        evicted++;
+        notes.push(`pending evicted (fixture ${idStr} already resolved)`);
+        continue;
+      }
+      if (!record) {
+        // 本体が読めない。Upstashの一時的な失敗でも null が返るため、
+        // 即座には消さず「連続で読めなかった回数」を数え、3回でようやく諦める。
+        const missKey = `pred:pendingmiss:${idStr}`;
+        let miss = 0;
+        try {
+          miss = Number(await upstashCmd(["INCR", missKey])) || 0;
+          await upstashCmd(["EXPIRE", missKey, "604800"]).catch(() => {});
+        } catch (e) { miss = 0; }
+        if (miss >= 3) {
+          await upstashCmd(["LREM", "pred:pending", "0", String(idStr)]).catch(() => {});
+          await upstashCmd(["DEL", missKey]).catch(() => {});
+          evicted++;
+          notes.push(`pending evicted (fixture ${idStr} record missing ${miss}x)`);
+        }
+        continue;
+      }
+      // 検証での指摘: 「連続で読めなかった回数」と書きながら、成功しても
+      //   カウンターを消していなかった。数週間おきの一時的な失敗が3回積もるだけで、
+      //   健全な予測が保留リストから外され、二度と答え合わせされなくなる。
+      //   読めた時点で必ず消す(=本当に「連続」でのみ諦める)。
+      await upstashCmd(["DEL", `pred:pendingmiss:${idStr}`]).catch(() => {});
       if (record.kickoff && (Date.now() - new Date(record.kickoff).getTime()) < AUTO_COLLECT_RESOLVE_MIN_AGE_MS) continue; // まだ試合中の可能性が高いので今回はスキップ
       checked++;
       try {
         const data = await callApiFootball("/fixtures", { id: idStr }, { jobCall: true });
         const entry = (data.response || [])[0];
-        if (!entry) continue;
+        // ---- 先頭詰まりの修正(2/3): APIから消えた試合ID ----
+        //   シーズン移行やID振り直しで /fixtures?id=… が空になる試合がある。
+        //   従来はここで continue するだけで、そのIDは永久に先頭に居座っていた。
+        if (!entry || !entry.fixture) {
+          const attempts = (Number(record.resolveAttempts) || 0) + 1;
+          record.resolveAttempts = attempts;
+          await upstashSetJSON(`pred:${idStr}`, record).catch(() => {});
+          if (attempts >= 3) {
+            await upstashCmd(["LREM", "pred:pending", "0", String(idStr)]).catch(() => {});
+            evicted++;
+            notes.push(`pending evicted (fixture ${idStr} not found ${attempts}x)`);
+          } else {
+            notes.push(`fixture ${idStr} not found (${attempts}/3)`);
+          }
+          continue;
+        }
         const statusShort = entry.fixture.status ? entry.fixture.status.short : null;
+        // ---- 先頭詰まりの修正(3/3): 結果が永久に出ない試合 ----
+        //   延期(PST)・中止(CANC)・放棄(ABD)・裁定勝ち(AWD)・不戦勝(WO)は
+        //   スコアが出ないため FINISHED_STATUSES に入らず、永久に残っていた。
+        if (UNRESOLVABLE_STATUSES.has(statusShort)) {
+          await upstashCmd(["LREM", "pred:pending", "0", String(idStr)]).catch(() => {});
+          evicted++;
+          notes.push(`pending evicted (fixture ${idStr} ${statusShort})`);
+          continue;
+        }
         if (FINISHED_STATUSES.has(statusShort) && entry.goals) {
           const r = await resolvePrediction(idStr, entry.goals.home, entry.goals.away);
           if (r) resolved++;
@@ -1878,6 +2074,12 @@ async function handleAutoCollectPredictions() {
   // ロジックを重複させない。
   try {
     const todayResult = await handleFixturesToday(new URLSearchParams(), { jobCall: true });
+    // 2026年8月の調査で発見: found:false(APIキー未設定・取得失敗)でも
+    // fixtures が空配列として扱われ、「何も記録できなかった」ことが
+    // 成功と区別できないまま ok:true で返っていた。理由を残す。
+    if (todayResult.body && todayResult.body.found === false) {
+      notes.push("log phase skipped: 今日の試合一覧を取得できませんでした" + (todayResult.body.noteJa ? ` (${todayResult.body.noteJa})` : ""));
+    }
     const fixtures = (todayResult.body && todayResult.body.fixtures) || [];
     const upcoming = fixtures.filter((f) => f.status === "NS");
     let attempted = 0;
@@ -1885,6 +2087,14 @@ async function handleAutoCollectPredictions() {
       if (attempted >= AUTO_COLLECT_LOG_CAP) { notes.push(`log cap reached (${AUTO_COLLECT_LOG_CAP})`); break; }
       const existing = await upstashGetJSON(`pred:${f.id}`);
       if (existing) continue; // 既に記録済み
+      // 2026年8月の調査で発見した「毎回同じ3試合で枠を使い切る」問題の修正:
+      //   親善試合など API-Football が /predictions を持たない試合は
+      //   getOrLogPrediction が null を返し、**何も保存されない**。
+      //   そのため次回の実行でも同じ試合が先頭に来て再び枠(1日最大12件)を
+      //   使い切り、後ろの試合は永久に記録されなかった。
+      //   「データが無かった」ことを短期の目印として残し、当日は再挑戦しない。
+      const noData = await upstashCmd(["GET", `pred:nodata:${f.id}`]).catch(() => null);
+      if (noData) { skippedNoData++; continue; }
       attempted++;
       const rec = await getOrLogPrediction(f.id, {
         league: f.league || null,
@@ -1893,10 +2103,19 @@ async function handleAutoCollectPredictions() {
         kickoff: f.date,
       }, { jobCall: true });
       if (rec) logged++;
+      else {
+        await upstashCmd(["SET", `pred:nodata:${f.id}`, new Date().toISOString(), "EX", "72000"]).catch(() => {});
+        notes.push(`no prediction data from API for fixture ${f.id}`);
+      }
     }
   } catch (e) {
     notes.push("log phase error: " + e.message);
   }
+
+  try {
+    pendingLenAfter = Number(await upstashCmd(["LLEN", "pred:pending"]));
+    if (!Number.isFinite(pendingLenAfter)) pendingLenAfter = null;
+  } catch (e) { pendingLenAfter = null; }
 
   // 第6次監査で発見した誤りの修正:
   //   両方のフェーズが例外で落ちても ok:true を返していたため、
@@ -1913,7 +2132,13 @@ async function handleAutoCollectPredictions() {
   const hadFatalError = notes.some((n) => /^(resolve|log) phase error:/.test(n));
   return {
     status: 200,
-    body: { ok: !hadFatalError, upstashConfigured: true, logged, resolved, notes },
+    body: {
+      ok: !hadFatalError, upstashConfigured: true, logged, resolved,
+      // 2026年8月の調査で追加した可観測性。「正答率が動かない」ときに
+      // 保留キューが詰まっているのかどうかを、外から数字で確認できるようにする。
+      evicted, skippedNoData, pendingLenBefore, pendingLenAfter,
+      notes,
+    },
   };
 }
 
@@ -2803,9 +3028,14 @@ async function handleLearningHealth(searchParams) {
   const metricsTrend = await getMetricsTrend(learningDeps, 7, todayDateKey).catch(() => null);
   const zeroKnowledge = diagnoseZeroKnowledge(growthLog);
   const zeroVerification = diagnoseZeroVerification(growthLog);
+  // 2026年8月・「正答率が何日も変わらない」調査を受けて追加:
+  // ホーム画面に出る「AI予測の正答率」(pred:* 系)の詰まりを自動で検出させる。
+  const predictionAccuracy = await handleAccuracyStats()
+    .then((r) => r.body).catch(() => null);
   const engines = buildEngineStatuses({
     growthLog,
     runHistory,
+    predictionAccuracy,
     upstashEnabled: UPSTASH_ENABLED,
     apiKeyConfigured: !!API_KEY,
     llmConfigured: !!process.env.ANTHROPIC_API_KEY,
@@ -3094,9 +3324,17 @@ async function handleTeamViewHistory(query) {
     return { status: 200, body: { ok: false, reason: "NO_UPSTASH", message: "Upstash未設定のためMemory Engineの記録はありません。" } };
   }
   const subjectKey = `team:${teamEn}:dailyView`;
-  const [current, history] = await Promise.all([
+  // ---- 2026年8月・第三者監査が発見した「書きっぱなし」の解消 ----
+  //   日次学習は次の2つも毎日書いていたのに、**読み出すコードが1つも無かった**。
+  //     ・team:<X>:predictionMemory … その日の予測の要点
+  //     ・memory:timeline:team:<X>:matches … 予測→結果→学びの因果の連なり
+  //   どちらも「AIが何を考え、どう外し、何を学んだか」の中核なので、
+  //   ここから読めるようにする(件数だけを増やして中身が見えない状態を解消)。
+  const [current, history, predictionMemory, matchTimeline] = await Promise.all([
     memoryStore.getLastConclusion(subjectKey),
     memoryStore.getConclusionHistory(subjectKey, 30),
+    memoryStore.getLastConclusion(`team:${teamEn}:predictionMemory`).catch(() => null),
+    thoughtTimeline.getTimelineForDisplay(`team:${teamEn}:matches`, 12).catch(() => null),
   ]);
   return {
     status: 200,
@@ -3104,6 +3342,12 @@ async function handleTeamViewHistory(query) {
       ok: true,
       team: teamEn,
       today: current ? { statement: current.statement, computedAt: current.computedAt, revision: current.revision } : null,
+      predictionMemory: predictionMemory
+        ? { statement: predictionMemory.statement, computedAt: predictionMemory.computedAt, revision: predictionMemory.revision }
+        : null,
+      predictionMemoryNoteJa: predictionMemory ? null : "このクラブの予測に関する記憶はまだありません(予測を1件以上立てた翌日から記録されます)。",
+      matchTimeline: matchTimeline || null,
+      matchTimelineNoteJa: matchTimeline && matchTimeline.length ? null : "予測→結果→学びの記録はまだありません(答え合わせが済んだ試合から作られます)。",
       // history[0]が直近の変化(=多くの場合「昨日の見解」)。それぞれ
       // 「その時点の見解」「変化理由」「いつ何に置き換わったか」を含む。
       history: history.map((h) => ({
@@ -3614,11 +3858,23 @@ async function handleDiscuss(body, clientIp) {
           const coachPart = top.coachName ? `監督は${top.coachName}。` : "";
           facts.push(`[似たクラブ] 実測データ(${top.basisJa})の距離では、${top.teamJa || top.teamEn}が${subject.labelJa || subject.labelEn}に最も近い状態のクラブです。${traitsPart}${coachPart}(毎晩更新の索引による機械的な判定)`);
           try {
+            // ---- 2026年8月・第三者監査が発見した「常に例外で死んでいた」箇所の修正 ----
+            //   getActiveKnowledge() が返すのは配列ではなく
+            //   { facts, analyses, opinions, profiles, reflections, ... } というオブジェクト。
+            //   そこへ .slice() を呼んでいたため **毎回 TypeError** になり、
+            //   下の catch が「知識が無かった」ものとして黙って握り潰していた。
+            //   つまり「似たクラブの知識を根拠に加える」機能は一度も動いていない。
             const simKnowledge = await knowledgeStore.getActiveKnowledge(top.teamEn);
-            (simKnowledge || []).slice(0, 2).forEach((k) => {
+            const simItems = simKnowledge
+              ? [].concat(simKnowledge.facts || [], simKnowledge.analyses || [], simKnowledge.reflections || [])
+              : [];
+            simItems.slice(0, 2).forEach((k) => {
               if (k && k.statement) facts.push(`[似たクラブ ${top.teamJa || top.teamEn} の知識] ${k.statement}`);
             });
-          } catch (e) { /* 似たクラブの知識が無ければ何も足さない(でっち上げない) */ }
+          } catch (e) {
+            // ここに来るのは本当に読み出しが失敗したときだけ。理由を握り潰さない。
+            knowledgeMeta.similarClubKnowledgeErrorJa = `似たクラブの知識を読み出せませんでした(${e.message})`;
+          }
           knowledgeMeta.similarClubs = {
             basisJa: top.basisJa,
             list: simEntry.similar.map((s) => ({ teamEn: s.teamEn, teamJa: s.teamJa, distance: s.distance })),
@@ -3982,14 +4238,46 @@ const MIME = {
   ".jpg": "image/jpeg",
   ".svg": "image/svg+xml",
 };
+// ---- 2026年8月・全機能監査で実際に再現したソース流出の修正 ----
+//   従来のガードは `filePath.startsWith(STATIC_ROOT)` だけだった。ところが
+//   本番は「リポジトリのルートで node server.js を動かす」フラット配置のため、
+//   STATIC_ROOT はリポジトリのルート**そのもの**になる。
+//   つまり /server.js や /learning/dailyJob.js は「STATIC_ROOTの内側」であり、
+//   ガードを素通りして **サーバーのソースコードがそのまま配信されていた**
+//   (監査では `GET /../server/server.js` で実際に中身が返ることを確認。
+//    URLの正規化で `..` が落ちるため、従来のガードには一度も引っかからない)。
+//   ソースが読めると、内部のキー名・エンドポイント・レート制限の抜け道が
+//   すべて明らかになる。公開してよいものだけを明示的に許可する方式へ変える。
+const PUBLIC_STATIC_EXT = new Set([".html", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".txt", ".webmanifest"]);
+// 万一 .html などの拡張子でも、置き場所として公開してはいけないもの
+const PRIVATE_PATH_RE = /(^|[\\/])(\.[^\\/]*|node_modules|server|learning|knowledge|memory|rag|reasoning|discuss|llm|scripts|backups)([\\/]|$)/i;
+
 function serveStatic(req, res, pathname) {
-  let rel = pathname === "/" ? "/index.html" : pathname;
-  const filePath = path.normalize(path.join(STATIC_ROOT, rel));
-  if (!filePath.startsWith(STATIC_ROOT)) { res.writeHead(403); res.end("Forbidden"); return; }
+  const rel = pathname === "/" ? "/index.html" : pathname;
+  let decoded;
+  try { decoded = decodeURIComponent(rel); } catch (e) { res.writeHead(400); res.end("Bad request"); return; }
+  if (decoded.includes("\0")) { res.writeHead(400); res.end("Bad request"); return; }
+
+  const filePath = path.normalize(path.join(STATIC_ROOT, decoded));
+  // ①従来どおり、正規化後にSTATIC_ROOTの外へ出ていないこと
+  if (filePath !== STATIC_ROOT && !filePath.startsWith(STATIC_ROOT + path.sep)) {
+    res.writeHead(403); res.end("Forbidden"); return;
+  }
+  const relFromRoot = path.relative(STATIC_ROOT, filePath);
+  // ②サーバー側のフォルダ・隠しファイルは配信しない
+  if (PRIVATE_PATH_RE.test(relFromRoot)) { res.writeHead(404); res.end("Not found"); return; }
+  // ③公開してよい拡張子だけ(.js/.json/.yml/.md/.env などは一切配信しない)
+  const ext = path.extname(filePath).toLowerCase();
+  if (!PUBLIC_STATIC_EXT.has(ext)) { res.writeHead(404); res.end("Not found"); return; }
+
   fs.readFile(filePath, (err, data) => {
     if (err) { res.writeHead(404); res.end("Not found"); return; }
-    const ext = path.extname(filePath).toLowerCase();
-    res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream" });
+    res.writeHead(200, {
+      "Content-Type": MIME[ext] || "application/octet-stream",
+      // ソース流出と同じ轍を踏まないための最低限のセキュリティヘッダ
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "strict-origin-when-cross-origin",
+    });
     res.end(data);
   });
 }
@@ -4299,6 +4587,83 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(body));
         return;
       }
+      // ---- 2026年8月・「選手スカウティングへの登録」調査で作った橋渡し ----
+      //   毎日の収集で kb:player:<id> に選手記録が貯まっていたのに、
+      //   それを読み出すエンドポイントが1つも無く、画面の選手検索は
+      //   index.html に直書きされた107人だけを対象にしていた。
+      //   収集済みの全選手を名前で引けるようにする。
+      if (pathname === "/api/knowledge/players") {
+        const q = (parsed.searchParams.get("q") || "").trim();
+        const limit = Math.max(1, Math.min(20, parseInt(parsed.searchParams.get("limit"), 10) || 8));
+        if (!q) {
+          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, reasonJa: "検索したい選手名(q)を指定してください。" }));
+          return;
+        }
+        const cacheKey = `kb:players:${q.toLowerCase()}:${limit}`;
+        const cached = cacheGet(cacheKey);
+        if (cached) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify(cached));
+          return;
+        }
+        const found = await clubDossier.searchPlayers(q, { limit });
+        const players = [];
+        for (const hit of found.results || []) {
+          const rec = await clubDossier.getPlayer(hit.id);
+          // 記録本体が読めなかった場合も索引の情報だけは返す(名前と所属は確かな実測)
+          players.push(rec ? { ...rec, matchedName: hit.name } : { ...hit, recordUnavailableJa: "選手記録の読み出しに失敗しました(索引にはあります)。" });
+        }
+        const body = {
+          ok: true,
+          available: found.available !== false,
+          reasonJa: found.reasonJa || null,
+          query: q,
+          indexedCount: found.indexedCount ?? null,
+          players,
+          // でっち上げ防止: この応答に含まれない項目は「無い」と明記する
+          notIncludedJa: "総合点・能力値・ヒートマップはAPI-Footballでは提供されないため、収集済みデータには含まれません(実測の出場・得点・アシスト・平均評価のみ)。",
+          sourceJa: "毎日の学習でAPI-Footballから収集し保存した実測値です。",
+        };
+        cacheSet(cacheKey, body, 5 * 60 * 1000);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
+      if (pathname === "/api/knowledge/scouting") {
+        // 新規登録・移籍・若手有望株・フォーム急上昇/急下降の検知結果。
+        // 実測値の変化からのみ生成される(推測は一切入れない)。
+        const cached = cacheGet("kb:scouting");
+        if (cached) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify(cached));
+          return;
+        }
+        const feed = await clubDossier.getScoutFeed(60);
+        const byType = {};
+        for (const it of feed.items || []) {
+          if (!byType[it.type]) byType[it.type] = [];
+          byType[it.type].push(it);
+        }
+        const body = {
+          ok: true, generatedAt: new Date().toISOString(),
+          available: feed.available !== false, reasonJa: feed.reasonJa || null,
+          counts: Object.fromEntries(Object.keys(byType).map((k) => [k, byType[k].length])),
+          byType, items: feed.items || [],
+          categoriesJa: {
+            new: "新規登録(この選手を初めて記録した)",
+            transfer: "移籍(前回の記録と所属クラブが変わった)",
+            prospect: "若手有望株(21歳以下・出場450分以上・平均評価6.8以上)",
+            formUp: "フォーム急上昇(平均評価が+0.15以上)",
+            formDown: "フォーム急下降(平均評価が-0.15以上)",
+          },
+          notComputedJa: "「怪我からの復帰」は、API-Footballの負傷者リストからの消失で判定できますが、離脱の開始日が提供されないため復帰かどうかを断定できません。断定できない項目は出していません。",
+        };
+        cacheSet("kb:scouting", body, 5 * 60 * 1000);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
       if (pathname === "/api/growth-log") {
         // ホーム画面の「昨日学んだこと」ウィジェット用。Upstash未設定・未実行の
         // 場合も、架空の数字を返さず正直な状態を返す(既存のhandleAccuracyStats
@@ -4345,7 +4710,7 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         const todayKey = appDateKey();
-        const [growthRaw, accuracyTrend, agenda, intelReport, answerability, selfImproveHistory, coverage] = await Promise.all([
+        const [growthRaw, accuracyTrend, agenda, intelReport, answerability, selfImproveHistory, coverage, weightsImpact] = await Promise.all([
           learningDeps.upstashGetJSON("learn:growthlog:latest").catch(() => null),
           getAccuracyTrend(learningDeps, todayKey).catch(() => ({ available: false })),
           loadLatestAgenda(learningDeps).catch(() => null),
@@ -4366,12 +4731,25 @@ const server = http.createServer(async (req, res) => {
             if (summary) cacheSet("kb:coverage", { ok: true, generatedAt: new Date().toISOString(), ...summary }, 5 * 60 * 1000);
             return summary;
           })(),
+          // ---- 2026年8月・第三者監査が発見した「書きっぱなし」の解消 ----
+          //   learn:weights:impact は「学習で重みを変えた結果、予測がどう変わったか」を
+          //   30件ぶん貯めていたのに、**読み出すコードがテスト以外に無かった**。
+          //   「本当に賢くなっているのか」を数字で示す中核なので、日次レポートに載せる。
+          (async () => {
+            const raw = (await upstashCmd(["LRANGE", "learn:weights:impact", "-10", "-1"]).catch(() => [])) || [];
+            const items = raw.map((x) => { try { return JSON.parse(x); } catch (e) { return null; } }).filter(Boolean).reverse();
+            return items.length
+              ? { available: true, items, noteJa: "重みを更新した日に、その更新が過去の実試合の予測をどう変えたかを再計算した記録です(直近10件)。" }
+              : { available: false, noteJa: "重みの更新がまだ行われていないため、学習が予測に与えた影響の記録はありません(検証済みの試合が必要件数に達すると始まります)。" };
+          })(),
         ]);
         const g = growthRaw || {};
         const body = {
           ok: true,
           generatedAt: new Date().toISOString(),
           date: g.date || todayKey,
+          // 学習が実際に予測を変えた記録(実測)
+          weightsImpact,
           isToday: g.date === todayKey,
           noteJa: g.date
             ? (g.date === todayKey ? "本日の学習実行の実測値です。" : `最新の学習記録は${g.date}のものです(本日分はまだ実行されていません)。`)
@@ -4529,12 +4907,34 @@ server.listen(PORT, () => {
   console.log(`AI予測の記録(Upstash Redis): ${UPSTASH_ENABLED ? "あり" : "なし(.envのUPSTASH_REDIS_REST_URL/TOKENを設定してください)"}`);
 });
 
+/**
+ * ---- テスト専用のフック(本番の動作には一切影響しない) ----
+ * 2026年8月・「正答率が更新されない」調査への対応で追加。
+ *
+ * なぜ必要か: この調査で見つかった欠陥(保留キューの先頭詰まり・
+ * 一時的なUpstash障害での恒久的な取りこぼし・予測データが無い試合による
+ * 枠の食い潰し)は、いずれも **「Redisの中身が実行後どう変わるか」でしか
+ * 検証できない**。過去に「index.htmlに文字列が含まれるか」だけを見る
+ * テストが、例外を投げるコードを合格させてしまった反省から、
+ * 依存(Upstash / API-Football)を差し替えて実際にハンドラを動かせるようにする。
+ * 本番では誰も呼ばないため、挙動は変わらない。
+ */
+function __setTestHooks(hooks) {
+  if (!hooks) return;
+  if (hooks.upstashCmd) upstashCmd = hooks.upstashCmd;
+  if (hooks.upstashGetJSON) upstashGetJSON = hooks.upstashGetJSON;
+  if (hooks.upstashSetJSON) upstashSetJSON = hooks.upstashSetJSON;
+  if (hooks.callApiFootball) callApiFootball = hooks.callApiFootball;
+  if (hooks.handleFixturesToday) handleFixturesToday = hooks.handleFixturesToday;
+}
+
 module.exports = {
   server,
+  __setTestHooks,
   handlePlayerSeasonStats,
   handleFixturesToday,
   handleFixtureAnalysis,
-  handlePredictionsToday, buildTodayPredictionEntry, // 利用者目線ラウンド: 今日のAI予想
+  handlePredictionsToday, buildTodayPredictionEntry, selectUpcomingPredictionRecords, // 利用者目線ラウンド: 今日のAI予想
   prioritizeFixturesForDisplay, // 利用者目線ラウンド: 表示上限の優先順位つき適用(テスト対象)
   handleBackupExport, // 精度証明ラウンド④: 学習状態の週次バックアップ
   handleCoachSearch,

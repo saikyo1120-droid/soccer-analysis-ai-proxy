@@ -29,6 +29,12 @@
     --series-4: #eda100;      /* yellow */
     --series-home-wash: rgba(42,120,214,0.10);
     --series-away-wash: rgba(235,104,52,0.10);
+    /* 2026年8月・第三者監査が発見した「定義されていないCSS変数」の追加。
+       これらは参照だけされていて定義が無く、常にフォールバックの固定色に落ちていたため、
+       ダークモードに切り替えても色が一切変わらなかった。 */
+    --series-2: #b3541e;      /* terracotta(予想カードの枠・強調) */
+    --series-3-wash: rgba(27,175,122,0.10);
+    --accent: #2a78d6;
     --good: #0ca30c;
     --warning: #fab219;
     --critical: #d03b3b;
@@ -52,6 +58,11 @@
     --series-4: #c98500;
     --series-home-wash: rgba(57,135,229,0.14);
     --series-away-wash: rgba(217,89,38,0.14);
+    /* ダークは背景 #1a1a19 の上でコントラスト比4.5:1を満たすよう明るくする
+       (#b3541e は3.49:1で不足していたため) */
+    --series-2: #e0885c;
+    --series-3-wash: rgba(25,158,112,0.16);
+    --accent: #3987e5;
     --good: #0ca30c;
     --warning: #fab219;
     --critical: #e66767;
@@ -121,7 +132,9 @@
   .bar-half.right .bar-fill { border-radius: 0 4px 4px 0; margin-left: 1px; }
   .bar-fill.home { background: var(--series-home); }
   .bar-fill.away { background: var(--series-away); }
-  .bar-value { position: absolute; top: 50%; transform: translateY(-50%); font-size: 12px; font-weight: 600; white-space: nowrap; }
+  /* 監査の指摘: クラブ名を絶対配置+nowrapで置いていたため375px幅で画面外へはみ出していた
+     (Arsenal vs Manchester City で scrollWidth 415 > clientWidth 375)。 */
+  .bar-value { position: absolute; top: 50%; transform: translateY(-50%); font-size: 12px; font-weight: 600; white-space: nowrap; max-width: 28vw; overflow: hidden; text-overflow: ellipsis; }
   .bar-half.left .bar-value { right: calc(100% + 6px); color: var(--text-primary); }
   .bar-half.right .bar-value { left: calc(100% + 6px); color: var(--text-primary); }
   .center-tick { width: 2px; background: var(--baseline); }
@@ -211,13 +224,17 @@
   .live-stat-item { background: var(--surface-2); border-radius: 8px; padding: 8px 10px; text-align: center; }
   .live-stat-item .num { font-size: 18px; font-weight: 800; }
   .live-stat-item .lbl { font-size: 11px; color: var(--text-muted); }
-  .real-fixture-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+  /* 2026年8月・全画面監査での補強: 非常に長いクラブ名(データ提供元の表記次第では
+     40文字を超えることがある)を受け取った日に、375px幅で「AI分析を見る」ボタンが
+     画面外へ押し出されて押せなくなっていた。折り返しを許可して常に押せるようにする。 */
+  .real-fixture-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; min-width: 0; }
+  .real-fixture-row > * { min-width: 0; }
   .real-fixture-row:last-child { border-bottom: none; }
   /* 2026年8月・優先順位⑩: 試合カードをAIマッチ分析と同じカードUIへ統一する。
      分析を開いている間だけ枠線と背景を強調し、「今どの試合を見ているか」を
      一目で分かるようにする(閉じている間は従来どおりの一覧の見た目を保つ)。 */
   .fixture-card { border-radius: 10px; transition: background .15s ease, box-shadow .15s ease; }
-  .fixture-card.is-expanded { background: var(--surface, rgba(0,0,0,.02)); box-shadow: 0 0 0 1px var(--border) inset; padding: 4px 10px 10px; margin: 6px -10px; }
+  .fixture-card.is-expanded { background: var(--surface-2); box-shadow: 0 0 0 1px var(--border) inset; padding: 4px 10px 10px; margin: 6px -10px; }
   .fixture-card.is-expanded > .real-fixture-row { border-bottom: 1px solid var(--border); }
   .fixture-analysis-slot { padding-top: 8px; }
   .fixture-analysis-slot .card { margin-bottom: 10px; }
@@ -276,7 +293,7 @@
   .rating-bar-wrap { margin: 8px 0 14px; }
 
   /* Playstyle diagnosis / gamified scout card */
-  .playstyle-banner { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border-radius: 12px; background: linear-gradient(135deg, var(--series-home-wash), var(--series-3-wash, var(--series-home-wash))); border: 1px solid var(--border); margin-bottom: 14px; }
+  .playstyle-banner { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border-radius: 12px; background: linear-gradient(135deg, var(--series-home-wash), var(--series-3-wash)); border: 1px solid var(--border); margin-bottom: 14px; }
   .playstyle-emoji { font-size: 36px; line-height: 1; }
   .playstyle-label { font-size: 20px; font-weight: 700; color: var(--text-primary); }
   .playstyle-sub { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
@@ -371,7 +388,7 @@
        開いた瞬間(5秒以内)に見せる。中身は毎朝の学習でAI自身のモデルが生成・
        保存した予測(learn:ownpred)の読み出しで、このカードが新しい計算を
        発生させることはない。予想が無い日は理由を正直に表示する。 -->
-  <div class="card" id="todayPredictionsCard" style="border:1.5px solid var(--series-2, #b3541e);">
+  <div class="card" id="todayPredictionsCard" style="border:1.5px solid var(--series-2);">
     <h2 style="margin-bottom:6px;">🔮 今日のAI予想</h2>
     <div id="todayPredictionsBody"><p class="value-note">今日のAI予想を読み込み中…</p></div>
   </div>
@@ -431,9 +448,9 @@
     <h2>🧠 AIマッチ分析(クラブ対戦シミュレーション)</h2>
     <p class="value-note" style="margin-bottom:12px;">登録クラブ同士を選ぶと、実データ(直近フォーム・得失点・怪我人数・順位・過去対戦・過密日程)をもとに、AIが勝率・重視した要素・試合展開・予想スコアまで読み解きます。単なる勝敗ではなく「AIがどう試合を読んだか」を見られる分析です。</p>
     <div class="compare-select-row">
-      <select id="maHomeSelect" style="padding:7px 10px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary);"></select>
+      <select id="maHomeSelect" aria-label="ホームチーム" style="padding:7px 10px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary);"></select>
       <span style="align-self:center; color:var(--text-muted);">vs</span>
-      <select id="maAwaySelect" style="padding:7px 10px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary);"></select>
+      <select id="maAwaySelect" aria-label="アウェイチーム" style="padding:7px 10px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary);"></select>
       <button class="apply-btn" id="maAnalyzeBtn" style="margin-top:0; width:auto; padding:9px 18px;">分析する ▶</button>
     </div>
     <div id="maResultWrap" style="margin-top:12px;"></div>
@@ -524,6 +541,14 @@
     </div>
 
     <div id="playerCardWrap"></div>
+
+    <!-- 2026年8月・「新規加入・移籍・若手有望株・フォーム急変が登録されているか」への回答。
+         毎日の収集で実測値が変わった瞬間に検知したものだけを並べる(推測は入れない)。 -->
+    <div class="card" id="scoutFeedCard" style="margin-top:14px; display:none;">
+      <h3 style="margin:0 0 4px;">🛰️ スカウト速報(AIが自動で見つけた動き)</h3>
+      <div class="muted" style="font-size:13px;">毎日の学習で実測値が変わったときにだけ記録しています。推測は含みません。</div>
+      <div id="scoutFeedBody" style="margin-top:10px;">読み込み中…</div>
+    </div>
   </div>
 
   <div class="card">
@@ -3499,9 +3524,9 @@ async function renderLiveBayernPanel(targetId) {
   try {
     const data = await fetchBayernLiveData();
     const matchChips = data.recent.length ? data.recent.map(m => `
-      <div class="form-chip" title="${m.date}">
-        <div class="letter ${m.outcome}">${m.outcome}</div>
-        <div class="rating" style="font-size:11px;">${m.gf}-${m.ga} ${m.opponent.replace('FC Bayern München','')}</div>
+      <div class="form-chip" title="${escapeHtml(m.date)}">
+        <div class="letter ${escapeHtml(m.outcome)}">${escapeHtml(m.outcome)}</div>
+        <div class="rating" style="font-size:11px;">${Number(m.gf)}-${Number(m.ga)} ${escapeHtml(String(m.opponent || "").replace('FC Bayern München',''))}</div>
       </div>`).join("") : `<p class="value-note">直近の試合データが見つかりませんでした。</p>`;
     el.innerHTML = `
       <h2>🔴 実データ:FCバイエルン・ミュンヘン(ブンデスリーガ ${data.season}/${String(data.season+1).slice(2)}シーズン)</h2>
@@ -3788,17 +3813,17 @@ async function renderRealPerformancePanel(player) {
   }
   const data = await fetchRealPlayerSeasonStats(player);
   if (!data) { el.innerHTML = ""; return; } // no proxy / no key / not found → leave the simulated section as the only content, unchanged
-  const s = data.stats;
+  const s = data.stats || {}; // 監査の指摘: statsが無い応答でパネルが永久に固まっていた
   const offSeasonNote = (data.requestedSeason && data.season && data.requestedSeason !== data.season)
     ? `新シーズンはまだ試合数が少ないため、直近の完了シーズン(${data.season})の実績を表示しています。`
     : "";
   // Showing the resolved club name here (not just the stat numbers) matters: it's
   // the one visible signal that lets anyone confirm at a glance that this is the
   // player's CLUB form and not, say, national-team stats that slipped through.
-  const teamNote = data.team ? `所属: ${data.team}。` : "";
+  const teamNote = data.team ? `所属: ${escapeHtml(data.team)}。` : "";
   el.innerHTML = `
     <div class="live-data-banner">
-      <span class="live-data-badge">🟢 実データ</span>API-Football(有料API)から取得した${data.season}シーズンの成績です(${data.fetchedAt.slice(0,10)}時点・キャッシュ済みの場合あり)。${teamNote}下のシミュレーション区画とは別ソースです。${offSeasonNote}
+      <span class="live-data-badge">🟢 実データ</span>API-Football(有料API)から取得した${data.season}シーズンの成績です(${data.fetchedAt ? String(data.fetchedAt).slice(0,10) + "時点・" : ""}キャッシュ済みの場合あり)。${teamNote}下のシミュレーション区画とは別ソースです。${offSeasonNote}
       <div class="live-stat-grid">
         <div class="live-stat-item"><div class="num">${s.appearances ?? "-"}</div><div class="lbl">出場</div></div>
         <div class="live-stat-item"><div class="num">${s.goals ?? "-"}</div><div class="lbl">ゴール</div></div>
@@ -3866,6 +3891,9 @@ function pumpPhotoQueue() {
 async function renderExternalPanel(player) {
   const el = document.getElementById("externalPanel");
   if (!el) return;
+  // 監査の指摘への対応: await の前に「今表示されているアバター要素」を掴んでおき、
+  // 戻ってきたときに別の選手のカードへ差し替わっていたら何もしない。
+  const avatarElAtStart = document.getElementById("playerAvatar");
   let result;
   try {
     result = await fetchExternalVerification(player);
@@ -3876,8 +3904,13 @@ async function renderExternalPanel(player) {
   const photo = (result.sdb && (result.sdb.strCutout || result.sdb.strThumb || result.sdb.strRender)) || (result.wiki && result.wiki.thumbnail && result.wiki.thumbnail.source) || null;
   photoCache[photoCacheKey(player)] = photo;
   if (photo) {
+    // 監査の指摘: この要素をawaitの「後」に取り直していたため、
+    // 別の選手を検索した直後に古い写真が新しいカードへ差し込まれていた
+    // (メッシ→ロナウドと検索して、ロナウドのカードにメッシの写真が出る)。
     const avatarEl = document.getElementById("playerAvatar");
-    if (avatarEl) avatarEl.innerHTML = `<img loading="lazy" decoding="async" src="${escapeHtml(photo)}" alt="${escapeHtml(player.name)}" onerror="this.parentElement.textContent='${player.emoji}';">`;
+    if (avatarEl && avatarEl === avatarElAtStart && avatarEl.isConnected) {
+      avatarEl.innerHTML = `<img loading="lazy" decoding="async" src="${escapeHtml(photo)}" alt="${escapeHtml(player.name)}" onerror="this.parentElement.textContent='${escapeHtml(player.emoji)}';">`;
+    }
   }
   let html = "";
   if (result.sdb) {
@@ -3969,11 +4002,11 @@ function renderPlayerCard(player, level) {
     <div class="fit-row"><div class="fit-name">${l.name}</div><span class="stars">${starStr(l.score/20)}</span></div>`).join("");
 
   wrap.innerHTML = `
-    ${player.isFallback ? `<div class="card" style="border-color:var(--warning);"><p style="margin:0; font-size:13px;">⚠️ 「${player.name}」はサンプルデータベースに未登録のため、AIが入力名から仮生成した<b>参考用のダミーデータ</b>です。実在の選手情報とは一致しません。</p></div>` : ""}
+    ${player.isFallback ? `<div class="card" style="border-color:var(--warning);"><p style="margin:0; font-size:13px;">⚠️ 「${escapeHtml(player.name)}」はサンプルデータベースに未登録のため、AIが入力名から仮生成した<b>参考用のダミーデータ</b>です。実在の選手情報とは一致しません。</p></div>` : ""}
 
     <div class="card">
       <div class="player-head">
-        <div class="avatar-lg" id="playerAvatar">${photoCache[photoCacheKey(player)] ? `<img loading="lazy" decoding="async" src="${photoCache[photoCacheKey(player)]}" alt="${player.name}" onerror="this.parentElement.textContent='${player.emoji}';">` : player.emoji}</div>
+        <div class="avatar-lg" id="playerAvatar">${photoCache[photoCacheKey(player)] ? `<img loading="lazy" decoding="async" src="${escapeHtml(photoCache[photoCacheKey(player)])}" alt="${escapeHtml(player.name)}" onerror="this.parentElement.textContent='${escapeHtml(player.emoji)}';">` : escapeHtml(player.emoji)}</div>
         <div>
           <div class="name-line">${player.emoji === "❔" ? "" : ""}${player.name}</div>
           <div style="font-size:13px; color:var(--text-secondary);">${player.nameJa}</div>
@@ -4035,7 +4068,7 @@ function renderPlayerCard(player, level) {
       </div>
       <div class="card">
         <h2>🏆 キャリア / タイトル</h2>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:16px;">
           <div><h3 style="font-size:13px; margin:0 0 6px;">🏟️ 所属クラブ歴</h3>${careerHtml}</div>
           <div><h3 style="font-size:13px; margin:0 0 6px;">🏅 主なタイトル</h3><div style="font-size:13px; color:var(--text-secondary);">${titlesHtml}</div></div>
         </div>
@@ -4240,12 +4273,12 @@ function renderComparison(player, otherKey) {
   wrapEl.innerHTML = `
     <div class="compare-cols">
       <div>
-        <div class="compare-head"><div class="avatar-lg" style="width:44px;height:44px;font-size:20px;">${photoA ? `<img loading="lazy" decoding="async" src="${photoA}" alt="">` : player.emoji}</div><div class="name">${player.nameJa}</div></div>
+        <div class="compare-head"><div class="avatar-lg" style="width:44px;height:44px;font-size:20px;">${photoA ? `<img loading="lazy" decoding="async" src="${escapeHtml(photoA)}" alt="">` : player.emoji}</div><div class="name">${player.nameJa}</div></div>
         <div class="tag-row">${player.styleTags.map(t => `<span class="tag">🏷️ ${t}</span>`).join("")}</div>
         <p class="value-note" style="margin-top:8px;">${playstyleTagLine(tagA)}</p>
       </div>
       <div>
-        <div class="compare-head"><div class="avatar-lg" style="width:44px;height:44px;font-size:20px;">${photoB ? `<img loading="lazy" decoding="async" src="${photoB}" alt="">` : other.emoji}</div><div class="name">${other.nameJa}</div></div>
+        <div class="compare-head"><div class="avatar-lg" style="width:44px;height:44px;font-size:20px;">${photoB ? `<img loading="lazy" decoding="async" src="${escapeHtml(photoB)}" alt="">` : other.emoji}</div><div class="name">${other.nameJa}</div></div>
         <div class="tag-row">${other.styleTags.map(t => `<span class="tag">🏷️ ${t}</span>`).join("")}</div>
         <p class="value-note" style="margin-top:8px;">${playstyleTagLine(tagB)}</p>
       </div>
@@ -4378,7 +4411,7 @@ function keyPlayersHtml(players, n) {
     const tag = computePlaystyleTag(p);
     const photo = photoCache[photoCacheKey(p)];
     return `<button class="chip match-player-chip" data-name="${p.nameJa}" style="margin:3px 4px 3px 0;">
-      <span class="chip-avatar">${photo ? `<img loading="lazy" decoding="async" src="${photo}" alt="">` : p.emoji}</span>${p.nameJa} ${tag.emoji}
+      <span class="chip-avatar">${photo ? `<img loading="lazy" decoding="async" src="${escapeHtml(photo)}" alt="">` : p.emoji}</span>${p.nameJa} ${tag.emoji}
     </button>`;
   }).join("");
 }
@@ -4430,7 +4463,7 @@ function fixtureRowHtml(f) {
   const group = classifyFixtureStatus(f.status);
   const dt = new Date(f.date);
   const timeStr = isNaN(dt.getTime()) ? "" : dt.toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
-  const scoreStr = f.score && (f.score.home !== null && f.score.home !== undefined) ? `${f.score.home} - ${f.score.away}` : "vs";
+  const scoreStr = f.score && (f.score.home !== null && f.score.home !== undefined) ? `${escapeHtml(String(f.score.home))} - ${escapeHtml(String(f.score.away))}` : "vs";
   const badgeClass = group === "live" ? "is-live" : group === "finished" ? "is-finished" : group === "upcoming" ? "is-upcoming" : "is-other";
   const badge = `<span class="status-badge ${badgeClass}">${group === "live" ? '<span class="live-dot"></span>' : ""}${fixtureStatusLabel(f.status, group)}</span>`;
   // UI/UX統一ラウンド: ホームの「今日のAI予想」と同じ情報(予想勝者・勝率・
@@ -4699,7 +4732,21 @@ async function renderRealFixturesIfAvailable() {
       noteParts.push("ℹ️ 日本時間の本日の試合はすべて終了しています。ヨーロッパの今夜の試合は日本時間では明日の日付になるため、明日の朝にこの欄と「🔮 今日のAI予想」へ並びます(AI予想は毎朝4時の学習で生成されます)。");
     }
     if (Number.isFinite(data.omittedCount) && data.omittedCount > 0) {
-      noteParts.push(`表示は${(data.fixtures || []).length}試合まで(この日に実際にあった${Number(data.totalToday)}試合のうち、終了済み${Number(data.omittedCount)}試合を省略しています。ライブ中・これからの試合は省略されません)。`);
+      // 2026年8月の調査で修正: 未終了の試合が表示枠(80)を超える日でも
+      // 「ライブ中・これからの試合は省略されません」と断言していた。
+      // サーバーが実際に切り捨てた件数(omittedUnfinishedCount)を見て文言を変える。
+      // 監査の指摘: `|| 0` だと「サーバーが0と言った」と「サーバーが何も言わなかった」が
+      // 同じ扱いになり、内訳が分からない日に「ライブ中の試合は省略していません」と
+      // 断言していた(古いサーバーに繋がった場合に149試合について嘘をつく)。
+      const rawUnfinishedCut = data.omittedUnfinishedCount;
+      const unfinishedKnown = rawUnfinishedCut !== undefined && rawUnfinishedCut !== null && Number.isFinite(Number(rawUnfinishedCut));
+      const unfinishedCut = unfinishedKnown ? Number(rawUnfinishedCut) : null;
+      const cutNoteJa = !unfinishedKnown
+        ? "省略した試合の内訳(終了済みか、ライブ中・これからか)は、接続先のサーバーからは取得できませんでした"
+        : unfinishedCut > 0
+          ? `うち${unfinishedCut}試合はライブ中・これからの試合です(同時開催が多い日は表示枠を超えます)`
+          : "省略したのはすべて終了済みの試合で、ライブ中・これからの試合は省略していません";
+      noteParts.push(`表示は${(data.fixtures || []).length}試合まで(この日に実際にあった${Number(data.totalToday)}試合のうち${Number(data.omittedCount)}試合を省略しています。${cutNoteJa})。`);
     }
     if (noteParts.length) { noteEl.textContent = noteParts.join(" "); noteEl.style.display = "block"; }
     else { noteEl.style.display = "none"; }
@@ -4886,14 +4933,26 @@ function buildUpcomingPreviewHtml(analysis, level) {
     const confidence = Math.round(50 + Math.min(38, Math.abs(diff) * 2.6));
     const favored = diff >= 0 ? f.home.name : f.away.name;
     const barPct = 50 + diff * 3;
-    const leadText = {
-      beginner: `🤖 AIの予想では「${favored}」の方が少し有利そうです！下の注目選手たちの活躍がポイントになりそうです。`,
-      standard: `🤖 <strong>AIの展開予想:</strong> 登録選手データの平均値では${favored}がやや優勢と分析されます(AI確信度 ${confidence}%)。両チームとも登録選手データがあるため、下記の注目選手を中心に試合の流れを予想できます。`,
-      expert: `🤖 <strong>AIの展開予想:</strong> 登録選手の総合能力値平均は${f.home.name} ${homeOverall.toFixed(1)} 対 ${f.away.name} ${awayOverall.toFixed(1)}(差分${Math.abs(diff).toFixed(1)}、AI確信度${confidence}%)。個々の対人マッチアップは下記の注目選手を軸に確認してください。`,
+    // ---- 2026年8月・第三者監査が発見した「母数を隠した平均値」の是正 ----
+    //   ここは登録済み選手だけの平均を比べている。実際には
+    //   アーセナル38人 vs マンチェスター・シティ1人 のような比較が起こり、
+    //   それでも「シティの方が有利そうです」と断言し、確信度%まで出していた。
+    //   母数を必ず開示し、母数が少ない/偏っている場合は勝ち負けを断言しない。
+    const nHome = homeP.length, nAway = awayP.length;
+    const thinSample = nHome < 5 || nAway < 5 || Math.max(nHome, nAway) >= Math.min(nHome, nAway) * 3;
+    const sampleNoteJa = `(この比較の母数: ${escapeHtml(f.home.name)} ${nHome}人 / ${escapeHtml(f.away.name)} ${nAway}人の登録選手のみ${thinSample ? "。母数が少ない、または左右で大きく偏っているため、クラブ全体の強さを表す数値ではありません" : ""})`;
+    const leadText = thinSample ? {
+      beginner: `🤖 登録されている選手の数が両チームで大きく違うため、どちらが有利かはこのデータからは判断できません。${sampleNoteJa}`,
+      standard: `🤖 <strong>AIの展開予想:</strong> 登録選手データの母数が不足または偏っているため、優劣の判定は行いません。下記の注目選手は、登録がある範囲での情報です。${sampleNoteJa}`,
+      expert: `🤖 <strong>AIの展開予想:</strong> 登録選手の総合能力値平均は${escapeHtml(f.home.name)} ${homeOverall.toFixed(1)} 対 ${escapeHtml(f.away.name)} ${awayOverall.toFixed(1)} ですが、母数が偏っているため優劣の推定には使えません。${sampleNoteJa}`,
+    }[level] || "" : {
+      beginner: `🤖 AIの予想では「${escapeHtml(favored)}」の方が少し有利そうです！下の注目選手たちの活躍がポイントになりそうです。${sampleNoteJa}`,
+      standard: `🤖 <strong>AIの展開予想:</strong> 登録選手データの平均値では${escapeHtml(favored)}がやや優勢と分析されます(AI確信度 ${confidence}%)。${sampleNoteJa}`,
+      expert: `🤖 <strong>AIの展開予想:</strong> 登録選手の総合能力値平均は${escapeHtml(f.home.name)} ${homeOverall.toFixed(1)} 対 ${escapeHtml(f.away.name)} ${awayOverall.toFixed(1)}(差分${Math.abs(diff).toFixed(1)}、AI確信度${confidence}%)。${sampleNoteJa}`,
     }[level] || "";
     predictionHtml = `
       <p class="value-note">${leadText}</p>
-      ${strengthBarHtml("AI優勢度", barPct, f.home.name, f.away.name)}
+      ${thinSample ? "" : strengthBarHtml("AI優勢度", barPct, f.home.name, f.away.name)}
       <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:8px;">
         <div style="flex:1; min-width:220px;"><strong>${f.home.name} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(homeP, 3)}</div></div>
         <div style="flex:1; min-width:220px;"><strong>${f.away.name} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(awayP, 3)}</div></div>
@@ -5039,6 +5098,9 @@ function buildDecisivePointsText(analysis, level) {
       ? `なお、${analysis.playersUnavailableReasonJa}このため、スコア以上の詳しい要因分析はできません。`
       : `なお、この試合は選手評価・イベントのデータが無いため、スコア以上の詳しい要因分析はできません(推測で理由は作りません)。`);
   }
+  // 検証での指摘: この関数はHTMLではなく**文章**を返す。中でチーム名・選手名など
+  // 提供元由来の文字列を多数連結しているため、差し込み側で必ずエスケープする
+  // (関数の中で12箇所を個別に囲うより、出口1箇所で確実に守る)。
   return parts.join("");
 }
 // 2026年8月・優先順位④: 試合中(ライブ)の実データ表示。終了後の「振り返り」
@@ -5052,7 +5114,7 @@ function buildLiveAnalysisHtml(analysis, level) {
   const ratingBarHtml = (homeAvg !== null && awayAvg !== null)
     ? `<div class="rating-bar-wrap">${strengthBarHtml("現時点の選手評価", 50 + (homeAvg - awayAvg) * 15, homeAvg.toFixed(2), awayAvg.toFixed(2))}</div>`
     : "";
-  const scoreStr = f.score && f.score.home !== null ? `${f.score.home} - ${f.score.away}` : "- - -";
+  const scoreStr = f.score && f.score.home !== null ? `${escapeHtml(String(f.score.home))} - ${escapeHtml(String(f.score.away))}` : "- - -";
   const elapsedStr = analysis.elapsed !== null && analysis.elapsed !== undefined ? `${analysis.elapsed}分経過` : "";
   return `
     <div class="card" style="border:1.5px solid var(--critical);">
@@ -5063,11 +5125,11 @@ function buildLiveAnalysisHtml(analysis, level) {
       ${ratingBarHtml}
       <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:10px;">
         <div style="flex:1; min-width:240px;">
-          <strong>${f.home.name} 現在の選手評価</strong>
+          <strong>${escapeHtml(f.home.name)} 現在の選手評価</strong>
           <div style="margin-top:6px;">${analysis.homePlayers.map(playerRatingRowHtml).join("") || `<p class="value-note">${escapeHtml(analysis.playersUnavailableReasonJa || "まだ評価データがありません。")}</p>`}</div>
         </div>
         <div style="flex:1; min-width:240px;">
-          <strong>${f.away.name} 現在の選手評価</strong>
+          <strong>${escapeHtml(f.away.name)} 現在の選手評価</strong>
           <div style="margin-top:6px;">${analysis.awayPlayers.map(playerRatingRowHtml).join("") || `<p class="value-note">${escapeHtml(analysis.playersUnavailableReasonJa || "まだ評価データがありません。")}</p>`}</div>
         </div>
       </div>
@@ -5095,26 +5157,26 @@ function buildFinishedAnalysisHtml(analysis, level) {
     const r = analysis.aiPredictionResult;
     const label = r.predictedWinner === "home" ? `${f.home.name} 勝利` : r.predictedWinner === "away" ? `${f.away.name} 勝利` : "引き分け";
     verdictHtml = `
-      <div style="margin:8px 0; padding:10px 12px; border-left:4px solid var(--series-2, #b3541e); background:rgba(0,0,0,.03); border-radius:6px;">
+      <div style="margin:8px 0; padding:10px 12px; border-left:4px solid var(--series-2); background:rgba(0,0,0,.03); border-radius:6px;">
         <div>🤖 試合前のAI予測記録: <strong>${escapeHtml(label)}</strong>(${Number(r.homePct)}% / ${Number(r.drawPct)}% / ${Number(r.awayPct)}%)
-        ${r.correct ? `<span style="color:#1c7c54; font-weight:bold; margin-left:6px;">✅ 的中</span>` : `<span style="color:#b3541e; font-weight:bold; margin-left:6px;">❌ 外れ</span>`}</div>
+        ${r.correct ? `<span style="color:var(--good); font-weight:bold; margin-left:6px;">✅ 的中</span>` : `<span style="color:var(--series-2); font-weight:bold; margin-left:6px;">❌ 外れ</span>`}</div>
       </div>`;
   }
   return `
     <div class="card">
-      <h2>📝 試合後の振り返り: ${escapeHtml(f.home.name)} ${f.score.home} - ${f.score.away} ${escapeHtml(f.away.name)}</h2>
+      <h2>📝 試合後の振り返り: ${escapeHtml(f.home.name)} ${escapeHtml(String(f.score.home))} - ${escapeHtml(String(f.score.away))} ${escapeHtml(f.away.name)}</h2>
       <p class="value-note">${escapeHtml(f.league || "")}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}(API-Footballの実データに基づく、試合終了後の振り返りです)</p>
       ${verdictHtml}
-      <p class="value-note"><strong>🤖 何が勝敗を分けたか:</strong> ${buildDecisivePointsText(analysis, level)}</p>
+      <p class="value-note"><strong>🤖 何が勝敗を分けたか:</strong> ${escapeHtml(buildDecisivePointsText(analysis, level))}</p>
       <div style="margin-top:8px;">${eventsTimelineVisualHtml(analysis.events, f.home.name)}</div>
       ${ratingBarHtml}
       <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:10px;">
         <div style="flex:1; min-width:240px;">
-          <strong>${f.home.name} 選手評価${analysis.motmHome ? "(MOTM候補: " + analysis.motmHome.name + ")" : ""}</strong>
+          <strong>${escapeHtml(f.home.name)} 選手評価${analysis.motmHome ? "(MOTM候補: " + escapeHtml(analysis.motmHome.name) + ")" : ""}</strong>
           <div style="margin-top:6px;">${analysis.homePlayers.map(playerRatingRowHtml).join("") || `<p class="value-note">${escapeHtml(analysis.playersUnavailableReasonJa || "選手評価データがありません。")}</p>`}</div>
         </div>
         <div style="flex:1; min-width:240px;">
-          <strong>${f.away.name} 選手評価${analysis.motmAway ? "(MOTM候補: " + analysis.motmAway.name + ")" : ""}</strong>
+          <strong>${escapeHtml(f.away.name)} 選手評価${analysis.motmAway ? "(MOTM候補: " + escapeHtml(analysis.motmAway.name) + ")" : ""}</strong>
           <div style="margin-top:6px;">${analysis.awayPlayers.map(playerRatingRowHtml).join("") || `<p class="value-note">${escapeHtml(analysis.playersUnavailableReasonJa || "選手評価データがありません。")}</p>`}</div>
         </div>
       </div>
@@ -5125,6 +5187,13 @@ function buildFinishedAnalysisHtml(analysis, level) {
     </div>`;
 }
 let lastRealFixtureAnalysis = null; // re-rendered at the new detail level when the 超入門/標準/戦術 switch changes
+// 監査の指摘: レベル切替時の再描画が、いま実際に表示している場所ではなく
+// 常に #realFixtureAnalysisWrap へ書き込んでいたため、同じ試合のカードが
+// ページ上に2つ並び、しかも見えている方は古いレベルのままだった。
+// どちらの入口から描画したかを覚えておき、その場所へ描き直す。
+let lastRealFixtureAnalysisSlotId = null;
+// スロットID → その枠に表示している分析。開き直したときに「今どれを見ているか」を復元する。
+const slotAnalysisCache = new Map();
 // 2026年8月・優先順位⑩「今日の試合カードはAIマッチ分析と同じ見やすいカードUIに
 // 統一してください」への対応。試合カードの中で開閉し、開いている間だけ分析を表示する。
 // キャッシュ(fetchRealFixtureAnalysis内)により、2回目以降の開閉は通信ゼロで即座に切り替わる。
@@ -5143,13 +5212,29 @@ async function renderFixtureAnalysisInline(btn) {
     slot.style.display = "none";
     btn.textContent = btn.dataset.baseLabel;
     if (cardEl) cardEl.classList.remove("is-expanded");
+    // 検証での指摘: 閉じても「今表示している分析」の記録が残っていたため、
+    // その後にレベルを切り替えると、非表示の要素へ描き込むだけで
+    // 画面上は何も変わらない(利用者から見ると切替が効かない)状態だった。
+    if (lastRealFixtureAnalysisSlotId === slot.id) {
+      lastRealFixtureAnalysis = null;
+      lastRealFixtureAnalysisSlotId = null;
+    }
     return;
   }
 
   slot.style.display = "block";
   btn.textContent = "▲ 閉じる";
   if (cardEl) cardEl.classList.add("is-expanded");
-  if (slot.dataset.loaded === "1") return; // 既に読み込み済みなら再取得しない
+  if (slot.dataset.loaded === "1") {
+    // 検証での指摘: ここで早期returnしていたため、一度開いたことのある試合を
+    // 開き直すと「今どの試合を表示しているか」が古いままになり、
+    // レベル切替が**別の試合**のカードを書き換えていた。
+    if (slotAnalysisCache.has(slot.id)) {
+      lastRealFixtureAnalysis = slotAnalysisCache.get(slot.id);
+      lastRealFixtureAnalysisSlotId = slot.id || null;
+    }
+    return; // 既に読み込み済みなら再取得しない
+  }
 
   slot.innerHTML = `<p class="value-note" style="margin:8px 0;">🔄 実データを取得中です…(サーバーが休止していた場合、初回は最大1分ほどかかることがあります)</p>`;
   const analysis = await fetchRealFixtureAnalysis(fixtureId);
@@ -5165,6 +5250,8 @@ async function renderFixtureAnalysisInline(btn) {
   slot.innerHTML = buildMostImportantFactorBanner(analysis) + bodyHtml;
   slot.dataset.loaded = "1";
   lastRealFixtureAnalysis = analysis;
+  lastRealFixtureAnalysisSlotId = slot.id || null;
+  if (slot.id) slotAnalysisCache.set(slot.id, analysis);
   if (analysis.fixture && analysis.fixture.home && analysis.fixture.away) {
     trackRecentMatch("real:" + fixtureId, `${analysis.fixture.home.name} vs ${analysis.fixture.away.name}`);
   }
@@ -5175,8 +5262,9 @@ async function renderRealFixtureAnalysis(fixtureId) {
   if (!wrapEl) return;
   wrapEl.innerHTML = `<div class="card"><p class="value-note">🔄 実データを取得中です…(サーバーが休止していた場合、初回は最大1分ほどかかることがあります)</p></div>`;
   const analysis = await fetchRealFixtureAnalysis(fixtureId);
-  if (!analysis) { wrapEl.innerHTML = `<div class="card"><p class="value-note">この試合の詳細データを取得できませんでした。時間をおいて再度お試しください。</p></div>`; lastRealFixtureAnalysis = null; return; }
+  if (!analysis) { wrapEl.innerHTML = `<div class="card"><p class="value-note">この試合の詳細データを取得できませんでした。時間をおいて再度お試しください。</p></div>`; lastRealFixtureAnalysis = null; lastRealFixtureAnalysisSlotId = null; return; }
   lastRealFixtureAnalysis = analysis;
+  lastRealFixtureAnalysisSlotId = null; // この入口は #realFixtureAnalysisWrap に描く
   // 優先順位⑩: 結論より先に「AIが最も重要だと判断した要因」を出す。
   const bodyHtml = analysis.phase === "finished" ? buildFinishedAnalysisHtml(analysis, state.level)
     : analysis.phase === "live" ? buildLiveAnalysisHtml(analysis, state.level)
@@ -5423,6 +5511,7 @@ async function renderMatchAnalysis(matchupId) {
     <div class="card">
       <h2>🤖 AI試合プレビュー: ${m.homeLabel} vs ${m.awayLabel}</h2>
       <div class="sim-banner">⚠️ これは実際の試合結果ではありません。登録選手のデータをもとにAIが生成した予測プレビューで、「分析する」を押すたびに新しく生成されます(今日この試合が実際に開催されるとは限りません)。</div>
+      <p class="value-note" style="margin:0 0 8px;">※ このプレビューの文章は、上部の「超入門/標準/戦術」の切り替えには連動しません(選手カードと、実際の試合の分析は連動します)。</p>
       <div style="text-align:center; margin:14px 0;">
         <div style="font-size:13px; color:var(--text-secondary); margin-bottom:4px;">AI予想スコア</div>
         <div style="font-size:32px; font-weight:800;">${m.homeLabel} <span style="color:var(--series-home);">${homeGoals}</span> - <span style="color:var(--series-away);">${awayGoals}</span> ${m.awayLabel}</div>
@@ -5493,13 +5582,118 @@ async function renderMatchAnalysis(matchupId) {
   wrapEl.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-function runPlayerSearch() {
+/* スカウト速報(新規加入・移籍・若手有望株・フォーム急上昇/急下降)。
+   サーバーが実測値の変化から検知したものだけを表示する。 */
+const SCOUT_TYPE_ICONS = { new: "🆕", transfer: "🔄", prospect: "🌱", formUp: "📈", formDown: "📉" };
+async function renderScoutFeed() {
+  const card = document.getElementById("scoutFeedCard");
+  const body = document.getElementById("scoutFeedBody");
+  if (!card || !body) return;
+  let data = null;
+  try {
+    data = await fetchJsonWithTimeout(`${API_PROXY_BASE}/knowledge/scouting`, backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { data = null; }
+  if (!data || !data.ok) { card.style.display = "none"; return; }
+  const esc = (v) => String(v == null ? "" : v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const items = Array.isArray(data.items) ? data.items : [];
+  card.style.display = "";
+  if (!items.length) {
+    body.innerHTML = `<div class="muted" style="font-size:13px">まだ検知した動きはありません。${esc(data.available === false ? (data.reasonJa || "") : "選手の記録が2回以上更新されると、その差分から検知が始まります。")}</div>`;
+    return;
+  }
+  const order = ["transfer", "prospect", "formUp", "formDown", "new"];
+  const rows = items
+    .slice()
+    .sort((a, b) => (order.indexOf(a.type) - order.indexOf(b.type)) || String(b.at).localeCompare(String(a.at)))
+    .slice(0, 24)
+    .map((it) => `<li style="padding:6px 0;border-bottom:1px solid var(--border);list-style:none">
+        <span style="font-size:15px">${SCOUT_TYPE_ICONS[it.type] || "•"}</span>
+        <strong style="margin-left:4px">${esc(it.name || "-")}</strong>
+        <span class="muted" style="font-size:12px;margin-left:6px">${esc(it.teamJa || it.teamEn || "")}</span>
+        <div class="muted" style="font-size:13px;margin-left:24px">${esc(it.labelJa)}: ${esc(it.detailJa || "")}</div>
+      </li>`).join("");
+  const counts = data.counts || {};
+  const summary = order.filter((k) => counts[k]).map((k) => `${SCOUT_TYPE_ICONS[k]}${esc((data.categoriesJa && data.categoriesJa[k] || k).split("(")[0])} ${counts[k]}件`).join(" / ");
+  body.innerHTML = `<div class="muted" style="font-size:12px;margin-bottom:6px">${summary}</div>
+    <ul style="margin:0;padding:0">${rows}</ul>
+    <div class="muted" style="font-size:12px;margin-top:8px">${esc(data.notComputedJa || "")}</div>`;
+}
+
+/* ---------------------------------------------------------------
+   2026年8月・「選手スカウティングへの登録」調査で判明した断絶への対応。
+
+   これまで選手検索の対象は、このHTMLに直書きされた107人だけだった。
+   毎日の学習でAPI-Footballから集めた選手記録(数百〜数千人)は
+   サーバー側に貯まっていたのに、それを引き出す経路が1本も無く、
+   未登録名を打つと **架空の能力値** を生成して表示していた。
+
+   探す順番を変える:
+     ① 手動整備した107人(能力値・ヒートマップ付き。体験が最も良い)
+     ② サーバーに収集済みの実データ(実測のみ。無い項目は「無い」と明記)
+     ③ どちらにも無ければ、従来どおり「参考値」であることを明示した推定カード
+--------------------------------------------------------------- */
+async function fetchCollectedPlayers(query) {
+  try {
+    const url = `${API_PROXY_BASE}/knowledge/players?q=${encodeURIComponent(query)}&limit=8`;
+    const data = await fetchJsonWithTimeout(url, backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+    if (!data || !data.ok || !Array.isArray(data.players) || !data.players.length) return null;
+    return data;
+  } catch (e) { return null; }
+}
+
+let lastCollectedPlayerCard = null; // 収集済み実データのカードを表示中かどうか
+function renderCollectedPlayerCard(data) {
+  const wrap = document.getElementById("playerCardWrap");
+  if (!wrap) return;
+  lastCollectedPlayerCard = data;
+  const esc = (v) => String(v == null ? "" : v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const num = (v, unit) => (v === null || v === undefined || v === "" ? '<span class="muted">測定できません</span>' : esc(v) + (unit || ""));
+  const cards = data.players.map((p) => {
+    const st = p.stats || {};
+    const rows = [
+      ["所属", esc(p.teamJa || p.teamEn || "-")],
+      ["ポジション", esc(p.position || "-")],
+      ["年齢", p.age ? esc(p.age) + "歳" : (p.birthDate ? esc(p.birthDate) : '<span class="muted">取得できません</span>')],
+      ["国籍", esc(p.nationality || "-")],
+      ["今季 出場", num(st.appearances, "試合")],
+      ["今季 出場時間", num(st.minutes, "分")],
+      ["今季 得点", num(st.goals, "点")],
+      ["今季 アシスト", num(st.assists, "本")],
+      ["平均評価", num(st.rating)],
+      ["パス成功率", num(st.passAccuracyPct, "%")],
+      ["デュエル勝率", num(st.duelWinRatePct, "%")],
+    ].map(([k, v]) => `<tr><th style="text-align:left;padding:4px 10px 4px 0;white-space:nowrap;font-weight:600">${k}</th><td style="padding:4px 0">${v}</td></tr>`).join("");
+    const updated = p.updatedAt ? `最終更新: ${esc(String(p.updatedAt).slice(0, 16).replace("T", " "))} (UTC)` : "";
+    return `<div class="card" style="margin-bottom:12px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap">
+        <h3 style="margin:0">${esc(p.name || p.matchedName || "-")}</h3>
+        <span class="muted" style="font-size:12px">${updated}</span>
+      </div>
+      <table style="border-collapse:collapse;margin-top:8px;font-size:14px">${rows}</table>
+    </div>`;
+  }).join("");
+  wrap.innerHTML = `<div class="card" style="border-left:4px solid var(--accent)">
+      <strong>AIが毎日収集している実データから ${data.players.length}件 見つかりました</strong>
+      <div class="muted" style="font-size:13px;margin-top:6px">${esc(data.sourceJa || "")}</div>
+      <div class="muted" style="font-size:13px;margin-top:4px">${esc(data.notIncludedJa || "")}</div>
+      <div class="muted" style="font-size:12px;margin-top:4px">検索できる収集済み選手: ${Number(data.indexedCount) || 0}人</div>
+    </div>${cards}`;
+  wrap.style.display = "";
+}
+
+let playerSearchRequestToken = 0; // 監査の指摘: 遅い検索の結果が新しい検索を上書きしていた
+async function runPlayerSearch() {
   const input = document.getElementById("playerSearchInput");
   const query = input.value;
   if (!query.trim()) return;
+  const myToken = ++playerSearchRequestToken;
   const found = findPlayer(query);
-  const player = found || buildFallbackPlayer(query);
-  renderPlayerCard(player, state.level);
+  if (found) { lastCollectedPlayerCard = null; renderPlayerCard(found, state.level); return; }
+  const collected = await fetchCollectedPlayers(query.trim());
+  if (myToken !== playerSearchRequestToken) return; // 新しい検索が始まっていれば古い結果は捨てる
+  if (collected) { renderCollectedPlayerCard(collected); return; }
+  lastCollectedPlayerCard = null;
+  renderPlayerCard(buildFallbackPlayer(query), state.level);
 }
 
 document.getElementById("playerSearchBtn").addEventListener("click", runPlayerSearch);
@@ -5946,7 +6140,10 @@ function renderDiscussReplyHtml(resp) {
   const formatNoteHtml = resp.formatNoteJa
     ? `<p class="value-note" style="margin-bottom:6px; opacity:.9;">※ ${escapeHtml(resp.formatNoteJa)}</p>`
     : "";
-  const stars = "★".repeat(resp.confidence.stars) + "☆".repeat(5 - resp.confidence.stars);
+  // 監査の指摘: confidence が無い応答で TypeError となり、吹き出しが
+  // 「🧠 AIが考えています…」のまま永久に固まっていた。
+  const starCount = Math.max(0, Math.min(5, Number(resp.confidence && resp.confidence.stars) || 0));
+  const stars = "★".repeat(starCount) + "☆".repeat(5 - starCount);
   const factsHtml = resp.facts && resp.facts.length
     ? `<details class="discuss-facts"><summary>📊 根拠にした事実を見る(${resp.facts.length}件)</summary><ul>${resp.facts.map(f => `<li>${escapeHtml(f)}</li>`).join("")}</ul></details>`
     : "";
@@ -5988,7 +6185,11 @@ function renderDiscussReplyHtml(resp) {
     }</ul>${kg.truncated ? `<p class="value-note">※ 関連が多いため一部のみ表示しています。</p>` : ""}</details>`
     : "";
 
-  const confidenceHtml = `<div class="discuss-confidence">${stars} <span class="value-note">${escapeHtml(resp.confidence.reasonJa)}</span></div>`;
+  // 監査(全ボタン走査)で実際に再現したクラッシュの修正:
+  // confidence を持たない応答で TypeError となり、回答が一切表示されず
+  // 吹き出しが「🧠 AIが考えています…」のまま固まっていた。
+  const confidenceReasonJa = (resp.confidence && resp.confidence.reasonJa) || "確信度の内訳はこの回答には付いていません。";
+  const confidenceHtml = `<div class="discuss-confidence">${stars} <span class="value-note">${escapeHtml(confidenceReasonJa)}</span></div>`;
   const followupsHtml = resp.followUpQuestions && resp.followUpQuestions.length
     ? `<div class="followup-chip-row">${resp.followUpQuestions.map(q => `<button class="chat-followup-btn" data-q="${escapeHtml(q)}">・${escapeHtml(q)}</button>`).join("")}</div>`
     : "";
@@ -6198,7 +6399,7 @@ function renderPlayerChips() {
     return true;
   }).sort((a, b) => ((b[1].overall || 0) - (a[1].overall || 0)) || String(a[1].nameJa).localeCompare(String(b[1].nameJa), "ja"));
   document.getElementById("playerChips").innerHTML = list.length
-    ? list.map(([key, p]) => `<button class="chip" data-name="${p.nameJa}"><span class="chip-avatar" id="chipAvatar-${key}">${photoCache[key] ? `<img loading="lazy" decoding="async" src="${photoCache[key]}" alt="">` : p.emoji}</span>${p.nameJa}<span style="opacity:.6; font-size:.85em; margin-left:4px;">${fmt(p.overall, 1)}</span></button>`).join("")
+    ? list.map(([key, p]) => `<button class="chip" data-name="${p.nameJa}"><span class="chip-avatar" id="chipAvatar-${key}">${photoCache[key] ? `<img loading="lazy" decoding="async" src="${escapeHtml(photoCache[key])}" alt="">` : p.emoji}</span>${p.nameJa}<span style="opacity:.6; font-size:.85em; margin-left:4px;">${fmt(p.overall, 1)}</span></button>`).join("")
     : `<p class="value-note">条件に合う登録選手がいません。</p>`;
   // lazily fetch real photos for whichever chips don't have one cached yet (capped concurrency)
   photoQueue.length = 0; // drop any stale pending jobs from a previous filter pass
@@ -6206,7 +6407,7 @@ function renderPlayerChips() {
     if (!photoCache[key]) {
       queuePhotoLoad(key, p, (url) => {
         const el = document.getElementById(`chipAvatar-${key}`);
-        if (el) el.innerHTML = `<img loading="lazy" decoding="async" src="${url}" alt="">`;
+        if (el) el.innerHTML = `<img loading="lazy" decoding="async" src="${escapeHtml(url)}" alt="">`;
       });
     }
   });
@@ -6254,14 +6455,22 @@ function renderRanking(key) {
   el.innerHTML = ranked.map((r, i) => {
     const photo = photoCache[photoCacheKey(r.p)];
     return `
-    <div class="similar-row" data-name="${r.p.nameJa}" style="cursor:pointer;">
+    <div class="similar-row" data-name="${escapeHtml(r.p.nameJa)}" role="button" tabindex="0" style="cursor:pointer;">
       <span class="rank">${medals[i] || (i + 1) + "."}</span>
-      <span class="chip-avatar" style="margin-right:6px;">${photo ? `<img loading="lazy" decoding="async" src="${photo}" alt="">` : r.p.emoji}</span>
+      <span class="chip-avatar" style="margin-right:6px;">${photo ? `<img loading="lazy" decoding="async" src="${escapeHtml(photo)}" alt="">` : escapeHtml(r.p.emoji)}</span>
       <span style="flex:1;">${r.p.nameJa}</span>
       <span class="pct">${fmt(r.score, 0)}</span>
     </div>`;
   }).join("") || `<p class="value-note">登録選手がいません。</p>`;
-  el.querySelectorAll("[data-name]").forEach(row => row.addEventListener("click", () => openPlayerFromDashboard(row.dataset.name)));
+  // 監査の指摘: クリックでしか開けず、キーボードだけの利用者はランキングから
+  // どの選手も開けなかった。Enter/Space でも同じ動作にする。
+  el.querySelectorAll("[data-name]").forEach(row => {
+    const open = () => openPlayerFromDashboard(row.dataset.name);
+    row.addEventListener("click", open);
+    row.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
+    });
+  });
 }
 document.getElementById("rankingSwitch").addEventListener("click", (e) => {
   const btn = e.target.closest("button"); if (!btn) return;
@@ -6277,17 +6486,25 @@ renderAll = function () {
   const q = document.getElementById("playerSearchInput").value;
   if (q && q.trim()) {
     const found = findPlayer(q);
-    renderPlayerCard(found || buildFallbackPlayer(q), state.level);
+    // 2026年8月の修正: 収集済み実データのカードを表示中に超入門/標準/戦術を
+    // 切り替えると、ここが架空の推定カードで上書きしてしまっていた。
+    // 実データのカードは説明の深さに依存しないので、そのまま残す。
+    if (found) renderPlayerCard(found, state.level);
+    else if (!lastCollectedPlayerCard) renderPlayerCard(buildFallbackPlayer(q), state.level);
   }
   // also re-render a currently-open real-fixture preview/review at the new
   // 超入門/標準/戦術 depth, so match analysis stays consistent with the player
   // profile's level switch instead of being stuck at whatever level it opened at.
   if (lastRealFixtureAnalysis) {
-    const wrapEl = document.getElementById("realFixtureAnalysisWrap");
-    if (wrapEl) {
-      wrapEl.innerHTML = lastRealFixtureAnalysis.phase === "finished" ? buildFinishedAnalysisHtml(lastRealFixtureAnalysis, state.level)
+    const wrapEl = lastRealFixtureAnalysisSlotId
+      ? document.getElementById(lastRealFixtureAnalysisSlotId)
+      : document.getElementById("realFixtureAnalysisWrap");
+    if (wrapEl && wrapEl.isConnected) {
+      const body = lastRealFixtureAnalysis.phase === "finished" ? buildFinishedAnalysisHtml(lastRealFixtureAnalysis, state.level)
         : lastRealFixtureAnalysis.phase === "live" ? buildLiveAnalysisHtml(lastRealFixtureAnalysis, state.level)
         : buildUpcomingPreviewHtml(lastRealFixtureAnalysis, state.level);
+      // インラインの入口は「最重要要因バナー+本文」の構成なので、そこへ描くときは同じ形にする
+      wrapEl.innerHTML = lastRealFixtureAnalysisSlotId ? buildMostImportantFactorBanner(lastRealFixtureAnalysis) + body : body;
     }
   }
 };
@@ -6329,7 +6546,7 @@ function renderDashFeaturedPlayer() {
   el.innerHTML = `
     <div class="match-row" style="cursor:pointer;" id="dashFeaturedPlayerRow">
       <div style="display:flex; align-items:center; gap:10px;">
-        <div class="chip-avatar" style="width:36px; height:36px; font-size:18px;">${photo ? `<img loading="lazy" decoding="async" src="${photo}" alt="">` : p.emoji}</div>
+        <div class="chip-avatar" style="width:36px; height:36px; font-size:18px;">${photo ? `<img loading="lazy" decoding="async" src="${escapeHtml(photo)}" alt="">` : p.emoji}</div>
         <div>
           <div class="teams">${p.nameJa}</div>
           <div class="sub">${buildVerdictLine(p)}</div>
@@ -6379,7 +6596,7 @@ function renderDashTrending() {
   el.innerHTML = players.map(p => {
     const photo = photoCache[photoCacheKey(p)];
     return `<button class="chip" data-name="${p.nameJa}" style="margin:3px 4px 3px 0;">
-      <span class="chip-avatar">${photo ? `<img loading="lazy" decoding="async" src="${photo}" alt="">` : p.emoji}</span>${p.nameJa}
+      <span class="chip-avatar">${photo ? `<img loading="lazy" decoding="async" src="${escapeHtml(photo)}" alt="">` : p.emoji}</span>${p.nameJa}
     </button>`;
   }).join("") + `<p class="value-note" style="margin-top:6px;">AIの「将来性」評価(年齢・能力値から算出)が高い選手を日替わりでピックアップしています。実際の移籍市場の評判とは異なります。</p>`;
   el.querySelectorAll("[data-name]").forEach(btn => btn.addEventListener("click", () => openPlayerFromDashboard(btn.dataset.name)));
@@ -6406,7 +6623,7 @@ function renderDashTrivia() {
   if (!el) return;
   const { p, text } = dailyTriviaFact();
   el.innerHTML = `<div class="trivia-box"><span class="emoji">💡</span><span>${text}</span></div>
-    <p class="value-note" style="margin-top:6px; cursor:pointer;" id="dashTriviaLink">→ ${p.nameJa}のカードを見る</p>`;
+    <button type="button" class="value-note" id="dashTriviaLink" style="margin-top:6px; cursor:pointer; background:none; border:none; padding:0; text-align:left; font:inherit; color:inherit;">→ ${escapeHtml(p.nameJa)}のカードを見る</button>`;
   document.getElementById("dashTriviaLink").addEventListener("click", () => openPlayerFromDashboard(p.nameJa));
 }
 function renderDashRecommendedMatches() {
@@ -6481,7 +6698,7 @@ function formatDateJa(iso) {
 
 function buildAccuracyRecentRow(rec) {
   const icon = rec.correct ? "✅" : "❌";
-  return `<div class="value-note" style="margin:3px 0;">${icon} ${rec.home || "?"} vs ${rec.away || "?"} — AI予測:${OUTCOME_LABEL_JA[rec.predictedWinner] || "-"} / 結果:${OUTCOME_LABEL_JA[rec.actualWinner] || "-"}</div>`;
+  return `<div class="value-note" style="margin:3px 0;">${icon} ${escapeHtml(rec.home || "?")} vs ${escapeHtml(rec.away || "?")} — AI予測:${OUTCOME_LABEL_JA[rec.predictedWinner] || "-"} / 結果:${OUTCOME_LABEL_JA[rec.actualWinner] || "-"}</div>`;
 }
 
 async function renderAiAccuracyWidget() {
@@ -6653,7 +6870,7 @@ async function renderGrowthLogWidget() {
     ? `<div class="value-note" style="margin-top:2px;">ℹ️ ${unresolvedClubs.length}クラブ(${unresolvedClubs.slice(0, 3).map((u) => escapeHtml(u.nameJa || u.nameEn)).join("・")}${unresolvedClubs.length > 3 ? "ほか" : ""})は、データ提供元での表記が異なるため今回は収集できませんでした。<strong>他のクラブの収集には影響していません</strong>(7日後に自動で再挑戦します)。</div>`
     : "";
   const errorWarningHtml = todayErrors.length
-    ? `<div class="value-note" style="margin-top:2px; color:#c0392b;">⚠️ 本日のデータ取得で${todayErrors.length}件のエラーが発生しました(詳細は「詳しく見る」)。該当した処理だけが見送られています。</div>`
+    ? `<div class="value-note" style="margin-top:2px; color:var(--critical);">⚠️ 本日のデータ取得で${todayErrors.length}件のエラーが発生しました(詳細は「詳しく見る」)。該当した処理だけが見送られています。</div>`
     : "";
   // 2026年8月・バグ修正: Renderのスリープ起床待ち等で同じ日に学習エンジンが
   // 複数回実行されることがある(サーバー側では合算表示するよう修正済みだが、
@@ -6713,7 +6930,7 @@ async function renderGrowthLogWidget() {
     : "";
   const zeroDiag = log.zeroKnowledgeDiagnosis || null;
   const zeroVerifyDiag = log.zeroVerificationDiagnosis || null;
-  const severityStyle = { ok: "color:#1e8449;", warn: "color:#b9770e;", error: "color:#c0392b;" };
+  const severityStyle = { ok: "color:var(--good);", warn: "color:var(--warning);", error: "color:var(--critical);" };
   const severityIcon = { ok: "✅", warn: "⚠️", error: "❌" };
   const zeroDiagHtml = (zeroDiag && zeroDiag.isZero && zeroDiag.causes && zeroDiag.causes.length)
     ? zeroDiag.causes.map((c) => `
@@ -6859,7 +7076,7 @@ async function renderGrowthLogWidget() {
     // 予算切れなのかどうかを、利用者自身が確認できるようにする。
     const budget = log.apiBudget || null;
     const budgetHtml = budget
-      ? `<p class="value-note" style="margin:8px 0 4px; opacity:.85;">📊 本日のAPIリクエスト使用量: <strong>${budget.totalSpent}</strong> / ${budget.dailyBudget}件(うち${budget.userReserve}件は利用者の操作用に確保)。日次学習に使える残り: ${budget.remainingForJob}件。${budget.remainingForJob === 0 ? "<span style=\"color:#c0392b;\">本日は予算を使い切ったため、一部の更新を見送りました。</span>" : ""}</p>`
+      ? `<p class="value-note" style="margin:8px 0 4px; opacity:.85;">📊 本日のAPIリクエスト使用量: <strong>${budget.totalSpent}</strong> / ${budget.dailyBudget}件(うち${budget.userReserve}件は利用者の操作用に確保)。日次学習に使える残り: ${budget.remainingForJob}件。${budget.remainingForJob === 0 ? "<span style=\"color:var(--critical);\">本日は予算を使い切ったため、一部の更新を見送りました。</span>" : ""}</p>`
       : "";
 
     // 2026年8月・優先順位⑨: dailyJob.js側は以前からteam/fixtureごとの失敗理由を
@@ -6869,8 +7086,8 @@ async function renderGrowthLogWidget() {
     // そのままだが、隠すよりずっと良い)。
     const errorsHtml = todayErrors.length
       ? `<div style="margin:8px 0 4px; padding:8px 10px; background:rgba(192,57,43,.08); border-radius:8px;">
-           <p class="value-note" style="color:#c0392b; font-weight:600; margin:0 0 4px;">⚠️ 本日発生したエラー(${todayErrors.length}件・開発者向けの技術的な詳細):</p>
-           <ul style="margin:0; padding-left:18px; font-size:12px; color:#c0392b; opacity:.85;">
+           <p class="value-note" style="color:var(--critical); font-weight:600; margin:0 0 4px;">⚠️ 本日発生したエラー(${todayErrors.length}件・開発者向けの技術的な詳細):</p>
+           <ul style="margin:0; padding-left:18px; font-size:12px; color:var(--critical); opacity:.85;">
              ${todayErrors.slice(0, 10).map((e) => `<li>${escapeHtml(String(e))}</li>`).join("")}
            </ul>
            ${todayErrors.length > 10 ? `<p class="value-note" style="margin:4px 0 0;">…他${todayErrors.length - 10}件</p>` : ""}
@@ -6949,8 +7166,8 @@ function predBarHtml(p) {
 function predResultBadgeHtml(p) {
   if (!p.resolved) return "";
   return p.correct
-    ? `<span style="color:#1c7c54; font-weight:bold; margin-left:6px;">✅ 的中</span>`
-    : `<span style="color:#b3541e; font-weight:bold; margin-left:6px;">❌ 外れ</span>`;
+    ? `<span style="color:var(--good); font-weight:bold; margin-left:6px;">✅ 的中</span>`
+    : `<span style="color:var(--series-2); font-weight:bold; margin-left:6px;">❌ 外れ</span>`;
 }
 // 成長可視化ラウンド⑤: 判断根拠のスコア行(この予測に実際に影響した要素と影響度)
 function predFactorsLineHtml(p) {
@@ -6978,7 +7195,7 @@ function predictionSummaryBlockHtml(p, titleJa) {
     ? `<div class="value-note" style="margin-top:2px;">🏦 市場(オッズ)比較: AIは市場より${p.market.edgePt > 0 ? "強気" : "弱気"}(${p.market.edgePt > 0 ? "+" : ""}${Number(p.market.edgePt)}pt)</div>`
     : "";
   return `
-    <div style="margin:8px 0; padding:10px 12px; border-left:4px solid var(--series-2, #b3541e); background:rgba(0,0,0,.03); border-radius:6px;">
+    <div style="margin:8px 0; padding:10px 12px; border-left:4px solid var(--series-2); background:rgba(0,0,0,.03); border-radius:6px;">
       <div>${escapeHtml(titleJa || "🤖 AIの予想")}: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predResultBadgeHtml(p)}</div>
       ${predBarHtml(p)}
       <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
@@ -6989,7 +7206,7 @@ function predictionSummaryBlockHtml(p, titleJa) {
 function predStripHtml(p) {
   if (!p) return "";
   const winPct = p.probs ? (p.predictedWinner === "home" ? p.probs.homeWinPct : p.predictedWinner === "away" ? p.probs.awayWinPct : p.probs.drawPct) : null;
-  return `🤖 AI予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${winPct !== null ? ` <span style="color:var(--series-2, #b3541e); font-weight:700;">${Number(winPct)}%</span>` : ""}${predResultBadgeHtml(p)}`;
+  return `🤖 AI予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${winPct !== null ? ` <span style="color:var(--series-2); font-weight:700;">${Number(winPct)}%</span>` : ""}${predResultBadgeHtml(p)}`;
 }
 // 一覧描画後(または予想データ到着後)に、予想ストリップの空きスロットを埋める。
 // DOM走査は予想がある試合の件数ぶんだけ(数件)なので描画コストはごく小さい。
@@ -7010,11 +7227,16 @@ function annotateFixtureRowsWithPredictions() {
 async function renderTodayPredictionsHero() {
   const el = document.getElementById("todayPredictionsBody");
   if (!el) return;
-  const data = await fetchTodayPredictionsShared();
+  let data = await fetchTodayPredictionsShared(); // 下で「次の試合」に差し替えるため let
   if (!data) {
     el.innerHTML = `<p class="value-note">AI予想を取得できませんでした(サーバー起動待ちの可能性があります。しばらくして再読み込みしてください)。</p>`;
     return;
   }
+  // 2026年8月・利用者からの指摘への対応: 今日の対象試合が無い日でも、AIが
+  // すでに予想している「次の試合」があればそれを表示する(カードを空にしない)。
+  const usingUpcoming = (!Array.isArray(data.predictions) || !data.predictions.length)
+    && Array.isArray(data.upcomingPredictions) && data.upcomingPredictions.length > 0;
+  if (usingUpcoming) data = { ...data, predictions: data.upcomingPredictions, bestPick: null };
   if (!data.found || !Array.isArray(data.predictions) || !data.predictions.length) {
     el.innerHTML = `<p class="value-note">${escapeHtml(data.noteJa || "本日のAI予想はありません。")}</p>`;
     return;
@@ -7049,7 +7271,7 @@ async function renderTodayPredictionsHero() {
   const best = data.bestPick ? data.predictions.find((x) => x.fixtureId === data.bestPick.fixtureId) : null;
   const rest = data.predictions.filter((p) => !best || p.fixtureId !== best.fixtureId).slice(0, best ? 4 : 5);
   const bestHtml = best ? `
-    <div style="border:2px solid var(--series-2, #b3541e); border-radius:8px; padding:8px 10px; margin-bottom:6px; background:rgba(179,84,30,.06);">
+    <div style="border:2px solid var(--series-2); border-radius:8px; padding:8px 10px; margin-bottom:6px; background:rgba(179,84,30,.06);">
       <div style="font-weight:700;">🎯 今日のベスト予想</div>
       <div class="value-note">${escapeHtml((data.bestPick && data.bestPick.reasonJa) || "")}</div>
       ${rowHtml(best)}
@@ -7058,14 +7280,26 @@ async function renderTodayPredictionsHero() {
   const shownCount = (best ? 1 : 0) + rest.length;
   const moreCount = data.predictions.length - shownCount;
   el.innerHTML = `
+    ${usingUpcoming ? `<p class="value-note" style="margin:0 0 6px; padding:6px 8px; background:rgba(0,0,0,.04); border-radius:6px;">📅 本日はAIが追跡しているクラブの試合がないため、<strong>AIが予想している「次の試合」</strong>を表示しています。</p>` : ""}
     ${rows.join("")}
     ${moreCount > 0 ? `<p class="value-note" style="margin-top:6px;">ほか${moreCount}試合の予想は「📡 本日の実際の試合」から見られます。</p>` : ""}
     <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
-      <button class="more-details-btn" type="button" style="display:inline-block; width:auto; padding:5px 12px;" onclick="var c=document.getElementById('realFixturesCard'); if(c && c.style.display!=='none'){c.scrollIntoView({behavior:'smooth'});}">📡 試合の詳しい分析を見る ▼</button>
+      ${(() => { const c = document.getElementById("realFixturesCard"); return c && c.style.display !== "none"; })()
+        ? `<button class="more-details-btn" type="button" id="jumpToFixturesBtn" style="display:inline-block; width:auto; padding:5px 12px;">📡 試合の詳しい分析を見る ▼</button>`
+        : `<span class="value-note">📡 本日の実際の試合一覧は、データ連携サーバーに接続できたときに表示されます。</span>`}
       <button class="more-details-btn" type="button" id="sharePredictionsBtn" style="display:inline-block; width:auto; padding:5px 12px;">🔗 この予想をシェア</button>
     </div>
     <p class="value-note" style="margin-top:6px; opacity:.8;">${escapeHtml(data.noteJa || "")}</p>`;
 
+  // 監査の指摘への対応: インラインonclickをやめ、対象カードが表示されている
+  // ときだけボタンを描画するようにしたので、ここで通常どおり配線する。
+  const jumpBtn = document.getElementById("jumpToFixturesBtn");
+  if (jumpBtn) {
+    jumpBtn.addEventListener("click", () => {
+      const c = document.getElementById("realFixturesCard");
+      if (c && c.style.display !== "none") c.scrollIntoView({ behavior: "smooth" });
+    });
+  }
   // 精度証明ラウンド③: シェアボタン(端末の共有機能があればそれを、無ければURLコピー)
   const shareBtn = document.getElementById("sharePredictionsBtn");
   if (shareBtn) {
@@ -7192,7 +7426,7 @@ async function renderDailyReportWidget() {
     : "";
   const applied = data.agendaAppliedToday;
   const appliedHtml = applied
-    ? `<div class="value-note" style="margin-top:4px; color:#1e8449;">✅ ${escapeHtml(applied.noteJa || "")}</div>`
+    ? `<div class="value-note" style="margin-top:4px; color:var(--good);">✅ ${escapeHtml(applied.noteJa || "")}</div>`
     : "";
   const legend = data.trustLegend;
   const legendHtml = legend
@@ -7305,7 +7539,7 @@ async function renderDailyReportWidget() {
             <div class="value-note">Memory利用率: ${rtToday.memoryAttachRatePct !== null ? `${rtToday.memoryAttachRatePct}%(前回の結論を思い出せた割合・対象${rtToday.memoryEligibleSamples}件)` : "対象となる考察がありませんでした"}</div>
             <div class="value-note" style="opacity:.8;">${escapeHtml(rtToday.noteJa || "")}</div>
           </div>`
-        : `<div class="value-note" style="margin-top:8px;">🧠 考察の質・RAG使用率: ${escapeHtml((rtToday && rtToday.reasonJa) || rt.reasonJa || "本日の考察の記録はまだ保存されていません(日次学習で保存されます)。")}</div>`)
+        : `<div class="value-note" style="margin-top:8px;">🧠 考察の質・RAG使用率: ${escapeHtml((rtToday && rtToday.reasonJa) || (rt && rt.reasonJa) || "本日の考察の記録はまだ保存されていません(日次学習で保存されます)。")}</div>`)
       : "";
     // ① Knowledgeの寄与ランキング
     const kc = intel.knowledgeContribution;
@@ -7353,6 +7587,9 @@ async function renderDailyReportWidget() {
 }
 renderDailyReportWidget();
 renderTodayPredictionsHero();
+// スカウト速報は選手スカウティング画面でのみ使う情報なので、
+// ホーム表示の邪魔をしないよう遅延して読み込む(初回描画を重くしない)。
+setTimeout(() => { renderScoutFeed(); }, 1200);
 </script>
 </body>
 </html>
