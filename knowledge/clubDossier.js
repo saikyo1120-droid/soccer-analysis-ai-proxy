@@ -39,6 +39,22 @@ const UNAVAILABLE_FIELDS_JA = {
 };
 
 const DIFF_LIST_CAP = 20; // 1クラブに保持する「最近の変化」の上限
+const SCOUT_FEED_KEEP = 300; // スカウト用フィード(新規/移籍/若手/フォーム急変)の保持件数
+
+/**
+ * 選手名の検索用に正規化する。
+ * アクセント付き文字(Mbappé / Müller / Özil / Håland)を素の英字へ落とし、
+ * 記号・余分な空白を除く。利用者が「mbappe」と打っても引けるようにするため。
+ */
+function normalizeForSearch(s) {
+  return String(s || "")
+    .normalize("NFD").replace(/[̀-ͯ]/g, "") // 濁点・アクセントを除去
+    .replace(/[øØ]/g, "o").replace(/[đĐ]/g, "d").replace(/[łŁ]/g, "l").replace(/[ßẞ]/g, "ss")
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 function slugOf(nameEn) {
   return String(nameEn || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -150,6 +166,38 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
         changes.push(`${label}の直近フォーム(1試合平均得失点差)が${pf}から${cf}へ${cf > pf ? "上向き" : "下向き"}ました`);
       }
     }
+    // ---- 2026年8月・第三者監査が発見した「取得しているのに何も生まれない」の修正 ----
+    //   毎日100クラブぶんの /transfers を呼んで保存していたのに、この差分関数に
+    //   transfers の分岐が無かった。そのため changesJa は常に空で、知識も
+    //   タイムラインも生まれず、保存先を読むコードも存在しなかった。
+    //   = 1日100リクエストが完全に無駄になっていた。実測の差分から事実を作る。
+    if (section === "transfers") {
+      const prevList = Array.isArray(p.recent) ? p.recent : [];
+      const curList = Array.isArray(c.recent) ? c.recent : [];
+      const keyOf = (t) => `${t.playerName}|${t.direction}|${t.date || ""}`;
+      const prevKeys = new Set(prevList.map(keyOf));
+      const added = curList.filter((t) => t.playerName && !prevKeys.has(keyOf(t)));
+      for (const t of added.slice(0, 5)) {
+        // ---- 検証で発見した「事実と逆のことを書く」欠陥の修正 ----
+        //   direction の実際の値は summarizeTransfers(rag/knowledgeSource.js:74)が
+        //   入れる **「加入」/「退団」** であって "in"/"out" ではない。
+        //   "in" と比較していたため、加入した選手について
+        //   「移籍先: 元所属クラブ」と、**逆の意味の文**を毎日生成していた。
+        //   両方の表記を受け付けたうえで、判別できない場合は
+        //   相手クラブの役割を断定しない(でっち上げない)。
+        const isIn = t.direction === "加入" || t.direction === "in";
+        const isOut = t.direction === "退団" || t.direction === "out";
+        const dir = isIn ? "加入" : isOut ? "退団" : "移籍";
+        const cp = t.counterpart
+          ? (isIn ? `(移籍元: ${t.counterpart})` : isOut ? `(移籍先: ${t.counterpart})` : `(相手クラブ: ${t.counterpart})`)
+          : "";
+        const when = t.date ? `${t.date}に` : "";
+        changes.push(`${label}に${when}${t.playerName}選手の${dir}が記録されました${cp}`);
+      }
+      // 検証での指摘: countLast30Days は上限5件で切り詰めた件数なので、
+      // 「実際の移籍件数」として書くと嘘になる。件数の断定はやめ、
+      // 個別の移籍が検知できた場合だけ事実を作る。
+    }
     if (section === "squad") {
       const pn = Array.isArray(p.players) ? p.players.length : null;
       const cn = Array.isArray(c.players) ? c.players.length : null;
@@ -175,16 +223,115 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
       firstSeenAt: (existing && existing.firstSeenAt) || new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
+    // ---- 2026年8月・「選手スカウティングへの登録」調査での追加 ----
+    // 新規加入・移籍・フォームの急変は、**保存の瞬間にしか分からない**
+    // (前回の記録 existing と今回の値を比べるのが唯一の手段で、後から
+    //  総当たりで求めるとRedisを数千回読むことになる)。ここで検知して
+    //  スカウト用の小さなフィードに積む。実測値のみ・でっち上げは一切しない。
+    const events = [];
+    const nowIso = record.updatedAt;
+    if (!existing) {
+      events.push({ type: "new", labelJa: "新規登録", detailJa: `${record.teamJa || record.teamEn || "所属クラブ"}の選手として初めて記録しました` });
+    } else if (player.teamEn && existing.teamEn && player.teamEn !== existing.teamEn) {
+      events.push({
+        type: "transfer", labelJa: "移籍",
+        detailJa: `${existing.teamJa || existing.teamEn} → ${record.teamJa || record.teamEn}`,
+        fromEn: existing.teamEn, toEn: player.teamEn,
+      });
+    }
+    const prevRating = existing && existing.stats && Number(existing.stats.rating);
+    const newRating = record.stats && Number(record.stats.rating);
+    if (Number.isFinite(prevRating) && Number.isFinite(newRating) && prevRating > 0) {
+      const delta = Math.round((newRating - prevRating) * 100) / 100;
+      if (delta >= 0.15) events.push({ type: "formUp", labelJa: "フォーム急上昇", detailJa: `平均評価が ${prevRating} → ${newRating}(+${delta})`, delta });
+      else if (delta <= -0.15) events.push({ type: "formDown", labelJa: "フォーム急下降", detailJa: `平均評価が ${prevRating} → ${newRating}(${delta})`, delta });
+    }
+    // 若手有望株: 21歳以下で、出場時間と評価がともに実測できている場合のみ
+    const age = Number(record.age);
+    const minutes = record.stats && Number(record.stats.minutes);
+    if (Number.isFinite(age) && age <= 21 && Number.isFinite(minutes) && minutes >= 450 && Number.isFinite(newRating) && newRating >= 6.8) {
+      const prevMinutes = existing && existing.stats && Number(existing.stats.minutes);
+      // 毎日同じ選手を積まないよう、出場時間が実際に増えた日だけ記録する
+      if (!Number.isFinite(prevMinutes) || minutes > prevMinutes) {
+        events.push({ type: "prospect", labelJa: "若手有望株", detailJa: `${age}歳・出場${minutes}分・平均評価${newRating}`, age, minutes, rating: newRating });
+      }
+    }
+
     const ok = await upstashSetJSON(key, record);
     if (ok !== false && !existing) {
       await upstashCmd(["INCR", "kb:player:count"]).catch(() => {});
     }
-    return { saved: ok !== false, isNew: !existing };
+    if (ok !== false && events.length) {
+      for (const ev of events) {
+        await upstashCmd(["LPUSH", "kb:player:scoutfeed", JSON.stringify({
+          ...ev, playerId: record.id, name: record.name || null,
+          teamEn: record.teamEn || null, teamJa: record.teamJa || null,
+          position: record.position || null, at: nowIso,
+        })]).catch(() => {});
+      }
+      await upstashCmd(["LTRIM", "kb:player:scoutfeed", "0", String(SCOUT_FEED_KEEP - 1)]).catch(() => {});
+    }
+    return { saved: ok !== false, isNew: !existing, events };
   }
 
   async function getPlayer(playerId) {
     if (!upstashEnabled || !playerId) return null;
     return (await upstashGetJSON(`kb:player:${playerId}`).catch(() => null)) || null;
+  }
+
+  // ---- 2026年8月・「選手スカウティングへの登録」調査で判明した断絶への対処 ----
+  //   収集済みの選手記録(kb:player:<id>)は480件あったのに、
+  //   `getPlayer()` の呼び出し元が**1箇所も存在せず**、
+  //   `kb:player:*` を列挙する手段(SCAN/索引)も無かった。
+  //   つまり「集めてはいるが、画面からは1件も引けない」状態。
+  //   画面の選手検索は index.html に直書きされた107人だけが対象だった。
+  //   名前→IDの小さな索引を1キーに持ち、検索1回=読み1回で引けるようにする。
+  //   (statsIndexと同じ設計。数千人でも数百KBに収まる)
+  async function getSearchIndex() {
+    if (!upstashEnabled) return {};
+    return (await upstashGetJSON("kb:player:searchIndex").catch(() => null)) || {};
+  }
+  async function saveSearchIndex(index) {
+    if (!upstashEnabled || !index) return false;
+    return (await upstashSetJSON("kb:player:searchIndex", index)) !== false;
+  }
+
+  /**
+   * 名前で選手を探す。索引は "name|teamEn|teamJa|position" の圧縮形式。
+   * 完全一致 → 前方一致 → 部分一致 の順に並べる(同点なら名前順で安定させる)。
+   */
+  async function searchPlayers(query, opts) {
+    const limit = Math.max(1, Math.min(50, (opts && opts.limit) || 10));
+    if (!upstashEnabled) return { available: false, reasonJa: "保存先(Upstash)が未設定のため、収集済み選手を検索できません。", results: [] };
+    const index = await getSearchIndex();
+    const ids = Object.keys(index || {});
+    const q = normalizeForSearch(query);
+    if (!q) return { available: true, indexedCount: ids.length, results: [] };
+    const scored = [];
+    for (const id of ids) {
+      const parts = String(index[id]).split("|");
+      const name = parts[0] || "";
+      const n = normalizeForSearch(name);
+      if (!n) continue;
+      let score = null;
+      if (n === q) score = 0;
+      else if (n.startsWith(q)) score = 1;
+      else if (n.includes(q)) score = 2;
+      else if (n.split(" ").some((w) => w.startsWith(q))) score = 3;
+      if (score === null) continue;
+      scored.push({ score, id: Number(id) || id, name, teamEn: parts[1] || null, teamJa: parts[2] || null, position: parts[3] || null });
+    }
+    scored.sort((a, b) => (a.score - b.score) || a.name.localeCompare(b.name));
+    return { available: true, indexedCount: ids.length, results: scored.slice(0, limit) };
+  }
+
+  /** スカウト用フィード(新規登録・移籍・若手有望株・フォーム急変)の直近ぶん */
+  async function getScoutFeed(limit) {
+    if (!upstashEnabled) return { available: false, reasonJa: "保存先(Upstash)が未設定です。", items: [] };
+    const n = Math.max(1, Math.min(SCOUT_FEED_KEEP, Number(limit) || 40));
+    const raw = (await upstashCmd(["LRANGE", "kb:player:scoutfeed", "0", String(n - 1)]).catch(() => [])) || [];
+    const items = raw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
+    return { available: true, items };
   }
 
   // ---- 第8次監査(Critical)の修正: 選手の「更新の古い順」インデックス ----
@@ -239,7 +386,10 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
     };
   }
 
-  return { getDossier, updateSection, savePlayer, getPlayer, getStatsIndex, saveStatsIndex, getCoverageSummary, slugOf };
+  return {
+    getDossier, updateSection, savePlayer, getPlayer, getStatsIndex, saveStatsIndex, getCoverageSummary, slugOf,
+    getSearchIndex, saveSearchIndex, searchPlayers, getScoutFeed,
+  };
 }
 
-module.exports = { createClubDossier, UNAVAILABLE_FIELDS_JA, slugOf };
+module.exports = { createClubDossier, UNAVAILABLE_FIELDS_JA, slugOf, normalizeForSearch, SCOUT_FEED_KEEP };
