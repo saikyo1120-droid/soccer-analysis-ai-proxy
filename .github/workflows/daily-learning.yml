@@ -71,6 +71,28 @@ jobs:
           LEARNING_ENDPOINT_URL: ${{ secrets.LEARNING_ENDPOINT_URL }}
           LEARNING_SECRET_KEY: ${{ secrets.LEARNING_SECRET_KEY }}
 
+      # ---- 2026年8月7日に追加した二重化 ----
+      # Predictions Auto-Collect が「実行機を確保できない(The job was not
+      # acquired by Runner of type hosted)」でGitHub側の理由により失敗した実績が
+      # あるため、こちらのワークフローからも同じ処理を呼んでおく。
+      # 1回あたりの処理量には上限(照合8件・記録3件)があるので、
+      # 二重に走ってもAPIの消費が跳ね上がることはない。
+      - name: Also run the predictions auto-collect (redundancy)
+        continue-on-error: true   # ここが失敗しても日次学習の結果は残す
+        run: |
+          URL="${LEARNING_ENDPOINT_URL%/api/learning/run-daily}/api/predictions/auto-collect"
+          echo "呼び出し先: $URL"
+          curl -sS -X POST "${URL}?key=${LEARNING_SECRET_KEY}" \
+            --max-time 90 -w "\nHTTP status: %{http_code}\n" -o autocollect.json || true
+          cat autocollect.json || true
+          echo "### 予測の自動収集(日次学習からの二重化)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat autocollect.json >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+        env:
+          LEARNING_ENDPOINT_URL: ${{ secrets.LEARNING_ENDPOINT_URL }}
+          LEARNING_SECRET_KEY: ${{ secrets.LEARNING_SECRET_KEY }}
+
       - name: Wait for the background job, then verify it actually finished
         run: |
           # このステップの開始時刻を基準に、「その後にranAtが更新されたか」だけを

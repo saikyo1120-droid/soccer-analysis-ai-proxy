@@ -19,10 +19,23 @@ name: Predictions Auto-Collect
 #   (Pro: $19/月・7,500req/日)に切り替えた上で、このファイルのcronをより
 #   短い間隔(例: 1時間おき "0 * * * *")に変更してください。
 #
-# 事前準備: daily-learning.yml と同じシークレット(Settings → Secrets and
-# variables → Actions)を使い回します。追加で1つだけ登録してください。
-#     AUTO_COLLECT_ENDPOINT_URL : 例) https://soccer-analysis-ai-proxy.onrender.com/api/predictions/auto-collect
-#   (LEARNING_SECRET_KEY は daily-learning.yml で既に登録済みのものをそのまま使います)
+# ---- 2026年8月・本番調査で判明した根本原因への対処(重要) ----
+# このワークフローは AUTO_COLLECT_ENDPOINT_URL という **専用のシークレット** を
+# 必要としていた。ところが手順書(DEVELOPER_HANDOVER)の「GitHub Secrets」欄には
+# LEARNING_ENDPOINT_URL と LEARNING_SECRET_KEY しか書かれておらず、
+# このシークレットは登録されていなかった可能性が高い。
+# その場合 curl のURLが空文字になり、**エンドポイントは一度も呼ばれない**。
+#   → 予測の答え合わせが進まない → ホーム画面の正答率が何日も動かない
+# 実際、手動実行しても本番の total/resolved/pending が1件も変化しなかった。
+#
+# weekly-backup.yml と同じやり方に揃え、**追加のシークレット登録を不要**にする。
+# LEARNING_ENDPOINT_URL(daily-learning.yml で既に登録済み)から組み立てる。
+# AUTO_COLLECT_ENDPOINT_URL が登録されていればそちらを優先して使う。
+#
+# 事前準備: daily-learning.yml と同じシークレットだけで動きます。
+#     LEARNING_ENDPOINT_URL : 例) https://soccer-analysis-ai-proxy.onrender.com/api/learning/run-daily
+#     LEARNING_SECRET_KEY   : Renderの AUTO_COLLECT_SECRET と同じ値
+#   (AUTO_COLLECT_ENDPOINT_URL は任意。登録しなくても動きます)
 
 on:
   schedule:
@@ -37,29 +50,50 @@ jobs:
     steps:
       - name: Call the predictions auto-collect endpoint
         run: |
-          curl -sS -X POST "${AUTO_COLLECT_ENDPOINT_URL}?key=${LEARNING_SECRET_KEY}" \
-            --max-time 90 \
-            --retry 2 \
-            --retry-delay 30 \
-            -w "\nHTTP status: %{http_code}\n" \
-            -o response.json
-          cat response.json
-          # Renderの無料プランはアクセスが無いとスリープするため、初回リクエストの
-          # 起動待ちで失敗することがある。念のためもう一度だけ叩き直す。
-          if ! grep -q '"ok":true' response.json; then
-            echo "1回目が失敗した可能性があるため、60秒待って再試行します"
-            sleep 60
-            curl -sS -X POST "${AUTO_COLLECT_ENDPOINT_URL}?key=${LEARNING_SECRET_KEY}" \
-              --max-time 90 -w "\nHTTP status: %{http_code}\n" -o response.json
-            cat response.json
+          # ---- 呼び出し先の決定(専用シークレット無しでも動くようにする) ----
+          URL="${AUTO_COLLECT_ENDPOINT_URL}"
+          if [ -z "$URL" ] && [ -n "$LEARNING_ENDPOINT_URL" ]; then
+            URL="${LEARNING_ENDPOINT_URL%/api/learning/run-daily}/api/predictions/auto-collect"
+            echo "AUTO_COLLECT_ENDPOINT_URL が未登録のため、LEARNING_ENDPOINT_URL から組み立てました。"
           fi
-          # 2026年8月・監査で発見された不具合の修正: リトライ後の最終結果を
-          # 確認しないまま終了していたため、実際には失敗していてもGitHub Actions
-          # 上は常に「Success」と表示されていた。ここで明示的に確認する。
-          if ! grep -q '"ok":true' response.json; then
-            echo "::error::予測自動収集の呼び出しに失敗しました(応答に \"ok\":true が含まれません)。上のresponse.jsonの内容を確認してください。"
+          if [ -z "$URL" ]; then
+            echo "::error::呼び出し先のURLが決まりません。Settings → Secrets and variables → Actions で LEARNING_ENDPOINT_URL(例: https://soccer-analysis-ai-proxy.onrender.com/api/learning/run-daily)を登録してください。"
             exit 1
           fi
+          if [ -z "$LEARNING_SECRET_KEY" ]; then
+            echo "::error::LEARNING_SECRET_KEY が未登録です。Renderの環境変数 AUTO_COLLECT_SECRET と同じ値を登録してください。"
+            exit 1
+          fi
+          # URL自体はシークレットではないので、どこを叩いたか分かるように出す
+          # (キーは絶対に出さない)
+          echo "呼び出し先: $URL"
+
+          call() {
+            curl -sS -X POST "${URL}?key=${LEARNING_SECRET_KEY}" \
+              --max-time 90 -w "\nHTTP status: %{http_code}\n" -o response.json || true
+            cat response.json || true
+          }
+          call
+          # Renderの無料プランはアクセスが無いとスリープするため、初回リクエストの
+          # 起動待ちで失敗することがある。念のためもう一度だけ叩き直す。
+          if ! grep -q '"ok":true' response.json 2>/dev/null; then
+            echo "1回目が失敗した可能性があるため、60秒待って再試行します"
+            sleep 60
+            call
+          fi
+          # リトライ後の最終結果を必ず確認する(失敗を成功として通さない)
+          if ! grep -q '"ok":true' response.json 2>/dev/null; then
+            echo "::error::予測自動収集の呼び出しに失敗しました。上の response.json と HTTP status を確認してください。403 の場合は LEARNING_SECRET_KEY と Render の AUTO_COLLECT_SECRET が一致していません。"
+            exit 1
+          fi
+          # ---- 2026年8月の監査で追加: 何件処理したのかをログに残す ----
+          #   「Successなのに1件も進んでいない」を見逃さないため、
+          #   ログ・答え合わせ・除外の件数をワークフローの要約に出す。
+          echo "### 予測の自動収集 結果" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat response.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
         env:
           AUTO_COLLECT_ENDPOINT_URL: ${{ secrets.AUTO_COLLECT_ENDPOINT_URL }}
+          LEARNING_ENDPOINT_URL: ${{ secrets.LEARNING_ENDPOINT_URL }}
           LEARNING_SECRET_KEY: ${{ secrets.LEARNING_SECRET_KEY }}
