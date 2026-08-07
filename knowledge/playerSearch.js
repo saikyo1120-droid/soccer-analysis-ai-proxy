@@ -1470,7 +1470,145 @@ function dailyHighlights(index, opts) {
   };
 }
 
+/* =========================================================
+   2026年8月7日・「データはあるのに検索できない」への構造的な対処
+   ---------------------------------------------------------
+   本番で起きたこと(実測):
+     ・選手の記録   1,378件(保存されている)
+     ・クラブの名簿 42クラブぶん(保存されている)
+     ・選手の索引   0人(作られていない)
+
+   原因は「索引づくりが、長い毎日の学習ジョブの **最後** に置かれていた」こと。
+   途中で止まると、材料はすべて保存済みなのに索引だけが永久にできない。
+   しかも索引づくり自体は **外部APIを1回も使わない**(保存済みの材料だけで
+   完結する)ので、長いジョブに相乗りさせる理由がそもそも無かった。
+
+   そこで、保存済みのデータだけから索引を作り直せる関数を独立させる。
+     ・外部API(API-Football)の呼び出し: 0回
+     ・毎日の学習が止まっていても、これ単体で検索が復活する
+     ・前回の索引があれば引き継ぐ(実測を消さない)
+   ========================================================= */
+async function rebuildIndexFromStore(deps, opts) {
+  const o = opts || {};
+  const clubDossier = o.clubDossier;
+  const clubs = o.clubs || [];
+  const nowMs = Number.isFinite(o.nowMs) ? o.nowMs : Date.now();
+  const todayKey = dateKeyNum(new Date(nowMs).toISOString());
+  const cap = Math.max(100, Math.min(20000, o.playerRecordCap || 6000));
+  const stats = {
+    ok: false, source: "store", apiCalls: 0,
+    fromSquads: 0, fromRecords: 0, carriedOver: 0,
+    clubsWithSquad: 0, recordsRead: 0, redisReads: 0,
+    reasonJa: null,
+  };
+  if (!deps || !deps.upstashEnabled) {
+    stats.reasonJa = "保存先(Upstash)が未設定のため、索引を作り直せません。";
+    return stats;
+  }
+  if (!clubDossier) {
+    stats.reasonJa = "クラブの調査ファイルを読む手段が渡されていないため、索引を作り直せません。";
+    return stats;
+  }
+
+  // ---- ① 前回の索引(あれば引き継ぐ) ----
+  const prevLoaded = await loadIndex(deps);
+  const prevMap = new Map();
+  for (const r of (prevLoaded.rows || [])) prevMap.set(Number(r[COL.id]), r);
+
+  // ---- ② クラブの名簿(保存済み)から、全所属選手の骨格を作る ----
+  const merged = new Map();
+  const mergeInto = (base, next) => {
+    const out = { ...(base || {}) };
+    for (const [k, v] of Object.entries(next || {})) {
+      if (k === "stats") continue;
+      if (v !== null && v !== undefined && v !== "") out[k] = v;
+    }
+    if (next && next.stats) {
+      out.stats = { ...(out.stats || {}) };
+      for (const [k, v] of Object.entries(next.stats)) {
+        if (v !== null && v !== undefined) out.stats[k] = v;
+      }
+    }
+    return out;
+  };
+  const put = (id, rec) => { merged.set(Number(id), mergeInto(merged.get(Number(id)), rec)); };
+
+  for (const club of clubs) {
+    const d = await clubDossier.getDossier(club.nameEn).catch(() => null);
+    stats.redisReads++;
+    const squad = d && d.sections && d.sections.squad && d.sections.squad.players;
+    if (!Array.isArray(squad) || !squad.length) continue;
+    stats.clubsWithSquad++;
+    for (const p of squad) {
+      if (!p || !p.id) continue;
+      put(p.id, {
+        id: Number(p.id), name: p.name, teamEn: club.nameEn, teamJa: club.nameJa,
+        leagueId: club.leagueId || null, position: p.position, age: p.age, number: p.number,
+      });
+      stats.fromSquads++;
+    }
+  }
+
+  // ---- ③ 保存済みの選手記録(実測の成績つき)を重ねる ----
+  const statsIndex = await clubDossier.getStatsIndex().catch(() => ({}));
+  stats.redisReads++;
+  // 更新が新しい順に読む(上限で切れても、より新しい実測が残るように)
+  const ids = Object.keys(statsIndex || {})
+    .sort((a, b) => String(statsIndex[b] || "").localeCompare(String(statsIndex[a] || "")))
+    .slice(0, cap);
+  for (const id of ids) {
+    const rec = await clubDossier.getPlayer(id).catch(() => null);
+    stats.redisReads++;
+    stats.recordsRead++;
+    if (!rec || !rec.id) continue;
+    put(rec.id, rec);
+    stats.fromRecords++;
+  }
+
+  // ---- ④ スタメン配置(細かいポジションの推定に使う。保存済み) ----
+  const grid = (await loadGrid(deps).catch(() => null)) || {};
+  stats.redisReads++;
+
+  // ---- ⑤ 索引の行を作る ----
+  const rows = [];
+  for (const [id, rec] of merged) {
+    const prev = prevMap.get(id) || null;
+    rows.push(toIndexRow(rec, { todayKey, gridStats: gridStatsFrom(grid[id]) }, nowMs, prev));
+  }
+  // 前回の索引にしかいない選手も残す(名簿の輪番で今日たまたま読めなかった人を消さない)
+  for (const [id, prevRow] of prevMap) {
+    if (merged.has(id)) continue;
+    rows.push(prevRow);
+    stats.carriedOver++;
+  }
+
+  if (!rows.length) {
+    stats.reasonJa = "保存済みのデータから作れる選手が1人もいませんでした(名簿も選手記録もまだ空です)。";
+    return stats;
+  }
+
+  const saveRes = await saveIndex(deps, rows, {
+    builtAt: new Date(nowMs).toISOString(),
+    dateKey: o.dateKey || null,
+    rebuiltFromStore: true,
+    sources: {
+      squadClubs: stats.clubsWithSquad,
+      playerRecords: stats.recordsRead,
+      carriedOver: stats.carriedOver,
+    },
+  });
+  stats.ok = saveRes.saved === true;
+  stats.count = rows.length;
+  stats.shardCount = saveRes.shardCount;
+  stats.withRating = rows.filter((r) => r[COL.rating] !== null && r[COL.rating] !== undefined).length;
+  stats.withNationality = rows.filter((r) => r[COL.nationality]).length;
+  stats.clubs = new Set(rows.map((r) => r[COL.teamEn]).filter(Boolean)).size;
+  stats.reasonJa = saveRes.saved === true ? null : (saveRes.reasonJa || "索引の保存に失敗しました。");
+  return stats;
+}
+
 module.exports = {
+  rebuildIndexFromStore,
   suggest, rankSuggestion, recommendPlayers, RECOMMEND_PRESETS, dailyHighlights,
   INDEX_KEY, INDEX_META_KEY, INDEX_SHARD_PREFIX, INDEX_GEN_PREFIX, shardKey, GRID_KEY, SHARD_SIZE, MAX_SHARDS, ROW_LENGTH,
   COL, BROAD_POSITIONS, BROAD_POSITION_JA, DETAILED_POSITION_JA, DETAILED_POSITION_ORDER,
