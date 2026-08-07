@@ -763,13 +763,21 @@ async function loadIndex(deps) {
   const legacy = await upstashGetJSON(INDEX_KEY).catch(() => null);
   if (Array.isArray(legacy)) rows.push(...legacy.filter((r) => Array.isArray(r) && r[COL.id]));
   if (rows.length) return { rows, meta, available: true, partial: false, missingShards: [], reasonJa: null };
-  // ---- 検証で判明した穴 ----
-  // 目次が読めない原因は「まだ作られていない」と「読み出しに失敗した」の両方が
-  // ありうる。以前はこれを available:true(=正常に0件)として返していたため、
-  // サーバー側の「失敗したら前回の内容を保持する」処理が働かなかった。
+  // ---- 2026年8月7日・本番調査で分かった「診断できなさ」の修正 ----
+  //   ここへ来る原因は3つあり、必要な対処がまったく違う:
+  //     ① 目次そのものが無い  → 毎日の学習がまだ一度も索引を作っていない
+  //     ② 目次はあるが0人     → 学習は走ったが材料が1人も無かった
+  //     ③ 目次の読み出し失敗  → 保存先への接続が一時的に落ちた
+  //   以前は3つとも同じ文言(「目次を読み出せませんでした」)にまとめていたため、
+  //   本番で「まだ作られていない」のか「壊れている」のかを外から判別できず、
+  //   原因の切り分けに丸1往復かかった。metaFound を必ず返し、文言も分ける。
+  const metaFound = !!meta;
   return {
-    rows: [], meta: null, available: false, partial: true, missingShards: [],
-    reasonJa: "選手索引の目次を読み出せませんでした。まだ作られていないか、保存先への接続が一時的に失敗しています(次の日次学習、またはしばらく待ってからの再読み込みで解消します)。",
+    rows: [], meta, metaFound, available: false, partial: true, missingShards: [],
+    expectedCount: metaFound && Number.isFinite(meta.count) ? meta.count : null,
+    reasonJa: metaFound
+      ? `選手索引の目次はありますが、登録されている選手が0人です(最終作成: ${meta.builtAt || "不明"})。次の毎日の学習で作り直されます。`
+      : "選手索引はまだ作られていません。毎日の学習が次に走ったときに作られます(24時間以上動いていない場合は、この画面を開くとサーバーが自動で学習を開始します)。",
   };
 }
 
