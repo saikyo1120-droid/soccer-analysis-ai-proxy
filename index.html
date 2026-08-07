@@ -19,7 +19,10 @@
     --surface-2: #f2f1ee;
     --text-primary: #0b0b0b;
     --text-secondary: #52514e;
-    --text-muted: #898781;
+    /* 2026年8月7日・UI監査: #898781 は白背景で 3.41〜3.50:1 しかなく、WCAG AA(4.5:1)に届いていなかった。
+       「取得できませんでした」など、いちばん読ませたい注記がこの色だったため実害が大きい。
+       ダークテーマ側は 4.5:1 を満たしているので変更しない。 */
+    --text-muted: #73716c;
     --gridline: #e1e0d9;
     --baseline: #c3c2b7;
     --border: rgba(11,11,11,0.10);
@@ -400,6 +403,23 @@
   .compare-select-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
   .compare-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 14px; }
   @media (max-width: 760px) { .compare-cols { grid-template-columns: 1fr; } }
+
+  /* ---- 2026年8月7日・UI監査で見つかった「スマホで押しにくい」の修正 ----
+     実測: モード切替タブ・レベル切替・「分析する ▶」・質問チップなどが
+     高さ 31〜34px しかなかった。Apple は44px、Google は48px を推奨しており、
+     指で押すには小さい(押し間違いが起きる)。スマホ幅のときだけ広げる。
+     PC の見た目は変えない。×(閉じる)のような小さな飾りボタンは対象外。 */
+  @media (max-width: 760px) {
+    button,
+    select,
+    input[type="text"],
+    input[type="number"],
+    input[type="search"] { min-height: 44px; }
+    button { display: inline-flex; align-items: center; justify-content: center; }
+    .sd-tray-chip button,
+    .ps-chip-x,
+    button.inline-x { min-height: 0; display: inline; }
+  }
   .compare-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
   .compare-head .name { font-size: 14px; font-weight: 700; }
   .compare-attr-row { display: grid; grid-template-columns: 46px 1fr 46px; align-items: center; gap: 8px; font-size: 12.5px; padding: 5px 0; border-bottom: 1px solid var(--gridline); }
@@ -3755,13 +3775,13 @@ async function renderLiveBayernPanel(targetId) {
         <div class="rating" style="font-size:11px;">${Number(m.gf)}-${Number(m.ga)} ${escapeHtml(String(m.opponent || "").replace('FC Bayern München',''))}</div>
       </div>`).join("") : `<p class="value-note">直近の試合データが見つかりませんでした。</p>`;
     el.innerHTML = `
-      <h2>🔴 実データ:FCバイエルン・ミュンヘン(ブンデスリーガ ${data.season}/${String(data.season+1).slice(2)}シーズン)</h2>
+      <h2>🔴 実データ:FCバイエルン・ミュンヘン(ブンデスリーガ ${Number(data.season)}/${String(Number(data.season) + 1).slice(2)}シーズン)</h2>
       <div class="meta-row" style="margin-top:0;">
-        <span>🏆 現在 ${data.rank ?? "-"}位</span>
-        <span>⭐ 勝点 ${data.points}</span>
-        <span>📅 ${data.played}試合</span>
-        <span>${data.won}勝${data.draw}分${data.lost}敗</span>
-        <span>得失点差 ${data.goalDiff > 0 ? "+" : ""}${data.goalDiff}</span>
+        <span>🏆 現在 ${Number.isFinite(Number(data.rank)) ? Number(data.rank) : "-"}位</span>
+        <span>⭐ 勝点 ${Number(data.points)}</span>
+        <span>📅 ${Number(data.played)}試合</span>
+        <span>${Number(data.won)}勝${Number(data.draw)}分${Number(data.lost)}敗</span>
+        <span>得失点差 ${Number(data.goalDiff) > 0 ? "+" : ""}${Number(data.goalDiff)}</span>
       </div>
       <h3 class="sim-subhead" style="margin-top:14px;">直近5試合の実結果</h3>
       <div class="form-row">${matchChips}</div>
@@ -4047,15 +4067,19 @@ async function renderRealPerformancePanel(player) {
   // the one visible signal that lets anyone confirm at a glance that this is the
   // player's CLUB form and not, say, national-team stats that slipped through.
   const teamNote = data.team ? `所属: ${escapeHtml(data.team)}。` : "";
+  // 外部APIの数値を画面に出すときの共通処理(数値でなければ "-")
+  const liveNum = (v) => (v === null || v === undefined || v === "" || !Number.isFinite(Number(v)) ? "-" : String(Number(v)));
   el.innerHTML = `
     <div class="live-data-banner">
-      <span class="live-data-badge">🟢 実データ</span>API-Football(有料API)から取得した${data.season}シーズンの成績です(${data.fetchedAt ? String(data.fetchedAt).slice(0,10) + "時点・" : ""}キャッシュ済みの場合あり)。${teamNote}下のシミュレーション区画とは別ソースです。${offSeasonNote}
+      <span class="live-data-badge">🟢 実データ</span>API-Football(有料API)から取得した${escapeHtml(String(data.season ?? ""))}シーズンの成績です(${data.fetchedAt ? escapeHtml(String(data.fetchedAt).slice(0,10)) + "時点・" : ""}キャッシュ済みの場合あり)。${teamNote}下のシミュレーション区画とは別ソースです。${offSeasonNote}
       <div class="live-stat-grid">
-        <div class="live-stat-item"><div class="num">${s.appearances ?? "-"}</div><div class="lbl">出場</div></div>
-        <div class="live-stat-item"><div class="num">${s.goals ?? "-"}</div><div class="lbl">ゴール</div></div>
-        <div class="live-stat-item"><div class="num">${s.assists ?? "-"}</div><div class="lbl">アシスト</div></div>
-        <div class="live-stat-item"><div class="num">${s.avgRating ?? "-"}</div><div class="lbl">平均レーティング</div></div>
-        <div class="live-stat-item"><div class="num">${s.minutes ?? "-"}</div><div class="lbl">出場時間(分)</div></div>
+        ${/* 2026年8月7日のセキュリティ監査の指摘: 外部API由来の数値を素通しで
+             innerHTML に入れていた。数値として扱えないものは "-" にする。 */""}
+        <div class="live-stat-item"><div class="num">${liveNum(s.appearances)}</div><div class="lbl">出場</div></div>
+        <div class="live-stat-item"><div class="num">${liveNum(s.goals)}</div><div class="lbl">ゴール</div></div>
+        <div class="live-stat-item"><div class="num">${liveNum(s.assists)}</div><div class="lbl">アシスト</div></div>
+        <div class="live-stat-item"><div class="num">${liveNum(s.avgRating)}</div><div class="lbl">平均レーティング</div></div>
+        <div class="live-stat-item"><div class="num">${liveNum(s.minutes)}</div><div class="lbl">出場時間(分)</div></div>
       </div>
     </div>`;
 }
@@ -5063,8 +5087,15 @@ function registeredPlayersForClubJa(clubJa) {
 // A symmetric home-vs-away strength bar, reusing the same bar-track/bar-half/
 // bar-fill visual language already used for the curated match analysis's
 // possession bar — one consistent "who's ahead" visual across the whole app.
-function strengthBarHtml(label, homePct, homeText, awayText) {
+function strengthBarHtml(rawLabel, homePct, rawHomeText, rawAwayText) {
   const clamp = Math.max(15, Math.min(85, Math.round(homePct)));
+  // 2026年8月7日のセキュリティ監査の指摘:
+  //   ここに渡ってくるチーム名は外部API(API-Football)由来で、呼び出し側の
+  //   一部がエスケープを忘れていた。**関数の中で必ずエスケープする**ことで、
+  //   呼び出し側の書き漏れがそのまま穴にならないようにする。
+  const label = escapeHtml(rawLabel);
+  const homeText = escapeHtml(rawHomeText);
+  const awayText = escapeHtml(rawAwayText);
   return `
     <div class="stat-row">
       <div class="label-line"><span class="metric-name">${label}</span></div>
@@ -5093,8 +5124,10 @@ function build90MinStoryHtml(f, homeP, awayP, level) {
   const bothSides = homeP.length > 0 && awayP.length > 0;
   const diff = bothSides ? homeOverall - awayOverall : 0;
   const favoredIsHome = diff >= 0;
-  const favoredName = bothSides ? (favoredIsHome ? f.home.name : f.away.name) : (homeP.length ? f.home.name : f.away.name);
-  const underdogName = bothSides ? (favoredIsHome ? f.away.name : f.home.name) : (homeP.length ? f.away.name : f.home.name);
+  // 2026年8月7日のセキュリティ監査の指摘: ここに入るのは外部API由来のクラブ名。
+  // 以降の文章に何度も差し込まれるので、**取り出す時点で1回だけ**エスケープする。
+  const favoredName = escapeHtml(bothSides ? (favoredIsHome ? f.home.name : f.away.name) : (homeP.length ? f.home.name : f.away.name));
+  const underdogName = escapeHtml(bothSides ? (favoredIsHome ? f.away.name : f.home.name) : (homeP.length ? f.away.name : f.home.name));
   const favoredPlayers = bothSides ? (favoredIsHome ? homeP : awayP) : (homeP.length ? homeP : awayP);
   const closeMatch = bothSides && Math.abs(diff) < 2.5;
 
@@ -5180,8 +5213,8 @@ function buildUpcomingPreviewHtml(analysis, level) {
       <p class="value-note">${leadText}</p>
       ${thinSample ? "" : strengthBarHtml("AI優勢度", barPct, f.home.name, f.away.name)}
       <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:8px;">
-        <div style="flex:1; min-width:220px;"><strong>${f.home.name} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(homeP, 3)}</div></div>
-        <div style="flex:1; min-width:220px;"><strong>${f.away.name} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(awayP, 3)}</div></div>
+        <div style="flex:1; min-width:220px;"><strong>${escapeHtml(f.home.name)} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(homeP, 3)}</div></div>
+        <div style="flex:1; min-width:220px;"><strong>${escapeHtml(f.away.name)} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(awayP, 3)}</div></div>
       </div>
       ${build90MinStoryHtml(f, homeP, awayP, level)}`;
   } else if (homeP.length || awayP.length) {
@@ -5189,11 +5222,11 @@ function buildUpcomingPreviewHtml(analysis, level) {
     const otherSide = homeP.length ? f.away.name : f.home.name;
     const players = homeP.length ? homeP : awayP;
     predictionHtml = `
-      <p class="value-note">🤖 <strong>AIの展開予想:</strong> ${side}には登録選手データがあるため、そちらの注目選手を中心にプレビューします(${otherSide}は現時点で未登録のクラブのため、選手個別の分析はまだ提供できません)。</p>
-      <div style="margin-top:6px;"><strong>${side} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(players, 3)}</div></div>
+      <p class="value-note">🤖 <strong>AIの展開予想:</strong> ${escapeHtml(side)}には登録選手データがあるため、そちらの注目選手を中心にプレビューします(${escapeHtml(otherSide)}は現時点で未登録のクラブのため、選手個別の分析はまだ提供できません)。</p>
+      <div style="margin-top:6px;"><strong>${escapeHtml(side)} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(players, 3)}</div></div>
       ${build90MinStoryHtml(f, homeP, awayP, level)}`;
   } else {
-    predictionHtml = `<p class="value-note">🤖 <strong>AIの展開予想:</strong> 現時点では${f.home.name}・${f.away.name}どちらも登録選手データがないため、選手個別の予想は提供できません(実際の試合結果や選手データが揃い次第、対応クラブを拡大予定です)。試合が終了すると、実データに基づいた選手評価と振り返りをこの場所で見られます。</p>`;
+    predictionHtml = `<p class="value-note">🤖 <strong>AIの展開予想:</strong> 現時点では${escapeHtml(f.home.name)}・${escapeHtml(f.away.name)}どちらも登録選手データがないため、選手個別の予想は提供できません(実際の試合結果や選手データが揃い次第、対応クラブを拡大予定です)。試合が終了すると、実データに基づいた選手評価と振り返りをこの場所で見られます。</p>`;
   }
 
   // UI/UX統一ラウンド: ホームと同じ「AIの予想(勝敗・勝率バー・根拠)」を
@@ -8142,8 +8175,12 @@ async function psLoadFacets() {
         //   であって、実際に選手が入っているクラブの数ではなかった。
         //   実測では100件と書きながら、選手がいるのは42クラブだけだった。
         //   利用者が「100クラブぶん入っている」と誤解するので、実数を書く。
-        const withPlayers = (data.clubs || []).filter((c) => Number(c.count) > 0).length;
-        const total = (data.clubs || []).length;
+        // サーバーが数えた実数を使う(画面側で数え直すとフィールド名の
+        // 取り違えのような事故が起きる。実際に1度起こした)
+        const withPlayers = Number.isFinite(Number(data.clubsWithPlayers))
+          ? Number(data.clubsWithPlayers)
+          : (data.clubs || []).filter((c) => Number(c.playerCount) > 0).length;
+        const total = Number(data.totalClubs) || (data.clubs || []).length;
         const rated = Number(data.withRatingCount);
         const coverage = withPlayers < total
           ? `<b>${withPlayers}/${total}クラブ</b>ぶんが入っています(残りは収集中です)`

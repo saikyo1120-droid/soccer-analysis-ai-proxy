@@ -26,6 +26,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { URL } = require("url");
+const { AsyncLocalStorage } = require("async_hooks");
 
 // Stage C: 対話エンジン(議論モード)関連。実体は server/rag/ ・ server/discuss/ ・
 // server/llm/ にあり、ここではモジュールとして読み込むだけ(利用箇所は下の方の
@@ -278,8 +279,27 @@ function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
   return fetch(url, { ...options, signal: controller.signal })
     .catch((e) => {
       if (e && e.name === "AbortError") {
-        const err = new Error(`リクエストがタイムアウトしました(${timeoutMs}ms): ${typeof url === "string" ? url : url.toString()}`);
+        // ---- 2026年8月7日のセキュリティ監査の指摘 ----
+        //   ここでURL全体をメッセージに入れており、そのメッセージが
+        //   /api/* の共通catchでHTTP応答本文にそのまま返っていた。
+        //   Upstashがタイムアウトすると **保存先のホスト名が外部に漏れる**。
+        //   識別に必要なのはホスト名までなので、パスとクエリは落とす。
+        //   ホスト名そのものも出さない。保存先(Upstash)のホスト名は
+        //   それ自体が当てにいける情報なので、**用途の名前** だけを返す。
+        let where = "外部サービス";
+        try {
+          const u = new URL(typeof url === "string" ? url : url.toString());
+          const h = u.hostname;
+          if (/upstash/i.test(h)) where = "保存先(データベース)";
+          else if (/api-sports|api-football|rapidapi/i.test(h)) where = "サッカーデータAPI";
+          else if (/anthropic/i.test(h)) where = "AI(文章生成)";
+          else if (/openligadb/i.test(h)) where = "OpenLigaDB";
+          else if (/thesportsdb/i.test(h)) where = "TheSportsDB";
+          else if (/wikipedia/i.test(h)) where = "Wikipedia";
+        } catch (e2) { /* URLとして読めなければ何も書かない */ }
+        const err = new Error(`リクエストがタイムアウトしました(${timeoutMs}ms・接続先: ${where})`);
         err.code = "TIMEOUT";
+        err.hostname = where;
         throw err;
       }
       throw e;
@@ -699,6 +719,18 @@ async function callApiFootball(endpoint, params, opts) {
     ? { "X-RapidAPI-Key": API_KEY, "X-RapidAPI-Host": API_HOST }
     : { "x-apisports-key": API_KEY };
 
+  // ---- 1端末あたりの上限(すべてのAPI呼び出しがここを必ず通る) ----
+  // 受付時の判定だけに頼ると、まだ一度も観測していない画面をすり抜けられる。
+  // 契約枠を実際に使う直前が、最も確実に止められる場所。
+  {
+    const store = heavyCtx.getStore();
+    if (store && !store.jobOnly && !(opts && opts.jobCall) && store.ip && heavyBudgetExceeded(store.ip)) {
+      const err = new Error(heavyLimitMessageJa());
+      err.code = "IP_DAILY_LIMIT";
+      err.messageJa = heavyLimitMessageJa();
+      throw err;
+    }
+  }
   // ---- 予算ガード(すべてのAPI呼び出しがここを必ず通る) ----
   const budget = await getApiBudget();
   // 欠陥Aの修正: 利用者のリクエストは「利用者用の予約枠」を含む全体から確保する。
@@ -713,6 +745,9 @@ async function callApiFootball(endpoint, params, opts) {
     err.budgetReasonJa = reservation.reason;
     throw err;
   }
+  // ここから先は必ず外部へ1回出る。利用者のリクエストであれば、その1回を
+  // 「いま処理中のリクエスト」の実測値として数える(裏の学習・答え合わせは除く)。
+  if (!isJobCall) { try { noteHeavyApiCall(); } catch (e) { /* 計測は本処理を妨げない */ } }
 
   // 第5次監査で発見した欠陥の修正:
   //   これまでは fetch が例外(タイムアウト・ネットワーク断)を投げると、
@@ -2301,6 +2336,91 @@ async function handleFixtureAnalysis(query) {
 // 復帰のきっかけにもなり好都合)。
 // API-Footballの無料枠(1日100リクエスト)を使い切らないよう、1回の実行あたりの
 // 新規記録・解決チェック件数には上限を設けている。
+// ============================================================================
+// 2026年8月7日のセキュリティ監査で判明した「コスト攻撃」への対処
+// ----------------------------------------------------------------------------
+//   /api/match-analysis は1リクエストで最大11回、/api/fixtures/analysis は3回、
+//   /api/coach-search は4回、API-Football を呼ぶ。
+//   レート制限は30回/分/IPしかないため、1つのIPが10秒ほどで300回超を発生させられ、
+//   1日の契約枠(7,500)を短時間で使い切らせることができた。
+//   「取得量を減らす」のではなく、**1つのIPが1日に使える回数** に上限を設ける。
+//   通常の利用者は1日にこの数を超えない(超えたら理由を日本語で返す)。
+const PER_IP_HEAVY_CALLS_PER_DAY = parseInt(process.env.PER_IP_HEAVY_CALLS_PER_DAY, 10) || 120;
+
+// ---- 2026年8月7日・第6次監査での作り直し(見積り課金 → 実測課金) ----
+//   最初の実装は「/api/match-analysis は11回ぶん」のように **固定の見積り** を
+//   前払いさせるものだった。これには3つの実害があった。
+//     (1) クラブ名が空・同一クラブ・長すぎるなど **外部APIを1回も呼ばない
+//         入力エラー** でも11回ぶん引かれる。利用者が打ち間違えを11回すると
+//         その日の分析ができなくなる(100問検証で実際に3問が弾かれた)。
+//     (2) キャッシュに当たって外部APIを1回も呼ばない場合も11回ぶん引かれる。
+//     (3) 逆に、見積りに入れ忘れたエンドポイントは何回呼んでも0として扱われる。
+//   「見積り」はでっち上げの一種なので、**実際に外部APIを何回呼んだかを数えて、
+//   終わってから引く** 方式に作り直した。取得量は1回も減らしていない
+//   (最終方針③「精度>コスト・取得量の削減は禁止」に適合)。
+//
+//   仕組み: リクエスト処理の全体を AsyncLocalStorage の中で走らせ、
+//   callApiFootball が呼ばれるたびに、そのリクエストの箱の中で1つ数える。
+//   応答を返し終わった時点で、その実測値をIPごとの本日の使用量に足す。
+//   裏で走る学習・答え合わせ(jobCall)は利用者の負担にしない。
+const heavyCtx = new AsyncLocalStorage();
+let heavyIpDailyBudget = { day: null, counts: new Map() };
+function heavyBudgetToday() {
+  const today = appDateKey();
+  if (heavyIpDailyBudget.day !== today) heavyIpDailyBudget = { day: today, counts: new Map() };
+  return heavyIpDailyBudget.counts;
+}
+// 外部APIを1回使ったことを、いま処理中のリクエストに記録する(利用者の呼び出しのみ)
+function noteHeavyApiCall() {
+  const store = heavyCtx.getStore();
+  if (store && !store.jobOnly) store.apiCalls++;
+}
+// どのエンドポイントが実際に外部APIを使ったかは、決め打ちの表ではなく **実測で覚える**。
+// (表を手で維持すると必ず古くなる。実測なら、後から足した画面も自動で対象になる)
+const heavyPathObserved = new Map(); // pathname -> これまでに観測した最大の外部API回数
+function isObservedHeavyPath(pathname) {
+  return (heavyPathObserved.get(pathname) || 0) > 0;
+}
+function heavyLimitMessageJa() {
+  return `この端末からの外部データ取得が本日の上限(${PER_IP_HEAVY_CALLS_PER_DAY}回)に達しました。`
+    + `翌日(日本時間0時)に自動で戻ります。1人の利用で契約枠を使い切ってしまうと、`
+    + `他の方の分析も止まってしまうための保護です。`;
+}
+function heavyBudgetExceeded(ip) {
+  const counts = heavyBudgetToday();
+  return (counts.get(ip || "unknown") || 0) >= PER_IP_HEAVY_CALLS_PER_DAY;
+}
+// 受付時の判定: すでに本日の上限に達していて、かつ **実際に外部APIを使う画面** のときだけ断る。
+// 前払いはしないので、入力エラーやキャッシュ命中では1回も引かれない。
+// 軽い画面(/api/health など)は巻き添えで止めない。
+function heavyBudgetPrecheck(ip, pathname) {
+  const counts = heavyBudgetToday();
+  const used = counts.get(ip || "unknown") || 0;
+  if (used >= PER_IP_HEAVY_CALLS_PER_DAY && isObservedHeavyPath(pathname)) {
+    return {
+      allowed: false,
+      usedToday: used,
+      messageJa: heavyLimitMessageJa(),
+    };
+  }
+  return { allowed: true, usedToday: used };
+}
+// 裏で走る処理(自己修復・毎日の学習・答え合わせ)は、利用者の使用量に数えない。
+// 呼び出し元がリクエスト処理の中でも、専用の箱に入れ替えて走らせる。
+function runInBackgroundCtx(fn) {
+  return heavyCtx.run({ apiCalls: 0, jobOnly: true, ip: null }, () => {
+    try { return Promise.resolve(fn()).catch(() => {}); } catch (e) { return Promise.resolve(); }
+  });
+}
+// 応答を返し終わってから、実際に使った回数だけ引く
+function chargeHeavyBudget(ip, calls, pathname) {
+  if (!calls || calls <= 0) return;
+  const counts = heavyBudgetToday();
+  const key = ip || "unknown";
+  counts.set(key, (counts.get(key) || 0) + calls);
+  if (pathname) heavyPathObserved.set(pathname, Math.max(heavyPathObserved.get(pathname) || 0, calls));
+}
+
 const AUTO_COLLECT_LOG_CAP = 3; // 1回の実行で新規に記録する試合数の上限
 // ---- 2026年8月7日・本番実測で判明した「答え合わせが追いつかない」の修正 ----
 //   実測: pending 18件 → 22件、resolved 0、45時間ぶん1件も答え合わせされていない。
@@ -5221,6 +5341,14 @@ const MIME = {
 const PUBLIC_STATIC_EXT = new Set([".html", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".txt", ".webmanifest"]);
 // 万一 .html などの拡張子でも、置き場所として公開してはいけないもの
 const PRIVATE_PATH_RE = /(^|[\\/])(\.[^\\/]*|node_modules|server|learning|knowledge|memory|rag|reasoning|discuss|llm|scripts|backups)([\\/]|$)/i;
+// ---- 2026年8月7日のセキュリティ監査の指摘 ----
+//   拡張子が .html というだけで、開発用の資料が誰でも読める状態だった
+//   (実測: /debug.html, /StageC反映手順.html などが200で配信されていた)。
+//   内部の設計・エンドポイント一覧・運用手順が公開されるのは望ましくない。
+//   公開してよいのは index.html だけに絞る(必要なら PUBLIC_HTML_EXTRA で追加)。
+const PUBLIC_HTML_ALLOW = new Set(
+  ["index.html"].concat(String(process.env.PUBLIC_HTML_EXTRA || "").split(",").map((x) => x.trim()).filter(Boolean))
+);
 
 function serveStatic(req, res, pathname) {
   const rel = pathname === "/" ? "/index.html" : pathname;
@@ -5239,6 +5367,11 @@ function serveStatic(req, res, pathname) {
   // ③公開してよい拡張子だけ(.js/.json/.yml/.md/.env などは一切配信しない)
   const ext = path.extname(filePath).toLowerCase();
   if (!PUBLIC_STATIC_EXT.has(ext)) { res.writeHead(404); res.end("Not found"); return; }
+  // .html は許可リストにあるものだけ(開発用の資料を公開しない)
+  if (ext === ".html") {
+    const base = decoded.split("/").pop();
+    if (!PUBLIC_HTML_ALLOW.has(base)) { res.writeHead(404); res.end("Not found"); return; }
+  }
 
   fs.readFile(filePath, (err, data) => {
     if (err) { res.writeHead(404); res.end("Not found"); return; }
@@ -5281,7 +5414,12 @@ function readJsonBody(req) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
+  // 実測課金のため、1リクエストの処理全体を専用の箱の中で走らせる
+  heavyCtx.run({ apiCalls: 0, jobOnly: false, ip: null }, () => { void handleHttpRequest(req, res); });
+});
+
+async function handleHttpRequest(req, res) {
   // 最終方針: 全リクエストの応答時間を常時計測(perfSnapshotで提出)。
   {
     const perfT0 = Date.now();
@@ -5306,10 +5444,37 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ found: false, error: "レート制限に達しました。しばらく待ってから再試行してください。" }));
       return;
     }
+    // 外部APIを多く消費する利用者を、1日の実測回数で制限する。
+    // 前払いではないので、入力エラーやキャッシュ命中(外部API 0回)では1回も引かれない。
+    const heavy = heavyBudgetPrecheck(ip, pathname);
+    if (!heavy.allowed) {
+      res.writeHead(429, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ found: false, ok: false, error: "daily quota reached", messageJa: heavy.messageJa }));
+      return;
+    }
+    // 応答を返し終わった時点で、このリクエストが実際に使った外部API回数だけ引く
+    {
+      const store = heavyCtx.getStore();
+      if (store) {
+        store.ip = ip;
+        let charged = false;
+        const settle = () => {
+          if (charged) return;
+          charged = true;
+          // 裏で走る自己修復(jobCall)はここに入らないので、利用者の負担にはならない
+          try { chargeHeavyBudget(ip, store.apiCalls, pathname); } catch (e) { /* 計測は本処理を妨げない */ }
+        };
+        res.on("finish", settle);
+        res.on("close", settle);
+      }
+    }
     // 答え合わせと毎日の学習が止まっていないかを確認する(古すぎる場合だけ裏で走る)。
     // await しない = 利用者のリクエストは1ミリ秒も遅くならない。
-    maybeSelfHealAutoCollect().catch(() => {});
-    maybeSelfHealDailyLearning().catch(() => {});
+    // 裏で走る処理は「利用者の箱」の外(専用の箱)で走らせる。
+    // これをしないと、たまたま自己修復の引き金を引いた利用者に
+    // 学習ぶんの外部API回数まで課金されてしまう。
+    runInBackgroundCtx(() => maybeSelfHealAutoCollect());
+    runInBackgroundCtx(() => maybeSelfHealDailyLearning());
 
     try {
       if (pathname === "/api/health") {
@@ -5715,7 +5880,38 @@ const server = http.createServer(async (req, res) => {
           clubs: new Set(rows.map((r) => r[C.teamEn]).filter(Boolean)).size,
           nationalities: new Set(rows.map((r) => r[C.nationality]).filter(Boolean)).size,
         };
-        const body = { ok: true, generatedAt: new Date().toISOString(), ...summary, playerIndex };
+        // ---- 2026年8月7日の反省 ----
+        //   収集の実行結果を、鍵つきのエンドポイントにしか出していなかったため、
+        //   「収集が動いているのに何も増えない」状態を外から確認できなかった。
+        //   件数と理由だけなので、ここ(鍵なしの診断)に必ず出す。
+        const [lastCollect, lastRebuild] = await Promise.all([
+          upstashGetJSON("kb:universe:lastplayercollect").catch(() => null),
+          upstashGetJSON("kb:player:index:lastrebuild").catch(() => null),
+        ]);
+        const slim = (r) => (r ? {
+          at: r.at, trigger: r.trigger, ok: r.ok,
+          clubsPlanned: r.clubsPlanned, clubsFetched: r.clubsFetched,
+          playersFetched: r.playersFetched, apiRequests: r.apiRequests,
+          resolvedNow: r.resolvedNow, recordsSaved: r.recordsSaved,
+          indexCount: r.indexCount, indexClubs: r.indexClubs, withRating: r.withRating,
+          cursorBefore: r.cursorBefore, cursorAfter: r.cursorAfter,
+          unresolvedCount: Array.isArray(r.unresolvedClubs) ? r.unresolvedClubs.length : null,
+          unresolvedSample: Array.isArray(r.unresolvedClubs) ? r.unresolvedClubs.slice(0, 5) : null,
+          errors: Array.isArray(r.errors) ? r.errors.slice(0, 3) : null,
+          notesJa: r.notesJa || null, reasonJa: r.reasonJa || null, tookMs: r.tookMs,
+        } : null);
+        const body = {
+          ok: true, generatedAt: new Date().toISOString(), ...summary, playerIndex,
+          lastPlayerCollect: slim(lastCollect),
+          lastIndexRebuild: slim(lastRebuild),
+          collectVerdictJa: !lastCollect
+            ? "選手データの収集は、この機能を入れてからまだ1度も走っていません。"
+            : (lastCollect.clubsFetched > 0
+              ? `直近の収集で ${lastCollect.clubsFetched}クラブ・${lastCollect.playersFetched}人を取得しました(API ${lastCollect.apiRequests}回)。`
+              : `直近の収集は ${lastCollect.clubsPlanned}クラブを対象にしましたが、1クラブも取得できませんでした。`
+                + (Array.isArray(lastCollect.unresolvedClubs) && lastCollect.unresolvedClubs.length
+                  ? `理由: ${lastCollect.unresolvedClubs.length}クラブでチームIDが分からず、照合もできませんでした。` : "")),
+        };
         cacheSet("kb:coverage", body, 5 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
@@ -5918,7 +6114,10 @@ const server = http.createServer(async (req, res) => {
           //   画面が「クラブ100件」と書いていたが、それは選べる一覧の数であって
           //   実際に選手が入っているクラブ数ではなかった(実測では42クラブ)。
           //   誤解を招くので、実数を渡して画面が正直に書けるようにする。
-          clubsWithPlayers: clubs.filter((c) => Number(c.count) > 0).length,
+          // 2026年8月7日: ここを c.count と書いていたが、実際のフィールド名は
+          // playerCount。そのため常に0になり、画面に「0/100クラブ」と
+          // **事実と違う数字** が出ていた(実測1,433人・63国籍あるのに0クラブ)。
+          clubsWithPlayers: clubs.filter((c) => Number(c.playerCount) > 0).length,
           withRatingCount: state.rows.filter((r) =>
             r[playerSearch.COL.rating] !== null && r[playerSearch.COL.rating] !== undefined).length,
           withNationalityCount: state.rows.filter((r) => r[playerSearch.COL.nationality]).length,
@@ -6418,6 +6617,11 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ found: false, error: "unknown endpoint" }));
     } catch (e) {
+      if (e && e.code === "IP_DAILY_LIMIT") {
+        res.writeHead(429, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ found: false, ok: false, error: "daily quota reached", messageJa: e.messageJa || e.message }));
+        return;
+      }
       res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ found: false, error: e.message }));
     }
@@ -6425,7 +6629,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   serveStatic(req, res, pathname);
-});
+}
 
 server.listen(PORT, () => {
   console.log(`soccer-analysis-ai-proxy: http://localhost:${PORT}/ で起動しました`);
