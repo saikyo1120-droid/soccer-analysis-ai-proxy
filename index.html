@@ -404,6 +404,27 @@
   .compare-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 14px; }
   @media (max-width: 760px) { .compare-cols { grid-template-columns: 1fr; } }
 
+  /* ---- 🧠 AIは昨日より賢くなったか(2026年8月7日) ----
+     件数ではなく「同じ質問への昨日と今日の答え」を読み比べてもらうカード。 */
+  .smarter-headline { font-size: 17px; font-weight: 700; line-height: 1.5; margin-bottom: 2px; }
+  .smarter-sub { font-size: 13px; color: var(--text-secondary); margin-top: 2px; }
+  .smarter-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 760px) { .smarter-grid { grid-template-columns: 1fr; } }
+  .smarter-q { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--surface-1); }
+  .smarter-q-head { font-size: 13.5px; font-weight: 600; color: var(--text-primary); margin-bottom: 6px; }
+  .smarter-badge { display: inline-block; font-size: 11.5px; font-weight: 700; padding: 3px 9px; border-radius: 999px; margin-bottom: 6px; }
+  .smarter-new { background: var(--series-3-wash); color: var(--series-3); }
+  .smarter-line { margin: 6px 0 2px; }
+  .smarter-tag { font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 4px; }
+  .smarter-tag-new { background: var(--series-3-wash); color: var(--series-3); }
+  .smarter-tag-chg { background: var(--series-home-wash); color: var(--series-home); }
+  .smarter-tag-ai { background: var(--surface-2); color: var(--text-secondary); }
+  .smarter-tag-lost { background: rgba(208,59,59,0.12); color: var(--critical); }
+  .smarter-list { margin: 4px 0 0; padding-left: 18px; font-size: 12.5px; line-height: 1.75; }
+  .smarter-old { color: var(--text-muted); text-decoration: line-through; }
+  .smarter-newv { color: var(--text-primary); font-weight: 700; }
+  .smarter-quote { font-size: 12.5px; line-height: 1.7; background: var(--surface-2); border-radius: 8px; padding: 8px 10px; margin-top: 4px; }
+
   /* ---- 2026年8月7日・UI監査で見つかった「スマホで押しにくい」の修正 ----
      実測: モード切替タブ・レベル切替・「分析する ▶」・質問チップなどが
      高さ 31〜34px しかなかった。Apple は44px、Google は48px を推奨しており、
@@ -492,6 +513,21 @@
       <button class="icon-btn" id="themeToggle">🌙 ダーク</button>
     </div>
   </header>
+
+  <!-- ================================================================
+       2026年8月7日・ご指摘への対応(いちばん重要):
+         「AIは裏では学習しているらしい。でも利用者から見ると
+           昨日と今日の違いが分からない」
+       件数を並べても伝わらない。ここに出すのは1つだけ:
+         **同じ質問に、昨日のAIと今日のAIがそれぞれ何と答えたか**
+       これは利用者が自分の目で確かめられるし、比べられる。
+       中身は /api/qa/latest(毎日の学習の直後にサーバー自身が実行した
+       自動検証の結果)をそのまま読むだけで、この画面が新しい計算を
+       起こすことはない。 -->
+  <div class="card" id="smarterCard" style="padding:16px 18px; border:2px solid var(--series-3);">
+    <h2 style="margin:0 0 4px;">🧠 AIは昨日より賢くなったか</h2>
+    <div id="smarterBody" class="muted" style="font-size:13px;">確認中…</div>
+  </div>
 
   <!-- 2026年8月・利用者目線ラウンド: 「AIは今日の試合をどう予想しているのか」を
        開いた瞬間(5秒以内)に見せる。中身は毎朝の学習でAI自身のモデルが生成・
@@ -7854,6 +7890,164 @@ async function renderDailyReportWidget() {
      ・移籍・調子の変化(実測から検知したものだけ)
    「Knowledge +54件」のような、利用者が確かめようのない件数は出さない。
    ========================================================= */
+/* ================================================================
+   🧠 AIは昨日より賢くなったか
+   ----------------------------------------------------------------
+   ご指摘: 「AIは裏では学習しているらしい。でも利用者から見ると
+            昨日と今日の違いが分からない」
+
+   ここに出すのは、件数ではなく **同じ質問への昨日と今日の答え** です。
+   利用者が自分で読み比べられるものだけを並べます。
+   中身は /api/qa/latest(学習の直後にサーバー自身が実行した自動検証)の
+   読み出しだけで、この画面が新しい計算を起こすことはありません。
+   ================================================================ */
+const SMARTER_ICONS = {
+  player_kubo: "👤", club_arsenal: "🛡️", club_mancity: "🛡️",
+  today_fixtures: "⚽", featured_players: "⭐", young_prospects: "🌱",
+  injuries: "🏥", transfers: "🔁",
+};
+
+function smarterQuestionBlock(it, esc) {
+  const icon = SMARTER_ICONS[it.id] || "❓";
+  const rows = [];
+
+  // 「昨日は答えられなかった」を最初に見せる(いちばん分かりやすい成長)
+  if (it.newlyAnswerable) {
+    rows.push(`<div class="smarter-badge smarter-new">昨日は答えられませんでした → 今日は答えられます</div>`);
+  }
+
+  // 新しく言えるようになったこと
+  if (it.newFacts && it.newFacts.length) {
+    rows.push(`<div class="smarter-line"><span class="smarter-tag smarter-tag-new">今日から言えること</span></div>`);
+    rows.push(`<ul class="smarter-list">${it.newFacts.map((f) =>
+      `<li><b>${esc(f.k)}</b>: ${esc(f.v)}</li>`).join("")}</ul>`);
+  }
+  // 値が変わったこと(昨日 → 今日)
+  if (it.changedFacts && it.changedFacts.length) {
+    rows.push(`<div class="smarter-line"><span class="smarter-tag smarter-tag-chg">数字が新しくなったこと</span></div>`);
+    rows.push(`<ul class="smarter-list">${it.changedFacts.map((f) =>
+      `<li><b>${esc(f.k)}</b>: <span class="smarter-old">${esc(f.from)}</span> → <span class="smarter-newv">${esc(f.to)}</span></li>`).join("")}</ul>`);
+  }
+  // 言えなくなったこと(後退)も、質問ごとに必ず出す
+  if (it.lostFacts && it.lostFacts.length) {
+    rows.push(`<div class="smarter-line"><span class="smarter-tag smarter-tag-lost">今日は言えなくなったこと</span></div>`);
+    rows.push(`<ul class="smarter-list">${it.lostFacts.map((f) =>
+      `<li><b>${esc(f.k)}</b>: ${esc(f.v)}</li>`).join("")}</ul>`);
+  }
+  // AI自身の言葉(クラブへの見解)が変わった場合
+  if (it.aiWordsChanged && it.aiWordsYesterday && it.aiWordsToday) {
+    rows.push(`<div class="smarter-line"><span class="smarter-tag smarter-tag-ai">AI自身の見方</span></div>`);
+    rows.push(`<div class="smarter-quote"><div><span class="muted">昨日:</span> ${esc(it.aiWordsYesterday)}</div>
+      <div style="margin-top:4px;"><span class="muted">今日:</span> <b>${esc(it.aiWordsToday)}</b></div></div>`);
+  }
+
+  if (!rows.length) {
+    rows.push(`<div class="value-note">${esc(
+      it.canAnswerToday === false
+        ? (it.reasonJa || "まだ答えられません。")
+        : it.hadYesterday
+          ? `昨日と同じ内容です(${it.factCountToday}項目)。この質問については新しい情報が入っていません。`
+          : "昨日の記録が無いため、比較できません。")}</div>`);
+  }
+
+  return `<div class="smarter-q">
+    <div class="smarter-q-head">${icon} ${esc(it.questionJa)}${it.subjectJa ? ` <span class="muted">(${esc(it.subjectJa)})</span>` : ""}</div>
+    ${it.volatile ? `<div class="value-note" style="margin:-2px 0 6px;">毎日必ず顔ぶれが変わるため、「増えた数」には入れていません。</div>` : ""}
+    ${rows.join("")}
+  </div>`;
+}
+
+async function renderSmarterCard() {
+  const el = document.getElementById("smarterBody");
+  if (!el) return;
+  const esc = escapeHtml;
+  let d = null;
+  try {
+    d = await fetchJsonWithTimeout(`${API_PROXY_BASE}/qa/latest`,
+      backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { d = null; }
+
+  if (!d) {
+    el.textContent = "サーバーに接続できないため、昨日との比較を読み込めませんでした。";
+    return;
+  }
+  if (d.available === false) {
+    el.innerHTML = `<div class="value-note">${esc(d.reasonJa || "自動検証がまだ走っていません。")}</div>`;
+    return;
+  }
+
+  const diff = (d.answers && d.answers.diff) || {};
+  const learning = d.learning || {};
+  const parts = [];
+
+  /* ---- 一行結論(いちばん上・大きく) ---- */
+  const grew = diff.grew;
+  const headline = grew === true
+    ? `はい。昨日は言えなかったことを ${diff.newFactTotal}件 言えるようになりました。`
+    : grew === false
+      ? "いいえ。昨日から言えることが増えていません。"
+      : "まだ判定できません(昨日の記録がありません)。";
+  const headColor = grew === true ? "var(--good)" : grew === false ? "var(--warning)" : "var(--text-secondary)";
+  parts.push(`<div class="smarter-headline" style="color:${headColor};">${esc(headline)}</div>`);
+  if (grew === true && diff.newlyAnswerableCount > 0) {
+    parts.push(`<div class="smarter-sub">そのうち ${diff.newlyAnswerableCount}問 は、昨日はまったく答えられなかった質問です。</div>`);
+  }
+  if (diff.changedFactTotal > 0) {
+    parts.push(`<div class="smarter-sub">さらに ${diff.changedFactTotal}件 の数字が新しくなりました。</div>`);
+  }
+  // 監査での指摘: 増えた話だけを出し、減った話を隠していた。
+  // 索引が壊れて選手が消えた日でも前向きな見出しが出てしまうため、必ず併記する。
+  if (diff.lostFactTotal > 0) {
+    parts.push(`<div class="smarter-sub" style="color:var(--warning);">いっぽうで、昨日は言えたのに今日は言えなくなったことが ${diff.lostFactTotal}件 あります。</div>`);
+  }
+  const gr = d.growth || {};
+  if (gr.droppedCount > 0 && gr.dropReasonJa) {
+    parts.push(`<div class="smarter-sub" style="color:var(--critical);">⚠️ ${esc(gr.dropReasonJa)}</div>`);
+  }
+  if (d.storageFailedJa) {
+    parts.push(`<div class="smarter-sub" style="color:var(--critical);">⚠️ ${esc(d.storageFailedJa)}</div>`);
+  }
+
+  /* ---- 同じ質問への、昨日と今日の答え ---- */
+  parts.push(`<h3 class="sim-subhead" style="margin-top:14px;">📋 毎日ぶつけている同じ質問への答え</h3>`);
+  parts.push(`<p class="value-note" style="margin:-4px 0 8px;">毎日まったく同じ8つの質問をAIに投げて、答えられる中身がどう変わったかを記録しています。${
+    diff.countingNoteJa ? esc(diff.countingNoteJa) : ""}</p>`);
+  const items = diff.items || [];
+  if (!items.length) {
+    parts.push(`<div class="value-note">${esc(diff.verdictJa || "まだ記録がありません。")}</div>`);
+  } else {
+    parts.push(`<div class="smarter-grid">${items.map((it) => smarterQuestionBlock(it, esc)).join("")}</div>`);
+  }
+
+  /* ---- 学習そのものの状態(隠さない) ---- */
+  parts.push(`<h3 class="sim-subhead" style="margin-top:14px;">🔧 学習そのものの状態</h3>`);
+  const okMark = learning.ok ? "✅" : "⚠️";
+  parts.push(`<p class="value-note">${okMark} ${esc(learning.reasonJa || "学習の状態を確認できませんでした。")}</p>`);
+  if (learning.available && !learning.finished && learning.stoppedAtJa) {
+    parts.push(`<p class="value-note">止まっている段階: <b>${esc(learning.stoppedAtJa)}</b>(全${learning.expectedStageCount}段階中 ${learning.reachedStageCount}段階まで)</p>`);
+  }
+
+  /* ---- 見つけた異常と、その場で直したこと ---- */
+  const an = d.anomalies || {};
+  if (an.foundCount > 0) {
+    parts.push(`<h3 class="sim-subhead" style="margin-top:14px;">🩺 見つけた異常と、その場で直したこと</h3>`);
+    parts.push(`<p class="value-note">${an.foundCount}件 見つけ、${an.fixedCount}件 を自動で直しました${
+      an.remainingCount ? `。まだ ${an.remainingCount}件 残っています。` : "(残り0件)。"}</p>`);
+    const logs = [];
+    (an.repairLog || []).forEach((r) => (r.actions || []).forEach((a) => {
+      logs.push(`<li>${a.ok ? "✅" : "❌"} ${esc(a.resultJa || "")}</li>`);
+    }));
+    if (logs.length) parts.push(`<ul class="smarter-list">${logs.join("")}</ul>`);
+    if (an.remainingCount) {
+      parts.push(`<ul class="smarter-list">${(an.remaining || []).map((r) =>
+        `<li>⚠️ <b>${esc(r.labelJa)}</b>: ${esc(r.detailJa || "")}${r.repairNoteJa ? ` <span class="muted">(${esc(r.repairNoteJa)})</span>` : ""}</li>`).join("")}</ul>`);
+    }
+  }
+
+  parts.push(`<p class="value-note" style="margin-top:12px;">${esc(d.honestyJa || "")}</p>`);
+  el.innerHTML = parts.join("");
+}
+
 async function renderDailyDiff() {
   const el = document.getElementById("dailyDiffBody");
   if (!el) return;
@@ -7972,6 +8166,7 @@ async function renderDailyDiff() {
   });
 }
 
+renderSmarterCard();
 renderDailyDiff();
 renderDailyReportWidget();
 renderTodayPredictionsHero();

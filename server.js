@@ -41,6 +41,7 @@ const { generateLLM, currentProviderName } = require("./llm");
 const { createKnowledgeStore } = require("./knowledge/knowledgeStore");
 const { createRelationshipIndex } = require("./knowledge/relationshipIndex");
 const { createMemoryStore } = require("./memory/memoryStore");
+const { createAutoQA } = require("./learning/autoQA");
 const { createClubProfileEngine } = require("./knowledge/clubProfileEngine");
 const { buildEvidencePool } = require("./reasoning/evidencePool");
 const { assembleReasoning, formatReasoningForPrompt } = require("./reasoning/reasoningEngine");
@@ -51,7 +52,7 @@ const { deliberate } = require("./reasoning/deliberation");
 // 依存(callApiFootball/resolveTeamId/Upstashアクセス関数)は、このファイル自身が
 // 定義した後にまとめて注入する(利用箇所は下の方の「Stage D」セクションを参照)。
 let { runDailyLearning } = require("./learning/dailyJob");   // テストで差し替えられるよう let
-const { getGrowthLog, getRecentFactsForTeam, computeFormScore, OWN_PREDICT_LOG_CAP: OWN_PREDICT_LOG_CAP_DISPLAY } = require("./learning/dailyJob");
+const { getGrowthLog, getRecentFactsForTeam, computeFormScore, LEARNING_STAGES, OWN_PREDICT_LOG_CAP: OWN_PREDICT_LOG_CAP_DISPLAY } = require("./learning/dailyJob");
 // 2026年8月・優先順位⑨: 「今日追加した知識0件」が正常な0件(前回から変化なし)
 // なのか、異常な0件(未実行・キー未設定・予算切れ等)なのかを実データから判定する。
 const { diagnoseZeroKnowledge, diagnoseZeroVerification, getRunHistory, buildEngineStatuses } = require("./learning/healthCheck");
@@ -519,7 +520,26 @@ function getApiPlanInfo() {
 // 第8次監査(Medium)の修正: Proプラン予算では1回のジョブが数百APIリクエスト+
 // LLM呼び出しで10分を超え得るため、既定10分ではロック失効後に別プロセスと
 // 並走し得た(解決の二重実行の引き金)。既定を30分に延長する。
-const DAILY_RUN_LOCK_SECONDS = Number(process.env.DAILY_RUN_LOCK_SECONDS) || 1800; // 既定30分
+// ---- 2026年8月7日・本番実測で判明した「学習が完走しない」の修正 ----
+//   実測: /api/learning/progress が「まだ進捗の記録がありません」のまま
+//   (= runDailyLearning が1度も開始できていない)。一方で選手の収集
+//   (自己修復)は動いており、索引は 1,433人 → 1,818人 に増えていた。
+//   つまり「短い処理は通るが、長い処理だけが通らない」状態だった。
+//
+//   原因は2つ重なっていた。
+//     (1) 実行ロックの寿命(30分)が、学習の所要時間(約40分)より短い。
+//         学習の途中でロックが切れ、別のリクエストが二重に学習を始められた。
+//         逆に、学習が数秒で失敗したときはロックが30分残り、その間は
+//         再試行が一切できなかった。
+//     (2) Renderの無料プランは、外から来るリクエストが15分ほど無いと
+//         インスタンスを停止する。学習は裏で40分走るが、その間
+//         誰もアクセスしなければ **途中で丸ごと落とされる**。
+//         短い処理(索引づくり0.1秒・収集12秒)だけが生き残っていたのは、
+//         これが理由。
+const DAILY_RUN_LOCK_SECONDS = Number(process.env.DAILY_RUN_LOCK_SECONDS) || 5400; // 既定90分(学習の所要時間+余裕)
+// このプロセスのこの起動を識別する値(実行ロックの持ち主判定に使う)
+const PROCESS_RUN_ID = `${process.pid}-${Math.floor(Date.now() / 1000)}-${String(process.hrtime.bigint() % 100000000n)}`;
+let dailyRunLockToken = null;
 
 // 第7次監査で発見した欠陥への対応:
 //   AUTO_COLLECT_SECRET を設定していない場合(手順書での既定)、
@@ -554,14 +574,71 @@ async function tryAcquireDailyRunLock() {
   }
   try {
     const key = `learn:runlock:${appDateKey()}`;
-    const result = await upstashCmd(["SET", key, new Date().toISOString(), "NX", "EX", String(DAILY_RUN_LOCK_SECONDS)]);
+    // ---- 監査の指摘: ロックに持ち主の印が無く、誰でも消せた ----
+    //   デプロイで2つのインスタンスが重なった瞬間に、新しい方が
+    //   「止まっている」と誤判定して **走行中のロックを消して** 二重起動できた。
+    //   このプロセスのこの実行だけが分かる印を書き込み、外すときに突き合わせる。
+    const token = `${PROCESS_RUN_ID}:${Date.now()}`;
+    const result = await upstashCmd(["SET", key, token, "NX", "EX", String(DAILY_RUN_LOCK_SECONDS)]);
     // Upstashは取得成功で "OK"、既に存在して書き込まなかった場合は null を返す
-    return { acquired: result === "OK" || result === true, skipped: false };
+    const acquired = result === "OK" || result === true;
+    if (acquired) dailyRunLockToken = token;
+    return { acquired, skipped: false, token: acquired ? token : null };
   } catch (e) {
     // ロックの取得可否が判断できない場合は、学習が一切動かなくなる方が困るため
     // 実行を許可する(安全側=可用性優先)。
     return { acquired: true, skipped: true, reasonJa: `実行ロックを確認できませんでした(${e.message})。` };
   }
+}
+
+// 学習が終わったら実行ロックを外す。
+// 自分が取ったロックだけを外す(他のプロセスの走行中のロックを消さない)。
+// force=true は「前の実行が落ちたまま残った印を片づける」場合だけに使う。
+async function releaseDailyRunLock(opts) {
+  if (!UPSTASH_ENABLED) return { released: false, reasonJa: "Upstash未設定" };
+  const key = `learn:runlock:${appDateKey()}`;
+  const force = !!(opts && opts.force);
+  try {
+    if (!force) {
+      const cur = await upstashCmd(["GET", key]).catch(() => null);
+      if (cur && dailyRunLockToken && String(cur) !== String(dailyRunLockToken)) {
+        // 別のプロセスが持っているロックなので触らない
+        return { released: false, reasonJa: "このロックは別の実行が持っているため、外しませんでした。" };
+      }
+    }
+    await upstashCmd(["DEL", key]);
+    dailyRunLockToken = null;
+    return { released: true };
+  } catch (e) { return { released: false, reasonJa: "ロックを外せませんでした(寿命で自動的に消えます)。" }; }
+}
+
+// ---- Renderの無料プランでの「途中で落とされる」対策 ----
+// 外から来るリクエストが一定時間無いとインスタンスが停止するため、
+// 長い処理(学習)が走っている間だけ、自分自身の公開URLを定期的に叩いて
+// 「使われている」状態を保つ。外部APIは1回も使わない。
+// 走るのは学習中だけ・最大時間つき(暴走しない)。
+const KEEP_AWAKE_INTERVAL_MS = Number(process.env.KEEP_AWAKE_INTERVAL_MS) || 4 * 60 * 1000;
+const KEEP_AWAKE_MAX_MS = Number(process.env.KEEP_AWAKE_MAX_MS) || 100 * 60 * 1000;
+function startKeepAwake(labelJa) {
+  const base = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_BASE_URL || "";
+  if (!base) {
+    console.log("[keep-awake] 公開URLが分からないため実行しません(RENDER_EXTERNAL_URLが未設定)。");
+    return () => {};
+  }
+  const startedAt = Date.now();
+  let pings = 0;
+  const timer = setInterval(() => {
+    if (Date.now() - startedAt > KEEP_AWAKE_MAX_MS) { clearInterval(timer); return; }
+    pings++;
+    fetchWithTimeout(`${base.replace(/\/$/, "")}/api/health?keepawake=1`, {}, 10000)
+      .catch(() => { /* 失敗しても本処理には影響しない */ });
+  }, KEEP_AWAKE_INTERVAL_MS);
+  if (typeof timer.unref === "function") timer.unref();
+  console.log(`[keep-awake] start (${labelJa})`);
+  return () => {
+    clearInterval(timer);
+    console.log(`[keep-awake] stop (${labelJa}) pings=${pings} elapsedMin=${Math.round((Date.now() - startedAt) / 60000)}`);
+  };
 }
 
 // ============================================================================
@@ -2413,11 +2490,20 @@ function runInBackgroundCtx(fn) {
   });
 }
 // 応答を返し終わってから、実際に使った回数だけ引く
+const HEAVY_BUDGET_MAX_IPS = 20000; // このファイルの他の表(rateBuckets等)と同じ考え方の上限
 function chargeHeavyBudget(ip, calls, pathname) {
   if (!calls || calls <= 0) return;
   const counts = heavyBudgetToday();
   const key = ip || "unknown";
   counts.set(key, (counts.get(key) || 0) + calls);
+  // 監査の指摘: この表だけ上限が無く、10万人が来た日は日付が変わるまで
+  // 全員ぶんを持ち続けていた(512MBのメモリに対して無視できない)。
+  // あふれたら、使用量の少ない順に捨てる(上限に近い人ほど守る価値がある)。
+  if (counts.size > HEAVY_BUDGET_MAX_IPS) {
+    const sorted = [...counts.entries()].sort((a, b) => a[1] - b[1]);
+    const drop = counts.size - Math.floor(HEAVY_BUDGET_MAX_IPS * 0.9);
+    for (let i = 0; i < drop; i++) counts.delete(sorted[i][0]);
+  }
   if (pathname) heavyPathObserved.set(pathname, Math.max(heavyPathObserved.get(pathname) || 0, calls));
 }
 
@@ -2796,6 +2882,12 @@ const LEARN_SWEEP_CHECK_INTERVAL_MS = Number.isFinite(Number(process.env.LEARN_S
   ? Number(process.env.LEARN_SWEEP_CHECK_INTERVAL_MS) : 15 * 60 * 1000;
 // 1日1回の処理なので、24時間+余裕の26時間で「明らかに止まっている」と判断する
 const LEARN_SWEEP_STALE_MS = Number(process.env.LEARN_SWEEP_STALE_MS) || 26 * 60 * 60 * 1000;
+// 学習の進捗がこれだけ更新されなければ「途中で落ちた」とみなして拾い直す。
+// (1つの段階が長くても十数分なので、35分止まっていれば生きていない)
+const LEARN_STALLED_MS = Number(process.env.LEARN_STALLED_MS) || 35 * 60 * 1000;
+// 止まった学習を拾い直せる回数の上限(1日あたり)。
+// 壊れていて何度やっても完走しない場合に、無限に走り続けないため。
+const LEARN_STALLED_RETRY_CAP_PER_DAY = Number(process.env.LEARN_STALLED_RETRY_CAP_PER_DAY) || 2;
 
 // 逃げ道: 自動起動を止めたい環境(テスト・検証用の複製など)では 0 を指定する
 const SELF_HEAL_DAILY_LEARNING = process.env.SELF_HEAL_DAILY_LEARNING !== "0";
@@ -2845,6 +2937,51 @@ async function maybeSelfHealDailyLearning() {
     const ranMs = latest && latest.ranAt ? new Date(latest.ranAt).getTime() : null;
     const age = Number.isFinite(ranMs) ? now - ranMs : Infinity;
     let reason = age >= LEARN_SWEEP_STALE_MS ? "stale" : null;
+    // ---- 2026年8月7日追加: 「始まったのに終わっていない」学習を拾い直す ----
+    //   Renderの無料プランでインスタンスが停止させられると、学習は途中で
+    //   消える。growthlog は更新されないので上の判定では拾えるが、26時間も
+    //   待つことになる。進捗(learn:progress)の最終更新が止まっていれば、
+    //   それは落ちた証拠なので、待たずに拾い直す。
+    if (!reason) {
+      const prog = await upstashGetJSON("learn:progress").catch(() => null);
+      if (prog && prog.finished === false && prog.at) {
+        const sinceStage = now - new Date(prog.at).getTime();
+        // ---- 2026年8月7日・監査で見つかった誤判定 ----
+        //   この分岐に来るのは「growthlogが新しい」= 直近に学習が完走した証拠が
+        //   ある場合だけ。完走したのに最後の進捗の書き込みだけ失敗すると
+        //   (Upstashの一時的な失敗・書き込みの直後に再デプロイ)、
+        //   進捗は finished:false のまま残る。旧実装はそれを「止まっている」と
+        //   判定し、**完走した学習をもう一度まるごと走らせて** いた
+        //   (API-Footballの消費が倍になる)。しかも回数の上限が無かった。
+        //   進捗の開始時刻より後に完走の記録があるなら、それは完走している。
+        const progStartedMs = prog.startedAt ? new Date(prog.startedAt).getTime() : null;
+        const finishedAfterThisRun = Number.isFinite(ranMs) && Number.isFinite(progStartedMs) && ranMs >= progStartedMs;
+        if (finishedAfterThisRun) {
+          // 完走の記録の方が新しい = 進捗の書き込みだけが失敗した。走らせ直さない。
+          console.log("[self-heal daily-learning] progress looks stale but growth log is newer; treating as finished");
+        } else if (Number.isFinite(sinceStage) && sinceStage >= LEARN_STALLED_MS) {
+          // 1日に何度も拾い直さない(壊れていて何度やっても完走しない場合の暴走防止)
+          let allowed = true;
+          try {
+            const rk = `learn:stalledretry:${appDateKey()}`;
+            const n = await upstashCmd(["INCR", rk]);
+            await upstashCmd(["EXPIRE", rk, "172800"]).catch(() => {});
+            if (Number(n) > LEARN_STALLED_RETRY_CAP_PER_DAY) {
+              allowed = false;
+              console.log(`[self-heal daily-learning] stalled retry cap reached (${LEARN_STALLED_RETRY_CAP_PER_DAY}/day)`);
+            }
+          } catch (e) { /* 数えられない場合は従来どおり許可する */ }
+          if (allowed) {
+            reason = "stalled";
+            console.log("[self-heal daily-learning] stalled run detected", JSON.stringify({
+              stage: prog.stage, stalledMin: Math.round(sinceStage / 60000),
+            }));
+            // 落ちた実行が握ったままの印を片づけてから取り直す
+            await releaseDailyRunLock({ force: true });
+          }
+        }
+      }
+    }
     // 索引まわりの修復は、学習が古いかどうかとは無関係に必ず確認する
     // (「学習が古い」ときにだけ見ていると、学習が新しい日に索引が欠けたままになる)
     await maybeRepairPlayerIndex();
@@ -2860,12 +2997,12 @@ async function maybeSelfHealDailyLearning() {
     if (!lock.acquired) return;
     dailyLearningRunning = true;
     console.log("[self-heal daily-learning] starting", JSON.stringify({
-      reason,
+      reason, reasonJa: reason === "stalled" ? "前回の学習が途中で止まっていたため拾い直します" : "最後の学習から時間が経っているため実行します",
       lastRanAt: latest && latest.ranAt ? latest.ranAt : null,
       hoursSince: Number.isFinite(age) ? Math.round(age / 3600000) : null,
     }));
     // 応答は既に返しているので、ここから先は利用者を待たせない
-    runDailyLearning(learningDeps)
+    runDailyLearningThenQA(learningDeps)
       .then((r) => {
         console.log("[self-heal daily-learning] done", JSON.stringify({
           ok: r && r.ok, date: r && r.date,
@@ -2877,6 +3014,79 @@ async function maybeSelfHealDailyLearning() {
   } catch (e) {
     dailyLearningRunning = false;
   }
+}
+
+// ---- 2026年8月7日・ご指示: 毎日の学習が終わった直後に、必ず自動QAを走らせる ----
+// 学習の入口が複数(GitHub Actions / 自己修復 / 手動)あるため、
+// **すべての入口がこの関数を通る**ようにして、走らせ忘れを構造的に無くす。
+// 自動QAが失敗しても学習の結果は返す(QAは学習の成果を壊してはいけない)。
+async function runDailyLearningThenQA(deps) {
+  // Renderの無料プランで途中停止させられないよう、学習中だけ自分を起こしておく
+  // 自動QA(索引の作り直し・追加収集を含む)が終わるまで起こしておく
+  const stopKeepAwake = startKeepAwake("毎日の学習と自動QA");
+  let result;
+  try {
+    result = await runDailyLearning(deps);
+  } catch (e) {
+    // ---- 失敗した場合だけロックを外す ----
+    //   失敗した日にロックが90分残ると、その間まったく再試行できない。
+    //   成功した場合は外さない: ロックは「今日はもう走った」という印なので、
+    //   GitHub Actions の再送(curl --retry)で二重に走らせないために残す。
+    //   (途中で落ちて外せなかった場合は、進捗が35分止まったのを見て
+    //    maybeSelfHealDailyLearning が外す)
+    await releaseDailyRunLock();
+    stopKeepAwake();
+    throw e;
+  }
+  try {
+    const qa = await runAutoQANow({ repairRounds: 2 });
+    console.log("[autoQA] after learning", JSON.stringify({
+      ok: qa && qa.ok,
+      finished: qa && qa.learning ? qa.learning.finished : null,
+      newFacts: qa && qa.answers && qa.answers.diff ? qa.answers.diff.newFactTotal : null,
+      anomalies: qa && qa.anomalies ? qa.anomalies.remainingCount : null,
+    }));
+    if (result && typeof result === "object") result.autoQA = { ok: qa && qa.ok, verdictJa: qa && qa.verdictJa };
+  } catch (e) {
+    console.error("[autoQA failed]", e && e.message);
+    if (result && typeof result === "object") result.autoQA = { ok: false, errorJa: `自動QAの実行に失敗しました: ${e.message}` };
+  } finally {
+    stopKeepAwake();
+  }
+  return result;
+}
+
+// 自動QAが「学習が完走していない」を検知したときに呼ぶ、学習の再起動。
+// 二重起動の防止は既存のロックをそのまま使う(新しい経路は作らない)。
+// 学習は数分かかるため、ここでは起動だけして待たない。
+const QA_LEARNING_RESTART_CAP_PER_DAY = 2;
+async function triggerDailyLearningForRepair() {
+  if (dailyLearningRunning) return { started: false, reasonJa: "学習は既に実行中です。" };
+  // 無限ループ防止: 学習 → 自動QA → 学習を再起動 → 自動QA … と回り続けないよう、
+  // 自動QAから学習を起動できる回数を1日あたりで制限する。
+  // (学習が壊れていて何度やっても完走しない場合、回し続けても直らないため)
+  // ---- 監査の指摘: 実行権を取れないときにも1日の回数だけ消費していた ----
+  //   GitHub Actionsが学習中だと、自動QAは1度も起動していないのに
+  //   「本日はすでに2回起動し直しました」になり、その日は本当に必要な
+  //   再起動ができなくなっていた。**先に実行権を取ってから数える**。
+  const lock = await tryAcquireDailyRunLock();
+  if (!lock.acquired) return { started: false, reasonJa: "別のプロセスが学習の実行権を持っています。" };
+  if (UPSTASH_ENABLED) {
+    const key = `qa:repair:learning:${appDateKey()}`;
+    const n = await upstashCmd(["INCR", key]).catch(() => null);
+    await upstashCmd(["EXPIRE", key, "172800"]).catch(() => {});
+    if (Number(n) > QA_LEARNING_RESTART_CAP_PER_DAY) {
+      // 取った実行権は返す(他の経路が使えるように)
+      await releaseDailyRunLock({ force: true });
+      return { started: false, reasonJa: `本日はすでに${QA_LEARNING_RESTART_CAP_PER_DAY}回、自動で学習を起動し直しました。それでも完走していないため、これ以上は自動で繰り返しません(人による確認が必要です)。` };
+    }
+  }
+  dailyLearningRunning = true;
+  runInBackgroundCtx(() => runDailyLearningThenQA(learningDeps)
+    .then((r) => console.log("[autoQA repair daily-learning] done", JSON.stringify({ ok: r && r.ok })))
+    .catch((e) => console.error("[autoQA repair daily-learning failed]", e && e.message))
+    .finally(() => { dailyLearningRunning = false; }));
+  return { started: true, reasonJa: "毎日の学習を起動しました(完走までは時間がかかります)。" };
 }
 
 // ---- 試合分析AI: 予測ロジックAPI化(Stage B) ----
@@ -3530,6 +3740,105 @@ const relationshipIndex = createRelationshipIndex({
 const memoryStore = createMemoryStore({
   upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
 });
+
+// ---- 2026年8月7日・ご指示: 毎日の学習が終わった直後に、サーバー自身が
+//      「本当に昨日より賢くなったか」を自動で検証する(autoQA.js)。
+//      異常を見つけたら直せるものはその場で直し、直した後にもう一度測る。
+const autoQA = createAutoQA({
+  upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
+  appDateKey,
+  memoryStore, clubDossier, playerSearch,
+  loadPlayerIndex: (forceFresh) => loadPlayerIndex(forceFresh),
+  learningStages: LEARNING_STAGES,
+  registeredTeams: CLUB_UNIVERSE,
+  // 自己修復で呼べる処理。いずれも既存の仕組みをそのまま使う(新しい経路は作らない)。
+  repair: {
+    rebuildPlayerIndex: () => rebuildPlayerIndexNow({ reason: "autoQA" }),
+    collectPlayers: () => collectPlayersNow({ reason: "autoQA" }),
+    resolvePredictions: () => handleAutoCollectPredictions({ jobCall: true }).then((r) => (r && r.body) || r),
+    // 学習そのものの再実行は、二重実行を防ぐロックを持つ既存の入口を通す
+    runDailyLearning: () => triggerDailyLearningForRepair(),
+  },
+  now: () => Date.now(),
+});
+// 画面が実際に使う分だけを取り出して返す(応答を小さくするため)。
+// 「今日の答えの全文」「学習の全段階ログ」「反映確認の内訳」は
+// 調査用であって、カードは読まない。/api/qa/run では全部返す。
+function buildPublicQaReport(rep) {
+  const diff = (rep.answers && rep.answers.diff) || {};
+  const an = rep.anomalies || {};
+  const lr = rep.learning || {};
+  return {
+    ok: rep.ok === true,
+    available: true,
+    dateKey: rep.dateKey || null,
+    comparedWith: rep.comparedWith || null,
+    finishedAt: rep.finishedAt || null,
+    learning: {
+      ok: lr.ok === true, available: lr.available === true, finished: lr.finished === true,
+      date: lr.date || null, expectedStageCount: lr.expectedStageCount ?? null,
+      reachedStageCount: lr.reachedStageCount ?? null, stoppedAtJa: lr.stoppedAtJa || null,
+      reasonJa: lr.reasonJa || null,
+    },
+    answers: {
+      diff: {
+        hasYesterday: diff.hasYesterday === true,
+        grew: diff.grew === undefined ? null : diff.grew,
+        newFactTotal: diff.newFactTotal || 0,
+        changedFactTotal: diff.changedFactTotal || 0,
+        lostFactTotal: diff.lostFactTotal || 0,
+        newlyAnswerableCount: diff.newlyAnswerableCount || 0,
+        countingNoteJa: diff.countingNoteJa || null,
+        verdictJa: diff.verdictJa || null,
+        items: (diff.items || []).map((i) => ({
+          id: i.id, questionJa: i.questionJa, subjectJa: i.subjectJa || null, volatile: i.volatile === true,
+          hadYesterday: i.hadYesterday, canAnswerToday: i.canAnswerToday, newlyAnswerable: i.newlyAnswerable,
+          factCountToday: i.factCountToday, factCountYesterday: i.factCountYesterday,
+          newFacts: (i.newFacts || []).slice(0, 5),
+          changedFacts: (i.changedFacts || []).slice(0, 5),
+          lostFacts: (i.lostFacts || []).slice(0, 3),
+          aiWordsToday: i.aiWordsToday || null, aiWordsYesterday: i.aiWordsYesterday || null,
+          aiWordsChanged: i.aiWordsChanged === true,
+          reasonJa: i.reasonJa || null,
+        })),
+      },
+    },
+    growth: {
+      hasYesterday: (rep.growth && rep.growth.hasYesterday) === true,
+      increasedCount: (rep.growth && rep.growth.increasedCount) || 0,
+      droppedCount: (rep.growth && rep.growth.droppedCount) || 0,
+      dropReasonJa: (rep.growth && rep.growth.dropReasonJa) || null,
+      items: ((rep.growth && rep.growth.items) || []).filter((i) => i.delta !== null && i.delta !== 0),
+    },
+    anomalies: {
+      foundCount: an.foundCount || 0, fixedCount: an.fixedCount || 0, remainingCount: an.remainingCount || 0,
+      remaining: (an.remaining || []).slice(0, 8),
+      repairLog: (an.repairLog || []).map((r) => ({
+        round: r.round,
+        actions: (r.actions || []).map((a) => ({ ok: a.ok, labelJa: a.labelJa, resultJa: a.resultJa })),
+      })),
+    },
+    storageFailedJa: rep.storageFailedJa || null,
+    verdictJa: rep.verdictJa || null,
+    honestyJa: rep.honestyJa || null,
+  };
+}
+
+let autoQAInFlight = false;
+async function runAutoQANow(opts) {
+  if (autoQAInFlight) return { ok: false, alreadyRunning: true, reasonJa: "自動QAは既に実行中です。" };
+  autoQAInFlight = true;
+  try {
+    const rep = await autoQA.runAutoQA(opts || {});
+    // ---- 検証で見つかった不具合 ----
+    //   /api/qa/latest はRedisの無料枠を守るためキャッシュしている。
+    //   新しい結果が出たときに入れ替えないと、学習が完走した直後でも
+    //   画面には「まだ走っていません」が最大10分出続けていた。
+    //   出来たてを直接入れ替える(Redisは1回も追加で使わない)。
+    try { if (rep && rep.available) cacheSet("qa:latest:public", buildPublicQaReport(rep), 10 * 60 * 1000); } catch (e) { /* 表示の都合なので失敗しても続行 */ }
+    return rep;
+  } finally { autoQAInFlight = false; }
+}
 
 // ---- 2026年8月・知識拡張フェーズ: クラブ/選手のLayer2固定知識を「議論モードで
 // 実際に質問されたとき」にもオンデマンドで生成・キャッシュできるようにする
@@ -5415,8 +5724,25 @@ function readJsonBody(req) {
 }
 
 const server = http.createServer((req, res) => {
-  // 実測課金のため、1リクエストの処理全体を専用の箱の中で走らせる
-  heavyCtx.run({ apiCalls: 0, jobOnly: false, ip: null }, () => { void handleHttpRequest(req, res); });
+  // 実測課金のため、1リクエストの処理全体を専用の箱の中で走らせる。
+  // 引き落としは「処理が最後まで終わったとき」に必ず1回だけ行う
+  // (利用者が途中で接続を切っても、サーバー側の処理は最後まで走るため)。
+  heavyCtx.run({ apiCalls: 0, jobOnly: false, ip: null, pathname: null }, () => {
+    const store = heavyCtx.getStore();
+    const settle = () => {
+      try { chargeHeavyBudget(store.ip, store.apiCalls, store.pathname); } catch (e) { /* 計測は本処理を妨げない */ }
+    };
+    handleHttpRequest(req, res).then(settle, (e) => {
+      settle();
+      try {
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ found: false, error: "internal error" }));
+        } else { res.end(); }
+      } catch (e2) { /* 応答が既に壊れている場合は何もできない */ }
+      console.error("[request failed]", (e && e.stack) || e);
+    });
+  });
 });
 
 async function handleHttpRequest(req, res) {
@@ -5452,21 +5778,16 @@ async function handleHttpRequest(req, res) {
       res.end(JSON.stringify({ found: false, ok: false, error: "daily quota reached", messageJa: heavy.messageJa }));
       return;
     }
-    // 応答を返し終わった時点で、このリクエストが実際に使った外部API回数だけ引く
+    // ---- 2026年8月7日・監査で見つかった課金逃れの穴 ----
+    //   応答の finish / close で引いていたが、Nodeは利用者が接続を切っても
+    //   処理を止めない。`curl -m 0.3` で切断し続けると、close が
+    //   「まだ外部APIを0回しか呼んでいない時点」で発火して確定してしまい、
+    //   そのあと11回呼んでも1回も引かれなかった。
+    //   → 引くのは「処理が最後まで終わったとき」に統一する
+    //     (handleHttpRequest を包んでいる側で必ず実行される)。
     {
       const store = heavyCtx.getStore();
-      if (store) {
-        store.ip = ip;
-        let charged = false;
-        const settle = () => {
-          if (charged) return;
-          charged = true;
-          // 裏で走る自己修復(jobCall)はここに入らないので、利用者の負担にはならない
-          try { chargeHeavyBudget(ip, store.apiCalls, pathname); } catch (e) { /* 計測は本処理を妨げない */ }
-        };
-        res.on("finish", settle);
-        res.on("close", settle);
-      }
+      if (store) { store.ip = ip; store.pathname = pathname; }
     }
     // 答え合わせと毎日の学習が止まっていないかを確認する(古すぎる場合だけ裏で走る)。
     // await しない = 利用者のリクエストは1ミリ秒も遅くならない。
@@ -5512,6 +5833,63 @@ async function handleHttpRequest(req, res) {
       // ---- 2026年8月7日・毎日の学習が「どこまで進んだか」を見る ----
       //   本番で「収集は進んだのに成長ログは前日のまま」= 途中で止まっている
       //   ことが分かったが、どこで止まったのかが分からなかった。
+      if (pathname === "/api/qa/latest") {
+        // 自動QAの最新結果(画面の「AIは昨日より賢くなったか」カードが読む)。
+        // ---- 2026年8月7日・監査で見つかった規模の問題 ----
+        //   このカードはトップページを開いた全員が読む。素で作ると
+        //   利用者1人につきRedisを1回使い、10万人規模で無料枠(1日10,000)を
+        //   即座に使い切る。中身は1日1回しか変わらないので、
+        //   このアプリで最もキャッシュに向いた値だった。
+        //   さらに、画面が使わない部分(今日の答えの全文・学習の全段階ログ)を
+        //   毎回送っていたため、応答が数十KBになっていた。必要な分だけ返す。
+        const qaCached = cacheGet("qa:latest:public");
+        if (qaCached) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
+          res.end(JSON.stringify(qaCached));
+          return;
+        }
+        const rep = await upstashGetJSON("qa:report:latest").catch(() => null);
+        const publicBody = rep ? buildPublicQaReport(rep) : {
+          ok: false, available: false,
+          reasonJa: "自動QAはまだ1度も走っていません(毎日の学習が完走した直後に自動で走ります)。",
+        };
+        // まだ結果が無い状態は、長く覚えない(初回の反映が遅れるため)
+        cacheSet("qa:latest:public", publicBody, rep ? 10 * 60 * 1000 : 60 * 1000);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
+        res.end(JSON.stringify(publicBody));
+        return;
+      }
+      if (pathname === "/api/qa/run") {
+        // 手動で自動QAを走らせる(保護付き)。異常があればこの中で自己修復まで行う。
+        const requiredSecret = process.env.AUTO_COLLECT_SECRET || "";
+        if (requiredSecret && parsed.searchParams.get("key") !== requiredSecret) {
+          res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "invalid or missing key" }));
+          return;
+        }
+        // ---- 監査で見つかった穴 ----
+        //   AUTO_COLLECT_SECRET を設定していない環境では誰でも叩けてしまい、
+        //   1回でRedisを100回以上使う処理を連打できた(隣の2つの
+        //   エンドポイントには同じ理由で既に絞りが入っている)。
+        //   鍵が無い場合は、1時間に1回だけに絞る。
+        if (!requiredSecret && UPSTASH_ENABLED) {
+          const lock = await upstashCmd(["SET", "qa:run:openlock", new Date().toISOString(), "NX", "EX", "3600"]).catch(() => null);
+          if (lock === null) {
+            res.writeHead(429, { "Content-Type": "application/json; charset=utf-8" });
+            res.end(JSON.stringify({
+              ok: false,
+              messageJa: "自動QAの手動実行は1時間に1回までです(保存先の無料枠を守るための制限です)。"
+                + "最新の結果は /api/qa/latest でいつでも読めます。",
+            }));
+            return;
+          }
+        }
+        const noRepair = parsed.searchParams.get("repair") === "0";
+        const rep = await runAutoQANow({ repairRounds: noRepair ? 0 : 2 });
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(rep));
+        return;
+      }
       if (pathname === "/api/learning/progress") {
         const prog = await upstashGetJSON("learn:progress").catch(() => null);
         const lastRebuild = await upstashGetJSON("kb:player:index:lastrebuild").catch(() => null);
@@ -5822,7 +6200,7 @@ async function handleHttpRequest(req, res) {
         if (parsed.searchParams.get("sync") === "1") {
           dailyLearningRunning = true;
           try {
-            const result = await runDailyLearning(learningDeps);
+            const result = await runDailyLearningThenQA(learningDeps);
             res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
             res.end(JSON.stringify(result));
           } finally {
@@ -5838,7 +6216,7 @@ async function handleHttpRequest(req, res) {
         dailyLearningRunning = true;
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify({ ok: true, started: true, message: "学習ジョブをバックグラウンドで開始しました。数分後に/api/growth-logで結果を確認してください。" }));
-        runDailyLearning(learningDeps)
+        runDailyLearningThenQA(learningDeps)
           .catch((e) => {
             console.error("[run-daily background error]", e && e.stack || e);
           })
