@@ -503,6 +503,15 @@
     <div id="aiAccuracyDetails" style="display:none; margin-top:10px;"></div>
   </div>
 
+  <!-- 2026年8月7日・ご指摘への対応:
+       「Knowledgeが増えた」「Memoryが増えた」と言われても利用者には
+       「だから何？」でしかない。ここには **利用者が自分で確かめられる変化**
+       だけを出す(実際のスコア・選手名・数値の差)。件数だけの指標は出さない。 -->
+  <div class="card" id="dailyDiffCard" style="padding:14px 18px; border:2px solid var(--accent);">
+    <h2 style="margin:0 0 6px;">📅 昨日から今日で変わったこと</h2>
+    <div id="dailyDiffBody" class="muted" style="font-size:13px;">読み込み中…</div>
+  </div>
+
   <!-- 2026年8月・「本当に毎日賢くなるAI」フェーズ(ご指示②):
        「学習しました」ではなく数字で証明する日次ダッシュボード。
        すべてサーバーの実測値(/api/learning/daily-report)をそのまま表示する。 -->
@@ -7801,6 +7810,136 @@ async function renderDailyReportWidget() {
     });
   }
 }
+
+/* =========================================================
+   2026年8月7日・「昨日と今日で何が変わったのか分からない」への対応
+   ---------------------------------------------------------
+   ここに出すのは、利用者が **自分で確かめられる変化** だけ。
+     ・実際のスコアと、AIの予想が当たったか外れたか
+     ・検索できる選手が何人増えたか(増えた選手の名前)
+     ・平均評価が動いた選手(数値の差つき)
+     ・移籍・調子の変化(実測から検知したものだけ)
+   「Knowledge +54件」のような、利用者が確かめようのない件数は出さない。
+   ========================================================= */
+async function renderDailyDiff() {
+  const el = document.getElementById("dailyDiffBody");
+  if (!el) return;
+  let d = null;
+  try {
+    d = await fetchJsonWithTimeout(`${API_PROXY_BASE}/daily-diff`,
+      backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { d = null; }
+  if (!d || !d.ok) {
+    el.textContent = "サーバーに接続できないため、昨日との違いを読み込めませんでした。";
+    return;
+  }
+  if (d.available === false) {
+    el.textContent = d.reasonJa || "昨日との比較ができません。";
+    return;
+  }
+  const esc = escapeHtml;
+  const parts = [];
+
+  parts.push(`<div style="font-size:14px; font-weight:600; color:var(--text-primary); margin-bottom:10px;">${esc(d.verdictJa || "")}</div>`);
+  if (d.firstDayJa) parts.push(`<div class="value-note" style="margin-bottom:10px;">${esc(d.firstDayJa)}</div>`);
+
+  /* ① 答え合わせできた試合 */
+  const p = d.predictions || {};
+  parts.push(`<h3 class="sim-subhead">⚽ 答え合わせできた試合(実際の結果)</h3>`);
+  if (p.available && p.items && p.items.length) {
+    parts.push(`<div class="ps-scroll"><table class="ps-table"><thead><tr>
+        <th>試合</th><th>実際の結果</th><th>AIの予想</th><th>判定</th></tr></thead><tbody>${
+      p.items.map((m) => `<tr>
+        <td>${esc(m.home)} vs ${esc(m.away)}<div class="muted" style="font-size:11.5px">${esc(m.league || "")}</div></td>
+        <td>${m.score ? `<b>${esc(m.score)}</b> ` : ""}${esc(m.actualWinnerJa)}</td>
+        <td>${esc(m.predictedWinnerJa)}</td>
+        <td>${m.correct ? '<span style="color:var(--good);font-weight:700">✅ 当たり</span>' : '<span style="color:var(--critical);font-weight:700">❌ 外れ</span>'}</td>
+      </tr>`).join("")}</tbody></table></div>`);
+    const dpt = p.accuracyDeltaPt;
+    parts.push(`<div class="value-note" style="margin-top:4px;">${p.resolvedCount}件中 ${p.hitCount}件が的中。`
+      + (p.accuracyBefore !== null && p.accuracyAfter !== null
+        ? ` 正答率 ${p.accuracyBefore}% → ${p.accuracyAfter}%${dpt !== null ? `(${dpt >= 0 ? "+" : ""}${dpt}pt)` : ""}`
+        : ` 現在の正答率 ${p.accuracyAfter !== null ? p.accuracyAfter + "%" : "測定前"}`)
+      + `</div>`);
+  } else {
+    parts.push(`<p class="value-note">${esc(p.reasonJa || "")}</p>`);
+  }
+
+  /* ② 検索できる選手 */
+  const pi = d.playerIndex || {};
+  parts.push(`<h3 class="sim-subhead" style="margin-top:14px;">🔍 検索できる選手</h3>`);
+  if (pi.countYesterday !== null && pi.countYesterday !== undefined) {
+    parts.push(`<p class="value-note"><b>${Number(pi.countYesterday).toLocaleString()}人 → ${Number(pi.countToday).toLocaleString()}人</b>`
+      + `(${pi.delta >= 0 ? "+" : ""}${pi.delta}人)・クラブ ${pi.clubsYesterday} → ${pi.clubsToday}</p>`);
+    if (pi.newlySearchable && pi.newlySearchable.length) {
+      parts.push(`<div class="chip-row" style="margin-top:4px;">`
+        + pi.newlySearchable.map((x) => `<button type="button" class="chip" data-diff-player="${esc(x.id)}">${esc(x.name)}<span style="opacity:.6;font-size:.85em;margin-left:4px">${esc(x.teamJa || "")}</span></button>`).join("")
+        + `</div><div class="value-note" style="margin-top:4px;">↑ 今日から新しく検索できるようになった選手です(押すと開きます)。</div>`);
+    }
+  } else {
+    parts.push(`<p class="value-note">現在 <b>${Number(pi.countToday || 0).toLocaleString()}人</b> を検索できます。${esc(pi.reasonJa || "")}</p>`);
+  }
+
+  /* ③ 平均評価が動いた選手 */
+  const pf = d.playerForm || {};
+  parts.push(`<h3 class="sim-subhead" style="margin-top:14px;">📈 平均評価が動いた選手(実測)</h3>`);
+  if (pf.available) {
+    const row = (x, dir) => `<li><button type="button" class="ps-link" data-diff-player="${esc(x.id)}">${esc(x.name)}</button>
+      <span class="muted" style="font-size:12px">${esc(x.teamJa || "")} ${x.from} → ${x.to}
+      <b style="color:${dir > 0 ? "var(--good)" : "var(--critical)"}">${x.delta > 0 ? "+" : ""}${x.delta}</b>(${x.days}日間)</span></li>`;
+    parts.push(`<div class="ps-two">
+      <div><div class="value-note" style="font-weight:600;">上がった選手</div>
+        ${pf.up.length ? `<ul class="ps-list">${pf.up.map((x) => row(x, 1)).join("")}</ul>` : '<p class="value-note">該当なし</p>'}</div>
+      <div><div class="value-note" style="font-weight:600;">下がった選手</div>
+        ${pf.down.length ? `<ul class="ps-list">${pf.down.map((x) => row(x, -1)).join("")}</ul>` : '<p class="value-note">該当なし</p>'}</div>
+    </div><div class="value-note" style="margin-top:4px;">${esc(pf.methodJa || "")}</div>`);
+  } else {
+    parts.push(`<p class="value-note">${esc(pf.reasonJa || "")}</p>`);
+  }
+
+  /* ④ 移籍・調子の変化 */
+  const cc = d.clubChanges || {};
+  parts.push(`<h3 class="sim-subhead" style="margin-top:14px;">🔁 クラブ・選手に起きた変化</h3>`);
+  if (cc.available) {
+    parts.push(`<ul class="ps-list">${cc.items.map((it) => `<li>${esc(it.name || "")}
+      <span class="muted" style="font-size:12px">${esc(it.teamJa || "")} — ${esc(it.labelJa || "")}: ${esc(it.detailJa || "")}</span></li>`).join("")}</ul>`);
+  } else {
+    parts.push(`<p class="value-note">${esc(cc.reasonJa || "")}</p>`);
+  }
+
+  /* ⑤ AIの見解が昨日から変わったクラブ(AI自身の言葉での差分) */
+  const av = d.aiViews || {};
+  parts.push(`<h3 class="sim-subhead" style="margin-top:14px;">🧠 AIのクラブ評価が変わったところ(AI自身の言葉)</h3>`);
+  if (av.available) {
+    parts.push(av.items.map((v) => `<div class="ps-sec" style="margin-bottom:10px;">
+        <div style="font-weight:600;">${esc(v.teamJa)}</div>
+        <div class="value-note" style="margin-top:2px;"><span style="opacity:.7">昨日まで:</span> ${esc(v.before)}</div>
+        <div style="font-size:13px; margin-top:2px;"><span class="muted">今日:</span> <b>${esc(v.after)}</b></div>
+        ${v.changeReasonJa ? `<div class="value-note" style="margin-top:2px;">変わった理由: ${esc(v.changeReasonJa)}</div>` : ""}
+      </div>`).join(""));
+    parts.push(`<div class="value-note">${esc(av.methodJa || "")}</div>`);
+  } else {
+    parts.push(`<p class="value-note">${esc(av.reasonJa || "")}</p>`);
+  }
+
+  /* ⑥ 学習と予測モデルの状態(ここだけは内部の話だが、止まっていたら分かるように) */
+  const lr = d.learningRun || {};
+  const md = d.model || {};
+  parts.push(`<h3 class="sim-subhead" style="margin-top:14px;">🧠 学習そのものの状態</h3>`);
+  parts.push(`<p class="value-note">${esc(lr.reasonJa || "")} ${esc(md.reasonJa || "")}</p>`);
+  parts.push(`<p class="value-note" style="margin-top:10px;">${esc(d.honestyJa || "")}</p>`);
+
+  el.innerHTML = parts.join("");
+  el.querySelectorAll("[data-diff-player]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      switchToPlayerMode();
+      await psEnsureInit();
+      await psOpenDetail(Number(btn.dataset.diffPlayer));
+    });
+  });
+}
+
+renderDailyDiff();
 renderDailyReportWidget();
 renderTodayPredictionsHero();
 // スカウト速報は「🔍 選手検索」画面の中にしか出ないカードなので、

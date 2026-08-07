@@ -1269,6 +1269,265 @@ async function resolvePrediction(fixtureId, homeGoals, awayGoals) {
 
 // ホーム画面に表示する「AI予測の実績」の集計値を返す。Upstash未設定の場合は
 // 正直に「記録なし」を返す(架空の数字は絶対に出さない)。
+/* ============================================================================
+   2026年8月7日・「昨日と今日で何が変わったのか、利用者に伝わらない」への対処
+   ----------------------------------------------------------------------------
+   ご指摘:
+     > Knowledge が増えた / Memory が増えた / RAG を実装した と言われても
+     > 利用者からすると「だから何？」という状態です。
+
+   まったくその通りで、これまで画面に出していたのは **内部の件数** だけだった。
+   件数をいくら出しても「賢くなった」は伝わらない。
+
+   ここで返すのは、利用者が **自分で確かめられる具体的な変化** に限る:
+     ・答え合わせできた試合(実際のスコアと、AIの予想が当たったか外れたか)
+     ・検索できる選手が何人増えたか(増えた選手の名前つき)
+     ・平均評価が上がった/下がった選手(実測の数値差つき)
+     ・クラブに起きた変化(移籍・怪我・調子。実測の差分から検知したものだけ)
+     ・予測モデルの重みが更新されたか(されていないならその理由)
+
+   計算できないものは「計算できません」と理由つきで返す(でっち上げない)。
+
+   比較の土台となる「その日のスナップショット」は、この画面が開かれたときに
+   1日1回だけ保存する(毎日の学習が途中で止まっても比較が続けられるように、
+   学習ジョブとは切り離してある)。
+   ============================================================================ */
+async function buildDailySnapshot() {
+  const idx = await loadPlayerIndex(false).catch(() => null);
+  const rows = (idx && idx.rows) || [];
+  const C = playerSearch.COL;
+  const [totalRaw, resolvedRaw, correctRaw, knowledgeRaw] = await Promise.all([
+    upstashCmd(["GET", "pred:total"]).catch(() => null),
+    upstashCmd(["GET", "pred:resolved"]).catch(() => null),
+    upstashCmd(["GET", "pred:correct"]).catch(() => null),
+    upstashCmd(["GET", "learn:knowledge:total"]).catch(() => null),
+  ]);
+  const resolved = parseInt(resolvedRaw, 10) || 0;
+  const correct = parseInt(correctRaw, 10) || 0;
+  return {
+    at: new Date().toISOString(),
+    dateKey: appDateKey(),
+    playerIndexCount: rows.length,
+    playerIndexClubs: new Set(rows.map((r) => r[C.teamEn]).filter(Boolean)).size,
+    playerIndexWithRating: rows.filter((r) => r[C.rating] !== null && r[C.rating] !== undefined).length,
+    // 名前は先頭2,000人ぶんだけ持つ(比較のためだけなので、これで十分)
+    playerIds: rows.slice(0, 2000).map((r) => Number(r[C.id])),
+    predTotal: parseInt(totalRaw, 10) || 0,
+    predResolved: resolved,
+    predCorrect: correct,
+    accuracyPct: resolved > 0 ? Math.round((correct / resolved) * 1000) / 10 : null,
+    knowledgeTotal: parseInt(knowledgeRaw, 10) || null,
+  };
+}
+
+async function handleDailyDiff() {
+  if (!UPSTASH_ENABLED) {
+    return { status: 200, body: { ok: true, available: false, reasonJa: "保存先(Upstash)が未設定のため、昨日との比較ができません。" } };
+  }
+  const cached = cacheGet("daily:diff");
+  if (cached) return { status: 200, body: { ...cached, cached: true } };
+
+  const todayKey = appDateKey();
+  const yKey = appDateKey(new Date(Date.now() - 86400000));
+  const snapKey = (k) => `kb:daily:snapshot:${k}`;
+
+  // ---- 今日のスナップショット(無ければ作って保存する) ----
+  let today = await upstashGetJSON(snapKey(todayKey)).catch(() => null);
+  const freshlyCreated = !today;
+  if (!today) {
+    today = await buildDailySnapshot();
+    await upstashSetJSON(snapKey(todayKey), today).catch(() => {});
+    await upstashCmd(["EXPIRE", snapKey(todayKey), String(30 * 86400)]).catch(() => {});
+  }
+  const yesterday = await upstashGetJSON(snapKey(yKey)).catch(() => null);
+
+  const idx = await loadPlayerIndex(false).catch(() => null);
+  const rows = (idx && idx.rows) || [];
+  const C = playerSearch.COL;
+
+  /* ---- ① 答え合わせできた試合(実際のスコアつき) ---- */
+  const recentRaw = (await upstashCmd(["LRANGE", "pred:recent", "-40", "-1"]).catch(() => [])) || [];
+  const recent = recentRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
+  const since = Date.now() - 36 * 3600 * 1000;
+  const resolvedRecently = recent
+    .filter((r) => r && r.resolved && r.resolvedAt && new Date(r.resolvedAt).getTime() >= since)
+    .sort((a, b) => String(b.resolvedAt).localeCompare(String(a.resolvedAt)))
+    .slice(0, 8)
+    .map((r) => ({
+      home: r.home, away: r.away, league: r.league,
+      kickoff: r.kickoff, resolvedAt: r.resolvedAt,
+      score: (r.homeGoals !== undefined && r.awayGoals !== undefined && r.homeGoals !== null)
+        ? `${r.homeGoals}-${r.awayGoals}` : null,
+      predictedWinnerJa: r.predictedWinner === "home" ? `${r.home}勝利`
+        : r.predictedWinner === "away" ? `${r.away}勝利` : "引き分け",
+      actualWinnerJa: r.actualWinner === "home" ? `${r.home}勝利`
+        : r.actualWinner === "away" ? `${r.away}勝利` : "引き分け",
+      correct: r.correct === true,
+    }));
+
+  const accBefore = yesterday && yesterday.accuracyPct !== null && yesterday.accuracyPct !== undefined ? yesterday.accuracyPct : null;
+  const accAfter = today.accuracyPct;
+  const predictions = {
+    available: resolvedRecently.length > 0,
+    items: resolvedRecently,
+    resolvedCount: resolvedRecently.length,
+    hitCount: resolvedRecently.filter((x) => x.correct).length,
+    accuracyBefore: accBefore, accuracyAfter: accAfter,
+    accuracyDeltaPt: (accBefore !== null && accAfter !== null) ? Math.round((accAfter - accBefore) * 10) / 10 : null,
+    reasonJa: resolvedRecently.length ? null
+      : "この36時間で答え合わせできた試合がありません(試合が終わり次第、自動で反映されます)。",
+  };
+
+  /* ---- ② 検索できる選手が何人増えたか ---- */
+  const prevIds = new Set((yesterday && yesterday.playerIds) || []);
+  const newlySearchable = prevIds.size
+    ? rows.filter((r) => !prevIds.has(Number(r[C.id]))).slice(0, 12)
+      .map((r) => ({ id: r[C.id], name: r[C.name], teamJa: r[C.teamJa] || r[C.teamEn] }))
+    : [];
+  const playerIndexDiff = {
+    countToday: today.playerIndexCount,
+    countYesterday: yesterday ? yesterday.playerIndexCount : null,
+    delta: yesterday ? today.playerIndexCount - yesterday.playerIndexCount : null,
+    clubsToday: today.playerIndexClubs,
+    clubsYesterday: yesterday ? yesterday.playerIndexClubs : null,
+    newlySearchable,
+    reasonJa: yesterday ? null : "昨日のスナップショットがまだありません(この画面を1日1回開くと、翌日から差分が出せます)。",
+  };
+
+  /* ---- ③ 平均評価が上がった/下がった選手(索引の実測差) ---- */
+  const withDelta = rows
+    .map((r) => ({ row: r, g: playerSearch.growthOf(r) }))
+    .filter((x) => x.g && x.g.measurable && Math.abs(x.g.delta) >= 0.05);
+  const toItem = (x) => ({
+    id: x.row[C.id], name: x.row[C.name], teamJa: x.row[C.teamJa] || x.row[C.teamEn],
+    from: x.g.baseRating, to: x.g.currentRating, delta: x.g.delta, days: x.g.days,
+  });
+  const playerForm = {
+    available: withDelta.length > 0,
+    up: withDelta.filter((x) => x.g.delta > 0).sort((a, b) => b.g.delta - a.g.delta).slice(0, 5).map(toItem),
+    down: withDelta.filter((x) => x.g.delta < 0).sort((a, b) => a.g.delta - b.g.delta).slice(0, 5).map(toItem),
+    measuredCount: withDelta.length,
+    reasonJa: withDelta.length ? null
+      : (rows.length
+        ? "平均評価の変化を測れる選手がまだいません(同じ選手を2日以上続けて取得できると測れるようになります)。"
+        : "選手の索引がまだ作られていないため、評価の変化を測れません。"),
+    methodJa: "毎日取得している平均評価の実測値どうしの差です。推定値や独自スコアではありません。",
+  };
+
+  /* ---- ④ クラブ・選手に起きた変化(実測の差分から検知したものだけ) ---- */
+  const feed = await clubDossier.getScoutFeed(40).catch(() => ({ items: [] }));
+  const feedSince = Date.now() - 48 * 3600 * 1000;
+  const changes = (feed.items || [])
+    .filter((it) => it && it.at && new Date(it.at).getTime() >= feedSince)
+    .slice(0, 10)
+    .map((it) => ({
+      type: it.type, name: it.name, teamJa: it.teamJa || it.teamEn,
+      labelJa: it.labelJa, detailJa: it.detailJa, at: it.at,
+    }));
+  const clubChanges = {
+    available: changes.length > 0,
+    items: changes,
+    reasonJa: changes.length ? null
+      : "この48時間で検知した移籍・調子の急変はありません(実測値が動いたときにだけ記録します)。",
+  };
+
+  /* ---- ⑤ AIの見解が昨日から変わったクラブ(AI自身の言葉での差分) ----
+     ご指摘「AI回答が昨日より賢くなったのか分からない」への直接の答え。
+     この記録(見解・変わった理由)は以前から毎日保存されていたのに、
+     **画面から読む経路が1本も無かった**。ここで初めて表に出す。 */
+  const viewChanges = [];
+  const viewSince = Date.now() - 72 * 3600 * 1000;
+  for (const team of REGISTERED_TEAMS.slice(0, 11)) {
+    try {
+      const key = `team:${team.nameEn}:dailyView`;
+      const [cur, hist] = await Promise.all([
+        memoryStore.getLastConclusion(key),
+        memoryStore.getConclusionHistory(key, 3),
+      ]);
+      if (!cur || !cur.statement) continue;
+      const prev = (hist || [])[0];
+      if (!prev || !prev.statement) continue;
+      const changedAt = prev.supersededAt || cur.computedAt;
+      if (!changedAt || new Date(changedAt).getTime() < viewSince) continue;
+      viewChanges.push({
+        teamJa: team.nameJa, teamEn: team.nameEn,
+        before: prev.statement, after: cur.statement,
+        changeReasonJa: prev.changeReason || cur.changeReason || null,
+        changedAt,
+      });
+    } catch (e) { /* 1クラブ読めなくても他を止めない */ }
+    if (viewChanges.length >= 4) break;
+  }
+  const aiViews = {
+    available: viewChanges.length > 0,
+    items: viewChanges,
+    reasonJa: viewChanges.length ? null
+      : "この72時間で、AIのクラブ評価が変わったものはありません(見解が変わったときにだけ記録します。毎日の学習が2回以上完了している必要があります)。",
+    methodJa: "AI自身がその日の実測値をもとに書いた「このクラブをどう見ているか」の文章です。変わったときだけ、前の文章と並べて出しています。",
+  };
+
+  /* ---- ⑥ 予測モデルの重み ---- */
+  const growth = await upstashGetJSON("learn:growthlog:latest").catch(() => null);
+  const model = {
+    lastLearnedDate: growth && growth.date ? growth.date : null,
+    weightsUpdated: growth ? (growth.weightsUpdatedV2 === true || growth.weightsUpdated === true) : null,
+    reasonJa: !growth ? "学習の記録がまだありません。"
+      : (growth.weightsUpdatedV2 === true || growth.weightsUpdated === true)
+        ? "検証で改善が確認できたため、予測の重みを更新しました。"
+        : "検証で改善が確認できなかったため、重みは更新していません(悪化させないための仕組みです)。",
+  };
+
+  /* ---- ⑥ 学習そのものが動いているか ---- */
+  const progress = await upstashGetJSON("learn:progress").catch(() => null);
+  const learningRun = {
+    lastDate: growth && growth.date ? growth.date : null,
+    isTodayDone: !!(growth && growth.date === todayKey),
+    lastStage: progress ? progress.stage : null,
+    lastStageAt: progress ? progress.at : null,
+    finished: progress ? progress.finished === true : null,
+    reasonJa: !growth ? "毎日の学習がまだ一度も完了していません。"
+      : growth.date === todayKey ? "本日の学習は完了しています。"
+        : `最後に完了した学習は ${growth.date} 分です。${progress && !progress.finished ? `本日の学習は「${progress.stage}」の段階で止まっています。` : "本日分はまだ完了していません。"}`,
+  };
+
+  /* ---- 総合判定: 利用者から見て「昨日と変わったか」 ---- */
+  const evidence = [];
+  if (predictions.resolvedCount > 0) {
+    evidence.push(`試合の答え合わせが${predictions.resolvedCount}件進みました(的中${predictions.hitCount}件)`);
+  }
+  if (playerIndexDiff.delta !== null && playerIndexDiff.delta > 0) {
+    evidence.push(`検索できる選手が${playerIndexDiff.delta}人増えました`);
+  }
+  if (playerForm.up.length || playerForm.down.length) {
+    evidence.push(`平均評価が動いた選手を${playerForm.measuredCount}人検知しました`);
+  }
+  if (clubChanges.items.length) {
+    evidence.push(`移籍・調子の変化を${clubChanges.items.length}件検知しました`);
+  }
+  if (viewChanges.length) {
+    evidence.push(`AIのクラブ評価が${viewChanges.length}件変わりました`);
+  }
+  const verdictJa = evidence.length
+    ? `昨日から次の変化がありました: ${evidence.join("、")}。`
+    : "昨日と比べて、利用者から見える変化はまだ検知できていません。" +
+      (learningRun.isTodayDone ? "" : "毎日の学習が本日まだ完了していないことが原因の可能性があります。");
+
+  const body = {
+    ok: true, available: true,
+    date: todayKey, comparedWith: yesterday ? yKey : null,
+    firstDayJa: yesterday ? null
+      : "昨日のスナップショットがまだ無いため、今回は「今日の状態」だけを表示しています。明日から本当の差分が出ます。",
+    snapshotCreatedNow: freshlyCreated,
+    verdictJa,
+    evidenceCount: evidence.length,
+    predictions, playerIndex: playerIndexDiff, playerForm, clubChanges, aiViews, model, learningRun,
+    honestyJa: "ここに出しているのは、すべて実測値の差分です。件数だけの指標(Knowledge件数・Memory件数など)は、利用者が確かめられないためこの欄には出していません。",
+    generatedAt: new Date().toISOString(),
+  };
+  cacheSet("daily:diff", body, 5 * 60 * 1000);
+  return { status: 200, body };
+}
+
 async function handleAccuracyStats() {
   if (!UPSTASH_ENABLED) {
     // 2026年8月・全機能監査の指摘: 0を返すだけで**理由が付いていなかった**。
@@ -2443,10 +2702,18 @@ async function maybeSelfHealDailyLearning() {
       const idx = await loadPlayerIndex(false).catch(() => null);
       const neverBuilt = idx && idx.metaFound === false && (idx.rows || []).length === 0;
       if (neverBuilt) {
+        // ---- 2026年8月7日の実測を受けた変更 ----
+        //   索引が無いときに「毎日の学習まるごと」を走らせるのは重すぎた。
+        //   実測では、学習は途中まで進んで選手記録を1,378件まで増やしたのに、
+        //   最後の索引づくりまで到達せずに終わっていた。
+        //   索引づくりは外部APIを1回も使わないので、**それだけ** を走らせる。
+        //   これなら数秒〜数十秒で終わり、検索がその場で復活する。
         const got = await upstashCmd([
-          "SET", "learn:indexbootstrap:lock", new Date().toISOString(), "NX", "EX", "10800",
+          "SET", "kb:player:index:rebuildlock", new Date().toISOString(), "NX", "EX", "1800",
         ]).catch(() => null);
-        if (got) reason = "player-index-missing";
+        if (got) {
+          rebuildPlayerIndexNow({ trigger: "self-heal" }).catch(() => {});
+        }
       }
     }
     if (!reason) return; // 定期実行が生きていて、索引もある
@@ -2741,6 +3008,51 @@ const { CLUB_UNIVERSE } = require("./learning/clubUniverse");
 const playerSearchDeps = {
   upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
 };
+
+// ============================================================================
+// 2026年8月7日・「データはあるのに検索できない」の構造的な対処
+// ----------------------------------------------------------------------------
+// 本番の実測: 選手記録1,378件・名簿42クラブが保存済みなのに、索引は0人。
+// 索引づくりが長い毎日の学習ジョブの最後にあり、そこまで到達していなかった。
+// 索引づくりは外部APIを1回も使わない(保存済みの材料だけで完結する)ので、
+// 長いジョブから切り離し、単体で作り直せるようにする。
+// ============================================================================
+let indexRebuildInFlight = false;
+let lastIndexRebuild = null;   // 直前の実行結果(画面と調査のために持つ)
+
+async function rebuildPlayerIndexNow(opts) {
+  if (indexRebuildInFlight) {
+    return { ok: false, alreadyRunning: true, reasonJa: "索引の作り直しは既に実行中です。" };
+  }
+  indexRebuildInFlight = true;
+  const t0 = Date.now();
+  try {
+    const r = await playerSearch.rebuildIndexFromStore(playerSearchDeps, {
+      clubDossier,
+      clubs: CLUB_UNIVERSE,
+      nowMs: Date.now(),
+      dateKey: appDateKey(),
+      playerRecordCap: Number(process.env.INDEX_REBUILD_RECORD_CAP) || 6000,
+    });
+    const out = { ...r, tookMs: Date.now() - t0, at: new Date().toISOString(), trigger: (opts && opts.trigger) || "manual" };
+    lastIndexRebuild = out;
+    await upstashSetJSON("kb:player:index:lastrebuild", out).catch(() => {});
+    // 作り直した内容をすぐ画面に反映する
+    if (out.ok) await loadPlayerIndex(true).catch(() => {});
+    console.log("[player-index rebuild]", JSON.stringify({
+      ok: out.ok, count: out.count, fromSquads: out.fromSquads, fromRecords: out.fromRecords,
+      redisReads: out.redisReads, tookMs: out.tookMs, reasonJa: out.reasonJa,
+    }));
+    return out;
+  } catch (e) {
+    const out = { ok: false, reasonJa: `索引の作り直しに失敗しました: ${e.message}`, tookMs: Date.now() - t0, at: new Date().toISOString() };
+    lastIndexRebuild = out;
+    console.error("[player-index rebuild failed]", e && e.message);
+    return out;
+  } finally {
+    indexRebuildInFlight = false;
+  }
+}
 // 索引の再読み込み間隔。夜間バッチは1日1回しか索引を書き換えないため、
 // 30分ごとに確認すれば十分(それでもRedis読み出しは1日150回程度で収まる)。
 const PLAYER_INDEX_TTL_MS = Number(process.env.PLAYER_INDEX_TTL_MS) || 30 * 60 * 1000;
@@ -4962,6 +5274,74 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(body));
         return;
       }
+      // ---- 2026年8月7日・「昨日と今日で何が変わったか」を実測で返す ----
+      if (pathname === "/api/daily-diff") {
+        const { status, body } = await handleDailyDiff();
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
+      // ---- 2026年8月7日・毎日の学習が「どこまで進んだか」を見る ----
+      //   本番で「収集は進んだのに成長ログは前日のまま」= 途中で止まっている
+      //   ことが分かったが、どこで止まったのかが分からなかった。
+      if (pathname === "/api/learning/progress") {
+        const prog = await upstashGetJSON("learn:progress").catch(() => null);
+        const lastRebuild = await upstashGetJSON("kb:player:index:lastrebuild").catch(() => null);
+        const ageSec = prog && prog.at ? Math.round((Date.now() - new Date(prog.at).getTime()) / 1000) : null;
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({
+          ok: true,
+          available: !!prog,
+          reasonJa: prog ? null : "まだ進捗の記録がありません(この機能を入れてから学習が1度も走っていません)。",
+          progress: prog || null,
+          secondsSinceLastStage: ageSec,
+          verdictJa: !prog ? null
+            : prog.finished ? `直近の学習は最後まで完了しています(${prog.elapsedSec}秒)。`
+              : (ageSec !== null && ageSec > 900
+                ? `「${prog.stage}」の段階で ${Math.round(ageSec / 60)}分 止まっています。ここで落ちた可能性が高いです。`
+                : `いま「${prog.stage}」の段階を実行中です(開始から${prog.elapsedSec}秒)。`),
+          playerIndexLastRebuild: lastRebuild || lastIndexRebuild || null,
+          dailyLearningRunning,
+        }));
+        return;
+      }
+      // ---- 2026年8月7日・保存済みデータから選手索引を作り直す ----
+      //   外部API(API-Football)の呼び出しは0回。毎日の学習が止まっていても
+      //   これだけで選手検索が復活する。
+      if (pathname === "/api/knowledge/rebuild-player-index") {
+        const requiredSecret = process.env.AUTO_COLLECT_SECRET || "";
+        if (requiredSecret && parsed.searchParams.get("key") !== requiredSecret) {
+          res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "invalid or missing key" }));
+          return;
+        }
+        // シークレット未設定でも外部から連打されないよう、30分に1回に制限する
+        // (索引づくりはRedis読み出しが数千回になるため)
+        if (!requiredSecret) {
+          const got = await upstashCmd([
+            "SET", "kb:player:index:rebuildlock", new Date().toISOString(), "NX", "EX", "1800",
+          ]).catch(() => null);
+          if (!got) {
+            const last = await upstashGetJSON("kb:player:index:lastrebuild").catch(() => null);
+            res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+            res.end(JSON.stringify({
+              ok: true, started: false, throttled: true,
+              messageJa: "索引の作り直しは30分に1回までです(保存先への読み出しが数千回になるため)。直前の結果を返します。",
+              lastRebuild: last || lastIndexRebuild || null,
+            }));
+            return;
+          }
+        }
+        const result = await rebuildPlayerIndexNow({ trigger: "manual" });
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({
+          ok: true, rebuilt: result.ok === true, result,
+          messageJa: result.ok
+            ? `保存済みのデータから ${result.count}人 の索引を作り直しました(外部APIの呼び出し 0回・保存先への読み出し ${result.redisReads}回・${result.tookMs}ミリ秒)。`
+            : (result.reasonJa || "索引を作り直せませんでした。"),
+        }));
+        return;
+      }
       // ---- 2026年8月7日・「正答率が動かない」調査で必要になった可視化 ----
       //   直前の1回ぶん(pred:autocollect:lastrun)しか外から見えなかったため、
       //   「毎回どうなっているのか」が分からず、原因の切り分けに丸1往復かかった。
@@ -5980,6 +6360,8 @@ module.exports = {
   handleCoachSearch,
   handleAccuracyStats,
   handleAutoCollectPredictions,
+  handleDailyDiff, rebuildPlayerIndexNow,
+  __clearCache: () => cache.clear(),   // テストで時間依存のキャッシュを跨ぐため
   handlePredictMatch,
   perfSnapshot, // 最終方針: 性能の常時計測(テスト・負荷試験から参照)
   handleDiscuss,
