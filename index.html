@@ -7528,7 +7528,14 @@ async function renderDailyReportWidget() {
     </div>
     <div class="value-note">
       🔮 新規予測: ${num(p.newToday)}件 ・ ✅ 答え合わせ: ${num(p.resolvedToday)}件(累計${num(p.resolvedTotal)}件) ・
-      📡 API使用: ${num(api.usedToday)}/${num(api.dailyBudget)}件${api.detectedPlan ? `(${escapeHtml(String(api.detectedPlan))}プラン)` : ""}
+      📡 API使用: ${num(api.usedToday)}/${num(api.dailyBudget)}件${(() => {
+        // 2026年8月7日の実測で発見: detectedPlan はオブジェクトなので、
+        // そのまま文字列にすると画面に「[object Object]プラン」と出ていた。
+        const p = api.detectedPlan;
+        if (!p) return "";
+        const name = typeof p === "string" ? p : (p.planNameJa || p.planName || null);
+        return name ? `(${escapeHtml(String(name))})` : "";
+      })()}
     </div>
     ${accuracyHtml}
     ${selfAssessHtml}

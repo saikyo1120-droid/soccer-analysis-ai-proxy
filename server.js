@@ -49,7 +49,8 @@ const { deliberate } = require("./reasoning/deliberation");
 // 毎日学習エンジン(Learning Engine)。実体は server/learning/dailyJob.js。
 // 依存(callApiFootball/resolveTeamId/Upstashアクセス関数)は、このファイル自身が
 // 定義した後にまとめて注入する(利用箇所は下の方の「Stage D」セクションを参照)。
-const { runDailyLearning, getGrowthLog, getRecentFactsForTeam, computeFormScore, OWN_PREDICT_LOG_CAP: OWN_PREDICT_LOG_CAP_DISPLAY } = require("./learning/dailyJob");
+let { runDailyLearning } = require("./learning/dailyJob");   // テストで差し替えられるよう let
+const { getGrowthLog, getRecentFactsForTeam, computeFormScore, OWN_PREDICT_LOG_CAP: OWN_PREDICT_LOG_CAP_DISPLAY } = require("./learning/dailyJob");
 // 2026年8月・優先順位⑨: 「今日追加した知識0件」が正常な0件(前回から変化なし)
 // なのか、異常な0件(未実行・キー未設定・予算切れ等)なのかを実データから判定する。
 const { diagnoseZeroKnowledge, diagnoseZeroVerification, getRunHistory, buildEngineStatuses } = require("./learning/healthCheck");
@@ -1342,12 +1343,12 @@ async function handleAccuracyStats() {
     const sinceLastRunH = lastRun ? hoursSince(lastRun.at) : null;
     let stalledReasonJa = null;
     if (!lastRun) {
-      stalledReasonJa = "自動照合(6時間ごと)が一度も実行を記録していません。GitHub Actions の predictions-auto-collect ワークフローが動いているかご確認ください。";
-    } else if (sinceLastRunH !== null && sinceLastRunH >= 9) {
-      stalledReasonJa = `自動照合の最後の実行が${sinceLastRunH}時間前です(本来は6時間ごと)。定期実行が止まっている可能性があります。`;
+      stalledReasonJa = "自動照合が一度も実行を記録していません。サイトを開くと1時間ごとに自動で走る仕組みですが、それも記録が無い状態です(保存先への接続をご確認ください)。";
+    } else if (sinceLastRunH !== null && sinceLastRunH >= 3) {
+      stalledReasonJa = `自動照合の最後の実行が${sinceLastRunH}時間前です(サイトを開くと1時間ごとに自動で走ります)。しばらく誰もサイトを開いていないか、定期実行が止まっている可能性があります。`;
     } else if (pendingDetail && pendingDetail.dueForCheck === 0 && pending > 0) {
       stalledReasonJa = "答え合わせ待ちの試合はすべて『まだ終わっていない』状態です。試合が終われば自動的に正答率へ反映されます(異常ではありません)。";
-    } else if (pendingDetail && pendingDetail.dueForCheck > 0 && sinceLastRunH !== null && sinceLastRunH < 9) {
+    } else if (pendingDetail && pendingDetail.dueForCheck > 0 && sinceLastRunH !== null && sinceLastRunH < 3) {
       // 直前の実行で「見たのに1件も解決しなかった」場合は、その理由を状態別に出す
       const tally = (lastRun && lastRun.statusTally) || null;
       const sawNothingResolvable = lastRun && lastRun.resolved === 0 && lastRun.evicted === 0
@@ -1355,7 +1356,7 @@ async function handleAccuracyStats() {
       if (sawNothingResolvable) {
         const parts = Object.entries(tally).map(([k, v]) => `${STATUS_LABELS_JA[k] || k} ${v}件`).join(" / ");
         stalledReasonJa = `直前の自動照合で${parts}を確認しましたが、まだ結果が確定していないため答え合わせできませんでした`
-          + `(日程変更などで「未開始」に戻った試合が含まれます)。これらは列の最後尾へ回すので、次回は別の試合を確認します。`;
+          + `(日程変更などで「未開始」に戻った試合が含まれます)。変更後の日程を記録に反映したので、次回は別の試合を確認します。`;
       } else {
         stalledReasonJa = `終了しているはずの試合が${pendingDetail.dueForCheck}件、答え合わせ待ちのまま残っています。1回の実行で照合できるのは${AUTO_COLLECT_RESOLVE_CAP}件までのため、順次消化されます。`;
       }
@@ -2042,7 +2043,17 @@ async function handleFixtureAnalysis(query) {
 // API-Footballの無料枠(1日100リクエスト)を使い切らないよう、1回の実行あたりの
 // 新規記録・解決チェック件数には上限を設けている。
 const AUTO_COLLECT_LOG_CAP = 3; // 1回の実行で新規に記録する試合数の上限
-const AUTO_COLLECT_RESOLVE_CAP = 8; // 1回の実行で解決を試みる保留中予測の上限
+// ---- 2026年8月7日・本番実測で判明した「答え合わせが追いつかない」の修正 ----
+//   実測: pending 18件 → 22件、resolved 0、45時間ぶん1件も答え合わせされていない。
+//   照合枠8件をすべて「日程変更でNSに戻った試合」に食われ、その後ろに並ぶ
+//   終了済みの試合に一度も到達していなかった。しかも1回の実行で3件を新規記録
+//   するため、**列は縮むどころか毎回伸びていた**。
+//
+//   API-Football の /fixtures は ids=1-2-3... で **1リクエストに20件** まとめて
+//   問い合わせできる。1件1リクエストをやめれば、同じAPI消費のまま照合できる
+//   件数を8件→60件に増やせる(最終方針③「精度>コスト・取得量は減らさない」に適合)。
+const AUTO_COLLECT_RESOLVE_CAP = Number(process.env.AUTO_COLLECT_RESOLVE_CAP) || 60; // 1回の実行で照合を試みる件数
+const AUTO_COLLECT_IDS_PER_CALL = 20; // /fixtures?ids= に一度に渡せる試合ID数(APIの仕様上限)
 const AUTO_COLLECT_RESOLVE_MIN_AGE_MS = 2 * 60 * 60 * 1000; // キックオフから2時間経っていない試合は「まだ終わっていない可能性が高い」としてスキップ
 // 記録上のキックオフからこれだけ経っても結果が確定しない試合は諦める
 // (延期の繰り返し・データ提供元での取り消しなど。列に永久に居座らせない)
@@ -2066,22 +2077,29 @@ async function handleAutoCollectPredictions(opts) {
 
   // フェーズ1: 保留中(まだ結果が確定していない)の予測を、実際の試合結果と突き合わせる。
   // 「今日の試合」一覧のスイープでは対応できない“前日以前にキックオフした試合”もここで拾える。
+  //
+  // ---- 2026年8月7日・本番実測で判明した構造的な詰まりの修正 ----
+  //   旧実装は「列の先頭から1件ずつ、1件1リクエスト、最大8件」だった。
+  //   実測ではその8件がすべて「日程変更でNSに戻った試合」で埋まり、
+  //   後ろに並ぶ **終了済みの試合に一度も到達していなかった**(45時間0件)。
+  //   さらに1回の実行で3件を新規記録するため、列は毎回伸びていた。
+  //
+  //   直し方(推測ではなく、実測した詰まり方に対する構造的な対処):
+  //     ① 先頭から順ではなく、**キックオフが古い順**に見る
+  //        (=終わっている可能性が最も高いものから照合する)
+  //     ② キックオフがまだ先の試合は、APIを呼ばずに最初から除外する
+  //        (日程変更を反映済みなので、ここで枠を1つも使わない)
+  //     ③ /fixtures?ids=a-b-c で **20件を1リクエスト** にまとめる
+  //        (同じAPI消費で照合できる件数が8件→60件になる)
   try {
     const pendingIds = (await upstashCmd(["LRANGE", "pred:pending", "0", "-1"])) || [];
     pendingLenBefore = pendingIds.length;
-    let checked = 0;
+
+    // ---- ①②: 記録を読み、照合すべきものだけを「古い順」に並べる ----
+    const candidates = [];
+    let awaitingKickoff = 0;
     for (const idStr of pendingIds) {
-      if (checked >= AUTO_COLLECT_RESOLVE_CAP) { notes.push(`resolve cap reached (${AUTO_COLLECT_RESOLVE_CAP})`); break; }
       const record = await upstashGetJSON(`pred:${idStr}`);
-      // ---- 2026年8月・「正答率が何日も変わらない」調査で発見した先頭詰まりの修正(1/3) ----
-      //   pred:pending は先頭から最大8件(AUTO_COLLECT_RESOLVE_CAP)しか見ない。
-      //   ところが「本体の記録が消えたID」「解決済みなのに消し残ったID」は
-      //   これまで一度も LREM されず、`continue` で素通りするだけだった。
-      //   そうした死んだIDが先頭に8件たまると、その後ろに並ぶ試合は
-      //   **二度と検証されない**=pred:resolved / pred:correct が増えない
-      //   =ホーム画面の「AI予測の正答率」が凍結する。
-      //   自社予測側(dailyJob.js:947-981)には同じ修正が入っていたが、
-      //   pred:* 系(API-Football予測)には移植されていなかった。
       if (record && record.resolved) {
         // 解決済みなのに残っている=LREMの取りこぼし。ここで確実に外す(APIは使わない)
         await upstashCmd(["LREM", "pred:pending", "0", String(idStr)]).catch(() => {});
@@ -2111,77 +2129,99 @@ async function handleAutoCollectPredictions(opts) {
       //   健全な予測が保留リストから外され、二度と答え合わせされなくなる。
       //   読めた時点で必ず消す(=本当に「連続」でのみ諦める)。
       await upstashCmd(["DEL", `pred:pendingmiss:${idStr}`]).catch(() => {});
-      if (record.kickoff && (Date.now() - new Date(record.kickoff).getTime()) < AUTO_COLLECT_RESOLVE_MIN_AGE_MS) continue; // まだ試合中の可能性が高いので今回はスキップ
-      checked++;
+      const kickMs = record.kickoff ? Date.parse(record.kickoff) : NaN;
+      if (Number.isFinite(kickMs) && (Date.now() - kickMs) < AUTO_COLLECT_RESOLVE_MIN_AGE_MS) {
+        awaitingKickoff++;   // まだ試合中/開始前。APIを1回も使わずに見送る
+        continue;
+      }
+      candidates.push({ idStr: String(idStr), record, kickMs: Number.isFinite(kickMs) ? kickMs : 0 });
+    }
+    // 古い試合ほど「もう終わっている」ので、そこから照合する
+    candidates.sort((a, b) => a.kickMs - b.kickMs);
+    if (candidates.length > AUTO_COLLECT_RESOLVE_CAP) {
+      notes.push(`resolve cap reached (${AUTO_COLLECT_RESOLVE_CAP} / due ${candidates.length})`);
+    }
+    const targets = candidates.slice(0, AUTO_COLLECT_RESOLVE_CAP);
+    notes.push(`due for check ${candidates.length} / awaiting kickoff ${awaitingKickoff}`);
+
+    // ---- ③: 20件ずつまとめて問い合わせる ----
+    for (let i = 0; i < targets.length; i += AUTO_COLLECT_IDS_PER_CALL) {
+      const chunk = targets.slice(i, i + AUTO_COLLECT_IDS_PER_CALL);
+      let entries = null;
       try {
-        const data = await callApiFootball("/fixtures", { id: idStr }, { jobCall: true });
-        const entry = (data.response || [])[0];
-        // ---- 先頭詰まりの修正(2/3): APIから消えた試合ID ----
-        //   シーズン移行やID振り直しで /fixtures?id=… が空になる試合がある。
-        //   従来はここで continue するだけで、そのIDは永久に先頭に居座っていた。
-        if (!entry || !entry.fixture) {
-          const attempts = (Number(record.resolveAttempts) || 0) + 1;
-          record.resolveAttempts = attempts;
-          await upstashSetJSON(`pred:${idStr}`, record).catch(() => {});
-          if (attempts >= 3) {
+        const data = chunk.length === 1
+          ? await callApiFootball("/fixtures", { id: chunk[0].idStr }, { jobCall: true })
+          : await callApiFootball("/fixtures", { ids: chunk.map((c) => c.idStr).join("-") }, { jobCall: true });
+        entries = data.response || [];
+      } catch (e) {
+        notes.push(`resolve batch failed (${chunk.length} fixtures): ${e.message}`);
+        if (e && e.code === "BUDGET_EXHAUSTED") { notes.push("API budget exhausted; stopping resolve phase"); break; }
+        continue;   // このかたまりは次回に回す(列の順番は変えない)
+      }
+      const byId = new Map();
+      for (const en of entries) {
+        if (en && en.fixture && en.fixture.id !== undefined) byId.set(String(en.fixture.id), en);
+      }
+      for (const c of chunk) {
+        const idStr = c.idStr;
+        const record = c.record;
+        const entry = byId.get(idStr);
+        try {
+          // ---- 先頭詰まりの修正(2/3): APIから消えた試合ID ----
+          //   シーズン移行やID振り直しで /fixtures?id=… が空になる試合がある。
+          //   従来はここで continue するだけで、そのIDは永久に先頭に居座っていた。
+          if (!entry || !entry.fixture) {
+            const attempts = (Number(record.resolveAttempts) || 0) + 1;
+            record.resolveAttempts = attempts;
+            await upstashSetJSON(`pred:${idStr}`, record).catch(() => {});
+            if (attempts >= 3) {
+              await upstashCmd(["LREM", "pred:pending", "0", String(idStr)]).catch(() => {});
+              evicted++;
+              notes.push(`pending evicted (fixture ${idStr} not found ${attempts}x)`);
+            } else {
+              notes.push(`fixture ${idStr} not found (${attempts}/3)`);
+            }
+            continue;
+          }
+          const statusShort = entry.fixture.status ? entry.fixture.status.short : null;
+          // ---- 先頭詰まりの修正(3/3): 結果が永久に出ない試合 ----
+          //   延期(PST)・中止(CANC)・放棄(ABD)・裁定勝ち(AWD)・不戦勝(WO)は
+          //   スコアが出ないため FINISHED_STATUSES に入らず、永久に残っていた。
+          if (UNRESOLVABLE_STATUSES.has(statusShort)) {
             await upstashCmd(["LREM", "pred:pending", "0", String(idStr)]).catch(() => {});
             evicted++;
-            notes.push(`pending evicted (fixture ${idStr} not found ${attempts}x)`);
-          } else {
-            notes.push(`fixture ${idStr} not found (${attempts}/3)`);
+            notes.push(`pending evicted (fixture ${idStr} ${statusShort})`);
+            continue;
           }
-          continue;
-        }
-        const statusShort = entry.fixture.status ? entry.fixture.status.short : null;
-        // ---- 先頭詰まりの修正(3/3): 結果が永久に出ない試合 ----
-        //   延期(PST)・中止(CANC)・放棄(ABD)・裁定勝ち(AWD)・不戦勝(WO)は
-        //   スコアが出ないため FINISHED_STATUSES に入らず、永久に残っていた。
-        if (UNRESOLVABLE_STATUSES.has(statusShort)) {
+          statusTally[statusShort || "unknown"] = (statusTally[statusShort || "unknown"] || 0) + 1;
+          if (FINISHED_STATUSES.has(statusShort) && entry.goals) {
+            const r = await resolvePrediction(idStr, entry.goals.home, entry.goals.away);
+            if (r) resolved++;
+            continue;
+          }
+          // まだ終わっていない試合。日程変更を記録に反映しておけば、
+          // 次回はキックオフ前として **APIを1回も使わずに** 見送れる。
+          const apiDate = entry.fixture.date ? Date.parse(entry.fixture.date) : NaN;
+          const recordedKick = record.kickoff ? Date.parse(record.kickoff) : NaN;
+          if (Number.isFinite(apiDate) && Number.isFinite(recordedKick) && apiDate > recordedKick + 60 * 1000) {
+            record.kickoff = entry.fixture.date;
+            await upstashSetJSON(`pred:${idStr}`, record).catch(() => {});
+            notes.push(`fixture ${idStr} rescheduled to ${entry.fixture.date} (${statusShort})`);
+          }
+          const ageMs = Number.isFinite(recordedKick) ? Date.now() - recordedKick : 0;
+          if (ageMs > PENDING_MAX_AGE_MS) {
+            await upstashCmd(["LREM", "pred:pending", "0", String(idStr)]).catch(() => {});
+            evicted++;
+            notes.push(`pending evicted (fixture ${idStr} still ${statusShort} after ${Math.round(ageMs / 86400000)} days)`);
+            continue;
+          }
+          // 最後尾へ回す。古い順に見る方式でも、同じ試合ばかり先に来ないようにする。
           await upstashCmd(["LREM", "pred:pending", "0", String(idStr)]).catch(() => {});
-          evicted++;
-          notes.push(`pending evicted (fixture ${idStr} ${statusShort})`);
-          continue;
+          await upstashCmd(["RPUSH", "pred:pending", String(idStr)]).catch(() => {});
+          rotated++;
+        } catch (e) {
+          notes.push(`resolve check failed for fixture ${idStr}: ${e.message}`);
         }
-        statusTally[statusShort || "unknown"] = (statusTally[statusShort || "unknown"] || 0) + 1;
-        if (FINISHED_STATUSES.has(statusShort) && entry.goals) {
-          const r = await resolvePrediction(idStr, entry.goals.home, entry.goals.away);
-          if (r) resolved++;
-          continue;
-        }
-        // ---- 2026年8月7日・本番の実測で発見した2度目の「先頭詰まり」の修正 ----
-        //   実測: 照合8件を試して resolved 0 / evicted 0、エラー注記も0。
-        //   つまり8件すべてが「終了(FT/AET/PEN)でもなく、結果が出ない
-        //   状態(PST/CANC/ABD/AWD/WO)でもない」= まだ終わっていない試合だった。
-        //   一番古い記録のキックオフは28時間前。試合が再設定(日程変更)されると
-        //   API側の状態は NS に戻るため、記録上のキックオフはとうに過ぎているのに
-        //   永久に「終わっていない」ままになる。
-        //   そういう試合が列の先頭に8件たまると、**毎回その8件だけを見て終わり**、
-        //   後ろに並ぶ試合は二度と検証されない(=正答率が凍る)。
-        //   以前に修正した「解決済み・記録なし・中止」の詰まりとは別の経路だった。
-        //
-        //   ①日程が変更されていれば、記録のキックオフを更新する
-        //   ②列の最後尾へ回す(次回は別の試合を見る)
-        //   ③記録上のキックオフから14日経っても解決しなければ諦める
-        const apiDate = entry.fixture.date ? Date.parse(entry.fixture.date) : NaN;
-        const recordedKick = record.kickoff ? Date.parse(record.kickoff) : NaN;
-        if (Number.isFinite(apiDate) && Number.isFinite(recordedKick) && apiDate > recordedKick + 60 * 1000) {
-          record.kickoff = entry.fixture.date;   // 日程変更を反映(次回は「まだ先」として扱われる)
-          await upstashSetJSON(`pred:${idStr}`, record).catch(() => {});
-          notes.push(`fixture ${idStr} rescheduled to ${entry.fixture.date} (${statusShort})`);
-        }
-        const ageMs = Number.isFinite(recordedKick) ? Date.now() - recordedKick : 0;
-        if (ageMs > PENDING_MAX_AGE_MS) {
-          await upstashCmd(["LREM", "pred:pending", "0", String(idStr)]).catch(() => {});
-          evicted++;
-          notes.push(`pending evicted (fixture ${idStr} still ${statusShort} after ${Math.round(ageMs / 86400000)} days)`);
-          continue;
-        }
-        // 最後尾へ回して、次回は列の別の試合を見られるようにする
-        await upstashCmd(["LREM", "pred:pending", "0", String(idStr)]).catch(() => {});
-        await upstashCmd(["RPUSH", "pred:pending", String(idStr)]).catch(() => {});
-        rotated++;
-      } catch (e) {
-        notes.push(`resolve check failed for fixture ${idStr}: ${e.message}`);
       }
     }
   } catch (e) {
@@ -2307,9 +2347,16 @@ async function handleAutoCollectPredictions(opts) {
 let autoSweepInFlight = false;
 let autoSweepLastCheckedAt = 0;
 // 何分おきに「古くなっていないか」を確認するか(Redis読み出しを増やしすぎない)
-const AUTO_SWEEP_CHECK_INTERVAL_MS = Number(process.env.AUTO_SWEEP_CHECK_INTERVAL_MS) || 10 * 60 * 1000;
-// 最後の実行からこれだけ経っていたら、自分で走る(cronは6時間おきなので、その1.5倍)
-const AUTO_SWEEP_STALE_MS = Number(process.env.AUTO_SWEEP_STALE_MS) || 9 * 60 * 60 * 1000;
+const AUTO_SWEEP_CHECK_INTERVAL_MS = Number.isFinite(Number(process.env.AUTO_SWEEP_CHECK_INTERVAL_MS))
+  ? Number(process.env.AUTO_SWEEP_CHECK_INTERVAL_MS) : 10 * 60 * 1000;
+// ---- 2026年8月7日・本番実測を受けた見直し ----
+//   実測: 直前の自動照合の trigger が "self-heal" だった=**GitHub Actions は
+//   9時間以上まったく動いていなかった**。9時間に1回では、1回の実行で新規記録
+//   3件・照合0件という日には列が伸びる一方になる。
+//   自己修復の間隔を1時間に縮める(NXロックも1時間なので二重には走らない)。
+//   1回の処理量は照合の問い合わせ数回・記録3件で、APIの1日予算(7,500)に対して
+//   十分小さい。取得量を減らすのではなく、**動く回数を増やして追いつかせる**。
+const AUTO_SWEEP_STALE_MS = Number(process.env.AUTO_SWEEP_STALE_MS) || 60 * 60 * 1000;
 
 async function maybeSelfHealAutoCollect() {
   if (!UPSTASH_ENABLED) return;
@@ -2341,6 +2388,89 @@ async function maybeSelfHealAutoCollect() {
       .finally(() => { autoSweepInFlight = false; });
   } catch (e) {
     autoSweepInFlight = false;
+  }
+}
+
+// ============================================================================
+// 2026年8月7日・毎日の学習も GitHub Actions に依存させない
+// ----------------------------------------------------------------------------
+// 実際に起きたこと(本番の実測):
+//   ・最後の学習記録は 2026-08-06T09:50Z(手動実行ぶん)。
+//     定刻(日本時間4:17=前日19:17Z)の実行記録が **存在しない**。
+//   ・同じ時間帯、自動照合の trigger も "self-heal" だった。
+//     = 2本のワークフローがどちらも動いていない。
+//
+// 影響は正答率だけではない。**選手検索の索引は毎日の学習でしか作られない**ため、
+// 学習が走らない限り「選手が1人も出てこない」状態が永久に続く。
+// つまり、この1点が止まるとアプリの主要機能がまとめて止まる。
+//
+// 対処: 自動照合と同じ考え方で、最後の学習から26時間以上経っていたら、
+// 利用者のリクエストのついでに **裏で** 学習を走らせる。
+//   ・応答を返してから走るので、利用者は1ミリ秒も待たない(最終方針⑥)
+//   ・Redis の NX ロック(既存の tryAcquireDailyRunLock)で二重起動を防ぐ
+//   ・GitHub Actions が動いていれば「まだ新しい」ので何もしない
+//   ・1日1回ぶんの処理量しか走らない(APIの取得量は増えも減りもしない)
+// ============================================================================
+let learnSweepLastCheckedAt = 0;
+// 0 を指定できるようにする(`||` だと 0 が既定値に落ちて、設定が黙って無視される)
+const LEARN_SWEEP_CHECK_INTERVAL_MS = Number.isFinite(Number(process.env.LEARN_SWEEP_CHECK_INTERVAL_MS))
+  ? Number(process.env.LEARN_SWEEP_CHECK_INTERVAL_MS) : 15 * 60 * 1000;
+// 1日1回の処理なので、24時間+余裕の26時間で「明らかに止まっている」と判断する
+const LEARN_SWEEP_STALE_MS = Number(process.env.LEARN_SWEEP_STALE_MS) || 26 * 60 * 60 * 1000;
+
+// 逃げ道: 自動起動を止めたい環境(テスト・検証用の複製など)では 0 を指定する
+const SELF_HEAL_DAILY_LEARNING = process.env.SELF_HEAL_DAILY_LEARNING !== "0";
+
+async function maybeSelfHealDailyLearning() {
+  if (!SELF_HEAL_DAILY_LEARNING) return;
+  if (!UPSTASH_ENABLED) return;
+  if (dailyLearningRunning) return;
+  const now = Date.now();
+  if (now - learnSweepLastCheckedAt < LEARN_SWEEP_CHECK_INTERVAL_MS) return;
+  learnSweepLastCheckedAt = now;
+  try {
+    const latest = await upstashGetJSON("learn:growthlog:latest").catch(() => null);
+    const ranMs = latest && latest.ranAt ? new Date(latest.ranAt).getTime() : null;
+    const age = Number.isFinite(ranMs) ? now - ranMs : Infinity;
+    let reason = age >= LEARN_SWEEP_STALE_MS ? "stale" : null;
+    // ---- 2026年8月7日・本番実測を受けた追加条件 ----
+    //   実測: 選手記録は922件あるのに索引は1度も作られておらず、画面の
+    //   「選手検索」が全機能停止していた。索引は毎日の学習でしか作られないため、
+    //   「まだ24時間経っていないから待つ」では主要機能が丸1日止まったままになる。
+    //   索引が **一度も作られていない** ときは、時間を待たずに学習を始める。
+    //   (作れなかった場合に無限に走らないよう、専用の3時間ロックで抑える)
+    if (!reason) {
+      const idx = await loadPlayerIndex(false).catch(() => null);
+      const neverBuilt = idx && idx.metaFound === false && (idx.rows || []).length === 0;
+      if (neverBuilt) {
+        const got = await upstashCmd([
+          "SET", "learn:indexbootstrap:lock", new Date().toISOString(), "NX", "EX", "10800",
+        ]).catch(() => null);
+        if (got) reason = "player-index-missing";
+      }
+    }
+    if (!reason) return; // 定期実行が生きていて、索引もある
+    // 二重起動の防止は既存のロックをそのまま使う(プロセスをまたいで効く)
+    const lock = await tryAcquireDailyRunLock();
+    if (!lock.acquired) return;
+    dailyLearningRunning = true;
+    console.log("[self-heal daily-learning] starting", JSON.stringify({
+      reason,
+      lastRanAt: latest && latest.ranAt ? latest.ranAt : null,
+      hoursSince: Number.isFinite(age) ? Math.round(age / 3600000) : null,
+    }));
+    // 応答は既に返しているので、ここから先は利用者を待たせない
+    runDailyLearning(learningDeps)
+      .then((r) => {
+        console.log("[self-heal daily-learning] done", JSON.stringify({
+          ok: r && r.ok, date: r && r.date,
+          playersIndexed: r && r.universe ? r.universe.playersIndexed : null,
+        }));
+      })
+      .catch((e) => console.error("[self-heal daily-learning failed]", e && e.message))
+      .finally(() => { dailyLearningRunning = false; });
+  } catch (e) {
+    dailyLearningRunning = false;
   }
 }
 
@@ -2648,6 +2778,9 @@ async function loadPlayerIndex(force) {
       } else {
         playerIndexState.rows = r.rows || [];
         playerIndexState.meta = r.meta || null;
+        // 「目次があるのか無いのか」は原因の切り分けに直結するので必ず持ち回す
+        playerIndexState.metaFound = r.metaFound !== undefined ? r.metaFound : !!r.meta;
+        playerIndexState.expectedCount = r.expectedCount ?? null;
         playerIndexState.available = r.available !== false;
         playerIndexState.partial = r.partial === true;
         playerIndexState.reasonJa = r.reasonJa || null;
@@ -4798,9 +4931,10 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ found: false, error: "レート制限に達しました。しばらく待ってから再試行してください。" }));
       return;
     }
-    // 答え合わせが止まっていないかを確認する(古すぎる場合だけ裏で走る)。
+    // 答え合わせと毎日の学習が止まっていないかを確認する(古すぎる場合だけ裏で走る)。
     // await しない = 利用者のリクエストは1ミリ秒も遅くならない。
     maybeSelfHealAutoCollect().catch(() => {});
+    maybeSelfHealDailyLearning().catch(() => {});
 
     try {
       if (pathname === "/api/health") {
@@ -4826,6 +4960,37 @@ const server = http.createServer(async (req, res) => {
         const { status, body } = await handlePredictionsToday();
         res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
+        return;
+      }
+      // ---- 2026年8月7日・「正答率が動かない」調査で必要になった可視化 ----
+      //   直前の1回ぶん(pred:autocollect:lastrun)しか外から見えなかったため、
+      //   「毎回どうなっているのか」が分からず、原因の切り分けに丸1往復かかった。
+      //   直近30回ぶんの実行記録をそのまま返す(保存済みの読み出しのみ)。
+      if (pathname === "/api/predictions/autocollect-log") {
+        if (!UPSTASH_ENABLED) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: true, available: false, reasonJa: "保存先(Upstash)が未設定のため、実行記録を読み出せません。", runs: [] }));
+          return;
+        }
+        const raw = (await upstashCmd(["LRANGE", "pred:autocollect:log", "0", "29"]).catch(() => [])) || [];
+        const runs = raw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
+        const resolvedTotal = runs.reduce((a, r) => a + (Number(r.resolved) || 0), 0);
+        const loggedTotal = runs.reduce((a, r) => a + (Number(r.logged) || 0), 0);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({
+          ok: true, available: runs.length > 0,
+          reasonJa: runs.length ? null : "まだ実行記録がありません。",
+          runs,
+          summary: {
+            runCount: runs.length,
+            resolvedTotal, loggedTotal,
+            // 記録が答え合わせを上回り続けると、待ち行列は永久に縮まない
+            queueGrowingJa: loggedTotal > resolvedTotal
+              ? `直近${runs.length}回で 新規記録${loggedTotal}件 > 答え合わせ${resolvedTotal}件 のため、答え合わせ待ちは増える一方です。`
+              : `直近${runs.length}回で 答え合わせ${resolvedTotal}件 ≧ 新規記録${loggedTotal}件 のため、待ち行列は縮んでいます。`,
+            triggers: runs.reduce((acc, r) => { const k = r.trigger || "unknown"; acc[k] = (acc[k] || 0) + 1; return acc; }, {}),
+          },
+        }));
         return;
       }
       if (pathname === "/api/fixtures/analysis") {
@@ -5056,6 +5221,9 @@ const server = http.createServer(async (req, res) => {
           partial: !!(idxState && idxState.partial),
           reasonJa: (idxState && idxState.reasonJa) || (rows.length ? null : "索引がまだ作られていません。"),
           count: rows.length,
+          // 「目次が無い」のか「目次はあるが中身が0」のかを外から区別できるようにする
+          metaFound: idxState ? (idxState.metaFound === true) : null,
+          expectedCount: idxState ? (idxState.expectedCount ?? null) : null,
           builtAt: (idxState && idxState.meta && idxState.meta.builtAt) || null,
           shardCount: (idxState && idxState.meta && idxState.meta.shardCount) || null,
           sources: (idxState && idxState.meta && idxState.meta.sources) || null,
@@ -5796,6 +5964,8 @@ function __setTestHooks(hooks) {
   if (hooks.upstashSetJSON) upstashSetJSON = hooks.upstashSetJSON;
   if (hooks.callApiFootball) callApiFootball = hooks.callApiFootball;
   if (hooks.handleFixturesToday) handleFixturesToday = hooks.handleFixturesToday;
+  // 自己修復のテストで「学習が始まったか」だけを見たいときに差し替える
+  if (hooks.runDailyLearning) runDailyLearning = hooks.runDailyLearning;
 }
 
 module.exports = {
