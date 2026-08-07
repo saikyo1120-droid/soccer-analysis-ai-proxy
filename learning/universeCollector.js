@@ -1171,3 +1171,210 @@ async function collectUniverse(deps, runAt, dateKey) {
 }
 
 module.exports = { collectUniverse, BUDGET_FLOOR, PLAYER_CAP_DEFAULT, seasonOf };
+
+/* ============================================================================
+   2026年8月7日・「索引はできたのに主要クラブが入っていない」への対処
+   ----------------------------------------------------------------------------
+   本番の実測(/api/knowledge/player-facets):
+     索引 1,401人 / 42クラブ。ところが
+       Arsenal / Barcelona / Bayern / Man City / Liverpool / PSG が **丸ごと不在**
+       国籍「Spain」はわずか2人、平均評価があるのは1,401人中354人
+   利用者が実際に試す名前(Arsenal・Spain・Messi)が、ことごとく穴に落ちていた。
+
+   原因:
+     全100クラブの選手を成績つきで取ってくるのは
+       /players?team=<id>&season=&page=   (③-b の一括取得)
+     だが、これは長い毎日の学習の後半にあり、そこへ到達する前に学習が終わっていた。
+     前半で終わる「名簿同期(1日14クラブ)」の分だけが溜まり、42クラブで頭打ち。
+
+   対処:
+     索引づくりを切り離したのと同じ考え方で、**選手データの収集も切り離す**。
+       ・1回あたりのクラブ数を区切る(既定25クラブ ≒ API 50〜100回)
+       ・どこまで進んだかを保存し、次回は続きから(輪番ではなく確実な巡回)
+       ・保存済みの索引に上書きマージする(実測を消さない)
+     これを数回まわせば、100クラブすべてが検索対象になる。
+   ============================================================================ */
+const COLLECT_CURSOR_KEY = "kb:universe:playercursor";
+
+async function collectClubPlayersBatch(deps, opts) {
+  const o = opts || {};
+  const {
+    callApiFootball, clubDossier, apiBudget,
+    upstashGetJSON, upstashSetJSON, upstashCmd,
+  } = deps;
+  const nowMs = Number.isFinite(o.nowMs) ? o.nowMs : Date.now();
+  const runAt = new Date(nowMs);
+  const season = seasonOf(runAt);
+  const clubLimit = Math.max(1, Math.min(100, o.clubLimit || 25));
+  const pageLimit = Math.max(1, Math.min(6, o.pageLimit || BULK_PAGE_LIMIT));
+  const recordSaveCap = Math.max(0, o.recordSaveCap === undefined ? 400 : o.recordSaveCap);
+
+  const stats = {
+    ok: false, at: runAt.toISOString(),
+    clubsPlanned: 0, clubsFetched: 0, playersFetched: 0, apiRequests: 0,
+    recordsSaved: 0, indexCount: null, indexClubs: null, withRating: null,
+    unresolvedClubs: [], errors: [], notesJa: [],
+    cursorBefore: null, cursorAfter: null, reasonJa: null,
+  };
+  if (typeof callApiFootball !== "function" || !clubDossier) {
+    stats.reasonJa = "収集に必要な部品が渡されていません。";
+    return stats;
+  }
+  const canSpend = (n) => (apiBudget ? apiBudget.remainingForJob() >= BUDGET_FLOOR + n : true);
+
+  // ---- どこまで進んだか(次回は続きから) ----
+  const cursorRec = (upstashGetJSON ? await upstashGetJSON(COLLECT_CURSOR_KEY).catch(() => null) : null) || {};
+  const start = Number.isFinite(Number(cursorRec.next)) ? Number(cursorRec.next) % CLUB_UNIVERSE.length : 0;
+  stats.cursorBefore = start;
+
+  const targets = [];
+  for (let i = 0; i < clubLimit; i++) targets.push(CLUB_UNIVERSE[(start + i) % CLUB_UNIVERSE.length]);
+  stats.clubsPlanned = targets.length;
+
+  const collected = new Map(); // playerId -> レコード
+  let cursorAfter = start;
+
+  for (const club of targets) {
+    if (!canSpend(2)) {
+      stats.notesJa.push(`APIの残り予算が安全ラインを下回ったため、${club.nameJa}以降は次回に回しました。`);
+      break;
+    }
+    // teamId は調査ファイルに保存済み(名前の照合はここではやらない=APIを使わない)
+    let teamId = null;
+    try {
+      const d = await clubDossier.getDossier(club.nameEn);
+      teamId = d && d.teamId ? d.teamId : null;
+    } catch (e) { teamId = null; }
+    cursorAfter = (cursorAfter + 1) % CLUB_UNIVERSE.length;
+    if (!teamId) {
+      stats.unresolvedClubs.push(club.nameEn);
+      continue;
+    }
+    try {
+      let page = 1, totalPages = 1, got = 0;
+      while (page <= Math.min(totalPages, pageLimit)) {
+        if (!canSpend(1)) { stats.notesJa.push(`予算不足のため ${club.nameJa} を${page - 1}ページで打ち切りました。`); break; }
+        const data = await callApiFootball("/players", { team: teamId, season, page });
+        stats.apiRequests++;
+        const t = data && data.paging && Number(data.paging.total);
+        if (Number.isFinite(t) && t > 0) totalPages = t;
+        const rows = (data && data.response) || [];
+        if (!rows.length) break;
+        for (const entry of rows) {
+          const pl = entry && entry.player;
+          if (!pl || !pl.id) continue;
+          const list = Array.isArray(entry.statistics) ? entry.statistics : [];
+          const best = list.length
+            ? list.reduce((acc, cur) =>
+              (((cur.games && cur.games.appearences) || 0) > ((acc.games && acc.games.appearences) || 0) ? cur : acc), list[0])
+            : null;
+          const real = best ? (computePlayerRealStats(best) || {}) : {};
+          collected.set(Number(pl.id), {
+            id: Number(pl.id), name: pl.name || null,
+            teamEn: club.nameEn, teamJa: club.nameJa, leagueId: club.leagueId || null,
+            nationality: pl.nationality || null,
+            height: pl.height || null,
+            birthDate: (pl.birth && pl.birth.date) || null,
+            age: Number.isFinite(Number(pl.age)) ? Number(pl.age) : null,
+            position: real.position || (best && best.games && best.games.position) || null,
+            // 取得できていない値は0で埋めず null のままにする(でっち上げ防止)
+            stats: best ? {
+              appearances: (best.games && best.games.appearences) ?? null,
+              lineups: (best.games && best.games.lineups) ?? null,
+              minutes: (best.games && best.games.minutes) ?? null,
+              rating: best.games && best.games.rating ? Math.round(parseFloat(best.games.rating) * 100) / 100 : null,
+              goals: (best.goals && best.goals.total) ?? null,
+              assists: (best.goals && best.goals.assists) ?? null,
+              keyPasses: real.keyPasses ?? null,
+              passAccuracyPct: real.passAccuracyPct ?? null,
+              dribbleSuccessRatePct: real.dribbleSuccessRatePct ?? null,
+              defensiveActions: real.defensiveActions ?? null,
+              duelWinRatePct: real.duelWinRatePct ?? null,
+              yellowCards: (best.cards && best.cards.yellow) ?? null,
+              redCards: (best.cards && best.cards.red) ?? null,
+              season,
+            } : null,
+          });
+          got++;
+        }
+        page++;
+      }
+      if (got > 0) { stats.clubsFetched++; stats.playersFetched += got; }
+    } catch (e) {
+      if (e && e.code === "BUDGET_EXHAUSTED") {
+        stats.notesJa.push("APIの1日予算に達したため、収集を打ち切りました(続きは次回)。");
+        break;
+      }
+      stats.errors.push(`collect_players_failed:${club.nameEn}:${e.code || e.message}`);
+    }
+  }
+
+  if (upstashSetJSON) {
+    await upstashSetJSON(COLLECT_CURSOR_KEY, {
+      next: cursorAfter, at: runAt.toISOString(),
+      lapCount: (Number(cursorRec.lapCount) || 0) + (cursorAfter <= start ? 1 : 0),
+    }).catch(() => {});
+  }
+  stats.cursorAfter = cursorAfter;
+
+  if (!collected.size) {
+    stats.reasonJa = stats.unresolvedClubs.length
+      ? `対象クラブのチームIDが保存されていないため取得できませんでした(${stats.unresolvedClubs.length}クラブ)。毎日の学習が一度も完了していない可能性があります。`
+      : "取得できた選手が0人でした。";
+    return stats;
+  }
+
+  // ---- 索引に上書きマージする(前回の実測を消さない) ----
+  const psDeps = {
+    upstashEnabled: !!(upstashGetJSON && upstashSetJSON),
+    upstashGetJSON, upstashSetJSON, upstashCmd,
+  };
+  const prevLoaded = await playerSearch.loadIndex(psDeps);
+  const prevMap = new Map();
+  for (const r of (prevLoaded.rows || [])) prevMap.set(Number(r[playerSearch.COL.id]), r);
+  const grid = (await playerSearch.loadGrid(psDeps).catch(() => null)) || {};
+  const todayKey = playerSearch.dateKeyNum(runAt.toISOString());
+
+  const rows = [];
+  const seen = new Set();
+  for (const [id, rec] of collected) {
+    seen.add(id);
+    rows.push(playerSearch.toIndexRow(rec, { todayKey, gridStats: playerSearch.gridStatsFrom(grid[id]) }, nowMs, prevMap.get(id) || null));
+  }
+  for (const [id, prevRow] of prevMap) {
+    if (seen.has(id)) continue;
+    rows.push(prevRow);   // 今回取得しなかった選手を消さない
+  }
+  const saveRes = await playerSearch.saveIndex(psDeps, rows, {
+    builtAt: runAt.toISOString(),
+    collectedBatch: true,
+    sources: { clubsFetched: stats.clubsFetched, playersFetched: stats.playersFetched },
+  });
+  stats.ok = saveRes.saved === true;
+  stats.indexCount = rows.length;
+  stats.indexClubs = new Set(rows.map((r) => r[playerSearch.COL.teamEn]).filter(Boolean)).size;
+  stats.withRating = rows.filter((r) => r[playerSearch.COL.rating] !== null && r[playerSearch.COL.rating] !== undefined).length;
+  if (!saveRes.saved) stats.reasonJa = saveRes.reasonJa || "索引の保存に失敗しました。";
+
+  // ---- 選手記録も保存する(上限つき。次回の作り直しの材料になる) ----
+  if (recordSaveCap > 0) {
+    let saved = 0;
+    const statsIndex = await clubDossier.getStatsIndex().catch(() => ({}));
+    for (const [id, rec] of collected) {
+      if (saved >= recordSaveCap) break;
+      if (!rec.stats) continue;              // 成績が無い選手は記録を増やさない
+      if (statsIndex[id]) continue;          // 既にあるものは書き直さない(コマンド節約)
+      try {
+        await clubDossier.savePlayer(rec);
+        statsIndex[id] = runAt.toISOString();
+        saved++;
+      } catch (e) { /* 1件失敗しても続ける */ }
+    }
+    if (saved) await clubDossier.saveStatsIndex(statsIndex).catch(() => {});
+    stats.recordsSaved = saved;
+  }
+  return stats;
+}
+
+module.exports.collectClubPlayersBatch = collectClubPlayersBatch;
+module.exports.COLLECT_CURSOR_KEY = COLLECT_CURSOR_KEY;
