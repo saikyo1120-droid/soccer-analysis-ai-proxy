@@ -154,6 +154,9 @@ async function collectUniverse(deps, runAt, dateKey) {
   const injuryCheckedClubs = new Set();  // 今日、負傷者リストを実際に確認できたクラブ(nameEn)
   const gridUpdates = new Map();         // playerId -> { grid, maxRow }(今日ぶん)
   const savedTodayIds = new Set();       // 今日 savePlayer を通した選手(速報の二重計上を防ぐ)
+  const injuryRowsToday = [];            // 怪我の履歴(/injuries の中身。追加コスト0)
+  const transferRowsToday = [];          // 移籍の履歴(/transfers の中身。追加コスト0)
+  const recent5ByPlayer = new Map();     // playerId -> 直近5試合の実測
   const squadOnlyPending = [];           // 名簿で見つけた選手(一括取得で拾えなければ後で保存する)
   const emittedByPlayer = new Map();     // playerId -> savePlayer が実際に出した速報の種類
 
@@ -341,7 +344,16 @@ async function collectUniverse(deps, runAt, dateKey) {
         injuryCheckedClubs.add(club.nameEn);
         for (const r of (inj.response || [])) {
           const pid = r && r.player && r.player.id;
-          if (pid) injuredIds.add(Number(pid));
+          if (!pid) continue;
+          injuredIds.add(Number(pid));
+          // 怪我の履歴(詳細画面用)。これも同じレスポンスの中にある情報。
+          injuryRowsToday.push({
+            playerId: Number(pid),
+            reasonJa: (r.player && r.player.reason) || null,
+            typeJa: (r.player && r.player.type) || null,
+            at: (r.fixture && r.fixture.date) ? String(r.fixture.date).slice(0, 10) : dateKey,
+            teamEn: club.nameEn, teamJa: club.nameJa,
+          });
         }
         const prevDossier = await clubDossier.getDossier(club.nameEn);
         const prevCount = prevDossier && prevDossier.sections.injuries
@@ -417,6 +429,20 @@ async function collectUniverse(deps, runAt, dateKey) {
         const tr = await callApiFootball("/transfers", { team: teamId });
         const since = new Date(runAt.getTime() - 30 * 86400000);
         const recent = summarizeTransfers(tr.response, teamId, 5, since);
+        // 追加コスト0: 選手ごとの移籍履歴(詳細画面用)。同じレスポンスの中にある。
+        for (const row of (tr.response || [])) {
+          const pid = row && row.player && row.player.id;
+          if (!pid) continue;
+          for (const mv of (row.transfers || []).slice(0, 6)) {
+            transferRowsToday.push({
+              playerId: Number(pid),
+              date: mv.date ? String(mv.date).slice(0, 10) : null,
+              fromEn: (mv.teams && mv.teams.out && mv.teams.out.name) || null,
+              toEn: (mv.teams && mv.teams.in && mv.teams.in.name) || null,
+              typeJa: mv.type || null,
+            });
+          }
+        }
         const r = await clubDossier.updateSection(club.nameEn, "transfers", {
           recent: recent.map((t) => ({ playerName: t.playerName, direction: t.direction, counterpart: t.counterpart, date: t.date ? String(t.date).slice(0, 10) : null })),
           countLast30Days: recent.length,
@@ -557,6 +583,8 @@ async function collectUniverse(deps, runAt, dateKey) {
             // ことが分かるようにする(でっち上げ防止)。
             stats: best ? {
               appearances: (best.games && best.games.appearences) ?? null,
+              // スタメン出場数。同じ応答に入っているのに使っていなかった(追加コスト0)
+              lineups: (best.games && best.games.lineups) ?? null,
               minutes: (best.games && best.games.minutes) ?? null,
               rating: best.games && best.games.rating ? Math.round(parseFloat(best.games.rating) * 100) / 100 : null,
               goals: (best.goals && best.goals.total) ?? null,
@@ -591,6 +619,97 @@ async function collectUniverse(deps, runAt, dateKey) {
         break;
       }
       stats.errors.push(`universe_bulk_players_failed:${club.nameEn}:${e.code || e.message}`);
+    }
+  }
+
+  // ============================================================
+  // ③-c 直近5試合の実測(2026年8月・「選手検索」統合で新設)
+  // ============================================================
+  // ご要望の「直近5試合評価」「最近5試合」「スタメン率の裏づけ」は、
+  // シーズン集計だけでは絶対に作れない(1試合ごとの数字が要る)。
+  // /fixtures/players?fixture=<id> は **1リクエストで両チーム全員** の
+  // その試合の評価・出場時間・得点・アシスト・先発かどうかを返す。
+  //
+  // 試合IDはコア更新で取得済みの /fixtures(直近10試合)を再利用するので、
+  // **試合一覧の取得は追加コスト0**。新たに増えるのは
+  // /fixtures/players の呼び出しだけ。TOP100クラブの直近5試合を重複除去すると
+  // 実測で200〜300試合程度(同士討ちは1回で両クラブぶん賄える)。
+  stats.recentMatches = { planned: 0, fetched: 0, playersCovered: 0 };
+  const RECENT_FIXTURE_CAP = Number(process.env.UNIVERSE_RECENT_FIXTURE_CAP) || 260;
+  const RECENT_PER_CLUB = Number(process.env.UNIVERSE_RECENT_PER_CLUB) || 5;
+  if (!alreadyRanToday) {
+    try {
+      // 直近5試合(終了済み)の試合IDを、全クラブぶん集めて重複を除く
+      const wanted = new Map(); // fixtureId -> date
+      for (const [, fixtures] of fixturesCache) {
+        const finished = (fixtures || [])
+          .filter((f) => f && f.fixture && f.fixture.status && f.fixture.status.short === "FT")
+          .sort((a, b) => new Date(b.fixture.date) - new Date(a.fixture.date))
+          .slice(0, RECENT_PER_CLUB);
+        for (const f of finished) {
+          if (!wanted.has(f.fixture.id)) wanted.set(f.fixture.id, f.fixture.date);
+        }
+      }
+      const ids = [...wanted.entries()]
+        .sort((a, b) => new Date(b[1]) - new Date(a[1]))   // 新しい試合から
+        .slice(0, RECENT_FIXTURE_CAP);
+      stats.recentMatches.planned = ids.length;
+      if (wanted.size > ids.length) {
+        skip("recentMatches", `直近試合の取得は1日${RECENT_FIXTURE_CAP}試合までとしているため、${wanted.size - ids.length}試合は次回に回しました。`);
+      }
+      for (const [fid, fdate] of ids) {
+        if (!canSpend(1)) {
+          skip("recentMatches", `APIの残り予算が不足したため、直近試合の取得を${stats.recentMatches.fetched}試合で打ち切りました。`);
+          break;
+        }
+        try {
+          const data = await callApiFootball("/fixtures/players", { fixture: fid });
+          stats.recentMatches.fetched++;
+          const sides = data.response || [];
+          for (let si = 0; si < sides.length; si++) {
+            const side = sides[si];
+            // 対戦相手は「もう一方の側」。side.team は選手自身のクラブなので、
+            // それを相手として記録すると、画面に事実と違う対戦相手が出てしまう。
+            // 2チームぶん揃っていないレスポンスでは相手を null(=未取得)にする。
+            const other = sides.length === 2 ? sides[1 - si] : null;
+            const opponentEn = (other && other.team && other.team.name) || null;
+            for (const p of (side.players || [])) {
+              const pid = p && p.player && p.player.id;
+              const st0 = p && p.statistics && p.statistics[0];
+              if (!pid || !st0) continue;
+              const g = st0.games || {};
+              const rating = g.rating ? Math.round(parseFloat(g.rating) * 100) / 100 : null;
+              const minutes = Number.isFinite(Number(g.minutes)) ? Number(g.minutes) : null;
+              const arr = recent5ByPlayer.get(Number(pid)) || [];
+              arr.push({
+                fixtureId: fid,
+                date: fdate ? String(fdate).slice(0, 10) : null,
+                teamEn: (side.team && side.team.name) || null,
+                opponentEn,
+                rating, minutes,
+                started: g.substitute === false ? 1 : (g.substitute === true ? 0 : null),
+                goals: (st0.goals && Number.isFinite(Number(st0.goals.total))) ? Number(st0.goals.total) : null,
+                assists: (st0.goals && Number.isFinite(Number(st0.goals.assists))) ? Number(st0.goals.assists) : null,
+              });
+              recent5ByPlayer.set(Number(pid), arr);
+            }
+          }
+        } catch (e) {
+          if (e && e.code === "BUDGET_EXHAUSTED") {
+            skip("recentMatches", "APIの1日予算に達したため、直近試合の取得を打ち切りました。");
+            break;
+          }
+          stats.errors.push(`universe_recent_fixture_failed:${fid}:${e.code || e.message}`);
+        }
+      }
+      // 新しい順に5件へ切り詰める
+      for (const [pid, arr] of recent5ByPlayer) {
+        arr.sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+        recent5ByPlayer.set(pid, arr.slice(0, 5));
+      }
+      stats.recentMatches.playersCovered = recent5ByPlayer.size;
+    } catch (e) {
+      stats.errors.push(`universe_recent_matches_failed:${e.message}`);
     }
   }
 
@@ -685,6 +804,7 @@ async function collectUniverse(deps, runAt, dateKey) {
           position: real.position || null,
           stats: {
             appearances: (best.games && best.games.appearences) ?? null,
+            lineups: (best.games && best.games.lineups) ?? null,
             minutes: (best.games && best.games.minutes) ?? null,
             rating: best.games && best.games.rating ? Math.round(parseFloat(best.games.rating) * 100) / 100 : null,
             goals: (best.goals && best.goals.total) ?? null,
@@ -792,7 +912,20 @@ async function collectUniverse(deps, runAt, dateKey) {
         // 0/1 を更新する。確認できていないクラブの選手は前回値を維持する
         // (確認していないのに「怪我していない」と書くのはでっち上げになる)。
         const injured = injuryCheckedClubs.has(rec.teamEn) ? injuredIds.has(id) : undefined;
-        const row = playerSearch.toIndexRow(rec, { leagueId: rec.leagueId, injured, gridStats, todayKey }, runAt.getTime(), prev);
+        // 直近5試合の実測(取れた選手だけ。取れていなければ前回値を維持する)
+        const r5 = recent5ByPlayer.get(id) || null;
+        let recent5Rating = null, recent5Count = null, recent5Minutes = null;
+        if (r5 && r5.length) {
+          const rated = r5.filter((x) => Number.isFinite(x.rating));
+          const played = r5.filter((x) => Number.isFinite(x.minutes));
+          recent5Count = rated.length;
+          recent5Rating = rated.length ? Math.round((rated.reduce((a, x) => a + x.rating, 0) / rated.length) * 100) / 100 : null;
+          recent5Minutes = played.length ? Math.round(played.reduce((a, x) => a + x.minutes, 0) / played.length) : null;
+        }
+        const row = playerSearch.toIndexRow(rec, {
+          leagueId: rec.leagueId, injured, gridStats, todayKey,
+          recent5Rating, recent5Count, recent5Minutes,
+        }, runAt.getTime(), prev);
         rows.push(row);
         if (prev && !rowsEquivalent(prev, row)) changed.push({ row, prev });
         else if (!prev) changed.push({ row, prev: null });
@@ -902,6 +1035,16 @@ async function collectUniverse(deps, runAt, dateKey) {
         if (liveIds.has(Number(pid))) prunedGrid[pid] = entry;
       }
       await playerSearch.saveGrid(psDeps, prunedGrid);
+      // ---- 詳細画面用の補助データ(直近5試合・移籍履歴・怪我履歴)----
+      // 索引とは別に、ブロック分割で保存する。画面は選手を開いたときだけ読む。
+      // 索引に載っている選手ぶんだけに絞る(退団者で膨らませない)。
+      const detailStores = await playerSearch.saveDetailStores(psDeps, {
+        liveIds,
+        recent5: recent5ByPlayer,
+        transfers: transferRowsToday,
+        injuries: injuryRowsToday,
+      });
+      stats.detailStores = detailStores;
       const saveRes = await playerSearch.saveIndex(psDeps, rows, {
         builtAt: runAt.toISOString(), dateKey,
         sources: {
@@ -924,6 +1067,8 @@ async function collectUniverse(deps, runAt, dateKey) {
         detailedPositionCount: rows.filter((r) => r[C.detailedPos]).length,
         injuredCount: rows.filter((r) => r[C.injured] === 1).length,
         withRating: rows.filter((r) => r[C.rating] !== null && r[C.rating] !== undefined).length,
+        withRecent5: rows.filter((r) => (r[C.recent5Count] || 0) >= 3).length,
+        withStartRate: rows.filter((r) => Number.isFinite(r[C.lineups])).length,
         firstBuild: isFirstBuild,
         // saveIndex がシャードごとに計測した実サイズ(ここで再度JSON化しない)
         approxBytes: (saveRes.meta && Array.isArray(saveRes.meta.bytesPerShard))
