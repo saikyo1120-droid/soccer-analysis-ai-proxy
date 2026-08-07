@@ -1233,22 +1233,59 @@ async function collectClubPlayersBatch(deps, opts) {
 
   const collected = new Map(); // playerId -> レコード
   let cursorAfter = start;
+  // teamIdが未保存のクラブを、その場で照合する回数の上限(1クラブ=API1回)
+  const resolveCap = Math.max(0, o.resolveCap === undefined ? 12 : o.resolveCap);
+  let resolvedThisRun = 0;
+  stats.resolvedNow = 0;
 
   for (const club of targets) {
     if (!canSpend(2)) {
       stats.notesJa.push(`APIの残り予算が安全ラインを下回ったため、${club.nameJa}以降は次回に回しました。`);
       break;
     }
-    // teamId は調査ファイルに保存済み(名前の照合はここではやらない=APIを使わない)
+    // teamId は調査ファイルに保存済みのものを使う(APIを使わない)。
+    // ---- 2026年8月7日・本番実測での修正 ----
+    //   保存済みのteamIdが無いクラブが多く、そこを黙って飛ばしていたため
+    //   収集が実質なにも進んでいなかった(索引 1,401→1,433 = +32人だけ)。
+    //   teamIdが無いクラブは、その場で1回だけ名前を照合して保存する。
+    //   照合はAPI1回なので、1実行あたりの上限を決めて使いすぎないようにする。
     let teamId = null;
+    let dossier = null;
     try {
-      const d = await clubDossier.getDossier(club.nameEn);
-      teamId = d && d.teamId ? d.teamId : null;
+      dossier = await clubDossier.getDossier(club.nameEn);
+      teamId = dossier && dossier.teamId ? dossier.teamId : null;
     } catch (e) { teamId = null; }
     cursorAfter = (cursorAfter + 1) % CLUB_UNIVERSE.length;
     if (!teamId) {
-      stats.unresolvedClubs.push(club.nameEn);
-      continue;
+      if (resolvedThisRun >= resolveCap || !canSpend(2)) {
+        stats.unresolvedClubs.push(club.nameEn);
+        continue;
+      }
+      try {
+        const found = await callApiFootball("/teams", { search: club.nameEn });
+        stats.apiRequests++;
+        resolvedThisRun++;
+        const list = (found && found.response) || [];
+        const exact = list.find((x) => x && x.team && String(x.team.name).toLowerCase() === club.nameEn.toLowerCase())
+          || list.find((x) => x && x.team && String(x.team.name).toLowerCase().replace(/[^a-z0-9]/g, "")
+            === club.nameEn.toLowerCase().replace(/[^a-z0-9]/g, ""))
+          || (list.length === 1 ? list[0] : null);
+        if (exact && exact.team && exact.team.id) {
+          teamId = exact.team.id;
+          stats.resolvedNow++;
+          // 次回からはAPIを使わずに済むよう保存する
+          await clubDossier.updateSection(club.nameEn, "basic",
+            (dossier && dossier.sections && dossier.sections.basic) || { note: "teamId resolved" },
+            { nameJa: club.nameJa, teamId, uefaRankSnapshot: club.rank }).catch(() => {});
+        }
+      } catch (e) {
+        if (e && e.code === "BUDGET_EXHAUSTED") {
+          stats.notesJa.push("APIの1日予算に達したため、クラブ名の照合を打ち切りました。");
+          break;
+        }
+        stats.errors.push(`resolve_failed:${club.nameEn}:${e.code || e.message}`);
+      }
+      if (!teamId) { stats.unresolvedClubs.push(club.nameEn); continue; }
     }
     try {
       let page = 1, totalPages = 1, got = 0;
