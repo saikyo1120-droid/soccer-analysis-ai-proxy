@@ -708,7 +708,37 @@ async function runDailyLearning(deps) {
   let aiViewsUnchanged = 0;
   const llmSkippedReasons = [];
 
+  // ============================================================================
+  // 2026年8月7日・「学習が途中で止まっている」を突き止めるための進捗記録
+  // ----------------------------------------------------------------------------
+  // 本番の実測: 選手記録は922件→1,378件に増えたのに、成長ログ(この関数の最後で
+  // 書かれる)は前日のまま。つまり **収集までは進んで、最後まで到達していない**。
+  // どこで止まったのかが分からず、原因の切り分けができなかった。
+  //
+  // 各段階の入口で「今どこにいるか」を1件だけ保存する(1実行あたり十数回の書き込み)。
+  // 次に止まったときは /api/learning/progress を見るだけで停止箇所が分かる。
+  // ============================================================================
+  // now は関数で渡されることがある(nowFn/runAt が正規化済みの値)
+  const runStartedAt = runAt.toISOString();
+  const stageLog = [];
+  let stageIndex = 0;
+  const stage = async (name) => {
+    stageIndex++;
+    const at = new Date().toISOString();
+    stageLog.push({ n: stageIndex, name, at });
+    if (!upstashEnabled) return;
+    try {
+      await upstashSetJSON("learn:progress", {
+        date: dateKey, startedAt: runStartedAt, stage: name, stageIndex,
+        at, elapsedSec: Math.max(0, Math.round((Date.now() - runAt.getTime()) / 1000)),
+        finished: false, stages: stageLog.slice(-30),
+      });
+    } catch (e) { /* 進捗の記録に失敗しても学習は止めない */ }
+  };
+  await stage("開始");
+
   // ---- ① 登録クラブの実結果から「事実」を抽出(Layer1)+ v2特徴量の下地を計算 ----
+  await stage("① 登録クラブの実結果から事実を抽出");
   const teamFormCache = new Map();
   // 2026年8月・優先順位②: 同じリーグ・同じチームの得点ランキング取得を
   // 1回の実行内で重複させないためのキャッシュ(APIリクエストの節約)。
@@ -763,6 +793,7 @@ async function runDailyLearning(deps) {
     }
   }
 
+  await stage("①-b 固定知識の自動補完");
   // ---- ①-b Knowledge Engine Layer2(固定知識)の自動補完 ----
   // 既に有効なプロフィールがあるクラブはスキップされる(ensureClubProfile内部で
   // 判定)ため、実際にLLM呼び出しが発生するのは「まだプロフィールが無い/失効した」
@@ -785,6 +816,7 @@ async function runDailyLearning(deps) {
     }
   }
 
+  await stage("①-c AIの見解を生成");
   // ---- ①-c Knowledge Engine Layer3(AIの現在の見解)を毎日生成 ----
   // 「昨日何を考えていたか・今日何を考えているか・その理由」をMemory Engineに
   // 記録する(Memory Engineは変化検知・変化理由の保存を既に実装済みなので、
@@ -880,6 +912,7 @@ async function runDailyLearning(deps) {
     llmSkippedReasons.push("LLM_NOT_CONFIGURED");
   }
 
+  await stage("①-d 監督交代・補強の影響");
   // ---- ①-d Knowledge Engine: 監督交代・補強の影響を毎日確認する(ご要望②) ----
   // 「監督交代による変化」「補強の影響」はいずれもAPI-Footballの実データ
   // (/coachs, /transfers)で取得できるため、AIの推測ではなく事実として記録する。
@@ -967,6 +1000,7 @@ async function runDailyLearning(deps) {
     }
   }
 
+  await stage("①-e リーグ知識の蓄積");
   // ---- ①-e 主要リーグのKnowledge Engine日次蓄積(2026年8月・優先順位⑥) ----
   // 登録クラブ単位(REGISTERED_TEAMS)とは別に、リーグ単位で順位表・得点/
   // アシストランキングを毎日取得し蓄積する。欧州5大リーグは毎日必ず、それ
@@ -980,6 +1014,7 @@ async function runDailyLearning(deps) {
     errors.push(`league_knowledge_failed:${e.message}`);
   }
 
+  await stage("①-f 選手情報の日次更新");
   // ---- ①-f 選手情報の日次更新(2026年8月・優先順位⑦) ----
   // 「聞かれた時だけ取得」から「毎日更新」へ。16項目それぞれについて、
   // 取得できた値、または取得できなかった理由を必ず記録する
@@ -1002,6 +1037,7 @@ async function runDailyLearning(deps) {
     errors.push(`player_daily_update_failed:${e.message}`);
   }
 
+  await stage("② 自社予測の答え合わせ");
   // ---- ② 保留中の自社予測を解決(試合が終わっていれば的中/不的中を確定) ----
   // 2026年8月・ご指示⑨: 解決した予測はその場で全市場(勝敗/BTTS/Over-Under/
   // スコア)の採点を行い、日次の精度記録(learn:accuracy:<date>)に積む。
@@ -1357,6 +1393,7 @@ async function runDailyLearning(deps) {
     return recentRecordsShared;
   }
 
+  await stage("③ 新しい予測を立てる");
   // ---- ③ TOP100クラブの直近の試合について、新しく自社予測を立てる ----
   // 2026年8月の調査で修正: 旧実装はここを REGISTERED_TEAMS(11クラブ)で回して
   // いたため、知識収集は毎日100クラブ回っているのに **予測はTOP100のうち9クラブ
@@ -1644,6 +1681,7 @@ async function runDailyLearning(deps) {
     predictionCoverage = { error: e.message, noteJa: "予測カバー率を取得できませんでした(Upstashの読み出しに失敗)" };
   }
 
+  await stage("③-b TOP100クラブの収集(選手索引もここ)");
   // ---- ③-b UEFA上位100クラブの知識収集(2026年8月・知識拡大フェーズ) ----
   // ご指示①②③: 上位100クラブとその選手の実データを、更新頻度の階層つきで
   // 毎日収集し、クラブ調査ファイル(kb:club:*)へ構造化して保存する。
@@ -1682,6 +1720,7 @@ async function runDailyLearning(deps) {
     errors.push(`universe_collection_failed:${e.message}`);
   }
 
+  await stage("④ モデルの重み調整");
   // ---- ④ 十分な検証データが溜まっていれば、モデルの重みを再調整する ----
   const totalResolvedRaw = await upstashCmd(["GET", "learn:ownpred:resolved"]).catch(() => null);
   const totalCorrectRaw = await upstashCmd(["GET", "learn:ownpred:correct"]).catch(() => null);
@@ -1924,6 +1963,7 @@ async function runDailyLearning(deps) {
     }
   }
 
+  await stage("④-b 過去試合によるモデル調整(バックテスト)");
   // ---- ④-b 過去試合によるモデル調整(2026年8月・共同開発者レビュー対応) ----
   //   上の重み学習は「自社が予測した試合」だけを使うため、本番でも36件しか
   //   貯まらず、11特徴量のうち10個の重みが初期値0のままだった。
@@ -1967,6 +2007,7 @@ async function runDailyLearning(deps) {
     modelTuning = { ran: false, adopted: false, reasonJa: `過去試合によるモデル調整でエラーが発生しました(${e && e.message})。` };
   }
 
+  await stage("⑤ 知識ベース更新と成長ログ");
   // ---- ⑤ 今日の知識ベース更新と成長ログ ----
   // Stage E以降: 「事実」の保存先はKnowledge Engine(knowledgeStore.js)に一本化。
   // 重複した内容(前日と全く同じ事実)は正直に「重複」として扱われ、二重に
@@ -2243,6 +2284,7 @@ async function runDailyLearning(deps) {
   // 知識の使用回数を1日1回まとめて保存する(質問時にはRedisへ書かない設計)。
   try { await knowledgeStore.flushUsageCounters(); } catch (e) { /* ベストエフォート */ }
 
+  await stage("⑥ 知能メトリクスの計測");
   // ---- 2026年8月・AI知能計測ラウンド(ご指示①〜⑨) ----
   // 1日の最後に「AIの脳」の測定をまとめて行う(重い読み書きはすべて夜間バッチの
   // ここで行い、利用者の質問時には一切行わない。最終方針⑥)。
@@ -2436,6 +2478,17 @@ async function runDailyLearning(deps) {
     await upstashCmd(["EXPIRE", `learn:growthlog:${dateKey}`, String(120 * 86400)]).catch(() => {});
   }
 
+  // 最後まで到達したことを記録する(途中で止まった場合は finished:false のまま残る)
+  if (upstashEnabled) {
+    try {
+      await upstashSetJSON("learn:progress", {
+        date: dateKey, startedAt: runStartedAt, stage: "完了", stageIndex: stageIndex + 1,
+        at: new Date().toISOString(),
+        elapsedSec: Math.max(0, Math.round((Date.now() - runAt.getTime()) / 1000)),
+        finished: true, stages: stageLog.slice(-30),
+      });
+    } catch (e) { /* ベストエフォート */ }
+  }
   return { ok: true, ...mergedGrowthLog };
 }
 
