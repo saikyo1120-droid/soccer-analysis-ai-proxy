@@ -7069,13 +7069,122 @@ async function renderGrowthLogWidget() {
   //   実際に本番で出たのは「3クラブの名前がデータ提供元と一致しない」
   //   という局所的な事象で、他の収集にはまったく影響していなかったため、
   //   利用者に誤った不安を与える表示になっていた。中身で説明を出し分ける。
+/* ================================================================
+   2026年8月7日・ご指摘への対応
+   ----------------------------------------------------------------
+   「AIの成長レポートでエラーが出ています」
+   画面には赤い ❌ と、こういう英語がそのまま並んでいた:
+
+     prediction_unresolvable:1548504:PST
+     odds_failed:1552121:HTTP_ERROR
+     predict_failed:Real Madrid:API-Football HTTP 429
+
+   ところが中身は3種類がまざっていた。
+     (1) 本当に困るもの  … 429で「その日の予測が8クラブぶん作れなかった」
+     (2) 正常な処理      … 延期になった試合を待ち行列から外した記録
+     (3) 仕様上の限界    … API-Footballが利き足や市場価値を提供していない
+   全部を同じ赤い「エラー」として出していたのが間違いだった。
+   何が起きて、利用者に影響があるのかを日本語で分ける。
+   ================================================================ */
+const LEARN_ERROR_RULES = [
+  {
+    test: /HTTP 429|RATE_LIMITED|1分あたりの上限/,
+    level: "impact",
+    titleJa: "データ提供元の1分あたりの上限に当たり、取得できなかったものがあります",
+    meaningJa: "API-Footballには1分あたりの回数制限があります。ここに当たったぶんは、その日のうちに取得できていません。",
+    effectJa: "その試合・そのクラブの分析が、当日は最新になりません(翌日の学習で自動的に取り直します)。",
+  },
+  {
+    test: /^predict_failed/,
+    level: "impact",
+    titleJa: "新しい予測を作れなかったクラブがあります",
+    meaningJa: "予測に必要なデータを取得できなかったクラブです。",
+    effectJa: "そのクラブについて、その日の新しい予測は作られていません。",
+  },
+  {
+    test: /^prediction_unresolvable:.*:(PST|CANC|ABD|AWD|WO)$/,
+    level: "normal",
+    titleJa: "延期・中止になった試合を、答え合わせの待ち行列から外しました",
+    meaningJa: "結果が出ない試合なので、いつまでも待たないように取り除いた記録です。",
+    effectJa: "正常な処理です。利用者への影響はありません。",
+  },
+  {
+    test: /^prediction_fixture_(missing|not_found)/,
+    level: "normal",
+    titleJa: "提供元から消えた試合を、答え合わせの対象から外しました",
+    meaningJa: "試合IDが振り直された・シーズン移行で消えた等で、確認しても見つからない試合です。",
+    effectJa: "正常な処理です。利用者への影響はありません。",
+  },
+  {
+    test: /存在しないため|提供していないため|提供されていません/,
+    level: "spec",
+    titleJa: "データ提供元がそもそも持っていない項目です",
+    meaningJa: "API-Footballが提供していない項目(利き足・市場価値・年俸など)です。",
+    effectJa: "取得できないものとして、画面でも「取得できません」と明記しています。",
+  },
+  {
+    test: /^odds_failed/,
+    level: "minor",
+    titleJa: "オッズを取得できなかった試合があります",
+    meaningJa: "その試合にオッズが提供されていないか、取得が一時的に失敗しました。",
+    effectJa: "市場との比較(ROI)の集計から、その試合だけが外れます。予測そのものには影響しません。",
+  },
+  {
+    test: /に一致する選手が見つかりませんでした/,
+    level: "minor",
+    titleJa: "提供元で見つからなかった選手がいます",
+    meaningJa: "表記ゆれ等で、API-Football側の選手と結びつけられなかったものです。",
+    effectJa: "その選手の成績だけが更新されません。他の選手には影響しません。",
+  },
+];
+const LEARN_ERROR_LEVEL_JA = {
+  impact: { labelJa: "影響があったもの", icon: "⚠️", color: "var(--critical)" },
+  minor: { labelJa: "小さな取りこぼし", icon: "△", color: "var(--warning)" },
+  normal: { labelJa: "正常な処理の記録", icon: "✓", color: "var(--text-secondary)" },
+  spec: { labelJa: "そもそも取得できない項目", icon: "—", color: "var(--text-muted)" },
+};
+
+function classifyLearnErrors(list) {
+  const groups = new Map();
+  let unknown = 0;
+  (list || []).forEach((raw) => {
+    const text = String(raw);
+    const rule = LEARN_ERROR_RULES.find((r) => r.test.test(text));
+    if (!rule) {
+      unknown++;
+      const key = "unknown";
+      if (!groups.has(key)) {
+        groups.set(key, {
+          level: "minor", titleJa: "分類できなかったもの",
+          meaningJa: "想定していない種類の記録です。", effectJa: "内容を確認する必要があります。",
+          items: [],
+        });
+      }
+      groups.get(key).items.push(text);
+      return;
+    }
+    if (!groups.has(rule.titleJa)) groups.set(rule.titleJa, { ...rule, items: [] });
+    groups.get(rule.titleJa).items.push(text);
+  });
+  const arr = [...groups.values()];
+  const order = { impact: 0, minor: 1, normal: 2, spec: 3 };
+  arr.sort((a, b) => order[a.level] - order[b.level]);
+  const impactCount = arr.filter((g) => g.level === "impact").reduce((n, g) => n + g.items.length, 0);
+  const harmlessCount = arr.filter((g) => g.level === "normal" || g.level === "spec").reduce((n, g) => n + g.items.length, 0);
+  return { groups: arr, impactCount, harmlessCount, unknown, total: (list || []).length };
+}
+
   const todayErrors = log.errors || [];
   const unresolvedClubs = (log.universe && log.universe.unresolvedClubs) || [];
   const unresolvedHtml = unresolvedClubs.length
     ? `<div class="value-note" style="margin-top:2px;">ℹ️ ${unresolvedClubs.length}クラブ(${unresolvedClubs.slice(0, 3).map((u) => escapeHtml(u.nameJa || u.nameEn)).join("・")}${unresolvedClubs.length > 3 ? "ほか" : ""})は、データ提供元での表記が異なるため今回は収集できませんでした。<strong>他のクラブの収集には影響していません</strong>(7日後に自動で再挑戦します)。</div>`
     : "";
+  const errClass = classifyLearnErrors(todayErrors);
   const errorWarningHtml = todayErrors.length
-    ? `<div class="value-note" style="margin-top:2px; color:var(--critical);">⚠️ 本日のデータ取得で${todayErrors.length}件のエラーが発生しました(詳細は「詳しく見る」)。該当した処理だけが見送られています。</div>`
+    ? (errClass.impactCount > 0
+      ? `<div class="value-note" style="margin-top:2px; color:var(--critical);">⚠️ 本日、実際に取得できなかったものが${errClass.impactCount}件あります(詳細は「詳しく見る」)。${
+        errClass.harmlessCount ? `残りの${errClass.harmlessCount}件は、正常な処理の記録か、提供元がそもそも持っていない項目です。` : ""}</div>`
+      : `<div class="value-note" style="margin-top:2px;">記録が${todayErrors.length}件ありますが、いずれも正常な処理の記録か、提供元がそもそも持っていない項目です(利用者への影響はありません)。</div>`)
     : "";
   // 2026年8月・バグ修正: Renderのスリープ起床待ち等で同じ日に学習エンジンが
   // 複数回実行されることがある(サーバー側では合算表示するよう修正済みだが、
@@ -7290,12 +7399,23 @@ async function renderGrowthLogWidget() {
     // 利用者が不安にならないよう、正直にエラー内容を開示する(技術的な文字列
     // そのままだが、隠すよりずっと良い)。
     const errorsHtml = todayErrors.length
-      ? `<div style="margin:8px 0 4px; padding:8px 10px; background:rgba(192,57,43,.08); border-radius:8px;">
-           <p class="value-note" style="color:var(--critical); font-weight:600; margin:0 0 4px;">⚠️ 本日発生したエラー(${todayErrors.length}件・開発者向けの技術的な詳細):</p>
-           <ul style="margin:0; padding-left:18px; font-size:12px; color:var(--critical); opacity:.85;">
-             ${todayErrors.slice(0, 10).map((e) => `<li>${escapeHtml(String(e))}</li>`).join("")}
-           </ul>
-           ${todayErrors.length > 10 ? `<p class="value-note" style="margin:4px 0 0;">…他${todayErrors.length - 10}件</p>` : ""}
+      ? `<div style="margin:8px 0 4px; padding:10px 12px; background:var(--surface-2); border-radius:8px;">
+           <p class="value-note" style="font-weight:600; margin:0 0 6px;">本日の記録 ${todayErrors.length}件の内訳${
+        errClass.impactCount > 0 ? `(うち実際に取得できなかったもの ${errClass.impactCount}件)` : "(取得できなかったものはありません)"}</p>
+           ${errClass.groups.map((g) => {
+        const L = LEARN_ERROR_LEVEL_JA[g.level] || LEARN_ERROR_LEVEL_JA.minor;
+        return `<div style="margin:0 0 8px;">
+               <div style="font-size:12.5px; font-weight:600; color:${L.color};">${L.icon} ${escapeHtml(g.titleJa)}(${g.items.length}件)</div>
+               <div class="value-note" style="margin:2px 0 0;">${escapeHtml(g.meaningJa)}</div>
+               <div class="value-note" style="margin:1px 0 0;">→ ${escapeHtml(g.effectJa)}</div>
+               <details style="margin-top:3px;"><summary class="value-note" style="cursor:pointer;">記録された内容を見る</summary>
+                 <ul style="margin:3px 0 0; padding-left:18px; font-size:11.5px; color:var(--text-muted);">
+                   ${g.items.slice(0, 8).map((e) => `<li>${escapeHtml(String(e))}</li>`).join("")}
+                 </ul>
+                 ${g.items.length > 8 ? `<p class="value-note" style="margin:2px 0 0;">…他${g.items.length - 8}件</p>` : ""}
+               </details>
+             </div>`;
+      }).join("")}
          </div>`
       : "";
     detailsEl.innerHTML = `

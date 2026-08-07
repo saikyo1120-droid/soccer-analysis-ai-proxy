@@ -429,11 +429,82 @@ function rateLimited(ip) {
 // RapidAPI経由の場合はヘッダー名が異なる(x-ratelimit-requests-limit は同じだが
 // 提供されないことがある)ため、取れなかった場合は正直にnullのままにする。
 let lastRateLimit = { dailyLimit: null, remaining: null, observedAt: null };
+
+// ============================================================================
+// 2026年8月7日・有料プラン移行の直後に本番で発生した HTTP 429 への対処
+// ----------------------------------------------------------------------------
+// 実測(本番の成長レポート): 12件のエラーのうち8件が
+//   predict_failed:Real Madrid:API-Football HTTP 429
+//   predict_failed:Bayern Munich:API-Football HTTP 429  … 計8クラブ
+// つまり **その日の新しい予測が、登録11クラブ中8クラブぶん作れていなかった**。
+//
+// 原因: API-Football には1日の上限(Pro=7,500)とは別に
+//       **1分あたりの上限(Pro=300回・毎秒5回)** がある。
+//       Renderを 0.1 CPU → 0.5 CPU にした結果、学習の所要時間が
+//       約40分 → 17分に縮み、同じ回数のリクエストをより短時間で
+//       撃つようになった。遅かったから偶然守れていた制限に、
+//       速くなった瞬間に当たった。
+//       (公式の説明: 少しの超過は待たされるが、続くと429、
+//        さらに続くとIPやAPIキーが一時的に遮断される)
+//
+// 対処: 取得量は1回も減らさず、**間隔だけを空ける**(最終方針③に適合)。
+//   ・直近60秒の呼び出し回数を数え、上限に近づいたら自動で待つ
+//   ・実際の上限はレスポンスヘッダー X-RateLimit-Limit から読み取る
+//   ・429が返ったときは、少し待ってから最大3回まで再試行する
+const API_RATE_SAFETY = Number(process.env.API_RATE_SAFETY) || 0.6; // 上限の何割まで使うか(デプロイ重なり等の余裕)
+const API_RATE_FALLBACK_PER_MIN = Number(process.env.API_RATE_PER_MIN) || 300; // Proの既定値
+const API_RETRY_ON_429 = Number.isFinite(Number(process.env.API_RETRY_ON_429)) ? Number(process.env.API_RETRY_ON_429) : 3;
+let observedPerMinuteLimit = null;   // ヘッダーから読み取った実際の毎分上限
+const apiCallTimestamps = [];        // 直近60秒の呼び出し時刻
+let apiRateWaitTotalMs = 0;          // 待った合計(証拠として提出する)
+let apiRate429Count = 0;
+
+function currentPerMinuteCap() {
+  const base = observedPerMinuteLimit || API_RATE_FALLBACK_PER_MIN;
+  return Math.max(5, Math.floor(base * API_RATE_SAFETY));
+}
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 毎分の上限を超えないように、必要なぶんだけ待ってから通す。 */
+async function waitForApiSlot() {
+  for (let guard = 0; guard < 120; guard++) {
+    const now = Date.now();
+    while (apiCallTimestamps.length && now - apiCallTimestamps[0] > 60000) apiCallTimestamps.shift();
+    const cap = currentPerMinuteCap();
+    if (apiCallTimestamps.length < cap) { apiCallTimestamps.push(now); return; }
+    // いちばん古い呼び出しが60秒を抜けるまで待つ
+    const waitMs = Math.max(50, 60000 - (now - apiCallTimestamps[0]) + 20);
+    apiRateWaitTotalMs += waitMs;
+    await sleepMs(waitMs);
+  }
+  apiCallTimestamps.push(Date.now()); // 念のための脱出(待ち続けない)
+}
+
+function apiRateSnapshot() {
+  const now = Date.now();
+  const recent = apiCallTimestamps.filter((t) => now - t <= 60000).length;
+  return {
+    perMinuteCapUsed: currentPerMinuteCap(),
+    perMinuteLimitObserved: observedPerMinuteLimit,
+    callsLastMinute: recent,
+    waitedTotalMs: apiRateWaitTotalMs,
+    retriedOn429: apiRate429Count,
+    noteJa: "1分あたりの上限に当たらないよう、必要なときだけ間隔を空けています(取得する件数は減らしていません)。",
+  };
+}
+
 function recordRateLimitHeaders(res) {
   try {
     if (!res || !res.headers || typeof res.headers.get !== "function") return;
     const limit = parseInt(res.headers.get("x-ratelimit-requests-limit"), 10);
     const remaining = parseInt(res.headers.get("x-ratelimit-requests-remaining"), 10);
+    // 1分あたりの上限(X-RateLimit-Limit)も読む。契約プランごとに違う
+    // (無料=10 / Pro=300 / Ultra=450 / Mega=900)ので、決め打ちにしない。
+    const perMin = parseInt(res.headers.get("x-ratelimit-limit"), 10);
+    if (Number.isFinite(perMin) && perMin > 0 && perMin !== observedPerMinuteLimit) {
+      observedPerMinuteLimit = perMin;
+      console.log(`[api-rate] 1分あたりの上限を検出: ${perMin}回/分 → 実際に使うのは ${currentPerMinuteCap()}回/分まで`);
+    }
     if (Number.isFinite(limit) && limit > 0) {
       const isNew = lastRateLimit.dailyLimit !== limit;
       lastRateLimit = {
@@ -835,9 +906,34 @@ async function callApiFootball(endpoint, params, opts) {
   //   成功・失敗にかかわらず必ず書き戻し対象に含める。
   //   (タイムアウトしたリクエストもAPI-Football側では消費として数えられるため、
   //    「失敗したら返却する」ではなく「数える」のが安全側の判断)
+  // 1分あたりの上限を超えないよう、必要なときだけ待つ(取得件数は減らさない)
+  await waitForApiSlot();
+
   let res;
   try {
     res = await fetchWithTimeout(url.toString(), { headers }, API_FOOTBALL_TIMEOUT_MS);
+    // ---- 429(1分あたりの上限超過)は「失敗」ではなく「待てば通る」 ----
+    //   公式の説明どおり、少し待って出し直せば成功する。ここで諦めると
+    //   その日の予測がクラブ単位で丸ごと欠ける(本番で8クラブ欠けた)。
+    //   予算は既に1回ぶん確保しているので、再試行ぶんも正しく数える。
+    let attempt = 0;
+    while (res && res.status === 429 && attempt < API_RETRY_ON_429) {
+      attempt++;
+      apiRate429Count++;
+      const retryAfterSec = parseInt(res.headers && typeof res.headers.get === "function" ? res.headers.get("retry-after") : null, 10);
+      const waitMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+        ? Math.min(60000, retryAfterSec * 1000)
+        : Math.min(30000, 2000 * Math.pow(2, attempt - 1)); // 2秒 → 4秒 → 8秒
+      console.log(`[api-rate] HTTP 429。${Math.round(waitMs / 1000)}秒待って再試行します(${attempt}/${API_RETRY_ON_429}・${endpoint})`);
+      apiRateWaitTotalMs += waitMs;
+      await sleepMs(waitMs);
+      // 再試行ぶんも1回として数える(予算とレート制限の両方に正しく計上する)
+      const again = isJobCall ? budget.tryReserve(1, `${endpoint}#retry`) : budget.tryReserveUser(1, `${endpoint}#retry`);
+      if (!again.allowed) break;
+      if (!isJobCall) { try { noteHeavyApiCall(); } catch (e2) { /* 計測は本処理を妨げない */ } }
+      await waitForApiSlot();
+      res = await fetchWithTimeout(url.toString(), { headers }, API_FOOTBALL_TIMEOUT_MS);
+    }
   } catch (e) {
     recordApiCallOutcome(false, e.code || "network"); // 成長可視化ラウンド②: 失敗を数える
     throw e;
@@ -868,8 +964,11 @@ async function callApiFootball(endpoint, params, opts) {
   }
   if (!res.ok) {
     recordApiCallOutcome(false, `http_${res.status}`);
-    const err = new Error(`API-Football HTTP ${res.status}`);
-    err.code = "HTTP_ERROR";
+    const err = new Error(res.status === 429
+      ? `API-Football HTTP 429(1分あたりの上限に当たりました。${API_RETRY_ON_429}回待って出し直しましたが解消しませんでした)`
+      : `API-Football HTTP ${res.status}`);
+    err.code = res.status === 429 ? "RATE_LIMITED" : "HTTP_ERROR";
+    err.httpStatus = res.status;
     throw err;
   }
   const json = await res.json();
@@ -7041,6 +7140,8 @@ function __setTestHooks(hooks) {
 module.exports = {
   server,
   __setTestHooks,
+  // 2026年8月7日: 1分あたりの上限(HTTP 429)への対処の検証用
+  callApiFootball, apiRateSnapshot,
   handlePlayerSeasonStats,
   handleFixturesToday,
   handleFixtureAnalysis,
