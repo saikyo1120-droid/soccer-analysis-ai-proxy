@@ -49,6 +49,26 @@
  *   (知識として保存しない)。
  */
 const { REGISTERED_TEAMS } = require("./registeredTeams");
+
+// ---- 学習の全段階(自動QAが「完走したか」を判定するための唯一の正解表) ----
+// ここを増やしたら stage() の呼び出しも同じ順序で増やすこと。
+// 自動QA(autoQA.js)はこの配列と learn:progress を突き合わせて完走を判定する。
+const LEARNING_STAGES = [
+  "開始",
+  "① 登録クラブの実結果から事実を抽出",
+  "①-b 固定知識の自動補完",
+  "①-c AIの見解を生成",
+  "①-d 監督交代・補強の影響",
+  "①-e リーグ知識の蓄積",
+  "①-f 選手情報の日次更新",
+  "② 自社予測の答え合わせ",
+  "③ 新しい予測を立てる",
+  "③-b TOP100クラブの収集(選手索引もここ)",
+  "④ モデルの重み調整",
+  "④-b 過去試合によるモデル調整(バックテスト)",
+  "⑤ 知識ベース更新と成長ログ",
+  "⑥ 知能メトリクスの計測",
+];
 const { createKnowledgeStore } = require("../knowledge/knowledgeStore");
 const { createMemoryStore } = require("../memory/memoryStore");
 const { createRelationshipIndex } = require("../knowledge/relationshipIndex");
@@ -2569,7 +2589,7 @@ async function getRecentFactsForTeam(deps, teamNameEnglish) {
 module.exports = {
   runDailyLearning, getGrowthLog, getRecentFactsForTeam,
   computeFormScore, predictOutcome, backtestAccuracy, outcomeFromScore,
-  DEFAULT_WEIGHTS, REGISTERED_TEAMS,
+  DEFAULT_WEIGHTS, REGISTERED_TEAMS, LEARNING_STAGES,
   buildReflectionText, mergeGrowthLogs,
   MIN_RESOLVED_FOR_RECALIBRATION, OWN_PRED_RECENT_KEEP, OWN_PREDICT_LOG_CAP,
   getTuningHistory,
