@@ -8136,7 +8136,25 @@ async function psLoadFacets() {
   if (unav && data.unavailableFieldsJa) unav.textContent = "検索条件にできない項目: " + Object.values(data.unavailableFieldsJa).join(" ");
   if (lead) {
     lead.innerHTML = data.available
-      ? `毎日の学習でUEFA上位100クラブから収集した <b>${psState.indexedCount.toLocaleString()}人</b> を、名前・国籍・クラブから探せます(クラブ ${(data.clubs || []).length}件 / 国籍 ${(data.nationalities || []).length}種類)。新加入・移籍・怪我・成績・調子は毎日の学習の翌日に自動で反映されます。`
+      ? (() => {
+        // ---- 2026年8月7日の指摘への対応 ----
+        //   ここは「クラブ100件」と書いていたが、これは **選べるクラブの一覧の数**
+        //   であって、実際に選手が入っているクラブの数ではなかった。
+        //   実測では100件と書きながら、選手がいるのは42クラブだけだった。
+        //   利用者が「100クラブぶん入っている」と誤解するので、実数を書く。
+        const withPlayers = (data.clubs || []).filter((c) => Number(c.count) > 0).length;
+        const total = (data.clubs || []).length;
+        const rated = Number(data.withRatingCount);
+        const coverage = withPlayers < total
+          ? `<b>${withPlayers}/${total}クラブ</b>ぶんが入っています(残りは収集中です)`
+          : `<b>${total}クラブ</b>すべてが入っています`;
+        const ratedNote = Number.isFinite(rated) && psState.indexedCount
+          ? ` 成績(平均評価)まで取得できているのは ${rated.toLocaleString()}人です。`
+          : "";
+        return `毎日の学習でUEFA上位100クラブから収集した <b>${psState.indexedCount.toLocaleString()}人</b> を、名前・国籍・クラブから探せます。`
+          + `現在 ${coverage}・国籍 ${(data.nationalities || []).length}種類。${ratedNote}`
+          + ` 新加入・移籍・怪我・成績・調子は毎日の学習の翌日に自動で反映されます。`;
+      })()
       : psEsc(data.reasonJa || "選手の索引がまだ作られていません。");
   }
   return data;

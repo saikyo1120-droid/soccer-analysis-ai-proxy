@@ -2680,6 +2680,39 @@ const LEARN_SWEEP_STALE_MS = Number(process.env.LEARN_SWEEP_STALE_MS) || 26 * 60
 // 逃げ道: 自動起動を止めたい環境(テスト・検証用の複製など)では 0 を指定する
 const SELF_HEAL_DAILY_LEARNING = process.env.SELF_HEAL_DAILY_LEARNING !== "0";
 
+// 選手検索が使える状態かを確認し、足りない分だけを裏で埋める。
+//   ・索引がまったく無い       → 保存済みデータから作り直す(外部API 0回)
+//   ・索引はあるがクラブが不足 → 25クラブぶんずつ収集して追いつかせる
+// どちらも応答を返したあとに走るので、利用者は待たされない。
+async function maybeRepairPlayerIndex() {
+  try {
+    const idx = await loadPlayerIndex(false).catch(() => null);
+    if (!idx) return;
+    const rowCount = (idx.rows || []).length;
+    const neverBuilt = idx.metaFound === false && rowCount === 0;
+    if (neverBuilt) {
+      // 索引づくりは外部APIを1回も使わないので、これだけを走らせる
+      // (以前は「毎日の学習まるごと」を走らせようとして重すぎ、完走しなかった)
+      const got = await upstashCmd([
+        "SET", "kb:player:index:rebuildlock", new Date().toISOString(), "NX", "EX", "1800",
+      ]).catch(() => null);
+      if (got) rebuildPlayerIndexNow({ trigger: "self-heal" }).catch(() => {});
+      return;
+    }
+    if (rowCount === 0) return;
+    // ---- 索引はあるが主要クラブが入っていない場合(2026年8月7日の実測) ----
+    //   索引1,401人・42クラブで Arsenal/Barcelona/Bayern などが丸ごと不在だった。
+    const clubsInIndex = idx.facets && idx.facets.clubs ? idx.facets.clubs.length : 0;
+    if (clubsInIndex >= Math.floor(CLUB_UNIVERSE.length * 0.8)) return;
+    const got = await upstashCmd([
+      "SET", "kb:universe:playercollectlock", new Date().toISOString(), "NX", "EX", "900",
+    ]).catch(() => null);
+    if (!got) return;
+    console.log("[player-collect] self-heal start", JSON.stringify({ clubsInIndex, target: CLUB_UNIVERSE.length }));
+    collectPlayersNow({ trigger: "self-heal" }).catch(() => {});
+  } catch (e) { /* 修復に失敗しても本体は止めない */ }
+}
+
 async function maybeSelfHealDailyLearning() {
   if (!SELF_HEAL_DAILY_LEARNING) return;
   if (!UPSTASH_ENABLED) return;
@@ -2692,31 +2725,16 @@ async function maybeSelfHealDailyLearning() {
     const ranMs = latest && latest.ranAt ? new Date(latest.ranAt).getTime() : null;
     const age = Number.isFinite(ranMs) ? now - ranMs : Infinity;
     let reason = age >= LEARN_SWEEP_STALE_MS ? "stale" : null;
+    // 索引まわりの修復は、学習が古いかどうかとは無関係に必ず確認する
+    // (「学習が古い」ときにだけ見ていると、学習が新しい日に索引が欠けたままになる)
+    await maybeRepairPlayerIndex();
     // ---- 2026年8月7日・本番実測を受けた追加条件 ----
     //   実測: 選手記録は922件あるのに索引は1度も作られておらず、画面の
     //   「選手検索」が全機能停止していた。索引は毎日の学習でしか作られないため、
     //   「まだ24時間経っていないから待つ」では主要機能が丸1日止まったままになる。
     //   索引が **一度も作られていない** ときは、時間を待たずに学習を始める。
     //   (作れなかった場合に無限に走らないよう、専用の3時間ロックで抑える)
-    if (!reason) {
-      const idx = await loadPlayerIndex(false).catch(() => null);
-      const neverBuilt = idx && idx.metaFound === false && (idx.rows || []).length === 0;
-      if (neverBuilt) {
-        // ---- 2026年8月7日の実測を受けた変更 ----
-        //   索引が無いときに「毎日の学習まるごと」を走らせるのは重すぎた。
-        //   実測では、学習は途中まで進んで選手記録を1,378件まで増やしたのに、
-        //   最後の索引づくりまで到達せずに終わっていた。
-        //   索引づくりは外部APIを1回も使わないので、**それだけ** を走らせる。
-        //   これなら数秒〜数十秒で終わり、検索がその場で復活する。
-        const got = await upstashCmd([
-          "SET", "kb:player:index:rebuildlock", new Date().toISOString(), "NX", "EX", "1800",
-        ]).catch(() => null);
-        if (got) {
-          rebuildPlayerIndexNow({ trigger: "self-heal" }).catch(() => {});
-        }
-      }
-    }
-    if (!reason) return; // 定期実行が生きていて、索引もある
+    if (!reason) return; // 定期実行は生きている(索引の修復は上で確認済み)
     // 二重起動の防止は既存のロックをそのまま使う(プロセスをまたいで効く)
     const lock = await tryAcquireDailyRunLock();
     if (!lock.acquired) return;
@@ -3005,6 +3023,7 @@ const clubDossier = createClubDossier({
 // 行う設計は禁止」に従い、検索1回あたりの Redis / API アクセスは 0 回。
 const playerSearch = require("./knowledge/playerSearch");
 const { CLUB_UNIVERSE } = require("./learning/clubUniverse");
+const { collectClubPlayersBatch } = require("./learning/universeCollector");
 const playerSearchDeps = {
   upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
 };
@@ -3019,6 +3038,50 @@ const playerSearchDeps = {
 // ============================================================================
 let indexRebuildInFlight = false;
 let lastIndexRebuild = null;   // 直前の実行結果(画面と調査のために持つ)
+let playerCollectInFlight = false;
+let lastPlayerCollect = null;
+
+// ---- 2026年8月7日・「索引はできたが主要クラブが入っていない」への対処 ----
+//   実測: 索引1,401人だが42クラブぶんしかなく、Arsenal/Barcelona/Bayern/
+//   Man City/Liverpool/PSG が丸ごと不在。国籍Spainは2人、平均評価は354人だけ。
+//   全100クラブの選手を成績つきで取る処理が、長い学習ジョブの後半にあり、
+//   そこへ到達する前に学習が終わっていたため。
+//   索引づくりと同じく、この収集も切り離して単体で回せるようにする。
+async function collectPlayersNow(opts) {
+  if (playerCollectInFlight) {
+    return { ok: false, alreadyRunning: true, reasonJa: "選手データの収集は既に実行中です。" };
+  }
+  playerCollectInFlight = true;
+  const t0 = Date.now();
+  try {
+    const r = await collectClubPlayersBatch({
+      callApiFootball: (endpoint, params) => callApiFootball(endpoint, params, { jobCall: true }),
+      clubDossier, apiBudget: await getApiBudget().catch(() => null),
+      upstashGetJSON, upstashSetJSON, upstashCmd,
+    }, {
+      nowMs: Date.now(),
+      clubLimit: Number(process.env.PLAYER_COLLECT_CLUB_LIMIT) || 25,
+      trigger: (opts && opts.trigger) || "manual",
+    });
+    const out = { ...r, tookMs: Date.now() - t0, trigger: (opts && opts.trigger) || "manual" };
+    lastPlayerCollect = out;
+    await upstashSetJSON("kb:universe:lastplayercollect", out).catch(() => {});
+    if (out.ok) await loadPlayerIndex(true).catch(() => {});
+    console.log("[player-collect]", JSON.stringify({
+      ok: out.ok, clubsFetched: out.clubsFetched, playersFetched: out.playersFetched,
+      apiRequests: out.apiRequests, indexCount: out.indexCount, indexClubs: out.indexClubs,
+      cursor: `${out.cursorBefore}->${out.cursorAfter}`, tookMs: out.tookMs, reasonJa: out.reasonJa,
+    }));
+    return out;
+  } catch (e) {
+    const out = { ok: false, reasonJa: `選手データの収集に失敗しました: ${e.message}`, tookMs: Date.now() - t0 };
+    lastPlayerCollect = out;
+    console.error("[player-collect failed]", e && e.message);
+    return out;
+  } finally {
+    playerCollectInFlight = false;
+  }
+}
 
 async function rebuildPlayerIndexNow(opts) {
   if (indexRebuildInFlight) {
@@ -5305,6 +5368,43 @@ const server = http.createServer(async (req, res) => {
         }));
         return;
       }
+      // ---- 2026年8月7日・選手データを100クラブぶん集めきる(区切って実行) ----
+      //   1回あたり25クラブ(API 50〜100回)。次回は続きから巡回するので、
+      //   4回まわせば100クラブすべてが検索対象になる。
+      if (pathname === "/api/knowledge/collect-players") {
+        const requiredSecret = process.env.AUTO_COLLECT_SECRET || "";
+        if (requiredSecret && parsed.searchParams.get("key") !== requiredSecret) {
+          res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "invalid or missing key" }));
+          return;
+        }
+        if (!requiredSecret) {
+          const got = await upstashCmd([
+            "SET", "kb:universe:playercollectlock", new Date().toISOString(), "NX", "EX", "600",
+          ]).catch(() => null);
+          if (!got) {
+            const last = await upstashGetJSON("kb:universe:lastplayercollect").catch(() => null);
+            res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+            res.end(JSON.stringify({
+              ok: true, started: false, throttled: true,
+              messageJa: "選手データの収集は10分に1回までです(外部APIを使うため)。直前の結果を返します。",
+              lastCollect: last || lastPlayerCollect || null,
+            }));
+            return;
+          }
+        }
+        const r = await collectPlayersNow({ trigger: "manual" });
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({
+          ok: true, collected: r.ok === true, result: r,
+          messageJa: r.ok
+            ? `${r.clubsFetched}クラブ・${r.playersFetched}人を取得し、索引を ${r.indexCount}人(${r.indexClubs}クラブ)に更新しました`
+              + `(API ${r.apiRequests}回・${Math.round(r.tookMs / 1000)}秒)。`
+              + (r.cursorAfter !== null ? ` 次回は${r.cursorAfter + 1}番目のクラブから続けます。` : "")
+            : (r.reasonJa || "収集できませんでした。"),
+        }));
+        return;
+      }
       // ---- 2026年8月7日・保存済みデータから選手索引を作り直す ----
       //   外部API(API-Football)の呼び出しは0回。毎日の学習が止まっていても
       //   これだけで選手検索が復活する。
@@ -5814,6 +5914,14 @@ const server = http.createServer(async (req, res) => {
           available: state.rows.length > 0,
           reasonJa: state.rows.length ? null : (state.reasonJa || "索引がまだ作られていません。"),
           indexedCount: state.rows.length,
+          // ---- 2026年8月7日の指摘への対応 ----
+          //   画面が「クラブ100件」と書いていたが、それは選べる一覧の数であって
+          //   実際に選手が入っているクラブ数ではなかった(実測では42クラブ)。
+          //   誤解を招くので、実数を渡して画面が正直に書けるようにする。
+          clubsWithPlayers: clubs.filter((c) => Number(c.count) > 0).length,
+          withRatingCount: state.rows.filter((r) =>
+            r[playerSearch.COL.rating] !== null && r[playerSearch.COL.rating] !== undefined).length,
+          withNationalityCount: state.rows.filter((r) => r[playerSearch.COL.nationality]).length,
           indexBuiltAt: state.meta && state.meta.builtAt ? state.meta.builtAt : null,
           clubs,
           totalClubs: clubs.length,
