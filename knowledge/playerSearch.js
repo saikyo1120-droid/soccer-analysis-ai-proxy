@@ -64,8 +64,13 @@ const COL = {
   defensiveActions: 28, duelWinRatePct: 29,
   yellowCards: 30, redCards: 31,
   injuredAt: 32,   // 怪我の有無を最後に確認できた日(YYYYMMDD)
+  // ---- 2026年8月・「選手検索」統合で追加 ----
+  lineups: 33,       // スタメン出場数(API-Footballの games.lineups。追加取得コスト0)
+  recent5Rating: 34, // 直近5試合の平均評価(/fixtures/players の実測)
+  recent5Count: 35,  // その平均に使えた試合数(3未満なら画面に出さない)
+  recent5Minutes: 36,// 直近5試合の平均出場時間
 };
-const ROW_LENGTH = 33;
+const ROW_LENGTH = 37;
 
 // API-Footballが返す4分類
 const BROAD_POSITIONS = ["Goalkeeper", "Defender", "Midfielder", "Attacker"];
@@ -351,6 +356,11 @@ function toIndexRow(p, extra, nowMs, prev) {
     : e.injured === false ? 0
       : (prev && (prev[COL.injured] === 0 || prev[COL.injured] === 1) ? prev[COL.injured] : null);
   row[COL.injuredAt] = injuredKnownToday ? todayKey : (prev ? (prev[COL.injuredAt] ?? null) : null);
+  row[COL.lineups] = numOrNull(st.lineups) ?? (prev ? prev[COL.lineups] : null);
+  // 直近5試合は別ステージで集計するため、渡されたときだけ更新する
+  row[COL.recent5Rating] = numOrNull(e.recent5Rating) ?? (prev ? prev[COL.recent5Rating] : null);
+  row[COL.recent5Count] = numOrNull(e.recent5Count) ?? (prev ? prev[COL.recent5Count] : null);
+  row[COL.recent5Minutes] = numOrNull(e.recent5Minutes) ?? (prev ? prev[COL.recent5Minutes] : null);
   // 今回の実測から差分を出せない日は、前回の値をそのまま残す。
   // (同日再実行や、そのクラブの一括取得が予算で見送られた日に消えていた)
   row[COL.formDelta] = formDelta !== null && formDelta !== undefined
@@ -420,6 +430,18 @@ function fromIndexRow(row) {
     duelWinRatePct: row[COL.duelWinRatePct],
     yellowCards: row[COL.yellowCards],
     redCards: row[COL.redCards],
+    // ---- 派生値(0で埋めず、元が取れていなければ null) ----
+    lineups: row[COL.lineups],
+    startRatePct: (Number.isFinite(row[COL.lineups]) && Number.isFinite(row[COL.appearances]) && row[COL.appearances] > 0)
+      ? Math.round((row[COL.lineups] / row[COL.appearances]) * 1000) / 10 : null,
+    minutesPerAppearance: (Number.isFinite(row[COL.minutes]) && Number.isFinite(row[COL.appearances]) && row[COL.appearances] > 0)
+      ? Math.round(row[COL.minutes] / row[COL.appearances]) : null,
+    recent5Rating: row[COL.recent5Count] >= 3 ? row[COL.recent5Rating] : null,
+    recent5Count: row[COL.recent5Count],
+    recent5Minutes: row[COL.recent5Count] >= 3 ? row[COL.recent5Minutes] : null,
+    recent5NoteJa: (row[COL.recent5Count] >= 3)
+      ? `直近${row[COL.recent5Count]}試合の実測`
+      : `直近の試合ごとの評価が${row[COL.recent5Count] || 0}試合ぶんしか取得できていないため、平均を出していません(3試合以上で表示します)。`,
     growth,
     updatedAt: dateKeyToIso(row[COL.updatedAt]),
     photo: row[COL.id] ? `https://media.api-sports.io/football/players/${row[COL.id]}.png` : null,
@@ -466,6 +488,7 @@ const SORTABLE = {
   rating: COL.rating, goals: COL.goals, assists: COL.assists,
   minutes: COL.minutes, appearances: COL.appearances,
   age: COL.age, height: COL.heightCm, form: COL.formDelta, name: COL.name,
+  lineups: COL.lineups, recent5: COL.recent5Rating,
 };
 
 function matchesRow(row, query, pre) {
@@ -500,6 +523,21 @@ function matchesRow(row, query, pre) {
   if (!inRange(row[COL.assists], q.assistsMin, q.assistsMax)) return false;
   if (!inRange(row[COL.rating], q.ratingMin, q.ratingMax)) return false;
   if (!inRange(row[COL.formDelta], q.formMin, q.formMax)) return false;
+  // ---- 2026年8月・「選手検索」統合で追加した条件 ----
+  if (q.startRateMin !== undefined || q.startRateMax !== undefined) {
+    const lu = row[COL.lineups], ap = row[COL.appearances];
+    const rate = (Number.isFinite(lu) && Number.isFinite(ap) && ap > 0) ? (lu / ap) * 100 : null;
+    if (!inRange(rate, q.startRateMin, q.startRateMax)) return false;
+  }
+  if (q.minutesPerAppMin !== undefined || q.minutesPerAppMax !== undefined) {
+    const mi = row[COL.minutes], ap = row[COL.appearances];
+    const mpa = (Number.isFinite(mi) && Number.isFinite(ap) && ap > 0) ? mi / ap : null;
+    if (!inRange(mpa, q.minutesPerAppMin, q.minutesPerAppMax)) return false;
+  }
+  if (q.recent5Min !== undefined || q.recent5Max !== undefined) {
+    const r5 = (row[COL.recent5Count] >= 3) ? row[COL.recent5Rating] : null;
+    if (!inRange(r5, q.recent5Min, q.recent5Max)) return false;
+  }
   return true;
 }
 
@@ -735,6 +773,117 @@ async function loadIndex(deps) {
   };
 }
 
+/* =========================================================
+   詳細画面用の補助データ(直近5試合・移籍履歴・怪我履歴)
+   ---------------------------------------------------------
+   索引とは別に持つ理由:
+     ・検索には使わないので、検索用の索引を重くしたくない
+     ・選手を1人開いたときにだけ読めば十分(Lazy Load)
+   索引と同じくブロック分割で保存し、読み出しはブロック数ぶんのGETだけ。
+   ========================================================= */
+const DETAIL_KEYS = {
+  recent5: "kb:player:recent5",
+  transfers: "kb:player:transfers",
+  injuries: "kb:player:injuries",
+};
+const DETAIL_SHARD_SIZE = 700;   // 1ブロックあたりの選手数
+const DETAIL_MAX_SHARDS = 20;
+
+async function saveShardedMap(deps, baseKey, map) {
+  const { upstashEnabled, upstashSetJSON, upstashCmd, upstashGetJSON } = deps;
+  if (!upstashEnabled) return { saved: false, count: 0 };
+  const ids = Object.keys(map);
+  const shardCount = Math.min(DETAIL_MAX_SHARDS, Math.max(1, Math.ceil(ids.length / DETAIL_SHARD_SIZE)));
+  const prevMeta = upstashGetJSON ? await upstashGetJSON(`${baseKey}:meta`).catch(() => null) : null;
+  const gen = prevMeta && Number.isFinite(prevMeta.generation) ? (prevMeta.generation + 1) % 1000 : 0;
+  let ok = true;
+  for (let i = 0; i < shardCount; i++) {
+    const chunk = {};
+    for (const id of ids.slice(i * DETAIL_SHARD_SIZE, (i + 1) * DETAIL_SHARD_SIZE)) chunk[id] = map[id];
+    if ((await upstashSetJSON(`${baseKey}:g${gen}:s${i}`, chunk)) === false) ok = false;
+  }
+  if (!ok) {
+    // 目次を更新しない = 前回の内容がそのまま使われる(混ざらない)
+    if (upstashCmd) for (let i = 0; i < shardCount; i++) await upstashCmd(["DEL", `${baseKey}:g${gen}:s${i}`]).catch(() => {});
+    return { saved: false, count: 0, reasonJa: "補助データの保存に失敗したため、前回の内容を使い続けます。" };
+  }
+  const okMeta = (await upstashSetJSON(`${baseKey}:meta`, {
+    generation: gen, shardCount, count: ids.length, savedAt: new Date().toISOString(),
+  })) !== false;
+  if (okMeta && upstashCmd && prevMeta && Number.isFinite(prevMeta.generation)) {
+    for (let i = 0; i < Math.min(DETAIL_MAX_SHARDS, prevMeta.shardCount || 0); i++) {
+      await upstashCmd(["DEL", `${baseKey}:g${prevMeta.generation}:s${i}`]).catch(() => {});
+    }
+  }
+  return { saved: okMeta, count: ids.length, shardCount };
+}
+
+async function loadShardedMap(deps, baseKey) {
+  const { upstashEnabled, upstashGetJSON } = deps;
+  if (!upstashEnabled) return { map: {}, available: false };
+  const meta = await upstashGetJSON(`${baseKey}:meta`).catch(() => null);
+  if (!meta || !Number.isFinite(meta.shardCount)) return { map: {}, available: false };
+  const map = {};
+  let missing = 0;
+  for (let i = 0; i < Math.min(DETAIL_MAX_SHARDS, meta.shardCount); i++) {
+    const chunk = await upstashGetJSON(`${baseKey}:g${meta.generation}:s${i}`).catch(() => null);
+    if (chunk && typeof chunk === "object") Object.assign(map, chunk);
+    else missing++;
+  }
+  return { map, available: missing === 0, missing, meta };
+}
+
+/**
+ * 3種類の補助データをまとめて保存する。
+ * @param {object} sets { liveIds:Set, recent5:Map, transfers:Array, injuries:Array }
+ */
+async function saveDetailStores(deps, sets) {
+  const live = sets.liveIds || new Set();
+  const keep = (id) => live.size === 0 || live.has(Number(id));
+
+  // 直近5試合(今日取れた選手ぶんだけ更新し、それ以外は前回の内容を残す)
+  const prevR5 = (await loadShardedMap(deps, DETAIL_KEYS.recent5)).map || {};
+  const r5 = {};
+  for (const [id, rows] of Object.entries(prevR5)) if (keep(id)) r5[id] = rows;
+  for (const [id, rows] of (sets.recent5 || new Map())) if (keep(id)) r5[id] = rows;
+
+  // 移籍履歴(日付で重複を除いて積む。最大10件)
+  const prevTr = (await loadShardedMap(deps, DETAIL_KEYS.transfers)).map || {};
+  const tr = {};
+  for (const [id, rows] of Object.entries(prevTr)) if (keep(id)) tr[id] = rows;
+  for (const row of (sets.transfers || [])) {
+    if (!keep(row.playerId)) continue;
+    const arr = tr[row.playerId] || [];
+    const key = `${row.date}|${row.fromEn}|${row.toEn}`;
+    if (arr.some((x) => `${x.date}|${x.fromEn}|${x.toEn}` === key)) continue;
+    arr.push(row);
+    arr.sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+    tr[row.playerId] = arr.slice(0, 10);
+  }
+
+  // 怪我履歴(同じ日・同じ理由は1件にまとめる。最大10件)
+  const prevInj = (await loadShardedMap(deps, DETAIL_KEYS.injuries)).map || {};
+  const inj = {};
+  for (const [id, rows] of Object.entries(prevInj)) if (keep(id)) inj[id] = rows;
+  for (const row of (sets.injuries || [])) {
+    if (!keep(row.playerId)) continue;
+    const arr = inj[row.playerId] || [];
+    const key = `${row.at}|${row.reasonJa}`;
+    if (arr.some((x) => `${x.at}|${x.reasonJa}` === key)) continue;
+    arr.push(row);
+    arr.sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")));
+    inj[row.playerId] = arr.slice(0, 10);
+  }
+
+  const a = await saveShardedMap(deps, DETAIL_KEYS.recent5, r5);
+  const b = await saveShardedMap(deps, DETAIL_KEYS.transfers, tr);
+  const c = await saveShardedMap(deps, DETAIL_KEYS.injuries, inj);
+  return {
+    recent5: a, transfers: b, injuries: c,
+    saved: a.saved && b.saved && c.saved,
+  };
+}
+
 async function loadGrid(deps) {
   const { upstashEnabled, upstashGetJSON } = deps;
   if (!upstashEnabled) return {};
@@ -763,6 +912,7 @@ const METRIC_DEFS = [
   { key: "dribbleSuccessRatePct", col: COL.dribbleSuccessRatePct, labelJa: "ドリブル成功率", higherIsBetter: true, unitJa: "%", digits: 1 },
   { key: "defensiveActions", col: COL.defensiveActions, labelJa: "守備アクション(タックル+インターセプト)", higherIsBetter: true, unitJa: "回" },
   { key: "duelWinRatePct", col: COL.duelWinRatePct, labelJa: "デュエル勝率", higherIsBetter: true, unitJa: "%", digits: 1 },
+  { key: "lineups", col: COL.lineups, labelJa: "スタメン出場数", higherIsBetter: true, unitJa: "試合" },
 ];
 
 /** 同ポジションの母集団の中での順位(%)。母集団が20人未満なら計算しない。 */
@@ -1047,7 +1197,273 @@ function comparePlayers(index, rows) {
   };
 }
 
+/* =========================================================
+   入力途中の候補表示(オートコンプリート)
+   ---------------------------------------------------------
+   索引はサーバーのメモリにあるので、1文字打つたびに
+   Redisにも外部APIにも触れずに候補を返せる。
+   ・完全一致 → 前方一致 → 単語の先頭一致 → 部分一致 の順
+   ・同点は「よく使われている順」(=所属選手が多いクラブ、選手数が多い国)
+   ========================================================= */
+function rankSuggestion(normalized, query) {
+  if (!normalized) return null;
+  if (normalized === query) return 0;
+  if (normalized.startsWith(query)) return 1;
+  if (normalized.split(" ").some((w) => w.startsWith(query))) return 2;
+  if (normalized.includes(query)) return 3;
+  return null;
+}
+
+/**
+ * @param {Array} index 索引
+ * @param {string} field "name" | "club" | "nationality"
+ * @param {string} q 入力途中の文字列
+ * @param {number} limit 返す件数
+ */
+function suggest(index, field, q, limit) {
+  const max = Math.max(1, Math.min(20, limit || 8));
+  const raw = String(q || "").trim();
+  const norm = normalizeForSearch(raw);
+  if (!raw) return [];
+
+  if (field === "club") {
+    const clubs = new Map();
+    for (const row of index) {
+      const en = row[COL.teamEn];
+      if (!en) continue;
+      const cur = clubs.get(en) || { value: en, labelJa: row[COL.teamJa] || en, count: 0, leagueId: row[COL.leagueId] };
+      cur.count++; clubs.set(en, cur);
+    }
+    const out = [];
+    for (const c of clubs.values()) {
+      // 英語表記と日本語表記のどちらでも引けるようにする
+      const score = Math.min(
+        rankSuggestion(normalizeForSearch(c.value), norm) ?? 99,
+        (c.labelJa && c.labelJa.includes(raw)) ? 1 : 99
+      );
+      if (score === 99) continue;
+      out.push({ ...c, score });
+    }
+    out.sort((a, b) => (a.score - b.score) || (b.count - a.count) || a.value.localeCompare(b.value));
+    return out.slice(0, max).map((c) => ({ value: c.value, labelJa: c.labelJa, count: c.count, subJa: `${c.count}人` }));
+  }
+
+  if (field === "nationality") {
+    const nats = new Map();
+    for (const row of index) {
+      const n = row[COL.nationality];
+      if (!n) continue;
+      nats.set(n, (nats.get(n) || 0) + 1);
+    }
+    const out = [];
+    for (const [name, count] of nats) {
+      const score = rankSuggestion(normalizeForSearch(name), norm);
+      if (score === null) continue;
+      out.push({ value: name, labelJa: name, count, score });
+    }
+    out.sort((a, b) => (a.score - b.score) || (b.count - a.count) || a.value.localeCompare(b.value));
+    return out.slice(0, max).map((n) => ({ value: n.value, labelJa: n.labelJa, count: n.count, subJa: `${n.count}人` }));
+  }
+
+  // 選手名
+  const out = [];
+  for (const row of index) {
+    const score = rankSuggestion(normalizeForSearch(row[COL.name]), norm);
+    if (score === null) continue;
+    // 同点のときは、出場時間が長い(=よく知られている)選手を先に出す
+    out.push({ score, minutes: row[COL.minutes] ?? -1, row });
+    if (out.length > 4000) break; // 暴走防止
+  }
+  out.sort((a, b) => (a.score - b.score) || (b.minutes - a.minutes) || String(a.row[COL.name]).localeCompare(String(b.row[COL.name])));
+  return out.slice(0, max).map((x) => ({
+    value: x.row[COL.name],
+    id: x.row[COL.id],
+    labelJa: x.row[COL.name],
+    subJa: [x.row[COL.teamJa] || x.row[COL.teamEn], BROAD_POSITION_JA[x.row[COL.position]] || null, x.row[COL.nationality] || null]
+      .filter(Boolean).join(" / "),
+    photo: x.row[COL.id] ? `https://media.api-sports.io/football/players/${x.row[COL.id]}.png` : null,
+  }));
+}
+
+/* =========================================================
+   AIおすすめ選手
+   ---------------------------------------------------------
+   「22歳以下・ウイング・評価が高い・怪我が少ない・伸びしろがある」
+   のような条件から候補を出す。順位づけに使うのは実測値だけで、
+   独自の総合点は作らない。**なぜその選手なのかを必ず添える**。
+   ========================================================= */
+const RECOMMEND_PRESETS = {
+  youngProspect: {
+    labelJa: "伸びしろのある若手",
+    query: { ageMax: 22, minutesMin: 450 },
+    weights: { rating: 1.0, growth: 1.2, startRate: 0.6, youth: 0.8 },
+    reasonJa: "22歳以下で、出場時間が450分以上あり、平均評価が伸びている選手",
+  },
+  inForm: {
+    labelJa: "いま調子が良い選手",
+    query: { formMin: 0.1 },
+    weights: { rating: 0.8, form: 1.5, recent5: 1.2 },
+    reasonJa: "直近で平均評価が上がっている選手",
+  },
+  reliable: {
+    labelJa: "毎試合出ている主力",
+    query: { minutesMin: 900 },
+    weights: { rating: 1.2, startRate: 1.5, minutes: 0.8 },
+    reasonJa: "スタメンで出続けていて、平均評価も高い選手",
+  },
+  fitOnly: {
+    labelJa: "いま出場できる選手",
+    query: { injured: false },
+    weights: { rating: 1.2, startRate: 0.8 },
+    reasonJa: "負傷者リストに載っておらず、平均評価が高い選手",
+  },
+};
+
+/** 実測値だけを使った並び替え。各要素の寄与を「理由」として必ず返す。 */
+function recommendPlayers(index, opts) {
+  const o = opts || {};
+  const limit = Math.max(1, Math.min(30, o.limit || 10));
+  const preset = RECOMMEND_PRESETS[o.preset] || null;
+  const query = { ...(preset ? preset.query : {}), ...(o.query || {}) };
+  const weights = { ...(preset ? preset.weights : { rating: 1 }), ...(o.weights || {}) };
+
+  const pool = searchIndex(index, query);
+  if (!pool.length) {
+    return {
+      available: false, items: [],
+      reasonJa: "条件に合う選手が見つかりませんでした。条件をゆるめてお試しください。",
+      presetJa: preset ? preset.labelJa : null,
+    };
+  }
+  // 各指標を「同ポジションではなく候補全体の中での順位(0〜1)」に直す。
+  // 単位の違う指標を足すために順位に直しているだけで、能力値は作っていない。
+  const cols = {
+    rating: COL.rating, minutes: COL.minutes, form: COL.formDelta,
+    recent5: COL.recent5Rating, goals: COL.goals, assists: COL.assists,
+  };
+  const pct = {};
+  for (const [key, col] of Object.entries(cols)) {
+    const vals = pool.map((r) => r[col]).filter((v) => v !== null && v !== undefined).sort((a, b) => a - b);
+    pct[key] = (v) => {
+      if (v === null || v === undefined || !vals.length) return null;
+      let lo = 0, hi = vals.length;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (vals[mid] < v) lo = mid + 1; else hi = mid; }
+      return vals.length > 1 ? lo / (vals.length - 1) : 0.5;
+    };
+  }
+  const startRateOf = (r) => {
+    const lu = r[COL.lineups], ap = r[COL.appearances];
+    return (Number.isFinite(lu) && Number.isFinite(ap) && ap > 0) ? lu / ap : null;
+  };
+  const youthOf = (r) => (Number.isFinite(r[COL.age]) ? Math.max(0, (30 - r[COL.age]) / 14) : null);
+  const growthOfRow = (r) => {
+    const g = growthOf(r);
+    return g.measurable ? Math.max(0, Math.min(1, (g.delta + 0.5) / 1.0)) : null;
+  };
+
+  const scored = pool.map((r) => {
+    const parts = [];
+    let total = 0, usedWeight = 0;
+    const add = (key, value, labelJa, detailJa) => {
+      const w = weights[key];
+      if (!w || value === null || value === undefined) return;
+      total += w * value; usedWeight += w;
+      if (value >= 0.7) parts.push({ labelJa, detailJa, strength: Math.round(value * 100) });
+    };
+    add("rating", pct.rating(r[COL.rating]), "平均評価が高い", r[COL.rating] !== null ? `平均評価 ${r[COL.rating]}` : null);
+    add("form", pct.form(r[COL.formDelta]), "調子が上向き", Number.isFinite(r[COL.formDelta]) ? `前回比 ${r[COL.formDelta] > 0 ? "+" : ""}${r[COL.formDelta]}` : null);
+    add("recent5", pct.recent5(r[COL.recent5Count] >= 3 ? r[COL.recent5Rating] : null), "直近5試合でも高評価", r[COL.recent5Count] >= 3 ? `直近${r[COL.recent5Count]}試合の平均 ${r[COL.recent5Rating]}` : null);
+    add("minutes", pct.minutes(r[COL.minutes]), "出場時間が長い", Number.isFinite(r[COL.minutes]) ? `${r[COL.minutes]}分` : null);
+    add("startRate", startRateOf(r), "スタメンで使われている", (() => {
+      const sr = startRateOf(r);
+      return sr === null ? null : `スタメン率 ${Math.round(sr * 100)}%`;
+    })());
+    add("youth", youthOf(r), "若い", Number.isFinite(r[COL.age]) ? `${r[COL.age]}歳` : null);
+    add("growth", growthOfRow(r), "平均評価が伸びている", (() => {
+      const g = growthOf(r);
+      return g.measurable ? g.noteJa : null;
+    })());
+    return { row: r, score: usedWeight > 0 ? total / usedWeight : 0, parts, usedWeight };
+  })
+    // 判断材料が1つも無い選手は候補にしない(でっち上げ防止)
+    .filter((x) => x.usedWeight > 0 && x.parts.length > 0);
+
+  scored.sort((a, b) => b.score - a.score);
+  return {
+    available: scored.length > 0,
+    presetJa: preset ? preset.labelJa : null,
+    criteriaJa: preset ? preset.reasonJa : "指定された条件",
+    poolSize: pool.length,
+    methodJa: "候補全体の中での順位(実測値)だけを組み合わせて並べています。能力値や総合点のような独自スコアは作っていません。",
+    reasonJa: scored.length ? null : "条件に合う選手はいましたが、根拠にできる実測値が揃っていませんでした。",
+    items: scored.slice(0, limit).map((x) => ({
+      ...fromIndexRow(x.row),
+      matchScore: Math.round(x.score * 100),
+      whyJa: x.parts.map((p) => p.detailJa ? `${p.labelJa}(${p.detailJa})` : p.labelJa),
+    })),
+  };
+}
+
+/* =========================================================
+   今日AIが注目する選手(実測の変化からだけ選ぶ)
+   ========================================================= */
+function dailyHighlights(index, opts) {
+  const o = opts || {};
+  const limit = o.limit || 5;
+  const picks = [];
+  const seen = new Set();
+  const push = (row, kindJa, whyJa) => {
+    const id = Number(row[COL.id]);
+    if (seen.has(id)) return;
+    seen.add(id);
+    picks.push({ ...fromIndexRow(row), kindJa, whyJa });
+  };
+
+  // ① 調子が最も上がった選手
+  const formUp = index.filter((r) => Number.isFinite(r[COL.formDelta]) && r[COL.formDelta] >= 0.15)
+    .sort((a, b) => b[COL.formDelta] - a[COL.formDelta]);
+  for (const r of formUp.slice(0, 2)) {
+    push(r, "調子が急上昇", `平均評価が前回比 +${r[COL.formDelta]}(現在 ${r[COL.rating]})`);
+  }
+  // ② 直近5試合で最も評価が高い若手
+  const youngHot = index
+    .filter((r) => Number.isFinite(r[COL.age]) && r[COL.age] <= 23 && r[COL.recent5Count] >= 3 && Number.isFinite(r[COL.recent5Rating]))
+    .sort((a, b) => b[COL.recent5Rating] - a[COL.recent5Rating]);
+  for (const r of youngHot.slice(0, 2)) {
+    push(r, "好調な若手", `${r[COL.age]}歳・直近${r[COL.recent5Count]}試合の平均評価 ${r[COL.recent5Rating]}`);
+  }
+  // ③ 移籍したばかりの選手(索引の所属変更から検知したもの)
+  const moved = (o.recentTransfers || []);
+  for (const t of moved.slice(0, 2)) {
+    const r = index.find((x) => Number(x[COL.id]) === Number(t.playerId));
+    if (r) push(r, "移籍", t.detailJa || "所属クラブが変わりました");
+  }
+  // ④ 怪我から戻った選手
+  const returned = (o.injuryReturns || []);
+  for (const t of returned.slice(0, 2)) {
+    const r = index.find((x) => Number(x[COL.id]) === Number(t.playerId));
+    if (r) push(r, "怪我から復帰", t.detailJa || "負傷者リストから外れました");
+  }
+  // ⑤ 枠が余ったら、平均評価が高く出場も多い選手で埋める
+  if (picks.length < limit) {
+    const solid = index
+      .filter((r) => Number.isFinite(r[COL.rating]) && Number.isFinite(r[COL.minutes]) && r[COL.minutes] >= 900)
+      .sort((a, b) => b[COL.rating] - a[COL.rating]);
+    for (const r of solid) {
+      if (picks.length >= limit) break;
+      push(r, "安定した主力", `出場${r[COL.minutes]}分・平均評価 ${r[COL.rating]}`);
+    }
+  }
+  return {
+    available: picks.length > 0,
+    items: picks.slice(0, limit),
+    methodJa: "前日からの実測の変化(調子・直近5試合・移籍・怪我)だけで選んでいます。AIの好みや評判は入っていません。",
+    reasonJa: picks.length ? null : "前日と比べて目立った変化がまだ検知できていません(索引が2日ぶん貯まると表示されます)。",
+  };
+}
+
 module.exports = {
+  suggest, rankSuggestion, recommendPlayers, RECOMMEND_PRESETS, dailyHighlights,
   INDEX_KEY, INDEX_META_KEY, INDEX_SHARD_PREFIX, INDEX_GEN_PREFIX, shardKey, GRID_KEY, SHARD_SIZE, MAX_SHARDS, ROW_LENGTH,
   COL, BROAD_POSITIONS, BROAD_POSITION_JA, DETAILED_POSITION_JA, DETAILED_POSITION_ORDER,
   UNAVAILABLE_SEARCH_FIELDS_JA, METRIC_DEFS, COMPARE_METRICS, SORTABLE,
@@ -1055,5 +1471,6 @@ module.exports = {
   emptyGridEntry, normalizeGridEntry, accumulateGrid, gridStatsFrom, inferDetailedPosition,
   toIndexRow, fromIndexRow, growthOf, inRange, matchesRow, precompute, searchIndex, sortRows, paginate, facetsOf,
   saveIndex, loadIndex, loadGrid, saveGrid,
+  DETAIL_KEYS, saveDetailStores, loadShardedMap, saveShardedMap,
   percentileTable, analyzePlayer, similarPlayers, fitClubs, comparePlayers,
 };
