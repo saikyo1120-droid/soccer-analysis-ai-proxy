@@ -514,21 +514,6 @@
     </div>
   </header>
 
-  <!-- ================================================================
-       2026年8月7日・ご指摘への対応(いちばん重要):
-         「AIは裏では学習しているらしい。でも利用者から見ると
-           昨日と今日の違いが分からない」
-       件数を並べても伝わらない。ここに出すのは1つだけ:
-         **同じ質問に、昨日のAIと今日のAIがそれぞれ何と答えたか**
-       これは利用者が自分の目で確かめられるし、比べられる。
-       中身は /api/qa/latest(毎日の学習の直後にサーバー自身が実行した
-       自動検証の結果)をそのまま読むだけで、この画面が新しい計算を
-       起こすことはない。 -->
-  <div class="card" id="smarterCard" style="padding:16px 18px; border:2px solid var(--series-3);">
-    <h2 style="margin:0 0 4px;">🧠 AIは昨日より賢くなったか</h2>
-    <div id="smarterBody" class="muted" style="font-size:13px;">確認中…</div>
-  </div>
-
   <!-- 2026年8月・利用者目線ラウンド: 「AIは今日の試合をどう予想しているのか」を
        開いた瞬間(5秒以内)に見せる。中身は毎朝の学習でAI自身のモデルが生成・
        保存した予測(learn:ownpred)の読み出しで、このカードが新しい計算を
@@ -558,6 +543,27 @@
     <div id="aiAccuracySummary">🤖 AI予測の実績を読み込み中…</div>
     <div id="aiAccuracyDetails" style="display:none; margin-top:10px;"></div>
   </div>
+
+  <!-- ---- 2026年8月8日・ご指定の並び順 ----
+       1. 今日のAI予想  2. AIに質問する  3. AI予測の実績(正答率)
+       4. AIは昨日より賢くなったか  5. 昨日から今日で変わったこと
+       「正答率」で今の実力を見せた直後に「昨日より賢くなったか」を置き、
+       その根拠として「昨日から今日で変わったこと」が続く並びにする。 -->
+  <!-- ================================================================
+       2026年8月7日・ご指摘への対応(いちばん重要):
+         「AIは裏では学習しているらしい。でも利用者から見ると
+           昨日と今日の違いが分からない」
+       件数を並べても伝わらない。ここに出すのは1つだけ:
+         **同じ質問に、昨日のAIと今日のAIがそれぞれ何と答えたか**
+       これは利用者が自分の目で確かめられるし、比べられる。
+       中身は /api/qa/latest(毎日の学習の直後にサーバー自身が実行した
+       自動検証の結果)をそのまま読むだけで、この画面が新しい計算を
+       起こすことはない。 -->
+  <div class="card" id="smarterCard" style="padding:16px 18px; border:2px solid var(--series-3);">
+    <h2 style="margin:0 0 4px;">🧠 AIは昨日より賢くなったか</h2>
+    <div id="smarterBody" class="muted" style="font-size:13px;">確認中…</div>
+  </div>
+
 
   <!-- 2026年8月7日・ご指摘への対応:
        「Knowledgeが増えた」「Memoryが増えた」と言われても利用者には
@@ -7144,7 +7150,11 @@ const LEARN_ERROR_LEVEL_JA = {
   spec: { labelJa: "そもそも取得できない項目", icon: "—", color: "var(--text-muted)" },
 };
 
-function classifyLearnErrors(list) {
+function classifyLearnErrors(list, serverClassification) {
+  // サーバー(healthCheck.js)が分類を返してきたら、そちらを正とする。
+  // 判定基準が画面とサーバーの2か所に分かれてズレるのを防ぐため。
+  // 古いサーバーに繋がった場合だけ、下の同じ規則で画面側が分類する。
+  if (serverClassification && Array.isArray(serverClassification.groups)) return serverClassification;
   const groups = new Map();
   let unknown = 0;
   (list || []).forEach((raw) => {
@@ -7179,12 +7189,14 @@ function classifyLearnErrors(list) {
   const unresolvedHtml = unresolvedClubs.length
     ? `<div class="value-note" style="margin-top:2px;">ℹ️ ${unresolvedClubs.length}クラブ(${unresolvedClubs.slice(0, 3).map((u) => escapeHtml(u.nameJa || u.nameEn)).join("・")}${unresolvedClubs.length > 3 ? "ほか" : ""})は、データ提供元での表記が異なるため今回は収集できませんでした。<strong>他のクラブの収集には影響していません</strong>(7日後に自動で再挑戦します)。</div>`
     : "";
-  const errClass = classifyLearnErrors(todayErrors);
+  const errClass = classifyLearnErrors(todayErrors, log.errorClassification);
+  const errHeadline = errClass.headlineJa
+    || (errClass.impactCount > 0
+      ? `本日、実際に取得できなかったものが${errClass.impactCount}件あります。`
+      : `記録が${todayErrors.length}件ありますが、利用者への影響はありません。`);
   const errorWarningHtml = todayErrors.length
-    ? (errClass.impactCount > 0
-      ? `<div class="value-note" style="margin-top:2px; color:var(--critical);">⚠️ 本日、実際に取得できなかったものが${errClass.impactCount}件あります(詳細は「詳しく見る」)。${
-        errClass.harmlessCount ? `残りの${errClass.harmlessCount}件は、正常な処理の記録か、提供元がそもそも持っていない項目です。` : ""}</div>`
-      : `<div class="value-note" style="margin-top:2px;">記録が${todayErrors.length}件ありますが、いずれも正常な処理の記録か、提供元がそもそも持っていない項目です(利用者への影響はありません)。</div>`)
+    ? `<div class="value-note" style="margin-top:2px;${errClass.impactCount > 0 ? " color:var(--critical);" : ""}">${
+      errClass.impactCount > 0 ? "⚠️ " : ""}${escapeHtml(errHeadline)}${errClass.impactCount > 0 ? "(詳細は「詳しく見る」)" : ""}</div>`
     : "";
   // 2026年8月・バグ修正: Renderのスリープ起床待ち等で同じ日に学習エンジンが
   // 複数回実行されることがある(サーバー側では合算表示するよう修正済みだが、

@@ -55,7 +55,7 @@ let { runDailyLearning } = require("./learning/dailyJob");   // テストで差�
 const { getGrowthLog, getRecentFactsForTeam, computeFormScore, LEARNING_STAGES, OWN_PREDICT_LOG_CAP: OWN_PREDICT_LOG_CAP_DISPLAY } = require("./learning/dailyJob");
 // 2026年8月・優先順位⑨: 「今日追加した知識0件」が正常な0件(前回から変化なし)
 // なのか、異常な0件(未実行・キー未設定・予算切れ等)なのかを実データから判定する。
-const { diagnoseZeroKnowledge, diagnoseZeroVerification, getRunHistory, buildEngineStatuses } = require("./learning/healthCheck");
+const { diagnoseZeroKnowledge, diagnoseZeroVerification, getRunHistory, buildEngineStatuses, classifyLearnErrors } = require("./learning/healthCheck");
 // 2026年8月・ご指示③: 特徴量生成の共通化(日次学習とオンデマンド分析でズレを起こさない)
 const { buildMatchFeatures } = require("./learning/featureEngine");
 // 2026年8月・優先順位⑤: 予測評価が「変わった時だけ」Memory Engineへ記録する。
@@ -333,6 +333,97 @@ async function upstashCmd(commandArray) {
   }
   return json ? json.result : null;
 }
+// ============================================================================
+// 2026年8月8日・「正答率の更新が遅い」の実測と対処
+// ----------------------------------------------------------------------------
+// 実測(scripts/resolve_profile_test.js):
+//   保留60件を答え合わせする1回の処理の内訳
+//     保存先(Upstash)  37,040ms / 614往復  … 全体の 97%
+//     サッカーAPI        1,000ms /   4回   … 全体の  3%
+//     アプリ内の計算        30ms            … 全体の  0%
+//   1件の答え合わせに、Upstashと 10.2往復 していた。
+//
+// 原因は「1コマンド = 1回のHTTPS往復」だったこと。取得している内容でも、
+// 計算量でもなく、**純粋に往復回数** が時間を決めていた。
+//
+// Upstashは複数コマンドを1回のリクエストにまとめる /pipeline に対応している。
+// 送る内容も、実行順も、結果もまったく同じで、往復回数だけが減る。
+// つまり **精度・データ量・APIコストに一切影響しない高速化** ができる。
+let upstashPipeline = async function upstashPipelineImpl(commands) {
+  if (!UPSTASH_ENABLED) {
+    const err = new Error("Upstash未設定(.envのUPSTASH_REDIS_REST_URL/TOKENを確認してください)");
+    err.code = "NO_UPSTASH";
+    throw err;
+  }
+  const list = (commands || []).filter(Boolean);
+  if (!list.length) return [];
+  // 1回のリクエストが大きくなりすぎないように分割する(タイムアウトを避ける)
+  const CHUNK = Number(process.env.UPSTASH_PIPELINE_CHUNK) || 50;
+  const out = [];
+  for (let i = 0; i < list.length; i += CHUNK) {
+    const chunk = list.slice(i, i + CHUNK);
+    const res = await fetchWithTimeout(`${UPSTASH_URL.replace(/\/$/, "")}/pipeline`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify(chunk),
+    }, UPSTASH_TIMEOUT_MS);
+    const json = await res.json();
+    if (!Array.isArray(json)) {
+      const err = new Error("Upstash pipeline error: " + JSON.stringify(json && json.error ? json.error : json).slice(0, 200));
+      err.code = "PIPELINE_ERROR";
+      throw err;
+    }
+    json.forEach((r) => out.push(r && Object.prototype.hasOwnProperty.call(r, "result") ? r.result : null));
+  }
+  return out;
+};
+
+// まとめて送るが、まとめ送りが使えない環境でも必ず動く(1件ずつに落とす)。
+// 「速くするために動かなくなる」ことが無いようにするための保険。
+let pipelineDisabled = false;
+let upstashHooksActive = false; // テストが保存先を差し替えているか
+async function upstashCmdBatch(commands) {
+  const list = (commands || []).filter(Boolean);
+  if (!list.length) return [];
+  if (!pipelineDisabled && !upstashHooksActive) {
+    try { return await upstashPipeline(list); }
+    catch (e) {
+      pipelineDisabled = true;
+      console.error("[upstash] まとめ送りが使えないため、1件ずつに切り替えます:", e && e.message);
+    }
+  }
+  const out = [];
+  for (const c of list) out.push(await upstashCmd(c).catch(() => null));
+  return out;
+}
+
+// ---- 「判定できなかった」と「判定できて偽だった」を区別できる版 ----
+//   二重計上を防ぐ鍵では、この2つの意味がまったく違う。
+//     結果が null       = 既に鍵がある = 数えてはいけない
+//     判定できなかった   = 通信が失敗した = **数える側に倒す**
+//                          (取りこぼしを永久化させないため。従来からの方針)
+//   まとめて送る形にしたとき、両方が null になって区別できなくなり、
+//   通信が失敗した試合が二度と数えられなくなっていた(検証で発見)。
+async function upstashCmdBatchDetailed(commands) {
+  const list = (commands || []).filter(Boolean);
+  if (!list.length) return [];
+  if (!pipelineDisabled && !upstashHooksActive) {
+    try {
+      const results = await upstashPipeline(list);
+      return results.map((r) => ({ determined: true, result: r }));
+    } catch (e) {
+      pipelineDisabled = true;
+      console.error("[upstash] まとめ送りが使えないため、1件ずつに切り替えます:", e && e.message);
+    }
+  }
+  const out = [];
+  for (const c of list) {
+    try { out.push({ determined: true, result: await upstashCmd(c) }); }
+    catch (e) { out.push({ determined: false, result: null }); }
+  }
+  return out;
+}
+
 async function upstashGetJSON(key) {
   try {
     const raw = await upstashCmd(["GET", key]);
@@ -1427,10 +1518,13 @@ async function getOrLogPrediction(fixtureId, meta, opts) {
 
 // 試合終了後、記録しておいた予測と実際の結果を突き合わせて的中/不的中を確定する。
 // 既に解決済み、またはそもそも記録が無い(=AIが予測していなかった)試合は何もしない。
-async function resolvePrediction(fixtureId, homeGoals, awayGoals) {
+async function resolvePrediction(fixtureId, homeGoals, awayGoals, opts) {
   if (!UPSTASH_ENABLED) return null;
+  const o = opts || {};
   const key = `pred:${fixtureId}`;
-  const record = await upstashGetJSON(key);
+  // 2026年8月8日: 呼び出し側が既に読み込んでいる場合は、同じ記録をもう一度
+  // 読みに行かない(往復を1回減らす。読む内容はまったく同じ)。
+  const record = o.record !== undefined && o.record !== null ? o.record : await upstashGetJSON(key);
   if (!record || record.resolved) return null;
   const actualWinner = outcomeFromScore(homeGoals, awayGoals);
   if (!actualWinner) return null;
@@ -1455,11 +1549,17 @@ async function resolvePrediction(fixtureId, homeGoals, awayGoals) {
   //   自社予測側(dailyJob.js)は既に .catch(() => "OK") で「取りこぼすより
   //   二重計上を避ける」ではなく「数える側」に倒しており、そちらに揃える。
   let mayCount = true;
-  try {
-    const claim = await upstashCmd(["SET", `pred:resolvelock:${fixtureId}`, new Date().toISOString(), "NX", "EX", "86400"]);
-    mayCount = claim === "OK" || claim === true;
-  } catch (e) {
-    mayCount = true; // ロックの可否を判定できない=数える側に倒す(恒久的な取りこぼしを防ぐ)
+  if (o.mayCount !== undefined) {
+    // 呼び出し側がまとめて鍵を取っている場合は、その結果をそのまま使う
+    // (鍵の意味は変えない。往復をまとめただけ)
+    mayCount = o.mayCount;
+  } else {
+    try {
+      const claim = await upstashCmd(["SET", `pred:resolvelock:${fixtureId}`, new Date().toISOString(), "NX", "EX", "86400"]);
+      mayCount = claim === "OK" || claim === true;
+    } catch (e) {
+      mayCount = true; // ロックの可否を判定できない=数える側に倒す(恒久的な取りこぼしを防ぐ)
+    }
   }
 
   record.resolved = true;
@@ -1467,14 +1567,23 @@ async function resolvePrediction(fixtureId, homeGoals, awayGoals) {
   record.correct = correct;
   record.resolvedAt = new Date().toISOString();
 
-  await upstashSetJSON(key, record);
-  await upstashCmd(["LREM", "pred:pending", "0", String(fixtureId)]).catch(() => {});
+  // ---- 2026年8月8日・「正答率の更新が遅い」の実測を受けた変更 ----
+  //   ここは以前、1件の答え合わせで最大6回、保存先と往復していた。
+  //   実測ではこの往復が処理時間の97%を占めていた。
+  //   **書く内容も順序もまったく同じまま**、1回のリクエストにまとめる。
+  //   (Upstashのpipelineは受け取った順に実行するので、意味は変わらない)
+  //   まとめ送りが使えない環境では、自動で1件ずつに落ちる。
+  const writes = [
+    ["SET", key, JSON.stringify(record)],
+    ["LREM", "pred:pending", "0", String(fixtureId)],
+  ];
   if (mayCount) {
-    await upstashCmd(["INCR", "pred:resolved"]).catch(() => {});
-    if (correct) await upstashCmd(["INCR", "pred:correct"]).catch(() => {});
-    await upstashCmd(["RPUSH", "pred:recent", JSON.stringify(record)]).catch(() => {});
-    await upstashCmd(["LTRIM", "pred:recent", "-20", "-1"]).catch(() => {});
+    writes.push(["INCR", "pred:resolved"]);
+    if (correct) writes.push(["INCR", "pred:correct"]);
+    writes.push(["RPUSH", "pred:recent", JSON.stringify(record)]);
+    writes.push(["LTRIM", "pred:recent", "-20", "-1"]);
   }
+  await upstashCmdBatch(writes);
   return record;
 }
 
@@ -2660,13 +2769,30 @@ async function handleAutoCollectPredictions(opts) {
     pendingLenBefore = pendingIds.length;
 
     // ---- ①②: 記録を読み、照合すべきものだけを「古い順」に並べる ----
+    // 2026年8月8日: 保留中の記録を **1件ずつ読んでいた** ため、
+    // 60件で60往復していた(実測で処理時間の97%が往復に消えていた)。
+    // 読む内容は同じまま、まとめて1回で読む。
+    const preloaded = new Map();
+    if (pendingIds.length) {
+      const rows = await upstashCmdBatch(pendingIds.map((id) => ["GET", `pred:${id}`]));
+      pendingIds.forEach((id, i) => {
+        const raw = rows[i];
+        let parsed = null;
+        if (raw !== null && raw !== undefined) { try { parsed = JSON.parse(raw); } catch (e) { parsed = null; } }
+        preloaded.set(String(id), parsed);
+      });
+    }
     const candidates = [];
     let awaitingKickoff = 0;
+    // まとめ読みで解決済みだった分は、まとめて待ち行列から外す(往復を増やさない)
+    const evictCmds = [];
     for (const idStr of pendingIds) {
-      const record = await upstashGetJSON(`pred:${idStr}`);
+      const record = preloaded.has(String(idStr))
+        ? preloaded.get(String(idStr))
+        : await upstashGetJSON(`pred:${idStr}`);
       if (record && record.resolved) {
         // 解決済みなのに残っている=LREMの取りこぼし。ここで確実に外す(APIは使わない)
-        await upstashCmd(["LREM", "pred:pending", "0", String(idStr)]).catch(() => {});
+        evictCmds.push(["LREM", "pred:pending", "0", String(idStr)]);
         evicted++;
         notes.push(`pending evicted (fixture ${idStr} already resolved)`);
         continue;
@@ -2692,7 +2818,7 @@ async function handleAutoCollectPredictions(opts) {
       //   カウンターを消していなかった。数週間おきの一時的な失敗が3回積もるだけで、
       //   健全な予測が保留リストから外され、二度と答え合わせされなくなる。
       //   読めた時点で必ず消す(=本当に「連続」でのみ諦める)。
-      await upstashCmd(["DEL", `pred:pendingmiss:${idStr}`]).catch(() => {});
+      evictCmds.push(["DEL", `pred:pendingmiss:${idStr}`]);
       const kickMs = record.kickoff ? Date.parse(record.kickoff) : NaN;
       if (Number.isFinite(kickMs) && (Date.now() - kickMs) < AUTO_COLLECT_RESOLVE_MIN_AGE_MS) {
         awaitingKickoff++;   // まだ試合中/開始前。APIを1回も使わずに見送る
@@ -2700,6 +2826,8 @@ async function handleAutoCollectPredictions(opts) {
       }
       candidates.push({ idStr: String(idStr), record, kickMs: Number.isFinite(kickMs) ? kickMs : 0 });
     }
+    // まとめて出せる後片づけを、ここで1回にまとめて送る
+    if (evictCmds.length) await upstashCmdBatch(evictCmds);
     // 古い試合ほど「もう終わっている」ので、そこから照合する
     candidates.sort((a, b) => a.kickMs - b.kickMs);
     if (candidates.length > AUTO_COLLECT_RESOLVE_CAP) {
@@ -2725,6 +2853,29 @@ async function handleAutoCollectPredictions(opts) {
       const byId = new Map();
       for (const en of entries) {
         if (en && en.fixture && en.fixture.id !== undefined) byId.set(String(en.fixture.id), en);
+      }
+      // ---- 二重計上を防ぐ鍵を、このチャンクぶんまとめて取る ----
+      //   1件ずつ SET NX していたため、60件で60往復していた。
+      //   鍵の意味(最初に取れた1つだけが数えてよい)は変えていない。
+      const claimedLocks = new Set();
+      {
+        const finished = chunk.filter((c) => {
+          const e = byId.get(String(c.idStr));
+          const st = e && e.fixture && e.fixture.status ? e.fixture.status.short : null;
+          return e && FINISHED_STATUSES.has(st) && e.goals;
+        });
+        if (finished.length) {
+          const nowIso = new Date().toISOString();
+          const claims = await upstashCmdBatchDetailed(finished.map((c) =>
+            ["SET", `pred:resolvelock:${c.idStr}`, nowIso, "NX", "EX", "86400"]));
+          finished.forEach((c, i) => {
+            const cl = claims[i] || { determined: false, result: null };
+            // 判定できた: "OK" なら自分が最初 → 数える / null なら既にある → 数えない
+            // 判定できなかった: 通信が失敗した → 数える側に倒す(永久な取りこぼしを防ぐ)
+            const may = cl.determined ? (cl.result === "OK" || cl.result === true) : true;
+            if (may) claimedLocks.add(String(c.idStr));
+          });
+        }
       }
       for (const c of chunk) {
         const idStr = c.idStr;
@@ -2759,7 +2910,12 @@ async function handleAutoCollectPredictions(opts) {
           }
           statusTally[statusShort || "unknown"] = (statusTally[statusShort || "unknown"] || 0) + 1;
           if (FINISHED_STATUSES.has(statusShort) && entry.goals) {
-            const r = await resolvePrediction(idStr, entry.goals.home, entry.goals.away);
+            // 2026年8月8日: 記録は既に読み込み済みなので渡す(往復を1回減らす)。
+            // 二重計上を防ぐ鍵も、このチャンクぶんをまとめて取ってある。
+            const r = await resolvePrediction(idStr, entry.goals.home, entry.goals.away, {
+              record,
+              mayCount: claimedLocks.has(String(idStr)),
+            });
             if (r) resolved++;
             continue;
           }
@@ -6854,6 +7010,9 @@ async function handleHttpRequest(req, res) {
         // これまでは画面に「0件」としか出ず、正常な0件(前回から変化なし)と
         // 異常な0件(未実行・キー未設定・予算切れ)を利用者が区別できなかった。
         try {
+          // 記録(errors)の種類分けはサーバー側で確定させ、画面はその結果を表示するだけにする
+          // (判定基準が2か所に分かれてズレるのを防ぐため)
+          result.errorClassification = classifyLearnErrors(result.errors || []);
           result.zeroKnowledgeDiagnosis = diagnoseZeroKnowledge(result);
           result.zeroVerificationDiagnosis = diagnoseZeroVerification(result);
           // 2026年8月・完全自動Learning Cycle ⑧: 「昨日より賢くなったか」の判定も
@@ -7128,6 +7287,13 @@ server.listen(PORT, () => {
  */
 function __setTestHooks(hooks) {
   if (!hooks) return;
+  // ---- 検証で見つかった設計の穴 ----
+  //   まとめ送り(upstashPipeline)は fetch を直接叩くため、
+  //   テストが upstashCmd を差し替えても **そこだけ本物に出て行っていた**。
+  //   保存先を差し替えたつもりで一部が素通りするのは、テストの意味を壊す。
+  //   差し替えが行われたら、まとめ送りは使わず、差し替えられた入口を通す。
+  if (hooks.upstashCmd || hooks.upstashGetJSON || hooks.upstashSetJSON) upstashHooksActive = true;
+  if (hooks.upstashPipeline) upstashPipeline = hooks.upstashPipeline;
   if (hooks.upstashCmd) upstashCmd = hooks.upstashCmd;
   if (hooks.upstashGetJSON) upstashGetJSON = hooks.upstashGetJSON;
   if (hooks.upstashSetJSON) upstashSetJSON = hooks.upstashSetJSON;
