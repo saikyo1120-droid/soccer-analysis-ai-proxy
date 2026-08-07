@@ -94,13 +94,36 @@ function diagnoseZeroKnowledge(growthLog) {
     });
   }
 
+  // ---- 2026年8月7日の修正 ----
+  //   以前はここで「エラーN件」と一括りにし、英語の文字列を3つ並べていた。
+  //   その中には、延期試合を待ち行列から外した **正常な処理の記録** や、
+  //   API-Footballがそもそも持っていない項目まで含まれていた。
+  //   利用者から見れば全部が赤い「エラー」に見え、
+  //   「バグが直っていない」と受け取られてしまう。
+  //   実際に取得できなかったものだけを問題として挙げ、それ以外は分けて書く。
   const otherErrors = errors.filter((e) => typeof e === "string" && !e.includes("NO_KEY"));
   if (otherErrors.length) {
-    causes.push({
-      code: ZERO_CAUSE.ERRORS, severity: isZero ? "error" : "warn",
-      titleJa: `データ取得時に${otherErrors.length}件のエラーが発生しました`,
-      detailJa: `代表的なエラー: ${otherErrors.slice(0, 3).join(" / ")}。API-Football側の一時的な不調や、シーズンオフでデータが空の場合にも発生します。`,
-    });
+    const cls = classifyLearnErrors(otherErrors);
+    if (cls.impactCount > 0) {
+      const top = cls.groups.filter((g) => g.level === "impact");
+      causes.push({
+        code: ZERO_CAUSE.ERRORS, severity: isZero ? "error" : "warn",
+        titleJa: `本日、実際に取得できなかったものが${cls.impactCount}件あります`,
+        detailJa: top.map((g) => `${g.titleJa}(${g.items.length}件): ${g.effectJa} 例: ${g.items.slice(0, 3).join(" / ")}`).join(" ")
+          + (cls.harmlessCount || cls.minorCount
+            ? ` なお、残り${cls.harmlessCount + cls.minorCount}件は、正常な処理の記録・提供元がそもそも持っていない項目・予測に影響しない小さな取りこぼしです。`
+            : ""),
+      });
+    } else if (cls.minorCount > 0) {
+      causes.push({
+        code: ZERO_CAUSE.ERRORS, severity: "warn",
+        titleJa: `本日、小さな取りこぼしが${cls.minorCount}件あります`,
+        detailJa: cls.groups.filter((g) => g.level === "minor")
+          .map((g) => `${g.titleJa}(${g.items.length}件): ${g.effectJa} 例: ${g.items.slice(0, 3).join(" / ")}`).join(" "),
+      });
+    }
+    // impact も minor も無い場合(正常な処理の記録・仕様上の限界だけ)は、
+    // 「エラー」としては1件も挙げない。
   }
 
   // ここまでで異常が1つも見つからず、かつ「重複でスキップ」が発生している場合は、
@@ -418,6 +441,146 @@ function buildEngineStatuses(ctx) {
   return s;
 }
 
+/* ============================================================================
+ * 2026年8月7日・ご指摘への対応(2度目)
+ * ----------------------------------------------------------------------------
+ * 画面には、こういう赤い行が出ていた:
+ *   ❌ データ取得時に12件のエラーが発生しました
+ *      代表的なエラー: prediction_unresolvable:1548504:PST / odds_failed:… /
+ *      predict_failed:Inter Miami:API-Football HTTP 429
+ *
+ * ところが12件の中身は3種類がまざっていた。
+ *   (1) 本当に困るもの … 429で「その日の予測が作れなかった」
+ *   (2) 正常な処理     … 延期になった試合を待ち行列から外した記録
+ *                        (以前の監査で、詰まりを防ぐために **わざと入れた** 処理)
+ *   (3) 仕様上の限界   … API-Footballが利き足・市場価値を提供していない
+ *
+ * ここが「エラーの正解表」。画面(index.html)もこの結果を使うので、
+ * 判定基準が2か所に分かれてズレることがない。
+ * ========================================================================== */
+const LEARN_ERROR_RULES = [
+  {
+    id: "rateLimited",
+    test: /HTTP 429|RATE_LIMITED|1分あたりの上限/,
+    level: "impact",
+    titleJa: "データ提供元の1分あたりの上限に当たり、取得できなかったものがあります",
+    meaningJa: "API-Footballには1分あたりの回数制限があります。ここに当たったぶんは、その日のうちに取得できていません。",
+    effectJa: "その試合・そのクラブの分析が、当日は最新になりません(翌日の学習で自動的に取り直します)。",
+  },
+  {
+    id: "predictFailed",
+    test: /^predict_failed/,
+    level: "impact",
+    titleJa: "新しい予測を作れなかったクラブがあります",
+    meaningJa: "予測に必要なデータを取得できなかったクラブです。",
+    effectJa: "そのクラブについて、その日の新しい予測は作られていません。",
+  },
+  {
+    id: "budget",
+    test: /BUDGET_EXHAUSTED|予算/,
+    level: "impact",
+    titleJa: "1日のAPI予算を使い切ったため、見送った処理があります",
+    meaningJa: "契約プランの1日あたりの上限に達しました。",
+    effectJa: "見送ったぶんは、翌日の学習で取り直します。",
+  },
+  {
+    id: "unresolvable",
+    test: /^prediction_unresolvable:.*:(PST|CANC|ABD|AWD|WO)$/,
+    level: "normal",
+    titleJa: "延期・中止になった試合を、答え合わせの待ち行列から外しました",
+    meaningJa: "結果が出ない試合なので、いつまでも待たないように取り除いた記録です。",
+    effectJa: "正常な処理です。利用者への影響はありません。",
+  },
+  {
+    id: "fixtureGone",
+    test: /^prediction_fixture_(missing|not_found)/,
+    level: "normal",
+    titleJa: "提供元から消えた試合を、答え合わせの対象から外しました",
+    meaningJa: "試合IDが振り直された・シーズン移行で消えた等で、確認しても見つからない試合です。",
+    effectJa: "正常な処理です。利用者への影響はありません。",
+  },
+  {
+    id: "notProvided",
+    test: /存在しないため|提供していないため|提供されていません/,
+    level: "spec",
+    titleJa: "データ提供元がそもそも持っていない項目です",
+    meaningJa: "API-Footballが提供していない項目(利き足・市場価値・年俸など)です。",
+    effectJa: "取得できないものとして、画面でも「取得できません」と明記しています。",
+  },
+  {
+    id: "odds",
+    test: /^odds_failed/,
+    level: "minor",
+    titleJa: "オッズを取得できなかった試合があります",
+    meaningJa: "その試合にオッズが提供されていないか、取得が一時的に失敗しました。",
+    effectJa: "市場との比較(ROI)の集計から、その試合だけが外れます。予測そのものには影響しません。",
+  },
+  {
+    id: "playerNotFound",
+    test: /に一致する選手が見つかりませんでした/,
+    level: "minor",
+    titleJa: "提供元で見つからなかった選手がいます",
+    meaningJa: "表記ゆれ等で、API-Football側の選手と結びつけられなかったものです。",
+    effectJa: "その選手の成績だけが更新されません。他の選手には影響しません。",
+  },
+  // ---- ここから下は「具体的な規則に当てはまらなかった取得失敗」の受け皿 ----
+  //   個別の規則より後ろに置くこと(先に置くと odds_failed 等を飲み込んでしまう)。
+  {
+    id: "fetchFailed",
+    test: /_failed:|HTTP_ERROR|取得に失敗/,
+    level: "impact",
+    titleJa: "取得に失敗したものがあります",
+    meaningJa: "提供元からの取得が失敗しました(一時的な不調・シーズンオフでデータが空、などでも起こります)。",
+    effectJa: "その項目だけが、その日は最新になりません(翌日の学習で取り直します)。",
+  },
+];
+
+/**
+ * 学習の記録(errors配列)を、利用者にとっての意味で分類する。
+ * level: impact(実際に取得できなかった) / minor(小さな取りこぼし)
+ *      / normal(正常な処理の記録)      / spec(そもそも取得できない項目)
+ */
+function classifyLearnErrors(list) {
+  const groups = new Map();
+  (list || []).forEach((raw) => {
+    const text = String(raw);
+    const rule = LEARN_ERROR_RULES.find((r) => r.test.test(text));
+    const key = rule ? rule.id : "unknown";
+    if (!groups.has(key)) {
+      groups.set(key, rule
+        ? { id: rule.id, level: rule.level, titleJa: rule.titleJa, meaningJa: rule.meaningJa, effectJa: rule.effectJa, items: [] }
+        : {
+          id: "unknown", level: "minor", titleJa: "分類できなかった記録",
+          meaningJa: "想定していない種類の記録です。", effectJa: "内容を確認する必要があります。", items: [],
+        });
+    }
+    groups.get(key).items.push(text);
+  });
+  const order = { impact: 0, minor: 1, normal: 2, spec: 3 };
+  const arr = [...groups.values()].sort((a, b) => order[a.level] - order[b.level]);
+  const countBy = (lv) => arr.filter((g) => g.level === lv).reduce((n, g) => n + g.items.length, 0);
+  const impactCount = countBy("impact");
+  const minorCount = countBy("minor");
+  const harmlessCount = countBy("normal") + countBy("spec");
+  return {
+    groups: arr,
+    total: (list || []).length,
+    impactCount, minorCount, harmlessCount,
+    // 画面の見出しに使う一文(ここで作っておけば表現が2か所でズレない)
+    headlineJa: (list || []).length === 0
+      ? null
+      : impactCount > 0
+        ? `本日、実際に取得できなかったものが${impactCount}件あります。`
+          + (minorCount ? `小さな取りこぼしが${minorCount}件、` : "")
+          + (harmlessCount ? `正常な処理の記録などが${harmlessCount}件です。` : (minorCount ? "" : ""))
+        : minorCount > 0
+          ? `本日、小さな取りこぼしが${minorCount}件あります(予測そのものには影響しません)。`
+            + (harmlessCount ? `残りの${harmlessCount}件は正常な処理の記録です。` : "")
+          : `記録が${(list || []).length}件ありますが、いずれも正常な処理の記録か、提供元がそもそも持っていない項目です(利用者への影響はありません)。`,
+  };
+}
+
 module.exports = {
   diagnoseZeroKnowledge, diagnoseZeroVerification, getRunHistory, buildEngineStatuses, ZERO_CAUSE,
+  classifyLearnErrors, LEARN_ERROR_RULES,
 };
