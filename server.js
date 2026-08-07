@@ -2668,6 +2668,84 @@ async function loadPlayerIndex(force) {
   return playerIndexState.loading;
 }
 
+// ---- 詳細画面用の補助データ(直近5試合・移籍履歴・怪我履歴)----
+// 検索には使わないので、**選手を1人開いたときに初めて**読み、以後キャッシュする。
+const playerDetailStores = { recent5: null, transfers: null, injuries: null, loadedAt: 0, loading: null };
+const DETAIL_STORE_TTL_MS = Number(process.env.DETAIL_STORE_TTL_MS) || 30 * 60 * 1000;
+async function loadPlayerDetailStores() {
+  const now = Date.now();
+  if (playerDetailStores.loadedAt && (now - playerDetailStores.loadedAt) < DETAIL_STORE_TTL_MS) return playerDetailStores;
+  if (playerDetailStores.loading) return playerDetailStores.loading;
+  playerDetailStores.loading = (async () => {
+    try {
+      const [r5, tr, inj] = await Promise.all([
+        playerSearch.loadShardedMap(playerSearchDeps, playerSearch.DETAIL_KEYS.recent5).catch(() => ({ map: {} })),
+        playerSearch.loadShardedMap(playerSearchDeps, playerSearch.DETAIL_KEYS.transfers).catch(() => ({ map: {} })),
+        playerSearch.loadShardedMap(playerSearchDeps, playerSearch.DETAIL_KEYS.injuries).catch(() => ({ map: {} })),
+      ]);
+      playerDetailStores.recent5 = r5.map || {};
+      playerDetailStores.transfers = tr.map || {};
+      playerDetailStores.injuries = inj.map || {};
+    } catch (e) {
+      playerDetailStores.recent5 = playerDetailStores.recent5 || {};
+      playerDetailStores.transfers = playerDetailStores.transfers || {};
+      playerDetailStores.injuries = playerDetailStores.injuries || {};
+    }
+    playerDetailStores.loadedAt = Date.now();
+    playerDetailStores.loading = null;
+    return playerDetailStores;
+  })();
+  return playerDetailStores.loading;
+}
+
+// ---- 人気検索・急上昇(⑤)----
+// 検索されるたびに数えるが、Redisへの書き込みは**まとめて**行う
+// (1検索1書き込みにすると、無料枠をすぐ使い切る)。
+const searchTally = new Map();          // playerId -> 今日の検索回数(メモリ上)
+let searchTallyFlushedAt = 0;
+const SEARCH_FLUSH_INTERVAL_MS = Number(process.env.SEARCH_FLUSH_INTERVAL_MS) || 10 * 60 * 1000;
+const SEARCH_TALLY_MAX = 2000;
+// 「今日の注目・人気・急上昇」は選手検索タブを開くたびに呼ばれる。
+// 中身は1日単位でしか変わらないので、数分キャッシュしてRedisへの往復を防ぐ。
+const HIGHLIGHTS_CACHE_MS = Number(process.env.HIGHLIGHTS_CACHE_MS) || 5 * 60 * 1000;
+// 選手詳細の本文キャッシュ。索引は1日1回しか変わらないので数分で十分。
+// (索引が入れ替わったときは loadPlayerIndex 側で作り直されるため、
+//   古い内容が長く残ることはない)
+const PLAYER_DETAIL_CACHE_MS = Number(process.env.PLAYER_DETAIL_CACHE_MS) || 5 * 60 * 1000;
+function notePlayerViewed(id) {
+  if (!id) return;
+  if (searchTally.size >= SEARCH_TALLY_MAX && !searchTally.has(id)) return;
+  searchTally.set(id, (searchTally.get(id) || 0) + 1);
+}
+async function flushSearchTally() {
+  if (!UPSTASH_ENABLED || searchTally.size === 0) return;
+  const now = Date.now();
+  if (now - searchTallyFlushedAt < SEARCH_FLUSH_INTERVAL_MS) return;
+  searchTallyFlushedAt = now;
+  const todayKey = appDateKey();
+  const snapshot = [...searchTally.entries()];
+  searchTally.clear();
+  try {
+    const prev = (await upstashGetJSON(`kb:player:views:${todayKey}`).catch(() => null)) || {};
+    for (const [id, n] of snapshot) prev[id] = (prev[id] || 0) + n;
+    // 上位500人だけ残す(無制限に増やさない)
+    const trimmed = Object.fromEntries(
+      Object.entries(prev).sort((a, b) => b[1] - a[1]).slice(0, 500)
+    );
+    await upstashSetJSON(`kb:player:views:${todayKey}`, trimmed);
+    await upstashCmd(["EXPIRE", `kb:player:views:${todayKey}`, String(14 * 86400)]).catch(() => {});
+  } catch (e) {
+    // ベストエフォート。失敗しても検索は止めない。
+    // ただし数えた回数を黙って捨てると「人気」が実態より少なく出るので、
+    // メモリへ戻して次回の書き込みに合流させる。
+    for (const [id, n] of snapshot) {
+      if (searchTally.size >= SEARCH_TALLY_MAX && !searchTally.has(id)) break;
+      searchTally.set(id, (searchTally.get(id) || 0) + n);
+    }
+    searchTallyFlushedAt = 0;   // 次のリクエストで再試行できるようにする
+  }
+}
+
 /** クエリ文字列 → playerSearch が理解する検索条件 */
 function parsePlayerQuery(sp) {
   const num = (k) => {
@@ -2702,6 +2780,10 @@ function parsePlayerQuery(sp) {
     assistsMin: num("assistsMin"), assistsMax: num("assistsMax"),
     ratingMin: num("ratingMin"), ratingMax: num("ratingMax"),
     formMin: num("formMin"), formMax: num("formMax"),
+    // 2026年8月・「選手検索」統合で追加
+    startRateMin: num("startRateMin"), startRateMax: num("startRateMax"),
+    minutesPerAppMin: num("minutesPerAppMin"), minutesPerAppMax: num("minutesPerAppMax"),
+    recent5Min: num("recent5Min"), recent5Max: num("recent5Max"),
     sort: sp.get("sort") || "rating",
     order: sp.get("order") === "asc" ? "asc" : "desc",
   };
@@ -5041,6 +5123,121 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(body));
         return;
       }
+      // ---- 2026年8月・「選手検索」1ページ統合で追加したエンドポイント ----
+      // ② 入力途中の候補表示(オートコンプリート)。
+      //    索引はメモリにあるので、1文字ごとに呼ばれても Redis も外部APIも触らない。
+      if (pathname === "/api/players/suggest") {
+        const t0 = Date.now();
+        const field = parsed.searchParams.get("field") || "name";
+        const q = parsed.searchParams.get("q") || "";
+        const limit = parseInt(parsed.searchParams.get("limit"), 10) || 8;
+        const state = await loadPlayerIndex(false);
+        const items = state.rows.length ? playerSearch.suggest(state.rows, field, q, limit) : [];
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          // 候補は数分変わらないので、ブラウザ側にも短く持たせる
+          "Cache-Control": "public, max-age=120",
+        });
+        res.end(JSON.stringify({
+          ok: true, field, query: q, items,
+          available: state.rows.length > 0,
+          reasonJa: state.rows.length ? null : (state.reasonJa || "索引がまだ作られていません。"),
+          tookMs: Date.now() - t0,
+        }));
+        return;
+      }
+      // ③ AIおすすめ選手
+      if (pathname === "/api/players/recommend") {
+        const t0 = Date.now();
+        const state = await loadPlayerIndex(false);
+        if (!state.rows.length) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: true, available: false, items: [], reasonJa: state.reasonJa || "索引がまだ作られていません。" }));
+          return;
+        }
+        const preset = parsed.searchParams.get("preset") || null;
+        const query = parsePlayerQuery(parsed.searchParams);
+        // 空の条件は渡さない(プリセットの条件を打ち消さないため)
+        const cleaned = {};
+        for (const [k, v] of Object.entries(query)) {
+          if (v === undefined || v === null || v === "" || (Array.isArray(v) && !v.length)) continue;
+          if (k === "sort" || k === "order") continue;
+          cleaned[k] = v;
+        }
+        const result = playerSearch.recommendPlayers(state.rows, {
+          preset, query: cleaned,
+          limit: parseInt(parsed.searchParams.get("limit"), 10) || 10,
+        });
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({
+          ok: true, ...result,
+          presets: Object.entries(playerSearch.RECOMMEND_PRESETS).map(([k, v]) => ({ key: k, labelJa: v.labelJa, reasonJa: v.reasonJa })),
+          tookMs: Date.now() - t0,
+        }));
+        return;
+      }
+      // ⑤⑥ 人気検索・急上昇・今日AIが注目する5人
+      if (pathname === "/api/players/highlights") {
+        const t0 = Date.now();
+        // これは「選手検索」タブを開くたびに必ず呼ばれる。中身は1日単位でしか
+        // 変わらない(注目5人)か、数分ずれても支障のないもの(閲覧数)なので、
+        // サーバー側で数分キャッシュする。これをしないと利用者1人につき
+        // Redisコマンドを3回使い、10万人規模で無料枠を即座に使い切る。
+        const cachedHl = cacheGet("players:highlights");
+        if (cachedHl) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
+          res.end(JSON.stringify({ ...cachedHl, cached: true }));
+          return;
+        }
+        const state = await loadPlayerIndex(false);
+        if (!state.rows.length) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: true, available: false, reasonJa: state.reasonJa || "索引がまだ作られていません。", picks: [], popular: [], trending: [] }));
+          return;
+        }
+        const byId = new Map(state.rows.map((r) => [Number(r[playerSearch.COL.id]), r]));
+        const todayKey = appDateKey();
+        const yesterdayKey = appDateKey(new Date(Date.now() - 86400000));
+        const [todayViews, yesterdayViews, feedRaw] = await Promise.all([
+          upstashGetJSON(`kb:player:views:${todayKey}`).catch(() => null),
+          upstashGetJSON(`kb:player:views:${yesterdayKey}`).catch(() => null),
+          upstashCmd(["LRANGE", "kb:player:scoutfeed", "0", "80"]).catch(() => []),
+        ]);
+        const tv = todayViews || {};
+        const yv = yesterdayViews || {};
+        // 今メモリに溜まっているぶんも足す(書き戻し前でも画面に反映される)
+        for (const [id, n] of searchTally) tv[id] = (tv[id] || 0) + n;
+        const popular = Object.entries(tv)
+          .sort((a, b) => b[1] - a[1]).slice(0, 8)
+          .map(([id, n]) => (byId.has(Number(id)) ? { ...playerSearch.fromIndexRow(byId.get(Number(id))), views: n } : null))
+          .filter(Boolean);
+        // 急上昇 = 昨日より増えた幅が大きい順(昨日0でも増分で測る)
+        const trending = Object.entries(tv)
+          .map(([id, n]) => ({ id: Number(id), delta: n - (yv[id] || 0), n }))
+          .filter((x) => x.delta > 0 && byId.has(x.id))
+          .sort((a, b) => b.delta - a.delta).slice(0, 8)
+          .map((x) => ({ ...playerSearch.fromIndexRow(byId.get(x.id)), views: x.n, viewsDelta: x.delta }));
+        // 今日AIが注目する5人(移籍・怪我復帰はスカウト速報から拾う)
+        const feed = (feedRaw || []).map((x) => { try { return JSON.parse(x); } catch (e) { return null; } }).filter(Boolean);
+        const highlights = playerSearch.dailyHighlights(state.rows, {
+          limit: 5,
+          recentTransfers: feed.filter((f) => f.type === "transfer").map((f) => ({ playerId: f.playerId, detailJa: f.detailJa })),
+          injuryReturns: [],
+        });
+        const hlBody = {
+          ok: true, available: true,
+          picks: highlights.items, picksMethodJa: highlights.methodJa, picksReasonJa: highlights.reasonJa,
+          popular, trending,
+          popularNoteJa: popular.length ? "このサイトで実際に開かれた回数です(本日ぶん)。" : "まだ十分な閲覧がありません(選手を開くと集計が始まります)。",
+          trendingNoteJa: trending.length ? "昨日と比べて閲覧が増えた順です。" : "前日との比較ができるだけの記録がまだありません。",
+          indexBuiltAt: state.meta && state.meta.builtAt ? state.meta.builtAt : null,
+          tookMs: Date.now() - t0,
+        };
+        cacheSet("players:highlights", hlBody, HIGHLIGHTS_CACHE_MS);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
+        res.end(JSON.stringify(hlBody));
+        return;
+      }
       // 絞り込みの候補一覧(クラブ・国籍・リーグ・ポジション)。
       // クラブはTOP100の全クラブを返す(索引にまだ選手がいないクラブも
       // 「0人」として出し、なぜ0人なのかが分かるようにする)。
@@ -5085,7 +5282,14 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(body));
         return;
       }
-      // 選手1人の詳細 + AI分析(⑧)。索引はメモリ、記録本体だけ1回読む。
+      // 選手1人の詳細 + AI分析(⑧)。索引はメモリ、補助データはキャッシュ。
+      //
+      // ここは「選手検索」で最もよく叩かれる。1回ごとにRedisを読むと
+      // 10万人規模で無料枠(10,000コマンド/日)を即座に超えるため、
+      //   ・組み立て済みの本文を数分キャッシュする
+      //   ・記録本体(kb:player:<id>)は既定では読まない(?withRecord=1 のときだけ)
+      // という2点で、通常の閲覧のRedisコマンドを0回にしている。
+      // 閲覧数の集計だけはキャッシュに当たっても必ず数える。
       if (pathname === "/api/knowledge/player") {
         const id = parseInt(parsed.searchParams.get("id"), 10);
         if (!Number.isFinite(id)) {
@@ -5093,8 +5297,22 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ ok: false, reasonJa: "選手ID(id)を指定してください。" }));
           return;
         }
+        const withRecord = parsed.searchParams.get("withRecord") === "1";
         const t0 = Date.now();
         const state = await loadPlayerIndex(false);
+        // キャッシュの鍵に索引の世代を入れる。毎朝索引が作り直された瞬間に
+        // 古い本文が無効になるので、「移籍したのに前のクラブが出る」が起きない。
+        const detailCacheKey = `player:detail:${(state.meta && state.meta.builtAt) || "none"}:${id}`;
+        if (!withRecord) {
+          const hit = cacheGet(detailCacheKey);
+          if (hit) {
+            notePlayerViewed(id);
+            flushSearchTally().catch(() => {});
+            res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+            res.end(JSON.stringify({ ...hit, cached: true }));
+            return;
+          }
+        }
         const row = state.rows.find((r) => Number(r[playerSearch.COL.id]) === id);
         if (!row) {
           res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
@@ -5107,18 +5325,79 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         const analysis = playerSearch.analyzePlayer(state.rows, row);
-        // 記録本体(kb:player:<id>)は詳細ページを開いたときだけ読む(Lazy Load)
-        const record = await clubDossier.getPlayer(id).catch(() => null);
+        // 補助データ(直近5試合・移籍・怪我)は詳細を開いたときだけ読み、
+        // 読んだあとは全リクエストで共有する(loadPlayerDetailStoresがキャッシュ)。
+        // 記録本体は索引と重複する内容なので、明示的に求められたときだけ読む。
+        const [record, stores] = await Promise.all([
+          withRecord ? clubDossier.getPlayer(id).catch(() => null) : Promise.resolve(null),
+          loadPlayerDetailStores().catch(() => ({ recent5: {}, transfers: {}, injuries: {} })),
+        ]);
+        // 人気検索・急上昇の集計(まとめて書き戻すので、ここではメモリに足すだけ)
+        notePlayerViewed(id);
+        flushSearchTally().catch(() => {});
+        const view = playerSearch.fromIndexRow(row);
+        const recent5 = (stores.recent5 || {})[String(id)] || [];
+        const transfers = (stores.transfers || {})[String(id)] || [];
+        const injuries = (stores.injuries || {})[String(id)] || [];
+        // 同ポジション内での順位(⑤ 同ポジション順位)
+        const posRows = state.rows.filter((r) => r[playerSearch.COL.position] === row[playerSearch.COL.position]);
+        const rankOf = (col) => {
+          const mine = row[col];
+          if (mine === null || mine === undefined) return null;
+          const vals = posRows.map((r) => r[col]).filter((v) => v !== null && v !== undefined);
+          if (vals.length < 20) return null;
+          const better = vals.filter((v) => v > mine).length;
+          return { rank: better + 1, of: vals.length };
+        };
         const body = {
           ok: true, available: true,
-          player: playerSearch.fromIndexRow(row),
+          player: view,
           analysis,
+          // ---- 2026年8月・「選手検索」統合で追加した情報 ----
+          seasonStats: {
+            appearances: view.appearances, lineups: view.lineups,
+            startRatePct: view.startRatePct, minutes: view.minutes,
+            minutesPerAppearance: view.minutesPerAppearance,
+            goals: view.goals, assists: view.assists, rating: view.rating,
+            keyPasses: view.keyPasses, passAccuracyPct: view.passAccuracyPct,
+            dribbleSuccessRatePct: view.dribbleSuccessRatePct,
+            defensiveActions: view.defensiveActions, duelWinRatePct: view.duelWinRatePct,
+            yellowCards: view.yellowCards, redCards: view.redCards,
+            noteJa: "今シーズンの累計です。取得できていない項目は0ではなく「未取得」と表示します。",
+          },
+          recentMatches: {
+            available: recent5.length > 0,
+            items: recent5,
+            reasonJa: recent5.length ? null : "この選手が出場した直近の試合ごとの記録が、まだ取得できていません(毎日の学習で順次集まります)。",
+          },
+          positionRanks: {
+            positionJa: view.positionJa,
+            sampleSize: posRows.length,
+            rating: rankOf(playerSearch.COL.rating),
+            goals: rankOf(playerSearch.COL.goals),
+            assists: rankOf(playerSearch.COL.assists),
+            minutes: rankOf(playerSearch.COL.minutes),
+            noteJa: "同じポジションの選手の中での順位です(実測値が取れている選手のみを母集団にしています)。",
+          },
+          transferHistory: {
+            available: transfers.length > 0,
+            items: transfers,
+            reasonJa: transfers.length ? null : "移籍の記録がまだありません(所属クラブの移籍情報を毎日取得しており、そこに現れた時点で表示されます)。",
+          },
+          injuryHistory: {
+            available: injuries.length > 0,
+            items: injuries,
+            reasonJa: injuries.length ? null : "負傷の記録がまだありません(負傷者リストに載った時点で記録されます)。",
+          },
           record: record || null,
-          recordNoteJa: record ? null : "個別の記録ファイルはまだ作られていません(索引の実測値のみ表示しています)。",
+          recordNoteJa: withRecord
+            ? (record ? null : "個別の記録ファイルはまだ作られていません(索引の実測値のみ表示しています)。")
+            : "表示している数値は毎日の学習で作られた索引の実測値です(記録本体は ?withRecord=1 で取得できます)。",
           indexBuiltAt: state.meta && state.meta.builtAt ? state.meta.builtAt : null,
           tookMs: Date.now() - t0,
           unavailableFieldsJa: playerSearch.UNAVAILABLE_SEARCH_FIELDS_JA,
         };
+        if (!withRecord) cacheSet(detailCacheKey, body, PLAYER_DETAIL_CACHE_MS);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
         return;
