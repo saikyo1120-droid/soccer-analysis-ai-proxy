@@ -520,6 +520,14 @@
        開いた瞬間(5秒以内)に見せる。中身は毎朝の学習でAI自身のモデルが生成・
        保存した予測(learn:ownpred)の読み出しで、このカードが新しい計算を
        発生させることはない。予想が無い日は理由を正直に表示する。 -->
+  <!-- 2026年8月18日・v48「推しクラブ」: 好きなクラブを1つ登録すると、ホームの
+       最上部が「あなたのクラブ」の見出しになる。中身は保存済みデータの読み出し
+       だけ(/api/club/summary は10分キャッシュ・新しい計算やAPI呼び出しなし)。
+       登録は端末内(localStorage)に保存し、サーバーには送らない。 -->
+  <div class="card" id="myClubCard" style="border:1.5px solid var(--series-home);">
+    <div id="myClubBody"></div>
+  </div>
+
   <div class="card" id="todayPredictionsCard" style="border:1.5px solid var(--series-2);">
     <h2 style="margin-bottom:6px;">🔮 今日のAI予想</h2>
     <div id="todayPredictionsBody"><p class="value-note">今日のAI予想を読み込み中…</p></div>
@@ -582,6 +590,14 @@
            オッズを取得できない試合では一切使わない=推測で埋めない) -->
     <p class="value-note" style="margin:0 0 8px; opacity:.85;">🧠 予測モデルは9リーグ×3シーズンの実試合とAI自身の的中記録から毎日学習しています。2026年8月18日からは市場オッズ(ブックメーカーの評価)も学習の材料に加えました(オッズの影響の強さはAI自身が実データから学習し、取得できない試合では使いません)。</p>
     <div id="reflectionsBody" class="muted" style="font-size:13px;">読み込み中…</div>
+  </div>
+
+  <!-- 2026年8月18日・v48「週間AIダイジェスト」: AIの1週間を実測記録だけから
+       機械的にまとめた読み物(毎週月曜の学習後に自動生成)。LLMの作文なし。
+       中身は /api/digest/latest の読み出しのみ。 -->
+  <div class="card" id="digestCard" style="border:1.5px solid var(--series-2);">
+    <h2 style="margin:0 0 4px;">📰 今週のAIダイジェスト</h2>
+    <div id="digestBody" class="muted" style="font-size:13px;">読み込み中…</div>
   </div>
 
 
@@ -8520,6 +8536,204 @@ async function renderReflectionsCard() {
   el.innerHTML = parts.join("");
 }
 
+// ---- 2026年8月18日・v48「推しクラブ(マイクラブ)」 ----
+//   登録は端末内(localStorage)のみ。サーバーに個人情報は送らない
+//   (送るのはクラブ名のパラメータ1つだけ)。
+const MY_CLUB_LS_KEY = "myClubEn";
+function myClubGet() {
+  try { return localStorage.getItem(MY_CLUB_LS_KEY) || null; } catch (e) { return null; }
+}
+function myClubSet(en) {
+  try { en ? localStorage.setItem(MY_CLUB_LS_KEY, en) : localStorage.removeItem(MY_CLUB_LS_KEY); } catch (e) { /* プライベートモード等 */ }
+}
+function renderMyClubPicker(el) {
+  const opts = Object.entries(UNIVERSE_CLUB_JA_TO_EN)
+    .map(([ja, en]) => `<option value="${escapeHtml(en)}">${escapeHtml(ja)}</option>`)
+    .join("");
+  el.innerHTML = `
+    <h2 style="margin:0 0 4px;">⭐ 推しクラブを登録</h2>
+    <p class="value-note" style="margin:0 0 8px;">好きなクラブを1つ選ぶと、この場所が「あなたのクラブ」専用の見出しになります(次の試合のAI予想・調子・このクラブでのAIの成績)。登録はこの端末の中だけに保存されます。</p>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <select id="myClubSelect" style="flex:1; min-width:200px; padding:9px 12px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary); font-size:14px;">
+        <option value="">クラブを選ぶ(予測対象100クラブ)…</option>${opts}
+      </select>
+      <button class="apply-btn" id="myClubSaveBtn" style="margin-top:0; width:auto; padding:9px 16px;">登録する</button>
+    </div>`;
+  const btn = document.getElementById("myClubSaveBtn");
+  if (btn) btn.addEventListener("click", () => {
+    const sel = document.getElementById("myClubSelect");
+    if (sel && sel.value) { myClubSet(sel.value); renderMyClubCard(); }
+  });
+}
+async function renderMyClubCard() {
+  const el = document.getElementById("myClubBody");
+  if (!el) return;
+  const esc = escapeHtml;
+  const clubEn = myClubGet();
+  if (!clubEn) { renderMyClubPicker(el); return; }
+  const clubJaGuess = reflClubJa(clubEn);
+  el.innerHTML = `<h2 style="margin:0 0 4px;">⭐ マイクラブ: ${esc(clubJaGuess)}</h2><p class="value-note">実測データを読み込み中…</p>`;
+  let d = null;
+  try {
+    d = await fetchJsonWithTimeout(`${API_PROXY_BASE}/club/summary?club=${encodeURIComponent(clubEn)}`,
+      backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { d = null; }
+  const headBtns = `
+    <span style="float:right; white-space:nowrap;">
+      <button class="icon-btn" id="myClubChangeBtn" style="padding:4px 10px; font-size:12px;">変更</button>
+      <button class="icon-btn" id="myClubClearBtn" style="padding:4px 10px; font-size:12px;">解除</button>
+    </span>`;
+  const wireBtns = () => {
+    const c = document.getElementById("myClubChangeBtn");
+    if (c) c.addEventListener("click", () => renderMyClubPicker(el));
+    const x = document.getElementById("myClubClearBtn");
+    if (x) x.addEventListener("click", () => { myClubSet(null); renderMyClubCard(); });
+  };
+  if (!d) {
+    el.innerHTML = `<h2 style="margin:0 0 4px;">⭐ マイクラブ: ${esc(clubJaGuess)}${headBtns}</h2>
+      <p class="value-note">サーバーに接続できないため、このクラブの実測データを読み込めませんでした(起動直後の可能性があります。少し待って再読み込みしてください)。</p>`;
+    wireBtns();
+    return;
+  }
+  if (d.ok === false || d.available === false) {
+    el.innerHTML = `<h2 style="margin:0 0 4px;">⭐ マイクラブ: ${esc(d.clubJa || clubJaGuess)}${headBtns}</h2>
+      <p class="value-note">${esc(d.reasonJa || d.messageJa || "このクラブの記録はまだありません。")}</p>`;
+    wireBtns();
+    return;
+  }
+  const parts = [];
+  parts.push(`<h2 style="margin:0 0 4px;">⭐ マイクラブ: ${esc(d.clubJa)}${headBtns}</h2>`);
+  // 次の試合
+  if (d.nextPrediction) {
+    const np = d.nextPrediction;
+    const when = np.kickoff ? new Date(np.kickoff).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+    parts.push(`<div style="margin-top:6px; padding:8px 10px; background:rgba(0,0,0,.04); border-radius:8px;">
+      <div class="value-note">次の試合(日本時間 ${esc(when)})${np.official === false ? ' <span class="smarter-tag smarter-tag-ai">参考(親善など)</span>' : ""}</div>
+      <div style="margin-top:2px;"><strong>${esc(reflClubJa(np.homeEn))} vs ${esc(reflClubJa(np.awayEn))}</strong></div>
+      <div style="margin-top:2px;">AIの予想: <strong>${esc(reflClubJa(np.predictedJa.replace("勝利", "")) + (np.predictedJa.includes("勝利") ? "勝利" : ""))}</strong>${np.predictedScoreline ? `(予想スコア ${esc(np.predictedScoreline)})` : ""}</div>
+    </div>`);
+  } else {
+    parts.push(`<div class="value-note" style="margin-top:6px;">保存済みの「次の試合の予想」は今はありません(毎朝の学習で、次の試合が近づくと自動で作られます)。</div>`);
+  }
+  // いまの状態(実測)
+  if (d.condition) {
+    const c = d.condition;
+    const bits = [];
+    if (c.standings) bits.push(`リーグ順位 <strong>${Number(c.standings.position)}位</strong>${Number.isFinite(Number(c.standings.points)) ? `(勝点${Number(c.standings.points)})` : ""}<span class="value-note">・${Number(c.standings.agoDays)}日前の実測</span>`);
+    if (c.injuries) bits.push(`負傷・出場停止 <strong>${Number(c.injuries.count)}人</strong>${(c.injuries.players || []).length ? `(${c.injuries.players.map(esc).join("・")}ほか)` : ""}<span class="value-note">・${Number(c.injuries.agoHours)}時間前の実測</span>`);
+    if (c.form) bits.push(`直近フォームスコア <strong>${Number(c.form.score)}</strong><span class="value-note">・${Number(c.form.agoHours)}時間前の実測</span>`);
+    if (bits.length) parts.push(`<div style="margin-top:8px;">${bits.map((b) => `<div style="margin:2px 0;">${b}</div>`).join("")}</div>`);
+  }
+  // このクラブでのAIの成績
+  const rec = d.record || {};
+  if (rec.n > 0) {
+    const offTxt = rec.official && rec.official.n > 0 ? `(うち公式戦 ${Number(rec.official.hits)}/${Number(rec.official.n)}件)` : "";
+    parts.push(`<div style="margin-top:8px;"><span class="value-note">このクラブが絡む試合でのAIの成績: </span><strong>${Number(rec.n)}件中${Number(rec.hits)}件的中(${Number(rec.hitRatePct)}%)</strong> <span class="value-note">${offTxt}</span></div>`);
+    if (rec.last && rec.last.length) {
+      parts.push(`<div style="margin-top:4px;">${rec.last.map((r) => {
+        const when = r.kickoff ? new Date(r.kickoff).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" }) : "";
+        return `<div class="value-note" style="margin:2px 0;">${r.correct ? "⭕" : "❌"} ${esc(when)} ${esc(reflClubJa(r.homeEn))} ${r.actualScore ? esc(r.actualScore) : "-"} ${esc(reflClubJa(r.awayEn))}${r.official === false ? ' <span class="smarter-tag smarter-tag-ai">参考</span>' : ""}</div>`;
+      }).join("")}</div>`);
+    }
+  } else {
+    parts.push(`<div class="value-note" style="margin-top:8px;">${esc(rec.noteJa || "このクラブの答え合わせ済み予測はまだありません。")}</div>`);
+  }
+  parts.push(`<div class="value-note" style="margin-top:8px; opacity:.8;">すべて実測値です(10分ごとに更新)。登録クラブはこの端末にだけ保存されます。</div>`);
+  el.innerHTML = parts.join("");
+  wireBtns();
+}
+
+// ---- 2026年8月18日・v48「週間AIダイジェスト」 ----
+function buildDigestShareImage(dg) {
+  const W = 1200, H = 630;
+  const cv = document.createElement("canvas");
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext("2d");
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, "#0b3d2e"); grad.addColorStop(1, "#052018");
+  ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "rgba(255,255,255,.08)";
+  for (let i = 0; i < 5; i++) ctx.fillRect(0, 120 + i * 110, W, 1);
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 44px sans-serif";
+  ctx.fillText("📰 今週のAIダイジェスト", 60, 90);
+  ctx.font = "26px sans-serif"; ctx.fillStyle = "#9fd6bd";
+  ctx.fillText(dg.periodJa || "", 60, 130);
+  ctx.fillStyle = "#ffffff"; ctx.font = "bold 34px sans-serif";
+  const line = (t, y, color, font) => { ctx.fillStyle = color || "#ffffff"; ctx.font = font || "28px sans-serif"; ctx.fillText(String(t).slice(0, 40), 60, y); };
+  line(dg.summary && dg.summary.n ? `今週の成績: ${dg.summary.hits}勝 / ${dg.summary.n}試合(${dg.summary.hitRatePct}%)` : "今週は答え合わせ対象の試合なし", 200, "#ffffff", "bold 34px sans-serif");
+  if (dg.bestHit) {
+    line("🎯 ベスト的中", 265, "#7fe0ae", "bold 27px sans-serif");
+    line(dg.bestHit.matchJa || "", 305, "#ffffff", "27px sans-serif");
+    if (dg.bestHit.marketPctForPick !== null) line(`市場は${dg.bestHit.marketPctForPick}%しか見ていなかった`, 342, "#9fd6bd", "24px sans-serif");
+  }
+  if (dg.worstMiss) {
+    line("🙈 一番の外れ(隠しません)", 410, "#f2b8b5", "bold 27px sans-serif");
+    line(dg.worstMiss.matchJa || "", 450, "#ffffff", "27px sans-serif");
+    if (dg.worstMiss.reasonJa) line(`理由: ${dg.worstMiss.reasonJa}`, 487, "#e8c4c2", "24px sans-serif");
+  }
+  line("外したら、理由まで正直に話すサッカーAI", 585, "#9fd6bd", "24px sans-serif");
+  return cv.toDataURL("image/png");
+}
+async function shareDigestImage(dg) {
+  try {
+    const dataUrl = buildDigestShareImage(dg);
+    const blob = await (await fetch(dataUrl)).blob();
+    const file = new File([blob], "ai_weekly_digest.png", { type: "image/png" });
+    if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: "今週のAIダイジェスト" });
+      return;
+    }
+    const a = document.createElement("a");
+    a.href = dataUrl; a.download = "ai_weekly_digest.png"; a.click();
+  } catch (e) { /* 共有キャンセル等は無視 */ }
+}
+async function renderDigestCard() {
+  const el = document.getElementById("digestBody");
+  if (!el) return;
+  const esc = escapeHtml;
+  let d = null;
+  try {
+    d = await fetchJsonWithTimeout(`${API_PROXY_BASE}/digest/latest`,
+      backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { d = null; }
+  if (!d) { el.textContent = "サーバーに接続できないため、ダイジェストを読み込めませんでした。"; return; }
+  if (d.available === false || !d.digest) {
+    el.innerHTML = `<div class="value-note">${esc(d.reasonJa || "ダイジェストはまだありません。")}</div>`;
+    return;
+  }
+  const dg = d.digest;
+  const parts = [];
+  parts.push(`<div class="value-note" style="margin-bottom:6px;">${esc(dg.periodJa || "")}のAIの1週間(実測記録からの自動生成・作文なし)</div>`);
+  parts.push(`<div style="margin-bottom:6px;"><strong>${esc((dg.summary && dg.summary.lineJa) || "")}</strong></div>`);
+  if (dg.bestHit) {
+    parts.push(`<div style="margin-top:6px;">🎯 <strong>ベスト的中:</strong> ${esc(dg.bestHit.matchJa)}<div class="value-note" style="margin:1px 0 0;">${esc(dg.bestHit.lineJa || "")}</div></div>`);
+  } else {
+    parts.push(`<div class="value-note" style="margin-top:6px;">🎯 この週の的中はありませんでした(隠さずそのまま書いています)。</div>`);
+  }
+  if (dg.worstMiss) {
+    parts.push(`<div style="margin-top:6px;">🙈 <strong>一番の外れ:</strong> ${esc(dg.worstMiss.matchJa)}${dg.worstMiss.official === false ? ' <span class="smarter-tag smarter-tag-ai">参考(親善など)</span>' : ""}<div class="value-note" style="margin:1px 0 0;">${esc(dg.worstMiss.lineJa || "")}</div></div>`);
+  }
+  if (dg.learned && dg.learned.lines && dg.learned.lines.length) {
+    parts.push(`<div style="margin-top:6px;">🧠 <strong>AIが学んだこと:</strong><ul class="smarter-list" style="margin-top:2px;">${dg.learned.lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul></div>`);
+  } else if (dg.learned && dg.learned.lineJa) {
+    parts.push(`<div class="value-note" style="margin-top:6px;">🧠 ${esc(dg.learned.lineJa)}</div>`);
+  }
+  if (dg.upcoming && dg.upcoming.length) {
+    parts.push(`<div style="margin-top:6px;">📅 <strong>来週の注目:</strong>${dg.upcoming.map((u) => {
+      const when = u.kickoff ? new Date(u.kickoff).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" }) : "";
+      return `<div class="value-note" style="margin:2px 0;">${esc(when)} ${esc(u.matchJa)} — AI予想: ${esc(u.predictedJa)}${u.official === false ? "(参考)" : ""}</div>`;
+    }).join("")}</div>`);
+  }
+  parts.push(`<div style="margin-top:8px;"><button class="apply-btn pred-share-btn" id="digestShareBtn" style="margin-top:0; width:auto; padding:7px 14px;">📸 画像でシェア</button></div>`);
+  parts.push(`<p class="value-note" style="margin-top:8px; opacity:.8;">${esc(dg.noteJa || "")}</p>`);
+  el.innerHTML = parts.join("");
+  const sb = document.getElementById("digestShareBtn");
+  if (sb) sb.addEventListener("click", () => shareDigestImage(dg));
+}
+
+renderMyClubCard();
+renderDigestCard();
 renderReflectionsCard();
 renderSmarterCard();
 renderDailyDiff();

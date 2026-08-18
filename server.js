@@ -6237,6 +6237,144 @@ async function handleHttpRequest(req, res) {
       // ---- 2026年8月7日・毎日の学習が「どこまで進んだか」を見る ----
       //   本番で「収集は進んだのに成長ログは前日のまま」= 途中で止まっている
       //   ことが分かったが、どこで止まったのかが分からなかった。
+      // ---- 2026年8月18日・v48: 週間AIダイジェスト(読み出しのみ・10分キャッシュ) ----
+      //   中身は日次学習が週1回生成して保存したJSON。ここでは計算しない(方針⑥)。
+      if (pathname === "/api/digest/latest") {
+        const digCached = cacheGet("digest:latest:public");
+        if (digCached) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
+          res.end(JSON.stringify(digCached));
+          return;
+        }
+        let dBody;
+        if (!UPSTASH_ENABLED) {
+          dBody = { ok: true, available: false, reasonJa: "保存先(Upstash)が未設定のため、ダイジェストはまだありません。" };
+        } else {
+          const dig = await upstashGetJSON("learn:digest:latest").catch(() => null);
+          dBody = dig
+            ? { ok: true, available: true, digest: dig }
+            : { ok: true, available: false, reasonJa: "最初のダイジェストは、次の月曜の朝の学習後に公開されます(週1回、直前の1週間分を実測から自動生成します)。" };
+        }
+        cacheSet("digest:latest:public", dBody, 10 * 60 * 1000);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
+        res.end(JSON.stringify(dBody));
+        return;
+      }
+      // ---- 2026年8月18日・v48: 推しクラブ(マイクラブ)の要約 ----
+      //   Redisの読み出しのみ(答え合わせ済み記録・保留中の予測・調査ファイル)。
+      //   対象は予測対象100クラブに限定し、クラブごとに10分キャッシュする。
+      //   新しい計算・API-Football呼び出しは一切発生しない(方針⑥)。
+      if (pathname === "/api/club/summary") {
+        const clubParam = parsed.searchParams.get("club") || "";
+        const club = discussMultiStep.resolveUniverseClub(clubParam);
+        if (!club) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, reason: "unknown_club", messageJa: "このクラブは予測対象100クラブの中に見つかりませんでした。" }));
+          return;
+        }
+        const csCacheKey = `clubsummary:${club.nameEn.toLowerCase()}`;
+        const csCached = cacheGet(csCacheKey);
+        if (csCached) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
+          res.end(JSON.stringify(csCached));
+          return;
+        }
+        let csBody;
+        if (!UPSTASH_ENABLED) {
+          csBody = { ok: true, clubEn: club.nameEn, clubJa: club.nameJa, available: false, reasonJa: "保存先(Upstash)が未設定のため、このクラブの記録はまだありません。" };
+        } else {
+          try {
+            // 共有キャッシュ: 全クラブで同じ2つの一覧を使い回す(10分に1回だけ読む)
+            let recentRecs = cacheGet("clubsummary:recentrecs");
+            if (recentRecs === undefined) {
+              const raw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "-300", "-1"]).catch(() => [])) || [];
+              recentRecs = raw.map((x) => { try { return typeof x === "object" ? x : JSON.parse(x); } catch (e) { return null; } }).filter((r) => r && r.resolved);
+              cacheSet("clubsummary:recentrecs", recentRecs, 10 * 60 * 1000);
+            }
+            let pendingRecs = cacheGet("clubsummary:pendingrecs");
+            if (pendingRecs === undefined) {
+              const pendingIds = (await upstashCmd(["LRANGE", "learn:ownpred:pending", "-40", "-1"]).catch(() => [])) || [];
+              const got = await Promise.all(pendingIds.map((id) => upstashGetJSON(`learn:ownpred:${id}`).catch(() => null)));
+              pendingRecs = got.filter(Boolean);
+              cacheSet("clubsummary:pendingrecs", pendingRecs, 10 * 60 * 1000);
+            }
+            const nameLc = club.nameEn.toLowerCase();
+            const involves = (r) => String(r.homeTeamEn || "").toLowerCase() === nameLc || String(r.awayTeamEn || "").toLowerCase() === nameLc;
+
+            const mine = recentRecs.filter(involves);
+            const hits = mine.filter((r) => r.correct === true);
+            const isOfficialRec = (r) => (r.official !== undefined
+              ? r.official !== false
+              : classifyFixtureOfficial(r.league, r.homeTeamEn, r.awayTeamEn).official);
+            const officialMine = mine.filter(isOfficialRec);
+            const officialHits = officialMine.filter((r) => r.correct === true);
+            const last = mine.slice()
+              .sort((a, b) => String(b.resolvedAt || "").localeCompare(String(a.resolvedAt || "")))
+              .slice(0, 5)
+              .map((r) => ({
+                kickoff: r.kickoff || null,
+                homeEn: r.homeTeamEn || null, awayEn: r.awayTeamEn || null,
+                predictedJa: r.predictedWinner === "home" ? `${r.homeTeamEn || "ホーム"}勝利` : r.predictedWinner === "away" ? `${r.awayTeamEn || "アウェイ"}勝利` : "引き分け",
+                actualScore: (r.actualScore && Number.isFinite(Number(r.actualScore.home))) ? `${r.actualScore.home}-${r.actualScore.away}` : null,
+                correct: r.correct === true,
+                official: isOfficialRec(r),
+              }));
+
+            // このクラブの「次の予測」(保留中の予測のうち、未来で最も近いもの)
+            const nowMs = Date.now();
+            const nexts = pendingRecs
+              .filter((r) => !r.resolved && involves(r) && r.kickoff && Date.parse(r.kickoff) > nowMs)
+              .sort((a, b) => String(a.kickoff).localeCompare(String(b.kickoff)));
+            const nx = nexts[0] || null;
+            const nextPrediction = nx ? {
+              kickoff: nx.kickoff,
+              homeEn: nx.homeTeamEn || null, awayEn: nx.awayTeamEn || null,
+              predictedJa: nx.predictedWinner === "home" ? `${nx.homeTeamEn || "ホーム"}勝利` : nx.predictedWinner === "away" ? `${nx.awayTeamEn || "アウェイ"}勝利` : "引き分け",
+              predictedScoreline: (nx.predictedScoreline && (scorelineOutcome(nx.predictedScoreline) === nx.predictedWinner)) ? nx.predictedScoreline : null,
+              official: nx.official !== undefined ? nx.official !== false : classifyFixtureOfficial(nx.league, nx.homeTeamEn, nx.awayTeamEn).official,
+            } : null;
+
+            // 調査ファイル(毎晩の学習で蓄積した実測)から、新しいものだけを出す
+            let condition = null;
+            try {
+              const d = await clubDossier.getDossier(club.nameEn);
+              if (d && d.sections) {
+                const ageH = (sec) => { const t = sec && sec.computedAt ? new Date(sec.computedAt).getTime() : NaN; return Number.isFinite(t) ? Math.round((Date.now() - t) / 3600000) : null; };
+                const fresh = (sec, limitH) => { const a = ageH(sec); return sec && a !== null && a <= limitH; };
+                condition = {
+                  standings: fresh(d.sections.standings, 168) && d.sections.standings.position !== null
+                    ? { position: d.sections.standings.position, points: d.sections.standings.points ?? null, agoDays: Math.round(ageH(d.sections.standings) / 24) } : null,
+                  injuries: fresh(d.sections.injuries, 72)
+                    ? { count: d.sections.injuries.injuryCount ?? null, players: (d.sections.injuries.injuredPlayers || []).slice(0, 3), agoHours: ageH(d.sections.injuries) } : null,
+                  form: fresh(d.sections.form, 72) && Number.isFinite(d.sections.form.currentFormScore)
+                    ? { score: d.sections.form.currentFormScore, agoHours: ageH(d.sections.form) } : null,
+                };
+                if (!condition.standings && !condition.injuries && !condition.form) condition = null;
+              }
+            } catch (e) { /* 調査ファイルが無くても他の実測は返す */ }
+
+            csBody = {
+              ok: true, available: true,
+              clubEn: club.nameEn, clubJa: club.nameJa, country: club.country, rank: club.rank,
+              record: {
+                n: mine.length, hits: hits.length,
+                hitRatePct: mine.length ? Math.round((hits.length / mine.length) * 1000) / 10 : null,
+                official: { n: officialMine.length, hits: officialHits.length, hitRatePct: officialMine.length ? Math.round((officialHits.length / officialMine.length) * 1000) / 10 : null },
+                last,
+                noteJa: mine.length ? null : "このクラブの答え合わせ済み予測はまだありません(予測対象に入り次第、ここに実測が並びます)。",
+              },
+              nextPrediction,
+              condition,
+            };
+          } catch (e) {
+            csBody = { ok: true, clubEn: club.nameEn, clubJa: club.nameJa, available: false, reasonJa: "記録の読み出しに一時的に失敗しました。しばらくして再度お試しください。" };
+          }
+        }
+        cacheSet(csCacheKey, csBody, 10 * 60 * 1000);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
+        res.end(JSON.stringify(csBody));
+        return;
+      }
       if (pathname === "/api/reflections") {
         // ---- 2026年8月18日・「AIの反省」を独立したコンテンツにする ----
         //   外れを自分から見せる予想サイトはほとんど無い。このAIの差別化の核。
