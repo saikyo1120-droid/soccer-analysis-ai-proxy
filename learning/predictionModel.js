@@ -325,17 +325,44 @@ function computeMatchProbabilities(homeLambda, awayLambda, maxGoals, rho) {
 
 // 最も確率の高いスコアライン(「2-1」のような最終予想スコア)をポアソン分布の
 // 格子から総当たりで探す。架空の数字ではなく、実際に計算した確率分布の最頻値。
-function mostLikelyScoreline(homeLambda, awayLambda, maxGoals, rho) {
+function mostLikelyScoreline(homeLambda, awayLambda, maxGoals, rho, consistentWith) {
   // 2026年8月: Dixon-Colesのτ補正を反映する。ρ=0(既定)なら従来と同一の結果。
+  //
+  // ---- 2026年8月18日・本番の「AIの反省」画面で見つかった自己矛盾の修正 ----
+  //   実例: 「AIの予想: Zalaegerszegi TE勝利(予想スコア 1-1)」
+  //   全体の勝率(勝ち/分け/負けの合計確率)ではホーム勝利が最有力でも、
+  //   単一スコアの最頻値は1-1(引き分け)になることが数学的に起こる
+  //   (勝ちスコアは2-1,1-0,2-0…と分散するが、引き分けは1-1に集中するため)。
+  //   正しい統計だが、1行の表示では「勝つと言いながらスコアは引き分け」という
+  //   矛盾にしか読めない。
+  //   → consistentWith("home"|"away"|"draw")を渡すと、**予想した勝敗と
+  //     整合するスコアの中での最頻値** を返す。これも明確に定義された統計であり、
+  //     数字のでっち上げではない(条件付きの最頻値)。
+  //   渡さなければ従来どおり全体の最頻値(互換性維持)。
   const cap = maxGoals || 6;
   const grid = scoreGrid(homeLambda, awayLambda, cap, rho);
+  const matches = (h, a) => {
+    if (consistentWith === "home") return h > a;
+    if (consistentWith === "away") return a > h;
+    if (consistentWith === "draw") return h === a;
+    return true;
+  };
   let best = { h: 0, a: 0, p: -1 };
   for (let h = 0; h <= cap; h++) {
     for (let a = 0; a <= cap; a++) {
+      if (!matches(h, a)) continue;
       if (grid[h][a] > best.p) best = { h, a, p: grid[h][a] };
     }
   }
   return `${best.h}-${best.a}`;
+}
+
+/** スコア文字列("2-1")の勝敗が、予想した勝敗と整合しているか。 */
+function scorelineOutcome(scoreline) {
+  const m = String(scoreline || "").match(/^(\d+)-(\d+)$/);
+  if (!m) return null;
+  const h = Number(m[1]); const a = Number(m[2]);
+  return h > a ? "home" : a > h ? "away" : "draw";
 }
 
 /** スコア予想の上位N件(Top1/Top3の精度計測に使う)。 */
@@ -970,7 +997,7 @@ module.exports = {
   dixonColesTau, scoreGrid,
   computeMatchProbabilitiesRaw,
   computeMatchProbabilities,
-  mostLikelyScoreline, topScorelinesFrom, marketProbabilities,
+  mostLikelyScoreline, scorelineOutcome, topScorelinesFrom, marketProbabilities,
   computeFactorImportance,
   backtestAccuracyV2,
   computeNegativeLogLikelihood,

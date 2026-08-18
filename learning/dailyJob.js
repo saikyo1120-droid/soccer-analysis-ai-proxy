@@ -1630,7 +1630,10 @@ async function runDailyLearning(deps) {
         similarPastJa: summarizeSimilarMatchesJa(similarPast),
         // 2026年8月・ご指示⑨: 最終スコア予想(ポアソン分布の最頻値)も記録し、
         // 試合後にスコア一致まで採点できるようにする。
-        predictedScoreline: mostLikelyScoreline(homeLambda, awayLambda),
+        // 2026年8月18日: 全体の最頻値だと「ホーム勝利(予想スコア1-1)」という
+        // 自己矛盾が起こる(本番の反省画面で実際に発生)。予想した勝敗と
+        // 整合するスコアの中での最頻値(条件付き最頻値)を保存する。
+        predictedScoreline: mostLikelyScoreline(homeLambda, awayLambda, 6, undefined, predictedWinner),
         // ご指示③④の証明: この予測がどのversionの重みで行われたか。
         weightsVersion: weights.version ?? 0,
         // ご指示⑤: この予測に使ったデータの信頼度(出所×鮮度)。
