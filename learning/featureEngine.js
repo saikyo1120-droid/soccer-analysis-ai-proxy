@@ -96,6 +96,9 @@ function buildTeamContext(src) {
     suspensionCount,
     xgNet: xg.xgNet ?? null,
     topScorerGoals: (topScorer && topScorer.player) ? topScorer.player.goals : null,
+    // v50: チームの地力レーティング由来の期待得点(呼び出し側がteamRatings.jsで
+    // 計算して渡す。無ければnull=特徴量0で影響なし)。
+    ratingExpGoals: Number.isFinite(s.ratingExpGoals) ? s.ratingExpGoals : null,
   };
 }
 

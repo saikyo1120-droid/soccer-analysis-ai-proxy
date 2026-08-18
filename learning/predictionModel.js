@@ -43,6 +43,11 @@ const EXTENDED_DEFAULT_WEIGHTS = {
   concededSumSensitivity: 0,  // 両チームの失点しやすさの合計
   fatigueSumSensitivity: 0,   // 両チームの過密日程の合計(疲れた試合は点が減るか)
   xgSumSensitivity: 0,        // 両チームのxG収支の合計
+  // ---- チームの地力レーティング(2026年8月18日・v50) ----
+  // teamRatings.jsが過去試合から学習した攻撃力・守備力に基づく期待得点
+  // (λ̂H・λ̂A)の差と和。既定値0 = レーティングが無い試合・学習前は影響しない。
+  ratingSensitivity: 0,     // 地力の差(どちらが強いか)
+  ratingSumSensitivity: 0,  // 地力ベースの点の入りやすさ(総得点)
   // ---- 市場オッズ(2026年8月18日・v47「予測モデルの根本強化」) ----
   // ブックメーカーのオッズから計算した「市場が見るホーム優位度」。
   // ブックメーカーの的中率(実測53〜55%)は現状の自前モデルより高いため、
@@ -54,6 +59,11 @@ const EXTENDED_DEFAULT_WEIGHTS = {
   // 起こりやすい/にくい(得点が互いに独立ではない)。ρで補正する。
   // **初期値0のときτ関数は恒等的に1**になり、素のポアソンと完全に一致する。
   rho: 0,
+  // ---- 市場ブレンド(2026年8月18日・v50) ----
+  // 最終確率 = (1−w)×自前モデル + w×市場(オッズの含意確率)。λモデルの外側の
+  // 確率レイヤーで適用する。0 = 従来どおり自前モデルのみ(既定)。
+  // 学習はfitMarketBlend(オッズ付きの答え合わせ済み記録・ホールドアウト関門つき)。
+  marketBlend: 0,
   version: 0,
   updatedAt: null,
 };
@@ -73,6 +83,7 @@ const EXTENDED_DEFAULT_WEIGHTS = {
 //   **Sum系の重みはすべて初期値0**なので、追加した時点では旧モデルと
 //   完全に同一の出力になる(最終方針①「劣化禁止」の実装)。
 const FEATURE_SUM_WEIGHT_MAP = {
+  ratingLambdaSum: "ratingSumSensitivity",
   attackSum: "attackSumSensitivity",
   concededSum: "concededSumSensitivity",
   fatigueSum: "fatigueSumSensitivity",
@@ -82,6 +93,7 @@ const FEATURE_SUM_WEIGHT_MAP = {
 // 和の特徴量は「リーグ平均からのズレ」に直す。生の値のままだと
 // homeBase/awayBase と役割が重なり、学習の収束が遅くなるため。
 const SUM_CENTERS = {
+  ratingLambdaSum: 2.6, // レーティング由来の期待総得点の平均目安(teamRatings.jsと揃える)
   attackSum: 2.8,    // 1チームあたり平均約1.4得点 × 2
   concededSum: 2.8,  // 同上(失点側)
   fatigueSum: 2.0,   // 直近7日の試合数の合計の目安
@@ -100,6 +112,7 @@ const FEATURE_WEIGHT_MAP = {
   xgDiff: "xgSensitivity",
   topScorerDiff: "topScorerSensitivity",
   marketEdge: "marketSensitivity",
+  ratingLambdaDiff: "ratingSensitivity",
 };
 
 const FEATURE_LABELS_JA = {
@@ -114,6 +127,7 @@ const FEATURE_LABELS_JA = {
   xgDiff: "xG(期待得点)の質",
   topScorerDiff: "エースの得点力",
   marketEdge: "市場オッズ(ブックメーカーの評価)",
+  ratingLambdaDiff: "チームの地力(長期レーティング)",
 };
 
 /**
@@ -170,6 +184,7 @@ function computeFeatureAvailability(homeCtx, awayCtx, h2h, market) {
     topScorerDiff: both(h.topScorerGoals, a.topScorerGoals),
     // 市場オッズはチームではなく試合に紐づくため、第4引数で受け取る。
     marketEdge: !!(market && Number.isFinite(market.homePct) && Number.isFinite(market.awayPct)),
+    ratingLambdaDiff: both(h.ratingExpGoals, a.ratingExpGoals),
   };
 }
 
@@ -214,6 +229,11 @@ function computeMatchFeatures(homeCtx, awayCtx, h2h, market) {
     marketEdge: market && Number.isFinite(market.homePct) && Number.isFinite(market.awayPct)
       ? (market.homePct - market.awayPct) / 100
       : 0,
+    // ratingLambdaDiff/Sum: チームの地力レーティング(v50)。teamRatings.jsが
+    //   過去試合から学習した期待得点(ctx.ratingExpGoals)の差と和。
+    //   どちらかのレーティングが無ければ0(=影響しない。推測で埋めない)。
+    ratingLambdaDiff: diffOrZero(h.ratingExpGoals, a.ratingExpGoals),
+    ratingLambdaSum: sumOrZero(h.ratingExpGoals, a.ratingExpGoals, SUM_CENTERS.ratingLambdaSum),
     // ---- 和の特徴量(λの独立化。2026年8月) ----
     // 「どちらが強いか」ではなく「どれだけ点が入る試合か」を表す。
     // 片方でも欠けていれば0(=総得点を動かさない)。推測で埋めない。
@@ -572,6 +592,7 @@ const LEARNABLE_KEYS = [
   "standingsSensitivity", "headToHeadSensitivity", "fatigueSensitivity",
   "venueSensitivity", "suspensionSensitivity", "xgSensitivity", "topScorerSensitivity",
   "marketSensitivity", // 市場オッズ(v47)。特徴量が全件0のデータでは勾配0=動かない
+  "ratingSensitivity", "ratingSumSensitivity", // チームの地力(v50)
   // λの独立化(和の重み)と Dixon-Coles の低スコア補正も学習対象にする
   "attackSumSensitivity", "concededSumSensitivity", "fatigueSumSensitivity", "xgSumSensitivity",
   "rho",
@@ -647,6 +668,8 @@ function isSaneWeights(w) {
   for (const k of ["homeBase", "awayBase"]) {
     if (w[k] !== undefined && !(w[k] > 0 && w[k] <= 5)) return false;
   }
+  // v50: 市場ブレンドは0〜0.95(1.0=完全に市場の受け売り、は許可しない)
+  if (w.marketBlend !== undefined && !(Number.isFinite(w.marketBlend) && w.marketBlend >= 0 && w.marketBlend <= 0.95)) return false;
   return true;
 }
 
@@ -671,6 +694,9 @@ const WEIGHT_LABELS_JA = {
   xgSensitivity: "xG(期待得点)の重要度",
   topScorerSensitivity: "エースの得点力の重要度",
   marketSensitivity: "市場オッズ(ブックメーカーの評価)の重要度",
+  ratingSensitivity: "チームの地力(長期レーティング)の重要度",
+  ratingSumSensitivity: "地力ベースの総得点予想の重要度",
+  marketBlend: "市場ブレンド比率(最終確率にオッズをどれだけ混ぜるか)",
 };
 const WEIGHT_CHANGE_THRESHOLD = 0.005; // これ未満の変化は「実質変化なし」として無視する
 
@@ -699,7 +725,11 @@ function describeOneWeightChange(key, oldVal, newVal) {
  */
 function describeWeightsHistoryEntry(entry) {
   if (!entry) return null;
-  const methodLabelJa = entry.method === "gradient_descent_v2" ? "拡張特徴量モデル(v2)" : "基本モデル(v1・フォーム差のみ)";
+  const methodLabelJa = entry.method === "gradient_descent_v2" ? "拡張特徴量モデル(v2)"
+    : entry.method === "market_blend" ? "市場ブレンド(最終確率のオッズ配合)" // v50
+    : entry.method === "history_gradient_descent" ? "過去試合の勾配学習(v47)" // v47採用分の表示名
+    : entry.method === "grid_search" ? "過去試合のグリッド探索"
+    : "基本モデル(v1・フォーム差のみ)";
   if (!entry.adopted) {
     return {
       date: entry.date, method: entry.method, methodLabelJa, adopted: false,
@@ -1046,6 +1076,117 @@ function summarizeFailureReasons(records, limit) {
   return Array.from(counts.values()).sort((a, b) => b.count - a.count).slice(0, limit || 5);
 }
 
+// ---- 2026年8月18日・v50「市場ブレンド」(利用者の選択②) ----
+// 最終確率 = (1−w)×自前モデルの確率 + w×市場(オッズ)の含意確率。
+// wは「オッズ付きで答え合わせ済みの自前記録」から学習する。市場は実測53〜55%
+// 当てるため、混ぜるほど的中率は市場へ近づく。その分「市場の受け売り」に
+// 近づくので、wと内訳は必ず画面で開示する(呼び出し側の責務)。
+
+/** 記録から (自前確率, 市場確率, 実際の結果) の組を取り出す。使えない記録はnull。 */
+function blendSampleOf(r) {
+  if (!r || !r.resolved || !r.actualWinner || !r.marketImplied) return null;
+  if (!Number.isFinite(r.homeLambda) || !Number.isFinite(r.awayLambda)) return null;
+  const m = r.marketImplied;
+  if (!Number.isFinite(m.homePct) || !Number.isFinite(m.drawPct) || !Number.isFinite(m.awayPct)) return null;
+  const p = computeMatchProbabilitiesRaw(r.homeLambda, r.awayLambda, undefined,
+    Number.isFinite(r.weightsSnapshot && r.weightsSnapshot.rho) ? r.weightsSnapshot.rho : 0);
+  return {
+    model: { home: p.homeWin, draw: p.draw, away: p.awayWin },
+    market: { home: m.homePct / 100, draw: m.drawPct / 100, away: m.awayPct / 100 },
+    actual: r.actualWinner,
+  };
+}
+
+/** wを混ぜた確率(正規化済み)。marketが無ければmodelをそのまま返す。 */
+function blendProbs(model, market, w) {
+  if (!market || !w) return { ...model };
+  const home = (1 - w) * model.home + w * market.home;
+  const draw = (1 - w) * model.draw + w * market.draw;
+  const away = (1 - w) * model.away + w * market.away;
+  const total = home + draw + away || 1;
+  return { home: home / total, draw: draw / total, away: away / total };
+}
+
+/**
+ * 市場ブレンド比 w を学習する。
+ * ・時系列で前70%を学習・後30%を検証に分け、検証NLLが w=0 を上回った場合だけ採用
+ *   (既存の重み学習と同じ「迷ったら現状維持」の関門)。
+ * ・グリッド探索(0〜0.9・0.05刻み)。データが少なければ正直に見送る。
+ */
+function fitMarketBlend(records, opts) {
+  const MIN_SAMPLES = (opts && opts.minSamples) || 40;
+  const samples = (records || []).map(blendSampleOf).filter(Boolean);
+  if (samples.length < MIN_SAMPLES) {
+    return { adopted: false, w: 0, samples: samples.length, reasonJa: `オッズ付きで答え合わせ済みの記録が${samples.length}件で、ブレンド学習に必要な${MIN_SAMPLES}件に達していません(記録が貯まれば自動で学習します)。` };
+  }
+  const split = Math.floor(samples.length * 0.7);
+  const train = samples.slice(0, split);
+  const valid = samples.slice(split);
+  if (valid.length < 10) {
+    return { adopted: false, w: 0, samples: samples.length, reasonJa: `検証用が${valid.length}件で不足しています。` };
+  }
+  const EPS = 1e-9;
+  const nllOf = (set, w) => set.reduce((s, x) =>
+    s - Math.log(Math.max(EPS, blendProbs(x.model, x.market, w)[x.actual])), 0) / set.length;
+  let bestW = 0, bestTrainNll = nllOf(train, 0);
+  for (let w = 0.05; w <= 0.901; w += 0.05) {
+    const nll = nllOf(train, w);
+    if (nll < bestTrainNll) { bestTrainNll = nll; bestW = Math.round(w * 100) / 100; }
+  }
+  const validBase = nllOf(valid, 0);
+  const validBest = nllOf(valid, bestW);
+  const accOf = (set, w) => set.filter((x) => {
+    const p = blendProbs(x.model, x.market, w);
+    const pick = p.home >= p.draw && p.home >= p.away ? "home" : p.away >= p.draw ? "away" : "draw";
+    return pick === x.actual;
+  }).length / set.length;
+  if (bestW === 0 || validBest >= validBase) {
+    return {
+      adopted: false, w: 0, samples: samples.length, bestTrainW: bestW,
+      validNllBase: Math.round(validBase * 10000) / 10000, validNllBest: Math.round(validBest * 10000) / 10000,
+      reasonJa: bestW === 0
+        ? "学習データ上も自前モデル単独が最良だったため、ブレンドは使いません。"
+        : `検証データでブレンド(w=${bestW})が自前モデル単独を上回らなかったため、採用を見送りました(迷ったら現状維持)。`,
+    };
+  }
+  return {
+    adopted: true, w: bestW, samples: samples.length,
+    validNllBase: Math.round(validBase * 10000) / 10000,
+    validNllBest: Math.round(validBest * 10000) / 10000,
+    validAccBasePct: Math.round(accOf(valid, 0) * 1000) / 10,
+    validAccBestPct: Math.round(accOf(valid, bestW) * 1000) / 10,
+    reasonJa: `検証${valid.length}件でブレンド(市場${Math.round(bestW * 100)}%+AI${Math.round((1 - bestW) * 100)}%)がNLL ${Math.round(validBase * 10000) / 10000}→${Math.round(validBest * 10000) / 10000}へ改善したため採用しました。`,
+  };
+}
+
+/**
+ * 予測時にブレンドを適用する(オッズが無ければ自前モデルのまま)。
+ * @returns {{ probs, predictedWinner, blendUsed }} blendUsed=null なら純自前。
+ */
+function applyMarketBlend(homeLambda, awayLambda, rho, marketImplied, w) {
+  const p = computeMatchProbabilitiesRaw(homeLambda, awayLambda, undefined, rho || 0);
+  const model = { home: p.homeWin, draw: p.draw, away: p.awayWin };
+  const usable = w > 0 && marketImplied
+    && Number.isFinite(marketImplied.homePct) && Number.isFinite(marketImplied.drawPct) && Number.isFinite(marketImplied.awayPct);
+  if (!usable) {
+    const pick = model.home >= model.draw && model.home >= model.away ? "home" : model.away >= model.draw ? "away" : "draw";
+    return { probs: model, predictedWinner: pick, blendUsed: null };
+  }
+  const market = { home: marketImplied.homePct / 100, draw: marketImplied.drawPct / 100, away: marketImplied.awayPct / 100 };
+  const probs = blendProbs(model, market, w);
+  const pick = probs.home >= probs.draw && probs.home >= probs.away ? "home" : probs.away >= probs.draw ? "away" : "draw";
+  return {
+    probs,
+    predictedWinner: pick,
+    blendUsed: {
+      w,
+      marketPct: Math.round(w * 100),
+      aiPct: Math.round((1 - w) * 100),
+      noteJa: `この予想は市場${Math.round(w * 100)}%+AI${Math.round((1 - w) * 100)}%の合成で判定しています(比率は実測で学習)。`,
+    },
+  };
+}
+
 module.exports = {
   EXTENDED_DEFAULT_WEIGHTS,
   FEATURE_WEIGHT_MAP,
@@ -1069,6 +1210,7 @@ module.exports = {
   computeFeatureEffectiveness,
   buildAblationCandidates,
   fitWeightsGradientDescent,
+  fitMarketBlend, applyMarketBlend, blendProbs,
   describeWeightsHistoryEntry,
   buildLearningSummary,
   classifyFailureReasons,

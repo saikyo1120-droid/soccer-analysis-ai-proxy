@@ -92,6 +92,7 @@ const {
 } = require("./features");
 const {
   EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, predictOutcomeV2, isSaneWeights,
+  applyMarketBlend, fitMarketBlend,
   computeFactorImportance, backtestAccuracyV2, fitWeightsGradientDescent,
   buildLearningSummary, classifyFailureReasons, summarizeFailureReasons,
   classifySuccessReasons, summarizeSuccessReasons, classifyContextualFailureReasons,
@@ -129,6 +130,8 @@ const { CLUB_UNIVERSE, clubsForPrediction } = require("./clubUniverse");
 const { tuneModelOnHistory, getTuningHistory } = require("./modelTuning");
 // v48「週間AIダイジェスト」(2026年8月18日・利用者の選択)
 const { generateAndStoreWeeklyDigest } = require("./weeklyDigest");
+// v50「チームの地力レーティング」(2026年8月18日・利用者の選択①)
+const { expGoalsFromRatings, RATINGS_KEY } = require("./teamRatings");
 // ① 学習によって「予測がどう変わったか」の記録
 const { computePredictionShift } = require("./predictionShift");
 // ⑩ AIが自分で「次に何を学ぶか」を決める
@@ -1423,6 +1426,9 @@ async function runDailyLearning(deps) {
   }
 
   await stage("③ 新しい予測を立てる");
+  // ---- v50: チーム別レーティング(前回の学習で保存済み)を1回だけ読み込む ----
+  //   無ければnull=レーティング特徴量は0(影響なし)。ここで新しい計算はしない。
+  const teamRatingsData = upstashEnabled ? await upstashGetJSON(RATINGS_KEY).catch(() => null) : null;
   // ---- ③ TOP100クラブの直近の試合について、新しく自社予測を立てる ----
   // 2026年8月の調査で修正: 旧実装はここを REGISTERED_TEAMS(11クラブ)で回して
   // いたため、知識収集は毎日100クラブ回っているのに **予測はTOP100のうち9クラブ
@@ -1588,9 +1594,11 @@ async function runDailyLearning(deps) {
         errors.push(`odds_failed:${fixtureId}:${e.code || e.message}`);
       }
 
+      // v50: 地力レーティング由来の期待得点(両チームのレーティングがあるときだけ)
+      const ratingEg = expGoalsFromRatings(teamRatingsData, homeTeamId, awayTeamId);
       const built = buildMatchFeatures(
-        { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXg, topScorer: homeTop },
-        { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXg, topScorer: awayTop },
+        { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXg, topScorer: homeTop, ratingExpGoals: ratingEg ? ratingEg.home : null },
+        { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXg, topScorer: awayTop, ratingExpGoals: ratingEg ? ratingEg.away : null },
         h2h,
         marketImplied // v47: 市場オッズを特徴量 marketEdge として渡す(無ければ0)
       );
@@ -1605,7 +1613,22 @@ async function runDailyLearning(deps) {
       // 重みは予測のたびにストレージから読み直すため、昨日更新された重みは
       // 今日の最初の予測から必ず使われる(古い重みを使い続ける経路は存在しない)。
       weightsMetaUsedToday = { version: weights.version ?? 0, updatedAt: weights.updatedAt || null };
-      const { predictedWinner, homeLambda, awayLambda } = predictOutcomeV2(features, weights);
+      const modelOut = predictOutcomeV2(features, weights);
+      const homeLambda = modelOut.homeLambda, awayLambda = modelOut.awayLambda;
+      // ---- v50「市場ブレンド」: 学習済みの比率wで、最終確率=(1−w)×自前+w×市場 ----
+      //   ・w=0(既定)またはオッズ無しのときは従来の判定と1ビットも変わらない
+      //   ・ブレンドで判定した場合は record.blendUsed に内訳を残し、画面で開示する
+      let predictedWinner = modelOut.predictedWinner;
+      let blendUsed = null;
+      const blendW = Number.isFinite(weights.marketBlend) ? weights.marketBlend : 0;
+      if (blendW > 0 && marketImplied) {
+        const blended = applyMarketBlend(homeLambda, awayLambda,
+          Number.isFinite(weights.rho) ? weights.rho : 0, marketImplied, blendW);
+        if (blended.blendUsed) {
+          predictedWinner = blended.predictedWinner;
+          blendUsed = blended.blendUsed;
+        }
+      }
       const importance = computeFactorImportance(features, weights);
       const topFactor = importance.find((i) => i.stars > 0);
 
@@ -1650,6 +1673,7 @@ async function runDailyLearning(deps) {
         originTeamEn: team.nameEn, stateHypothesis,
         // 精度証明ラウンド: オッズ(市場比較・ROI用)と「似た試合」(RAG強化)
         odds: matchOdds, marketImplied, marketEdgePt,
+        blendUsed, // v50: 市場ブレンドで判定した場合の内訳(nullなら純自前モデル)
         similarPast: similarPast.length ? similarPast : null,
         similarPastJa: summarizeSimilarMatchesJa(similarPast),
         // 2026年8月・ご指示⑨: 最終スコア予想(ポアソン分布の最頻値)も記録し、
@@ -2067,6 +2091,40 @@ async function runDailyLearning(deps) {
     modelTuning = { ran: false, adopted: false, reasonJa: `過去試合によるモデル調整でエラーが発生しました(${e && e.message})。` };
   }
 
+  // ---- v50「市場ブレンド」の学習(オッズ付きの答え合わせ済み記録から) ----
+  //   最終確率にどれだけ市場を混ぜるか(w)を、実測のホールドアウト検証で決める。
+  //   関門を通らなければ w は変えない(以前採用したwが実測で不利になれば0へ戻す)。
+  let marketBlendFitToday = null;
+  try {
+    const recentForBlend = await loadRecentRecordsOnce();
+    const fitB = fitMarketBlend(recentForBlend);
+    marketBlendFitToday = fitB;
+    const MIN_SAMPLES_FOR_BLEND_CHANGE = 40;
+    if (upstashEnabled && fitB && fitB.samples >= MIN_SAMPLES_FOR_BLEND_CHANGE) {
+      const storedNow = (await upstashGetJSON("learn:weights").catch(() => null)) || {};
+      const currentW = Number.isFinite(storedNow.marketBlend) ? storedNow.marketBlend : 0;
+      const newW = fitB.adopted ? fitB.w : 0;
+      if (Math.abs(newW - currentW) >= 0.005) {
+        const merged = { ...EXTENDED_DEFAULT_WEIGHTS, ...storedNow, marketBlend: newW, version: (storedNow.version || 0) + 1, updatedAt: runAt.toISOString() };
+        if (isSaneWeights(merged)) {
+          const okSave = await upstashSetJSON("learn:weights", merged);
+          if (okSave !== false) {
+            await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
+              date: dateKey, adopted: true, method: "market_blend",
+              oldWeights: { marketBlend: currentW }, newWeights: { marketBlend: newW },
+              sampleSize: fitB.samples, note: fitB.reasonJa,
+            })]).catch(() => {});
+            marketBlendFitToday = { ...fitB, saved: true, fromW: currentW, toW: newW };
+          } else {
+            marketBlendFitToday = { ...fitB, saved: false, reasonJa: `${fitB.reasonJa || ""}(ただし保存に失敗したため反映されていません)` };
+          }
+        }
+      }
+    }
+  } catch (e) {
+    errors.push(`market_blend_fit_failed:${e && (e.code || e.message)}`);
+  }
+
   await stage("⑤ 知識ベース更新と成長ログ");
   // ---- ⑤ 今日の知識ベース更新と成長ログ ----
   // Stage E以降: 「事実」の保存先はKnowledge Engine(knowledgeStore.js)に一本化。
@@ -2158,6 +2216,15 @@ async function runDailyLearning(deps) {
   }
 
   const growthLog = {
+    // v50: 市場ブレンドの学習結果(採否・w・検証NLL)を実測のまま残す
+    marketBlendFit: marketBlendFitToday ? {
+      adopted: !!marketBlendFitToday.adopted, w: marketBlendFitToday.w ?? 0,
+      samples: marketBlendFitToday.samples ?? 0,
+      saved: marketBlendFitToday.saved === true,
+      validNllBase: marketBlendFitToday.validNllBase ?? null,
+      validNllBest: marketBlendFitToday.validNllBest ?? null,
+      reasonJa: marketBlendFitToday.reasonJa || null,
+    } : null,
     // v48: 週間ダイジェストの生成結果(生成した週・見送り理由)を実測のまま残す
     weeklyDigest: weeklyDigestResult ? {
       generated: !!weeklyDigestResult.generated,

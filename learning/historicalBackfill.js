@@ -190,6 +190,9 @@ function buildTrainingRows(matches, window) {
         fixtureId: m.id,
         date: m.date,
         leagueId: m.leagueId,
+        // v50: チーム別レーティング学習(teamRatings.js)のためにチームIDを保持する
+        homeId: m.homeId,
+        awayId: m.awayId,
         homeName: m.homeName,
         awayName: m.awayName,
         homeCtx: hCtx,
@@ -244,6 +247,7 @@ async function saveDataset(deps, rows, meta) {
   // 保存サイズを抑えるため、学習に必要な項目だけを残す
   const slim = rows.map((r) => ({
     d: r.date, l: r.leagueId,
+    hi: r.homeId, ai: r.awayId, // v50: レーティング学習用のチームID(1件+約20バイト)
     h: r.homeCtx, a: r.awayCtx,
     hg: r.actualHomeGoals, ag: r.actualAwayGoals, w: r.actualWinner,
   }));
@@ -271,7 +275,9 @@ async function saveDataset(deps, rows, meta) {
     // 旧形式(単一キー)が残っていると読み出しで混ざるので消す
     await upstashCmd(["DEL", BACKFILL_KEY]).catch(() => {});
   }
-  const fullMeta = { ...(meta || {}), shardCount, shardSize: BACKFILL_SHARD_SIZE, storedRows: stored.length, truncatedRows: truncated };
+  // v50: 行フォーマットの版。チームID(hi/ai)を含む形式は2。
+  // modelTuning側はこれを見て、古い形式の保存分を作り直す(週1回の更新日を待たない)。
+  const fullMeta = { ...(meta || {}), rowsVersion: 2, shardCount, shardSize: BACKFILL_SHARD_SIZE, storedRows: stored.length, truncatedRows: truncated };
   const okMeta = (await upstashSetJSON(BACKFILL_META_KEY, fullMeta)) !== false;
   return {
     saved: okMeta, shardCount, storedRows: stored.length, truncatedRows: truncated, meta: fullMeta,
@@ -297,6 +303,7 @@ async function loadDataset(deps) {
   }
   const rows = slim.map((r) => ({
     date: r.d, leagueId: r.l,
+    homeId: r.hi, awayId: r.ai, // 旧形式(v49以前)の保存分には無い(undefined) → レーティング学習から自然に除外される
     homeCtx: r.h, awayCtx: r.a,
     actualHomeGoals: r.hg, actualAwayGoals: r.ag, actualWinner: r.w,
   }));

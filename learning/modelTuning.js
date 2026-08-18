@@ -36,6 +36,9 @@ const {
   computeMatchFeatures, fitWeightsGradientDescent,
   FEATURE_WEIGHT_MAP, FEATURE_SUM_WEIGHT_MAP, LEARNABLE_KEYS,
 } = require("./predictionModel");
+// v50「チームの地力レーティング」: 過去試合からチーム別の攻撃力・守備力を学習し、
+// 期待得点(λ̂)を特徴量として既存モデルへ渡す(重みは実測で学習・初期0)。
+const { fitTeamRatings, expGoalsFromRatings, RATINGS_KEY } = require("./teamRatings");
 
 const TUNING_LOG_KEY = "learn:modeltuning:log";
 // 採用後も「最初のモデルと比べてどれだけ良くなったか」を毎日残すための基準。
@@ -85,8 +88,11 @@ async function ensureDataset(deps, runAt) {
   const wantIds = DEFAULT_BACKFILL_LEAGUES.map((l) => l.id);
   const haveIds = (meta && Array.isArray(meta.leagues)) ? meta.leagues : [];
   const leagueSetChanged = existing.rows.length > 0 && wantIds.some((id) => !haveIds.includes(id));
+  // v50: 行フォーマットが古い(チームIDが無い=レーティング学習に使えない)場合も
+  // 更新日を待たずに作り直す(1回だけ約29リクエスト。以降は週1回に戻る)。
+  const rowsFormatOld = existing.rows.length > 0 && (!meta || meta.rowsVersion !== 2);
 
-  if (existing.rows.length > 0 && ageDays < REFRESH_DAYS && !leagueSetChanged) {
+  if (existing.rows.length > 0 && ageDays < REFRESH_DAYS && !leagueSetChanged && !rowsFormatOld) {
     return { ...existing, refreshed: false, reasonJa: null };
   }
 
@@ -257,6 +263,28 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     if (upstashEnabled) await upstashSetJSON(BASELINE_KEY, baseline);
   }
 
+  // ---- v50: チーム別レーティングの学習と、特徴量への注入 ----
+  //   評価の公正のため、検証(test)に使うレーティングは**学習用(train)だけ**で
+  //   学習する(testの結果を知っているレーティングでtestを評価しない)。
+  //   本番保存用は最後に全データで学習し直す(使えるデータは全部使う)。
+  const nowMsForRatings = runAt.getTime();
+  const ratingsTrain = fitTeamRatings(train, { nowMs: nowMsForRatings });
+  const attachRatings = (rows, ratings) => {
+    if (!ratings || !ratings.available) return 0;
+    let attached = 0;
+    for (const r of rows) {
+      const eg = expGoalsFromRatings(ratings, r.homeId, r.awayId);
+      if (eg) {
+        r.homeCtx = { ...r.homeCtx, ratingExpGoals: eg.home };
+        r.awayCtx = { ...r.awayCtx, ratingExpGoals: eg.away };
+        attached++;
+      }
+    }
+    return attached;
+  };
+  const ratingsAttachedTrain = attachRatings(train, ratingsTrain);
+  const ratingsAttachedTest = attachRatings(test, ratingsTrain);
+
   const found = searchParams(train, base);
 
   // ---- v47「予測モデルの根本強化」: 過去試合で全特徴量の重みを学習する ----
@@ -331,7 +359,28 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     // どちらの候補が勝ったか(実測の記録。gradFit.detailは学習の中身の説明)
     method: gradWon ? "history_gradient_descent" : "grid_search",
     gradientFit: gradFit.detail,
+    // v50: レーティング学習の実測記録
+    teamRatings: {
+      trainFit: { available: ratingsTrain.available, teams: ratingsTrain.teamsRated, matches: ratingsTrain.matchesUsed, reasonJa: ratingsTrain.reasonJa || null },
+      attachedTrain: ratingsAttachedTrain, attachedTest: ratingsAttachedTest,
+    },
   };
+
+  // ---- v50: 本番用レーティングは全データで学習して保存する ----
+  //   これは「重み」ではなく「データから測ったチームの状態」なので、重みの
+  //   採否とは独立に、毎回最新へ更新する(古いレーティングを使い続けない)。
+  //   保存に失敗したら既存のレーティングが残る(読み出し側は無ければ影響0)。
+  let ratingsSaved = false;
+  try {
+    const ratingsFull = fitTeamRatings(ds.rows, { nowMs: nowMsForRatings });
+    if (ratingsFull.available && upstashEnabled) {
+      ratingsFull.builtAt = runAt.toISOString();
+      ratingsSaved = (await upstashSetJSON(RATINGS_KEY, ratingsFull)) !== false;
+    }
+    record.teamRatings.fullFit = { available: ratingsFull.available, teams: ratingsFull.teamsRated, matches: ratingsFull.matchesUsed, saved: ratingsSaved, reasonJa: ratingsFull.reasonJa || null };
+  } catch (e) {
+    record.teamRatings.fullFit = { available: false, saved: false, reasonJa: `レーティング学習でエラー(${e && e.message})` };
+  }
 
   if (upstashEnabled) {
     await upstashCmd(["LPUSH", TUNING_LOG_KEY, JSON.stringify(record)]).catch(() => {});
@@ -349,6 +398,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   return {
     ran: true,
     adopted: record.adopted,
+    teamRatings: record.teamRatings,
     consistencyChecked: record.consistencyChecked,
     reasonJa: record.reasonJa,
     datasetSize: ds.rows.length,
