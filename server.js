@@ -5481,6 +5481,8 @@ async function handleDiscuss(body, clientIp) {
   }
 
   const subject = (body.subject && typeof body.subject === "object") ? body.subject : { type: null };
+  // v51(第10次監査でvarから昇格): 実成績が取れた選手の質問は上位モデルで考察する
+  let playerStatsFoundForTier = false;
   const plan = planInformationNeeds(question, subject);
 
   let facts = [];
@@ -5782,8 +5784,6 @@ async function handleDiscuss(body, clientIp) {
     }
   } else if (subject.type === "player") {
     const hint = (body.playerHint && typeof body.playerHint === "object") ? body.playerHint : {};
-    // v51: ティア判定用(実成績が取れた選手の質問は上位モデルで考察する)
-    var playerStatsFoundForTier = false;
     const q = new URLSearchParams({ name: hint.name || "", team: hint.team || "", teamEn: hint.teamEn || "", birth: hint.birth || "" });
     const { body: statsBody } = await handlePlayerSeasonStats(q);
     if (statsBody.found) {
@@ -5948,7 +5948,7 @@ async function handleDiscuss(body, clientIp) {
   //  実成績1〜2件でも「その選手の実データで考える」価値があるため、件数ではなく
   //  「実成績が取れたか」で判定する)。
   const llmTier = ((subject.type === "club" && subject.labelEn && realFactCountForTier >= 6)
-    || (subject.type === "player" && typeof playerStatsFoundForTier !== "undefined" && playerStatsFoundForTier)) ? "heavy" : "light";
+    || (subject.type === "player" && playerStatsFoundForTier)) ? "heavy" : "light";
 
   let llmOut;
   let llmModelUsed = null, llmTierUsed = null, llmWasTruncated = false;
@@ -6336,6 +6336,103 @@ async function handleHttpRequest(req, res) {
       // ---- 2026年8月7日・毎日の学習が「どこまで進んだか」を見る ----
       //   本番で「収集は進んだのに成長ログは前日のまま」= 途中で止まっている
       //   ことが分かったが、どこで止まったのかが分からなかった。
+      // ---- 2026年8月18日・v53「AIが見る地力ランキング」 ----
+      //   v50で学習したチーム別レーティング(攻撃力+守備力)のTOP50を公開する。
+      //   世界のどこにも無い、このAI独自のデータ商品。Redis読み出しのみ・30分キャッシュ。
+      //   ↑↓は週次スナップショット(前週の順位)との比較。データが無い間は正直に案内。
+      if (pathname === "/api/ratings/rankings") {
+        const rkCached = cacheGet("ratings:rankings:public");
+        if (rkCached) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=300" });
+          res.end(JSON.stringify(rkCached));
+          return;
+        }
+        let rkBody;
+        if (!UPSTASH_ENABLED) {
+          rkBody = { ok: true, available: false, reasonJa: "保存先(Upstash)が未設定のため、レーティングはまだありません。" };
+        } else {
+          const ratings = await upstashGetJSON(RATINGS_KEY).catch(() => null);
+          if (!ratings || !ratings.available || !ratings.byTeam) {
+            rkBody = { ok: true, available: false, reasonJa: "地力レーティングは、次の朝の学習(9リーグ×3シーズンの実試合からの初回学習)のあとに公開されます。でっち上げの暫定値は出しません。" };
+          } else {
+            const prev = await upstashGetJSON("learn:ratings:ranks:prev").catch(() => null);
+            const prevRanks = (prev && prev.ranks) || {};
+            const jaByEnLc = new Map(CLUB_UNIVERSE.map((c) => [c.nameEn.toLowerCase(), c.nameJa]));
+            const teams = Object.entries(ratings.byTeam)
+              .map(([id, t]) => ({
+                id: Number(id),
+                name: (ratings.namesById && ratings.namesById[id]) || `チームID ${id}`,
+                att: t.att, def: t.def,
+                strength: Math.round((t.att + t.def) * 1000) / 1000,
+                matches: t.n,
+              }))
+              .sort((a, b) => b.strength - a.strength)
+              .slice(0, 50)
+              .map((t, i) => {
+                const rank = i + 1;
+                const prevRank = prevRanks[t.id];
+                return {
+                  rank,
+                  ...t,
+                  nameJa: jaByEnLc.get(String(t.name).toLowerCase()) || null,
+                  // ↑↓: 前週スナップショットとの差(前週が無い/圏外はnull=「—」表示)
+                  move: Number.isFinite(prevRank) ? prevRank - rank : null,
+                };
+              });
+            rkBody = {
+              ok: true, available: true,
+              updatedAt: ratings.builtAt || null,
+              matchesUsed: ratings.matchesUsed || null,
+              teamsRated: ratings.teamsRated || teams.length,
+              prevWeekKey: (prev && prev.weekKey) || null,
+              teams,
+              noteJa: `9リーグ×3シーズンの実試合${ratings.matchesUsed ? `(${ratings.matchesUsed}試合)` : ""}から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。`,
+            };
+          }
+        }
+        cacheSet("ratings:rankings:public", rkBody, 30 * 60 * 1000);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=300" });
+        res.end(JSON.stringify(rkBody));
+        return;
+      }
+      // ---- 2026年8月18日・v53「AIと予想対決」: 過去の対決の答え合わせ ----
+      //   端末内に保存された自分の予想(fixtureId)を、保存済みの予測記録と照合する。
+      //   Redisの読み出しのみ・最大30件・確定した結果は60分キャッシュ(結果は不変)。
+      if (pathname === "/api/duel/results") {
+        const idsParam = String(parsed.searchParams.get("ids") || "");
+        const ids = idsParam.split(",").map((x) => x.trim()).filter((x) => /^\d{1,12}$/.test(x)).slice(0, 30);
+        if (!ids.length) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, reason: "no_ids", messageJa: "照合する試合IDがありません。" }));
+          return;
+        }
+        const results = {};
+        for (const id of ids) {
+          const dKey = `duel:res:${id}`;
+          let entry = cacheGet(dKey);
+          if (entry === undefined) {
+            const rec = UPSTASH_ENABLED ? await upstashGetJSON(`learn:ownpred:${id}`).catch(() => null) : null;
+            entry = rec ? {
+              found: true,
+              resolved: rec.resolved === true,
+              aiPick: rec.predictedWinner || null,
+              actualWinner: rec.resolved === true ? (rec.actualWinner || null) : null,
+              actualScore: (rec.resolved === true && rec.actualScore && Number.isFinite(Number(rec.actualScore.home)))
+                ? `${rec.actualScore.home}-${rec.actualScore.away}` : null,
+              official: rec.official !== undefined ? rec.official !== false
+                : classifyFixtureOfficial(rec.league, rec.homeTeamEn, rec.awayTeamEn).official,
+              homeEn: rec.homeTeamEn || null, awayEn: rec.awayTeamEn || null,
+              kickoff: rec.kickoff || null,
+            } : { found: false };
+            // 確定結果は変わらないので長め、未確定・未発見は短めにキャッシュ
+            cacheSet(dKey, entry, entry.found && entry.resolved ? 60 * 60 * 1000 : 5 * 60 * 1000);
+          }
+          results[id] = entry;
+        }
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=60" });
+        res.end(JSON.stringify({ ok: true, results }));
+        return;
+      }
       // ---- 2026年8月18日・v48: 週間AIダイジェスト(読み出しのみ・10分キャッシュ) ----
       //   中身は日次学習が週1回生成して保存したJSON。ここでは計算しない(方針⑥)。
       if (pathname === "/api/digest/latest") {
@@ -6518,6 +6615,16 @@ async function handleHttpRequest(req, res) {
               : classifyFixtureOfficial(r.league, r.homeTeamEn, r.awayTeamEn).official);
             const officialRecs = recs.filter(isOfficialRec);
             const officialHits = officialRecs.filter((r) => r.correct === true);
+            // ---- v53「的中ストリーク」: 公式戦の連続的中(現在と、保存窓内の最長) ----
+            //   recsは新しい順に整列済み。現在のストリーク=先頭からcorrect===trueが続く数。
+            //   最長は保存されている範囲(直近最大300件)内の実測で、その旨を明記する。
+            let streakCurrent = 0;
+            for (const r of officialRecs) { if (r.correct === true) streakCurrent++; else break; }
+            let streakBest = 0, run = 0;
+            for (let i = officialRecs.length - 1; i >= 0; i--) { // 古い順に走査
+              run = officialRecs[i].correct === true ? run + 1 : 0;
+              if (run > streakBest) streakBest = run;
+            }
             const reasonTally = new Map();
             const items = misses.slice(0, 6).map((r) => {
               const reasons = [];
@@ -6560,7 +6667,15 @@ async function handleHttpRequest(req, res) {
             body = {
               ok: true, available: recs.length > 0,
               resolvedCount: recs.length, hitCount: hits.length, missCount: misses.length,
-              officialSummary: {
+              streak: {
+              official: {
+                current: streakCurrent,
+                best: streakBest,
+                windowN: officialRecs.length,
+                noteJa: `連続的中は保存済みの直近${officialRecs.length}件の公式戦の実測です。`,
+              },
+            },
+            officialSummary: {
                 n: officialRecs.length,
                 hits: officialHits.length,
                 hitRatePct: officialRecs.length ? Math.round((officialHits.length / officialRecs.length) * 1000) / 10 : null,

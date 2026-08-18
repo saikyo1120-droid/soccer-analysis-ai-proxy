@@ -524,6 +524,9 @@
        最上部が「あなたのクラブ」の見出しになる。中身は保存済みデータの読み出し
        だけ(/api/club/summary は10分キャッシュ・新しい計算やAPI呼び出しなし)。
        登録は端末内(localStorage)に保存し、サーバーには送らない。 -->
+  <!-- v53「的中ストリーク」: いま公式戦で何連続的中中かをライブ表示(実測のみ) -->
+  <div id="streakStrip" style="display:none; margin:0 0 10px; padding:8px 12px; border-radius:8px; border:1.5px solid var(--series-2); background:rgba(179,84,30,.07); font-size:14px;"></div>
+
   <div class="card" id="myClubCard" style="border:1.5px solid var(--series-home);">
     <div id="myClubBody"></div>
   </div>
@@ -669,10 +672,20 @@
   <!-- 2026年8月18日・ホーム整理: 開発の計器盤(学習ダッシュボード・成長レポート・
        日々の差分)は「AIの裏側」タブへ。消したのではなく、置き場所を変えただけ。
        サッカーを見に来た人が最初に見るのは、予想・質問・正答率・反省・賢くなったか。 -->
-  <div class="segmented" id="modeSwitch" style="margin-bottom:16px;">
+  <div class="segmented" id="modeSwitch" style="margin-bottom:16px; flex-wrap:wrap;">
     <button data-mode="match" class="active">⚽ 試合分析AI</button>
     <button data-mode="player">🔍 選手検索</button>
+    <button data-mode="rankings">🏆 地力ランキング</button>
     <button data-mode="backstage">🛠 AIの裏側</button>
+  </div>
+
+  <!-- v53「AIが見る地力ランキング」: v50で学習した約200クラブの攻撃力・守備力から
+       算出したTOP50。実測データからの機械的な計算のみ(主観・人手調整なし)。 -->
+  <div id="rankingsSection" style="display:none;">
+    <div class="card" style="border:1.5px solid var(--series-2);">
+      <h2 style="margin:0 0 4px;">🏆 AIが見る世界クラブ地力ランキング</h2>
+      <div id="rankingsBody" class="muted" style="font-size:13px;">読み込み中…</div>
+    </div>
   </div>
 
   <div id="backstageSection" style="display:none;">
@@ -991,10 +1004,25 @@ document.getElementById("modeSwitch").addEventListener("click", (e) => {
   // 2026年8月18日: 開発の計器盤(学習ダッシュボード等)は「AIの裏側」タブへ移動。
   // 描画は今までどおりページ読み込み時に済ませてあるので、開いた瞬間に表示される。
   document.getElementById("backstageSection").style.display = mode === "backstage" ? "block" : "none";
+  // v53: 地力ランキング(開いた最初の1回だけ読み込む=方針⑥)
+  document.getElementById("rankingsSection").style.display = mode === "rankings" ? "block" : "none";
+  if (mode === "rankings") rankingsEnsureInit();
   // 選手検索の読み込みは「このタブを開いた最初の1回だけ」。
   // ホーム画面を見ているだけの人に通信させない(方針⑥)。
   if (mode === "player") psEnsureInit();
 });
+// v53: #rankings リンクで直接ランキングタブを開ける(シェア用URL)。
+// 注意: この時点ではまだ後方の let 宣言(rankingsInited等)が未初期化のため、
+// 同期実行するとTDZエラーでタブが空のままになる(実際にテストで再現)。
+// スクリプト全体の解釈が終わった後(タスクキュー末尾)に実行する。
+setTimeout(() => {
+  try {
+    // ブラウザ以外の実行環境(テストのDOM評価等)では location が無い場合がある
+    if (typeof location === "undefined" || location.hash !== "#rankings") return;
+    const rkBtn = document.querySelector('#modeSwitch button[data-mode="rankings"]');
+    if (rkBtn) rkBtn.click();
+  } catch (e) { /* ハッシュ誘導は付加機能。失敗してもページ本体に影響させない */ }
+}, 0);
 
 const ATTR_LABELS = { attack: "攻撃力", shooting: "シュート", dribbling: "ドリブル", passing: "パス", tactical: "戦術理解", speed: "スピード", physical: "フィジカル", defense: "守備" };
 const ZONE_COORDS = {
@@ -7719,6 +7747,11 @@ function predBlendLineHtml(p) {
 // 一覧の行に足す1行の予想ストリップ(軽さ優先: バー無し・テキストのみ)
 function predStripHtml(p) {
   if (!p) return "";
+  // v53: 対決モード中でまだ自分の予想を選んでいない未開始試合は、一覧側でも
+  // AIの予想をネタバレしない(上の予想カードで先に選んでもらう)。
+  if (typeof duelModeOn === "function" && duelModeOn() && String(p.status || "") === "NS" && !p.resolved && !duelGetPicks()[p.fixtureId]) {
+    return `🤜🤛 <span class="value-note">対決中 — 上の「今日のAI予想」で自分の予想を先に選ぶと表示されます</span>`;
+  }
   const winPct = p.probs ? (p.predictedWinner === "home" ? p.probs.homeWinPct : p.predictedWinner === "away" ? p.probs.awayWinPct : p.probs.drawPct) : null;
   return `🤖 AI予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${winPct !== null ? ` <span style="color:var(--series-2); font-weight:700;">${Number(winPct)}%</span>` : ""}${predResultBadgeHtml(p)}`;
 }
@@ -7735,13 +7768,225 @@ function annotateFixtureRowsWithPredictions() {
   });
 }
 
+// ================================================================
+// 2026年8月18日・v53「AIと予想対決(Beat the AI)」
+//   AIの予想を見る前に、自分の予想を先にタップする。試合後に自動で答え合わせし、
+//   「あなた◯勝◯分◯敗 vs AI」を積み上げる。記録はこの端末(localStorage)のみ。
+//   スキップも自由(スキップした試合は対戦成績に数えない=公平)。
+// ================================================================
+const DUEL_LS_KEY = "duelPicks";
+const DUEL_MODE_KEY = "duelMode";
+function duelModeOn() {
+  try { return localStorage.getItem(DUEL_MODE_KEY) !== "0"; } catch (e) { return false; }
+}
+function duelSetMode(on) {
+  try { localStorage.setItem(DUEL_MODE_KEY, on ? "1" : "0"); } catch (e) { /* 保存不可環境 */ }
+}
+function duelGetPicks() {
+  try { return JSON.parse(localStorage.getItem(DUEL_LS_KEY) || "{}") || {}; } catch (e) { return {}; }
+}
+function duelSavePicks(picks) {
+  try {
+    // 端末容量の保護: 最大200件(古い順に削除)
+    const ids = Object.keys(picks);
+    if (ids.length > 200) {
+      ids.sort((a, b) => String(picks[a].at || "").localeCompare(String(picks[b].at || "")));
+      ids.slice(0, ids.length - 200).forEach((id) => delete picks[id]);
+    }
+    localStorage.setItem(DUEL_LS_KEY, JSON.stringify(picks));
+  } catch (e) { /* 保存不可環境では対決記録は残らない(その旨は盤面に表示) */ }
+}
+function duelRecordPick(p, pick) {
+  const picks = duelGetPicks();
+  picks[p.fixtureId] = {
+    pick, at: new Date().toISOString(), kickoff: p.kickoff || null,
+    home: (p.home && p.home.name) || "", away: (p.away && p.away.name) || "",
+  };
+  duelSavePicks(picks);
+}
+/** 保存済みの対決から通算成績を計算する(SKIPと未確定は数えない) */
+function duelComputeRecord() {
+  const picks = duelGetPicks();
+  const resolved = Object.values(picks).filter((x) => x && x.pick !== "SKIP" && x.res && x.res.actual);
+  resolved.sort((a, b) => String(a.kickoff || "").localeCompare(String(b.kickoff || "")));
+  let w = 0, d = 0, l = 0, userHits = 0, aiHits = 0;
+  const seq = [];
+  for (const x of resolved) {
+    const u = x.pick === x.res.actual;
+    const a = x.res.ai === x.res.actual;
+    if (u) userHits++;
+    if (a) aiHits++;
+    const o = u && !a ? "W" : (!u && a ? "L" : "D");
+    if (o === "W") w++; else if (o === "L") l++; else d++;
+    seq.push(o);
+  }
+  let streak = 0;
+  for (let i = seq.length - 1; i >= 0; i--) { if (seq[i] === "W") streak++; else break; }
+  return { w, d, l, userHits, aiHits, n: resolved.length, streak };
+}
+/** 未確定の対決を /api/duel/results で答え合わせする(最大30件・古すぎるものは対象外) */
+async function duelSyncResults() {
+  const picks = duelGetPicks();
+  const now = Date.now();
+  const pending = Object.entries(picks)
+    .filter(([, x]) => x && x.pick !== "SKIP" && !x.res && x.kickoff && (now - Date.parse(x.kickoff)) > 2 * 3600e3)
+    .sort((a, b) => String(b[1].kickoff).localeCompare(String(a[1].kickoff)))
+    .slice(0, 30);
+  if (!pending.length) return false;
+  let data = null;
+  try {
+    data = await fetchJsonWithTimeout(`${API_PROXY_BASE}/duel/results?ids=${pending.map(([id]) => id).join(",")}`,
+      backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { return false; }
+  if (!data || !data.ok || !data.results) return false;
+  let changed = false;
+  for (const [id] of pending) {
+    const r = data.results[id];
+    if (r && r.found && r.resolved && r.actualWinner) {
+      picks[id].res = { actual: r.actualWinner, ai: r.aiPick || null, official: r.official !== false, score: r.actualScore || null };
+      changed = true;
+    }
+  }
+  if (changed) duelSavePicks(picks);
+  return changed;
+}
+function duelScoreboardHtml() {
+  if (!duelModeOn()) {
+    return `<div class="value-note" style="margin:0 0 8px;">🤜🤛 AIとの予想対決はOFFです <button class="ghost-btn" id="duelModeOnBtn" type="button" style="padding:2px 10px; font-size:12px;">ONにする</button></div>`;
+  }
+  const rec = duelComputeRecord();
+  const head = rec.n
+    ? `🤜🤛 <strong>AIとの対決: あなた${rec.w}勝${rec.d}分${rec.l}敗</strong>${rec.streak >= 2 ? ` <span style="color:var(--series-2); font-weight:700;">🔥${rec.streak}連勝中</span>` : ""} <span class="value-note">(的中数: あなた${rec.userHits} vs AI${rec.aiHits})</span>`
+    : `🤜🤛 <strong>AIと予想対決</strong> <span class="value-note">AIの予想を見る前に、自分の予想をタップ。試合後に自動で答え合わせします。</span>`;
+  return `<div id="duelScoreboard" style="margin:0 0 8px; padding:8px 10px; border:1.5px solid var(--series-home); border-radius:8px; background:rgba(0,0,0,.03);">
+    <div>${head}</div>
+    <div class="value-note" style="margin-top:3px;">記録はこの端末の中だけに保存されます ・ <button class="ghost-btn" id="duelShareBtn" type="button" style="padding:2px 10px; font-size:12px;"${rec.n ? "" : " disabled"}>📸 対戦成績をシェア</button> <button class="ghost-btn" id="duelModeOffBtn" type="button" style="padding:2px 10px; font-size:12px;">対決をOFF</button></div>
+  </div>`;
+}
+function buildDuelShareImage() {
+  const rec = duelComputeRecord();
+  const W = 1200, H = 630;
+  const cv = document.createElement("canvas");
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext("2d");
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, "#12263a"); grad.addColorStop(1, "#071522");
+  ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "#ffffff"; ctx.font = "bold 48px sans-serif";
+  ctx.fillText("🤜🤛 サッカーAIと予想対決", 60, 100);
+  ctx.font = "bold 72px sans-serif"; ctx.fillStyle = "#7fd0f0";
+  ctx.fillText(`${rec.w}勝 ${rec.d}分 ${rec.l}敗`, 60, 230);
+  ctx.font = "34px sans-serif"; ctx.fillStyle = "#ffffff";
+  ctx.fillText(`的中数: わたし ${rec.userHits} vs AI ${rec.aiHits}(${rec.n}試合)`, 60, 300);
+  if (rec.streak >= 2) { ctx.fillStyle = "#ffb85c"; ctx.font = "bold 40px sans-serif"; ctx.fillText(`🔥 いまAIに${rec.streak}連勝中`, 60, 370); }
+  ctx.fillStyle = "#9fc4dd"; ctx.font = "26px sans-serif";
+  ctx.fillText("外したら理由まで正直に話すサッカーAIに、あなたは勝てるか。", 60, 560);
+  return cv.toDataURL("image/png");
+}
+async function shareDuelImage() {
+  try {
+    const dataUrl = buildDuelShareImage();
+    const blob = await (await fetch(dataUrl)).blob();
+    const file = new File([blob], "beat_the_ai.png", { type: "image/png" });
+    if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: "サッカーAIと予想対決" });
+      return;
+    }
+    const a = document.createElement("a");
+    a.href = dataUrl; a.download = "beat_the_ai.png"; a.click();
+  } catch (e) { /* キャンセル等 */ }
+}
+const DUEL_PICK_LABELS = { home: "ホーム勝ち", draw: "引き分け", away: "アウェイ勝ち" };
+function duelPickRowHtml(p, homeName, awayName, kickoffStr) {
+  return `
+    <div style="padding:10px 0; border-bottom:1px solid var(--border);">
+      <div><strong>${homeName} vs ${awayName}</strong>
+        <span class="value-note" style="margin-left:8px;">${escapeHtml(p.league || "")}${kickoffStr ? " ・ " + kickoffStr : ""}</span></div>
+      <div style="margin-top:4px;">🤜🤛 <strong>AIより先に、あなたの予想は?</strong> <span class="value-note">(選ぶとAIの予想が見えます)</span></div>
+      <div style="margin-top:6px; display:flex; gap:6px; flex-wrap:wrap;">
+        <button class="apply-btn duel-pick-btn" type="button" data-fixture="${Number(p.fixtureId)}" data-pick="home" style="margin-top:0; width:auto; padding:7px 12px;">${homeName}勝ち</button>
+        <button class="apply-btn duel-pick-btn" type="button" data-fixture="${Number(p.fixtureId)}" data-pick="draw" style="margin-top:0; width:auto; padding:7px 12px; opacity:.85;">引き分け</button>
+        <button class="apply-btn duel-pick-btn" type="button" data-fixture="${Number(p.fixtureId)}" data-pick="away" style="margin-top:0; width:auto; padding:7px 12px;">${awayName}勝ち</button>
+        <button class="ghost-btn duel-skip-btn" type="button" data-fixture="${Number(p.fixtureId)}" style="padding:7px 12px; font-size:12px;">予想せずAIの答えを見る</button>
+      </div>
+    </div>`;
+}
+function duelMyPickLineHtml(p) {
+  const mine = duelGetPicks()[p.fixtureId];
+  if (!mine || mine.pick === "SKIP") return "";
+  const same = mine.pick === p.predictedWinner;
+  return `<div class="value-note" style="margin-top:2px;">🫵 あなたの予想: <strong>${escapeHtml(DUEL_PICK_LABELS[mine.pick] || mine.pick)}</strong> ${same ? "— AIと同じ予想です 🤝" : "— AIと勝負! 🤜🤛"}</div>`;
+}
+
+// ================================================================
+// 2026年8月18日・v53「AIが見る地力ランキング」タブ
+// ================================================================
+let rankingsInited = false;
+function rankingsEnsureInit() {
+  if (rankingsInited) return;
+  rankingsInited = true;
+  renderRankingsTab();
+}
+async function renderRankingsTab() {
+  const el = document.getElementById("rankingsBody");
+  if (!el) return;
+  let d = null;
+  try {
+    d = await fetchJsonWithTimeout(`${API_PROXY_BASE}/ratings/rankings`, backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { d = null; }
+  if (!d) { el.innerHTML = `<p class="value-note">ランキングを取得できませんでした(サーバー起動待ちの可能性があります)。</p>`; return; }
+  if (!d.available) {
+    el.innerHTML = `<p class="value-note">${escapeHtml(d.reasonJa || "レーティングはまだありません。")}</p>`;
+    return;
+  }
+  const esc = escapeHtml;
+  const moveHtml = (m) => m === null || m === undefined ? `<span class="value-note">—</span>`
+    : m > 0 ? `<span style="color:var(--success,#1d7a46); font-weight:700;">▲${m}</span>`
+    : m < 0 ? `<span style="color:var(--critical,#b3261e); font-weight:700;">▼${-m}</span>`
+    : `<span class="value-note">→</span>`;
+  const rows = (d.teams || []).map((t) => `
+    <tr>
+      <td style="padding:5px 8px; text-align:right; font-weight:700;">${Number(t.rank)}</td>
+      <td style="padding:5px 4px; text-align:center;">${moveHtml(t.move)}</td>
+      <td style="padding:5px 8px;">${esc(t.nameJa || t.name)}${t.nameJa ? ` <span class="value-note">${esc(t.name)}</span>` : ""}</td>
+      <td style="padding:5px 8px; text-align:right;"><strong>${Number(t.strength).toFixed(2)}</strong></td>
+      <td style="padding:5px 8px; text-align:right;" class="value-note">${Number(t.att).toFixed(2)} / ${Number(t.def).toFixed(2)}</td>
+    </tr>`).join("");
+  el.innerHTML = `
+    <p class="value-note" style="margin:0 0 8px;">${esc(d.noteJa || "")}</p>
+    <div class="value-note" style="margin:0 0 8px;">最終更新: ${d.updatedAt ? new Date(d.updatedAt).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" }) : "-"}(毎朝の学習後に自動更新)</div>
+    <div style="overflow-x:auto;">
+      <table style="width:100%; border-collapse:collapse; font-size:13px;">
+        <thead><tr class="value-note"><th style="padding:5px 8px; text-align:right;">順位</th><th style="padding:5px 4px;">前週比</th><th style="padding:5px 8px; text-align:left;">クラブ</th><th style="padding:5px 8px; text-align:right;">地力</th><th style="padding:5px 8px; text-align:right;">攻/守</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
+      <button class="more-details-btn" type="button" id="rankingsShareBtn" style="display:inline-block; width:auto; padding:5px 12px;">🔗 このランキングをシェア</button>
+    </div>`;
+  const sb = document.getElementById("rankingsShareBtn");
+  if (sb) sb.addEventListener("click", async () => {
+    const top3 = (d.teams || []).slice(0, 3).map((t) => `${t.rank}位 ${t.nameJa || t.name}`).join(" / ");
+    const text = `🏆 AIが見る世界クラブ地力ランキング: ${top3} | 実試合${d.matchesUsed || "?"}件からAIが学習した独自レーティング`;
+    const url = `${location.origin + location.pathname}#rankings`;
+    try {
+      if (navigator.share) { await navigator.share({ title: "AI地力ランキング", text, url }); return; }
+      await navigator.clipboard.writeText(`${text}\n${url}`);
+      sb.textContent = "✅ コピーしました";
+      setTimeout(() => { sb.textContent = "🔗 このランキングをシェア"; }, 2000);
+    } catch (e) { /* キャンセル等 */ }
+  });
+}
+
 // ---- 2026年8月・利用者目線ラウンド: 「🔮 今日のAI予想」ヒーローカード ----
 // サーバーの /api/predictions/today(保存済み予測の読み出しのみ)を表示する。
 // 予想が無い日は「なぜ無いのか」をサーバーの正直な説明そのままで表示する。
-async function renderTodayPredictionsHero() {
+let todayPredCachedData = null; // v53: 対決のタップ後に再取得せず再描画するためのキャッシュ
+async function renderTodayPredictionsHero(reuseCached) {
   const el = document.getElementById("todayPredictionsBody");
   if (!el) return;
-  let data = await fetchTodayPredictionsShared(); // 下で「次の試合」に差し替えるため let
+  let data = (reuseCached && todayPredCachedData) ? todayPredCachedData : await fetchTodayPredictionsShared(); // 下で「次の試合」に差し替えるため let
+  if (data) todayPredCachedData = data;
   if (!data) {
     el.innerHTML = `<p class="value-note">AI予想を取得できませんでした(サーバー起動待ちの可能性があります。しばらくして再読み込みしてください)。</p>`;
     return;
@@ -7759,6 +8004,11 @@ async function renderTodayPredictionsHero() {
     const homeName = escapeHtml((p.home && p.home.name) || "ホーム");
     const awayName = escapeHtml((p.away && p.away.name) || "アウェイ");
     const kickoffStr = p.kickoff ? new Date(p.kickoff).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "";
+    // ---- v53「AIと予想対決」: 未開始の試合は、自分の予想を選ぶまでAIの予想を伏せる ----
+    //   (スキップでいつでも見られる。対決OFFなら従来どおり)
+    if (duelModeOn() && String(p.status || "") === "NS" && !p.resolved && p.predictedWinner && !duelGetPicks()[p.fixtureId]) {
+      return duelPickRowHtml(p, homeName, awayName, kickoffStr);
+    }
     const scoreStr = (p.score && p.score.home !== null && p.score.home !== undefined) ? ` <strong>${Number(p.score.home)} - ${Number(p.score.away)}</strong>` : "";
     // 精度証明ラウンド: 実績補正後の勝率(較正)・似た試合・市場(オッズ)比較。
     // それぞれ実測がある試合にだけ表示する(無いものは出さない=でっち上げない)。
@@ -7776,6 +8026,7 @@ async function renderTodayPredictionsHero() {
         <div><strong>${homeName} vs ${awayName}</strong>${scoreStr}${predResultBadgeHtml(p)}
           <span class="value-note" style="margin-left:8px;">${escapeHtml(p.league || "")}${kickoffStr ? " ・ " + kickoffStr : ""}</span></div>
         <div style="margin-top:2px;">🤖 AIの予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}</div>
+        ${duelMyPickLineHtml(p)}
         ${predBarHtml(p)}
         <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
         ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${predBlendLineHtml(p)}${predFreshnessLineHtml(p)}
@@ -7797,6 +8048,7 @@ async function renderTodayPredictionsHero() {
   const shownCount = (best ? 1 : 0) + rest.length;
   const moreCount = data.predictions.length - shownCount;
   el.innerHTML = `
+    ${duelScoreboardHtml()}
     ${usingUpcoming ? `<p class="value-note" style="margin:0 0 6px; padding:6px 8px; background:rgba(0,0,0,.04); border-radius:6px;">📅 本日はAIが追跡しているクラブの試合がないため、<strong>AIが予想している「次の試合」</strong>を表示しています。</p>` : ""}
     ${rows.join("")}
     ${moreCount > 0 ? `<p class="value-note" style="margin-top:6px;">ほか${moreCount}試合の予想は「📡 本日の実際の試合」から見られます。</p>` : ""}
@@ -7838,6 +8090,29 @@ async function renderTodayPredictionsHero() {
   el.querySelectorAll(".pred-share-btn").forEach((b) => {
     b.addEventListener("click", () => { sharePredictionImage(Number(b.dataset.shareIdx)); });
   });
+  // ---- v53「AIと予想対決」の配線 ----
+  el.querySelectorAll(".duel-pick-btn").forEach((b) => {
+    b.addEventListener("click", () => {
+      const fid = Number(b.dataset.fixture);
+      const p = (data.predictions || []).find((x) => Number(x.fixtureId) === fid);
+      if (p) { duelRecordPick(p, b.dataset.pick); renderTodayPredictionsHero(true); }
+    });
+  });
+  el.querySelectorAll(".duel-skip-btn").forEach((b) => {
+    b.addEventListener("click", () => {
+      const fid = Number(b.dataset.fixture);
+      const p = (data.predictions || []).find((x) => Number(x.fixtureId) === fid);
+      if (p) { duelRecordPick(p, "SKIP"); renderTodayPredictionsHero(true); }
+    });
+  });
+  const duelShareBtn = document.getElementById("duelShareBtn");
+  if (duelShareBtn) duelShareBtn.addEventListener("click", shareDuelImage);
+  const duelOffBtn = document.getElementById("duelModeOffBtn");
+  if (duelOffBtn) duelOffBtn.addEventListener("click", () => { duelSetMode(false); renderTodayPredictionsHero(true); });
+  const duelOnBtn = document.getElementById("duelModeOnBtn");
+  if (duelOnBtn) duelOnBtn.addEventListener("click", () => { duelSetMode(true); renderTodayPredictionsHero(true); });
+  // 過去の対決の答え合わせ(非同期・変化があれば盤面を更新)
+  duelSyncResults().then((changed) => { if (changed) renderTodayPredictionsHero(true); }).catch(() => {});
 }
 
 async function renderDailyReportWidget() {
@@ -8509,6 +8784,21 @@ async function renderReflectionsCard() {
     el.innerHTML = `<div class="value-note">${esc(d.reasonJa || "答え合わせが済んだ予測がまだありません。")}</div>`;
     return;
   }
+  // ---- v53「的中ストリーク」: ホーム最上部のストリップ(実測のみ・0でも正直に) ----
+  try {
+    const strip = document.getElementById("streakStrip");
+    const st = d.streak && d.streak.official;
+    if (strip && st && Number.isFinite(st.current)) {
+      if (st.current >= 2) {
+        strip.innerHTML = `🔥 <strong>AIはいま公式戦${Number(st.current)}連続的中中</strong> <span class="value-note">(保存範囲内の最長: ${Number(st.best)}連続 ・ ${esc(st.noteJa || "")})</span>`;
+      } else if (st.current === 1) {
+        strip.innerHTML = `⚽ <strong>AIは直近の公式戦を的中</strong> — 連続なるか? <span class="value-note">(保存範囲内の最長: ${Number(st.best)}連続)</span>`;
+      } else {
+        strip.innerHTML = `🙈 <strong>直近の公式戦は外しました。</strong>次で仕切り直しです <span class="value-note">(保存範囲内の最長: ${Number(st.best)}連続的中)</span>`;
+      }
+      strip.style.display = "block";
+    }
+  } catch (e) { /* ストリップは付加情報 */ }
   const parts = [];
   // 2026年8月18日: 公式戦の成績を主表示に。親善・2軍は「参考」と明記して分ける
   // (親善試合は主力を休ませるため、プロでも当てられない。混ぜると実力より低く見える)。
