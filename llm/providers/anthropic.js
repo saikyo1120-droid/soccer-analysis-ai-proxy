@@ -15,20 +15,28 @@
 // (APIキー自体は正しいのに、です)。.trim()で前後の空白・改行を必ず取り除く
 // ことで、この種の貼り付けミスの影響を受けないようにする。
 const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || "").trim();
-// 既定モデル: コスト最適化の方針(設計書②)に合わせて軽量モデルを既定にしています。
-// 2026年8月時点でAnthropic公式ドキュメント(platform.claude.com/docs)を確認し、
-// 直接のAnthropic API経由では入手できなくなっていた旧モデル(claude-3-5-haiku-
-// 20241022。Bedrock/Google Cloud経由でのみ現在も提供)から、現行の軽量モデル
-// claude-haiku-4-5(入力$1/output$5 per MTok)に更新しました。Anthropicのモデルは
-// 時期によって新しいものが追加されるため、最新の推奨モデルIDは
-// https://platform.claude.com/docs/en/about-claude/models で確認し、必要なら
-// .env の ANTHROPIC_MODEL で上書きしてください。
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5";
-// 2026年8月・精度証明ラウンド⑥: 「重い分析だけ高性能モデル」用の上位モデル。
-// 実データの根拠が十分に揃ったクラブ考察のときだけ使われる(llm/index.jsのtier参照)。
-// モデルIDは https://platform.claude.com/docs/en/about-claude/models で確認し、
-// .env の ANTHROPIC_MODEL_HEAVY で上書きできる。
-const ANTHROPIC_MODEL_HEAVY = process.env.ANTHROPIC_MODEL_HEAVY || "claude-sonnet-4-5";
+// ---- 2026年8月18日・「AIが賢いと思えない」へのご指示による格上げ ----
+// これまでの既定は最小モデル(claude-haiku-4-5・$1/$5 per MTok)だった。
+// 会話が賢く感じない主因はここ(モデルの格・文脈の薄さ)だったため、
+// 公式ドキュメント(platform.claude.com/docs)で現行IDと価格を確認のうえ更新:
+//   既定(全質問):     claude-sonnet-5  … $2/$10 per MTok。旧sonnet-4-5($3/$15)より
+//                     賢く、しかも安い。1質問あたり約2円。
+//   重い分析(heavy):  claude-opus-5    … $5/$25 per MTok。実データが十分に揃った
+//                     深い考察のときだけ。1質問あたり約6〜9円。
+// さらに上のclaude-fable-5($10/$50)も存在する。使う場合は
+// .env の ANTHROPIC_MODEL_HEAVY=claude-fable-5 で上書きできる(費用は約2倍)。
+// 1日の呼び出し上限(MAX_LLM_CALLS_PER_DAY)と1人あたり上限は従来どおり効くので、
+// 月額の上限はその設定で制御できる。
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
+const ANTHROPIC_MODEL_HEAVY = process.env.ANTHROPIC_MODEL_HEAVY || "claude-opus-5";
+// ---- 2026年8月18日・v51: モデルID起因の全滅を防ぐ予備モデル ----
+// 将来モデルIDが廃止・変更された場合、従来は全ての考察が失敗し続けた
+// (利用者には「接続できませんでした」しか出ない)。モデルが見つからない
+// エラーのときだけ、確実に存在する予備モデルで1回だけ再試行する。
+// どのモデルで答えたかは呼び出し元(llm/index.js経由のmeta)に正直に出る。
+const ANTHROPIC_FALLBACK_MODEL = process.env.ANTHROPIC_FALLBACK_MODEL || "claude-haiku-4-5";
+// 尻切れ書き直し時の上限の天井(コスト暴走防止。環境変数で変更可能)
+const TRUNCATE_RETRY_CAP = parseInt(process.env.ANTHROPIC_TRUNCATE_RETRY_CAP, 10) || 2400;
 const ANTHROPIC_API_BASE = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION = "2023-06-01";
 
@@ -60,12 +68,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = ANTHROPIC_TIMEOUT
   }
 }
 
-async function generate({ systemPrompt, userPrompt, maxTokens, tier }) {
-  if (!ANTHROPIC_API_KEY) {
-    const err = new Error("ANTHROPIC_API_KEY が設定されていません(.envを確認してください)");
-    err.code = "NO_KEY";
-    throw err;
-  }
+async function callOnce(model, { systemPrompt, userPrompt, maxTokens }) {
   const res = await fetchWithTimeout(ANTHROPIC_API_BASE, {
     method: "POST",
     headers: {
@@ -74,7 +77,7 @@ async function generate({ systemPrompt, userPrompt, maxTokens, tier }) {
       "content-type": "application/json",
     },
     body: JSON.stringify({
-      model: resolveModel(tier),
+      model,
       max_tokens: maxTokens || 700,
       system: systemPrompt || "",
       messages: [{ role: "user", content: userPrompt || "" }],
@@ -84,6 +87,8 @@ async function generate({ systemPrompt, userPrompt, maxTokens, tier }) {
     const bodyText = await res.text().catch(() => "");
     const err = new Error(`Anthropic API HTTP ${res.status}: ${bodyText.slice(0, 300)}`);
     err.code = "HTTP_ERROR";
+    err.httpStatus = res.status;
+    err.bodyText = bodyText;
     throw err;
   }
   const json = await res.json();
@@ -94,7 +99,54 @@ async function generate({ systemPrompt, userPrompt, maxTokens, tier }) {
     err.code = "EMPTY_RESPONSE";
     throw err;
   }
-  return text;
+  // v51: stop_reason==="max_tokens" は「トークン上限で文章が途中で切れた」印。
+  // 本番の実画面で「…むしろ得点・アシストという直結指」のような尻切れが
+  // 実際に発生したため、切れたかどうかを必ず呼び出し元へ返す。
+  return { text, truncated: json.stop_reason === "max_tokens" };
+}
+
+/** 「モデルIDが存在しない/使えない」系のエラーか(=予備モデルで救済できる) */
+function isModelNotFoundError(e) {
+  if (!e || e.code !== "HTTP_ERROR") return false;
+  if (e.httpStatus !== 400 && e.httpStatus !== 404) return false;
+  return /model/i.test(String(e.bodyText || ""));
+}
+
+async function generate({ systemPrompt, userPrompt, maxTokens, tier }) {
+  if (!ANTHROPIC_API_KEY) {
+    const err = new Error("ANTHROPIC_API_KEY が設定されていません(.envを確認してください)");
+    err.code = "NO_KEY";
+    throw err;
+  }
+  const requested = resolveModel(tier);
+  const runWithModel = async (model, fallbackFrom) => {
+    let r = await callOnce(model, { systemPrompt, userPrompt, maxTokens });
+    // ---- v51: 尻切れ対策 ----
+    // 上限に当たって文章が切れた場合、1回だけ上限を2倍(既定の天井2400)にして
+    // 書き直す。それでも切れたら truncated:true を正直に返す(呼び出し元が
+    // 利用者に「末尾が省略された」と注記する)。
+    if (r.truncated) {
+      const retryMax = Math.min(TRUNCATE_RETRY_CAP, Math.max(1200, (maxTokens || 700) * 2));
+      console.error(`[anthropic] 応答がトークン上限(${maxTokens || 700})で途切れたため、上限${retryMax}で1回だけ書き直します(model=${model})`);
+      try {
+        const retry = await callOnce(model, { systemPrompt, userPrompt, maxTokens: retryMax });
+        r = retry;
+      } catch (e) { /* 書き直しに失敗したら、切れた初回の本文をそのまま使う(無いより正直に多い方) */ }
+    }
+    return { text: r.text, model, fallbackFrom: fallbackFrom || undefined, truncated: !!r.truncated };
+  };
+  try {
+    return await runWithModel(requested);
+  } catch (e) {
+    // モデルが見つからない場合だけ、予備モデルで1回だけ再試行する。
+    // それ以外(レート制限・キー不正・タイムアウト等)は従来どおり失敗を返す
+    // (予備モデルでも同じ理由で失敗するだけなので、費用を二重に使わない)。
+    if (isModelNotFoundError(e) && ANTHROPIC_FALLBACK_MODEL && ANTHROPIC_FALLBACK_MODEL !== requested) {
+      console.error(`[anthropic] モデル「${requested}」が見つからないため、予備モデル「${ANTHROPIC_FALLBACK_MODEL}」で再試行します:`, e.message);
+      return await runWithModel(ANTHROPIC_FALLBACK_MODEL, requested);
+    }
+    throw e;
+  }
 }
 
 module.exports = { generate, resolveModel };
