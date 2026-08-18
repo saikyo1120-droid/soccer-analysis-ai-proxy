@@ -40,11 +40,17 @@ const FIXED_QUESTIONS = [
   { id: "player_kubo", kind: "player", questionJa: "久保建英はどんな選手ですか？", targetJa: "久保建英", match: ["kubo", "久保"] },
   { id: "club_arsenal", kind: "club", questionJa: "アーセナルの今の状態は？", nameEn: "Arsenal", nameJa: "アーセナル" },
   { id: "club_mancity", kind: "club", questionJa: "マンチェスター・シティの今の状態は？", nameEn: "Manchester City", nameJa: "マンチェスター・シティ" },
-  { id: "today_fixtures", kind: "fixtures", questionJa: "今日の試合は？" },
-  { id: "featured_players", kind: "picks", questionJa: "注目選手は？" },
-  { id: "young_prospects", kind: "young", questionJa: "若手有望株は？" },
-  { id: "injuries", kind: "injuries", questionJa: "怪我情報は？" },
-  { id: "transfers", kind: "transfers", questionJa: "移籍情報は？" },
+  // churn(入れ替わりの性質)の意味:
+  //   "all"   … 中身が毎日そっくり入れ替わる。増減どちらも成長の証拠にならない
+  //   "rank"  … 上位N件の並べ替え。順位が変わっただけで、知識は増減していない
+  //   "window"… 直近N日の窓。入ってくるのは新しい情報だが、
+  //             出ていくのは「古くなっただけ」で、言えなくなったわけではない
+  //   未指定  … 増減どちらも成長・後退として数える(選手・クラブの事実)
+  { id: "today_fixtures", kind: "fixtures", questionJa: "今日の試合は？", churn: "all" },
+  { id: "featured_players", kind: "picks", questionJa: "注目選手は？", churn: "rank" },
+  { id: "young_prospects", kind: "young", questionJa: "若手有望株は？", churn: "rank" },
+  { id: "injuries", kind: "injuries", questionJa: "怪我情報は？", churn: "window" },
+  { id: "transfers", kind: "transfers", questionJa: "移籍情報は？", churn: "window" },
 ];
 
 const CLUBS_FOR_AGGREGATE = 40; // 怪我・移籍を集計するときに見るクラブ数の上限
@@ -226,7 +232,7 @@ function createAutoQA(deps) {
     const C = (playerSearch && playerSearch.COL) || {};
     const { rows, available: idxAvailable } = await loadIndexRows();
     const answers = [];
-    const push = (q, o) => answers.push({ id: q.id, questionJa: q.questionJa, ...o });
+    const push = (q, o) => answers.push({ id: q.id, questionJa: q.questionJa, churn: q.churn || null, ...o });
 
     for (const q of FIXED_QUESTIONS) {
       try {
@@ -274,7 +280,7 @@ function createAutoQA(deps) {
           const todayKey = dateKeyOf();
           const pendingRaw = await upstashCmd(["LRANGE", "learn:ownpred:pending", "0", "29"]).catch(() => null);
           if (!Array.isArray(pendingRaw)) {
-            push(q, { canAnswer: false, facts: [], aiWordsJa: null, volatile: true,
+            push(q, { canAnswer: false, facts: [], aiWordsJa: null,
               reasonJa: "予測の待ち行列を読み出せませんでした(保存先に接続できていません)。0件だったのではなく、測れていません。" });
             continue;
           }
@@ -297,11 +303,6 @@ function createAutoQA(deps) {
           }
           push(q, {
             canAnswer: facts.length > 0, facts, aiWordsJa: null,
-            // ---- 成長の判定からは外す ----
-            //   試合の顔ぶれは毎日必ず入れ替わる。これを「新しく言えるように
-            //   なったこと」に数えると、何も学んでいない日でも必ず
-            //   「賢くなりました」になる(このファイルの冒頭で禁じた水増し)。
-            volatile: true,
             checkedCount: checked,
             reasonJa: facts.length ? null
               : `待ち行列の${checked}件を確認しましたが、今日キックオフの試合についてのAI自身の予測はまだ記録されていません。`,
@@ -396,9 +397,16 @@ function createAutoQA(deps) {
 
     for (const t of (todaySet.answers || [])) {
       const y = yMap.get(t.id) || null;
-      // volatile = 中身が毎日必ず入れ替わる質問(今日の試合など)。
-      // 画面には出すが、「昨日より賢くなったか」の数には入れない。
-      const isVolatile = t.volatile === true;
+      // ---- 2026年8月18日・本番で毎日「後退あり」と誤検知していた件 ----
+      //   実測: 自動QAが毎日 ANSWER_REGRESSION(4件が言えなくなった)を出していた。
+      //   中身を見ると「注目選手の上位8人」の顔ぶれが入れ替わっただけだった。
+      //   上位8人から外れることは、その選手について答えられなくなることではない。
+      //   同じく「今日の試合」「直近30日の移籍」も、性質上ふつうに入れ替わる。
+      //   入れ替わりの性質ごとに、何を数えるかを分ける。
+      const churn = t.churn || null;
+      const countGain = churn !== "all" && churn !== "rank";   // 増えたぶんを成長として数えるか
+      const countLoss = churn === null;                        // 減ったぶんを後退として数えるか
+      const isVolatile = churn === "all" || churn === "rank";
       const yFacts = new Map(((y && y.facts) || []).map((f) => [f.k, f.v]));
       const tFacts = new Map((t.facts || []).map((f) => [f.k, f.v]));
 
@@ -410,12 +418,12 @@ function createAutoQA(deps) {
       for (const [k, v] of yFacts) if (!tFacts.has(k)) lostFacts.push({ k, v });
 
       const newlyAnswerable = !!(t.canAnswer && y && !y.canAnswer);
-      if (!isVolatile) {
+      if (countGain) {
         if (newlyAnswerable) newlyAnswerableCount++;
         newFactTotal += newFacts.length;
         changedFactTotal += changedFacts.length;
-        lostFactTotal += lostFacts.length;
       }
+      if (countLoss) lostFactTotal += lostFacts.length;
 
       // AI自身の言葉(クラブの見解)の変化
       const aiChanged = !!(t.aiWordsJa && y && y.aiWordsJa && t.aiWordsJa !== y.aiWordsJa);
@@ -423,6 +431,11 @@ function createAutoQA(deps) {
       items.push({
         id: t.id, questionJa: t.questionJa, subjectJa: t.subjectJa || null,
         volatile: isVolatile,
+        churn,
+        churnNoteJa: churn === "all" ? "毎日必ず顔ぶれが変わるため、増えた数にも減った数にも入れていません。"
+          : churn === "rank" ? "上位の並べ替えなので、増えた数にも減った数にも入れていません(順位が変わっただけで、その選手について答えられなくなったわけではありません)。"
+            : churn === "window" ? "直近の期間で区切っているため、期間から外れたぶんは「言えなくなった」に数えていません。"
+              : null,
         hadYesterday: !!y,
         canAnswerToday: !!t.canAnswer, canAnswerYesterday: y ? !!y.canAnswer : null,
         newlyAnswerable,
@@ -452,7 +465,7 @@ function createAutoQA(deps) {
       items,
       newFactTotal, changedFactTotal, lostFactTotal, newlyAnswerableCount,
       grew: hasYesterday ? grew : null,
-      countingNoteJa: "「今日の試合」は毎日必ず顔ぶれが変わるため、増えた数には入れていません(何も学んでいない日でも増えたように見えてしまうため)。",
+      countingNoteJa: "「今日の試合」と「注目選手・若手有望株の上位」は、性質上ふつうに入れ替わるため、増えた数にも減った数にも入れていません(何も学んでいない日でも「賢くなった」「後退した」と出てしまうため)。「怪我」「移籍」は新しく入ったぶんだけを数え、期間から外れたぶんは減少に数えていません。",
       verdictJa: !hasYesterday
         ? "昨日の答えが保存されていないため、今日は比較できません(明日から比較できます)。"
         : grew

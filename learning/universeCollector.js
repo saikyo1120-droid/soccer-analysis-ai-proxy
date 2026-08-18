@@ -774,8 +774,47 @@ async function collectUniverse(deps, runAt, dateKey) {
     // 1件ずつ読んでいた(1日数千Redisコマンド。選手3万人規模では無料枠を
     // 単独で超過)。playerId→statsUpdatedAtの索引1キー(読み1回・書き1回)に変更。
     const statsIndex = await clubDossier.getStatsIndex();
-    const withAge = candidates.map((c) => ({ ...c, updatedAt: statsIndex[c.playerId] || "" }));
+    // 連続して取得できなかった選手の記録(毎日同じ失敗を繰り返さないため)
+    // このファイルは保存先を deps 経由で受け取る(直接の変数は存在しない)。
+    // 無い環境でも動くように、必ず存在確認してから使う。
+    const playerFailCounts = (deps.upstashGetJSON
+      ? (await deps.upstashGetJSON(PLAYER_FAIL_KEY).catch(() => null)) : null) || {};
+    let playerFailDirty = false;
+    const nowMsForSkip = runAt.getTime();
+    const isSkipped = (playerId) => {
+      const v = playerFailCounts[String(playerId)];
+      if (!v || typeof v !== "object" || !v.skipUntil) return false;
+      const until = Date.parse(v.skipUntil);
+      if (!Number.isFinite(until)) return false;
+      if (until > nowMsForSkip) return true;
+      // 期限が切れたら、もう一度だけ試す(恒久的に切り捨てない)
+      delete playerFailCounts[String(playerId)];
+      playerFailDirty = true;
+      return false;
+    };
+    // ---- 2026年8月18日・検証で判明した二重処理 ----
+    //   候補は各クラブの名簿から作るため、同じ選手が複数回入ることがある
+    //   (移籍直後で新旧どちらの名簿にも載っている、など)。
+    //   本番のエラーが「Guillem Badia【2回】」と出ていたのはこれ。
+    //   1日に同じ選手を2回取りに行くのは、API枠の無駄でしかない。
+    const seenPlayerIds = new Set();
+    const uniqueCandidates = candidates.filter((c) => {
+      const k = String(c.playerId);
+      if (seenPlayerIds.has(k)) return false;
+      seenPlayerIds.add(k);
+      return true;
+    });
+    stats.playersDeduped = candidates.length - uniqueCandidates.length;
+    const withAge = uniqueCandidates
+      .filter((c) => !isSkipped(c.playerId))
+      .map((c) => ({ ...c, updatedAt: statsIndex[c.playerId] || "" }));
     withAge.sort((a, b) => String(a.updatedAt).localeCompare(String(b.updatedAt)));
+    const skippedCount = uniqueCandidates.length - withAge.length;
+    if (skippedCount > 0) {
+      stats.playersSkippedUnavailable = skippedCount;
+      stats.notesJa = stats.notesJa || [];
+      stats.notesJa.push(`提供元から繰り返し取得できなかった選手 ${skippedCount}人 は、当面この輪番から外しています(一定期間後に自動でもう一度試します)。`);
+    }
     let done = 0;
     let indexDirty = false;
     for (const c of withAge) {
@@ -826,16 +865,52 @@ async function collectUniverse(deps, runAt, dateKey) {
         emittedByPlayer.set(Number(c.playerId), new Set(((detailRes && detailRes.events) || []).map((ev) => ev.type)));
         statsIndex[c.playerId] = runAt.toISOString();
         indexDirty = true;
+        // 取得できたので、それまでの連続失敗の記録は消す(本当に「連続」でのみ諦める)
+        if (playerFailCounts[String(c.playerId)] !== undefined) {
+          delete playerFailCounts[String(c.playerId)];
+          playerFailDirty = true;
+        }
         stats.playersUpdated++;
         stats.playersFromDetailStats++;
         done++;
       } catch (e) {
         if (e && e.code === "BUDGET_EXHAUSTED") { skip("playerStats", "APIの1日予算に達したため、選手の詳細成績の更新を打ち切りました。"); break; }
-        stats.errors.push(`universe_player_failed:${c.name}:${e.code || e.message}`);
+        // ---- 2026年8月18日・本番で10日間まったく同じエラーが出続けた原因 ----
+        //   実測: universe_player_failed:Guillem Badia:API_ERROR が
+        //   8/9〜8/18 の10日間、毎日1件ずつ記録されていた。
+        //
+        //   この輪番は statsIndex(選手ID→最終更新時刻)の **古い順** に処理する。
+        //   成功したときと「統計が空だった」ときは時刻を進めるのに、
+        //   **失敗したときだけ進めていなかった**。
+        //   その結果、取得できない選手は永遠に updatedAt が空のまま
+        //   毎日必ず列の先頭に来て、毎日同じ失敗を繰り返し、
+        //   しかも他の選手の枠を1つ食い続けていた。
+        //   (すぐ上の「統計が無い選手も輪番を前進させる」と同じ対処が、
+        //    例外の側に入っていなかった)
+        //
+        //   対処: 失敗しても輪番は前進させる(列の後ろへ回す)。
+        //   そのうえで連続失敗を数え、3回続いたら当面スキップする。
+        //   「毎日エラーを出し続ける」でも「黙って消す」でもなく、
+        //   「取得できない選手として、理由つきで一覧に残す」。
+        statsIndex[c.playerId] = runAt.toISOString();
+        indexDirty = true;
+        const failKey = String(c.playerId);
+        const prevFails = Number(playerFailCounts[failKey] || 0) + 1;
+        playerFailCounts[failKey] = prevFails;
+        playerFailDirty = true;
+        if (prevFails >= PLAYER_FAIL_GIVEUP) {
+          // これ以上は毎日試さない(APIも枠も無駄になるため)。理由は残す。
+          playerFailCounts[failKey] = { fails: prevFails, skipUntil: new Date(runAt.getTime() + PLAYER_FAIL_SKIP_DAYS * 86400000).toISOString(), name: c.name, reason: e.code || e.message };
+          stats.unavailablePlayers = stats.unavailablePlayers || [];
+          stats.unavailablePlayers.push({ name: c.name, playerId: c.playerId, fails: prevFails, reasonJa: `提供元から${prevFails}回続けて取得できなかったため、${PLAYER_FAIL_SKIP_DAYS}日間はこの選手の更新を見送ります(${e.code || e.message})。` });
+        } else {
+          stats.errors.push(`universe_player_failed:${c.name}:${e.code || e.message}`);
+        }
         done++;
       }
     }
     if (indexDirty) await clubDossier.saveStatsIndex(statsIndex);
+    if (playerFailDirty && deps.upstashSetJSON) await deps.upstashSetJSON(PLAYER_FAIL_KEY, playerFailCounts).catch(() => {});
   } catch (e) { stats.errors.push(`universe_players_failed:${e.message}`); }
 
   // ============================================================
@@ -1194,6 +1269,13 @@ module.exports = { collectUniverse, BUDGET_FLOOR, PLAYER_CAP_DEFAULT, seasonOf }
        ・保存済みの索引に上書きマージする(実測を消さない)
      これを数回まわせば、100クラブすべてが検索対象になる。
    ============================================================================ */
+// 提供元から繰り返し取得できない選手を覚えておく場所。
+// これが無いと、取得できない選手が毎日「更新が最も古い」ままになり、
+// 永遠に列の先頭に居座って、毎日同じエラーを出し続ける(本番で10日続いた)。
+const PLAYER_FAIL_KEY = "kb:player:statsfail";
+const PLAYER_FAIL_GIVEUP = Number(process.env.PLAYER_FAIL_GIVEUP) || 3;   // 何回続けて失敗したら見送るか
+const PLAYER_FAIL_SKIP_DAYS = Number(process.env.PLAYER_FAIL_SKIP_DAYS) || 30; // 見送る日数(その後もう一度試す)
+
 const COLLECT_CURSOR_KEY = "kb:universe:playercursor";
 
 async function collectClubPlayersBatch(deps, opts) {
