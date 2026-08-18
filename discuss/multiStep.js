@@ -141,8 +141,13 @@ async function executePlannedActions(actions, deps) {
           .map((x) => { try { return JSON.parse(x); } catch { return null; } })
           .filter((r) => r && r.resolved === true);
         const nameLc = a.club.nameEn.toLowerCase();
+        // v49: originTeamEn(予測を作った対象クラブ=このアプリの表記)も照合する。
+        // 相手側の表記はAPI-Football由来でスペルが違うことがあるため
+        // (例: Bayern Munich / Bayern München)、home/awayだけでは取りこぼす。
         const mine = records.filter((r) =>
-          String(r.homeTeamEn || "").toLowerCase() === nameLc || String(r.awayTeamEn || "").toLowerCase() === nameLc);
+          String(r.homeTeamEn || "").toLowerCase() === nameLc
+          || String(r.awayTeamEn || "").toLowerCase() === nameLc
+          || String(r.originTeamEn || "").toLowerCase() === nameLc);
         if (!mine.length) {
           addedFacts.push(`[AI自身の予測実績] ${a.club.nameJa}について答え合わせ済みの予測はまだありません(正直にお伝えします)。`);
           executed.push({ type: a.type, clubJa: a.club.nameJa, ok: true, noteJa: "答え合わせ済みの予測はまだありませんでした。" });
