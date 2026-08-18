@@ -6420,6 +6420,10 @@ function renderDiscussReplyHtml(resp) {
   const formatNoteHtml = resp.formatNoteJa
     ? `<p class="value-note" style="margin-bottom:6px; opacity:.9;">※ ${escapeHtml(resp.formatNoteJa)}</p>`
     : "";
+  // v51: 2回試しても文字数上限で切れた場合の正直な注記(黙って尻切れを見せない)
+  const truncatedNoteHtml = resp.truncatedNoteJa
+    ? `<p class="value-note" style="margin-bottom:6px; opacity:.9;">${escapeHtml(resp.truncatedNoteJa)}</p>`
+    : "";
   // 監査の指摘: confidence が無い応答で TypeError となり、吹き出しが
   // 「🧠 AIが考えています…」のまま永久に固まっていた。
   const starCount = Math.max(0, Math.min(5, Number(resp.confidence && resp.confidence.stars) || 0));
@@ -6427,7 +6431,7 @@ function renderDiscussReplyHtml(resp) {
   const factsHtml = resp.facts && resp.facts.length
     ? `<details class="discuss-facts"><summary>📊 根拠にした事実を見る(${resp.facts.length}件)</summary><ul>${resp.facts.map(f => `<li>${escapeHtml(f)}</li>`).join("")}</ul></details>`
     : "";
-  let body = formatNoteHtml;
+  let body = formatNoteHtml + truncatedNoteHtml;
   if (resp.meta && resp.meta.parsedOk === false) {
     // LLMが指定フォーマットに従わなかった場合の保険(aiOpinionに文章だけが入っている)。
     // 2026年8月・100問検証での修正: なぜいつもの6項目が出ないのかを

@@ -5181,6 +5181,31 @@ function tryConsumeLlmBudgetForIp(ip) {
   return true;
 }
 
+// v51: 多段思考の player_stats アクション用 — 選手名から実成績の事実行を作る。
+// 中身は既存の handlePlayerSeasonStats(検索+シーズン成績)そのまま。見つからなければ
+// found:false(推測で埋めない)。
+async function fetchPlayerStatsFactsForMultiStep(playerName) {
+  try {
+    const q = new URLSearchParams({ name: playerName });
+    const { body: statsBody } = await handlePlayerSeasonStats(q);
+    if (!statsBody || !statsBody.found) return { found: false };
+    const s = statsBody.stats || {};
+    const nm = (statsBody.player && statsBody.player.name) || playerName;
+    const facts = [
+      `${nm}の${statsBody.season}シーズン実成績: 出場${s.appearances ?? "不明"}試合・${s.goals ?? "不明"}得点・${s.assists ?? "不明"}アシスト・平均レーティング${s.avgRating ?? "不明"}`,
+    ];
+    const extras = [];
+    if (s.keyPasses !== null && s.keyPasses !== undefined) extras.push(`キーパス${s.keyPasses}本`);
+    if (s.passAccuracyPct !== null && s.passAccuracyPct !== undefined) extras.push(`パス成功率${s.passAccuracyPct}%`);
+    if (s.dribbleSuccessRatePct !== null && s.dribbleSuccessRatePct !== undefined) extras.push(`ドリブル成功率${s.dribbleSuccessRatePct}%`);
+    if (s.duelWinRatePct !== null && s.duelWinRatePct !== undefined) extras.push(`デュエル勝率${s.duelWinRatePct}%`);
+    if (extras.length) facts.push(`${nm}の追加実成績: ${extras.join("・")}`);
+    return { found: true, facts };
+  } catch (e) {
+    return { found: false };
+  }
+}
+
 // 第9次監査(v49): 全体上限で回答を返せなかったときに個人の1回を返す(上の修正とセット)
 function refundLlmBudgetForIp(ip) {
   const today = appDateKey();
@@ -5298,6 +5323,9 @@ function buildDiscussSystemPrompt() {
     "事実と自分の意見は明確に書き分けてください(「〜という結果が出ています」と「私は〜と考えます」のように)。",
     "利用者が意見や感想を述べている場合は、頭ごなしに否定せず、まずその視点を受け止めてください。",
     "あなたは単に事実を検索して並べる「検索AI」ではありません。以下の型に沿って、自分の頭で考えて議論してください。",
+    "与えられた事実に数字(得点・試合数・成功率・順位・確率・日付)がある場合は、必ずその数字を本文へ引用して論じてください。数字を使わないふわっとした一般論だけで各欄を埋めないでください。",
+    "「もし〜なら」という仮定の質問には、事実からの推論であることを明示した上で、根拠→影響→対応策の順で具体的に述べてください。",
+    "各欄は必ず最後まで書き切って、文章として完結させてください(文の途中で止めない)。",
     "「AIが前回下した結論」が与えられていて、かつ今回の結論が変わった場合は、②AI独自の意見の中で必ず",
     "「以前は〜と評価していましたが、今回は〜に評価を変えました」という趣旨の文を含めてください。",
     "前回の結論が無い、または今回と同じ場合は、変化した体で書かない(でっち上げない)でください。",
@@ -5754,9 +5782,12 @@ async function handleDiscuss(body, clientIp) {
     }
   } else if (subject.type === "player") {
     const hint = (body.playerHint && typeof body.playerHint === "object") ? body.playerHint : {};
+    // v51: ティア判定用(実成績が取れた選手の質問は上位モデルで考察する)
+    var playerStatsFoundForTier = false;
     const q = new URLSearchParams({ name: hint.name || "", team: hint.team || "", teamEn: hint.teamEn || "", birth: hint.birth || "" });
     const { body: statsBody } = await handlePlayerSeasonStats(q);
     if (statsBody.found) {
+      playerStatsFoundForTier = true;
       const s = statsBody.stats || {};
       const playerName = (statsBody.player && statsBody.player.name) || hint.name || "対象選手";
       facts.push(`${playerName}の${statsBody.season}シーズン実成績: 出場${s.appearances ?? "不明"}試合・${s.goals ?? "不明"}得点・${s.assists ?? "不明"}アシスト・平均レーティング${s.avgRating ?? "不明"}`);
@@ -5800,6 +5831,19 @@ async function handleDiscuss(body, clientIp) {
           });
         } catch (e) { /* ベストエフォート */ }
       }
+      // ---- v51: 所属クラブの状況を根拠に加える(Redis読み出しのみ・失敗しても続行) ----
+      //   「怪我で離脱したら影響は?」のような質問は、選手個人の成績だけでなく
+      //   所属クラブの現在の状態が根拠として必要になる。毎晩の学習で蓄積済みの
+      //   知識から最大2件だけ加える(新しいAPI呼び出しはしない)。
+      if (hint.teamEn) {
+        try {
+          const clubK = await knowledgeStore.getActiveKnowledge(hint.teamEn);
+          const clubItems = clubK ? [].concat(clubK.facts || [], clubK.analyses || []) : [];
+          clubItems.slice(0, 2).forEach((k) => {
+            if (k && k.statement) facts.push(`[所属クラブの状況] ${k.statement}`);
+          });
+        } catch (e) { /* 無ければ無いで続行 */ }
+      }
     } else {
       facts.push(`${hint.name || "対象選手"}の実成績データは見つかりませんでした(${statsBody.reason || "不明"})。`);
       confidence = { stars: 1, reasonJa: "実成績データを取得できなかったため、一般的な知識のみに基づく考察です。" };
@@ -5818,7 +5862,11 @@ async function handleDiscuss(body, clientIp) {
   //     回数は「質問1回=1回」のまま数える。二重に取らない)。
   //   ・DISCUSS_MULTISTEP=0 で完全無効化(従来と同一動作)。
   let multiStepMeta = null;
-  if (discussMultiStep.isMultiStepEnabled() && (subject.type === "club" || !subject.type)) {
+  // v51: 選手の質問でも多段思考を使う(選手比較・所属クラブの状況の追加取得)
+  const msSubject = subject.type === "player"
+    ? { ...subject, playerName: (body.playerHint && body.playerHint.name) || null }
+    : subject;
+  if (discussMultiStep.isMultiStepEnabled() && (subject.type === "club" || subject.type === "player" || !subject.type)) {
     // 「最後の1枠」を計画に使わないための予約ルール:
     //   計画の呼び出し(+1)をしても、他の誰かの回答用に最低1枠が残る場合だけ
     //   多段思考を実行する。残り予算が少ない日は、多段思考より「より多くの
@@ -5829,7 +5877,7 @@ async function handleDiscuss(body, clientIp) {
       multiStepMeta = { enabled: true, ran: false, reasonJa: "本日のサイト全体のAI利用予算が残り少ないため、多段思考を省略して通常の1段構成で回答しました。" };
     } else {
       const factHeadings = facts.slice(0, 12).map((f) => String(f).slice(0, 48));
-      const msPlan = await discussMultiStep.planExtraDataNeeds({ question, subject, factHeadings, generateLLM });
+      const msPlan = await discussMultiStep.planExtraDataNeeds({ question, subject: msSubject, factHeadings, generateLLM });
       if (!msPlan.ok) {
         multiStepMeta = { enabled: true, ran: false, reasonJa: "調査計画の生成に失敗したため、通常の1段構成で回答しました(壊れた計画を無理に実行することはしません)。", planError: msPlan.reason };
       } else {
@@ -5840,6 +5888,8 @@ async function handleDiscuss(body, clientIp) {
           // (比較の質問なら、両クラブに同じ観点のデータが揃うのが筋)。
           defaultNeeds: plan.needs,
           upstashCmd: UPSTASH_ENABLED ? upstashCmd : null,
+          // v51: 選手比較用(実成績を1〜3行の事実にして返す)
+          fetchPlayerStatsFacts: fetchPlayerStatsFactsForMultiStep,
         });
         if (exec.addedFacts.length) facts.push(...exec.addedFacts);
         multiStepMeta = {
@@ -5893,14 +5943,27 @@ async function handleDiscuss(body, clientIp) {
   //   それ以外(一般質問・選手・根拠の薄い質問) → 軽量モデル(コストを抑える)
   // 使ったモデルはmetaで開示する。LLM_TIER_ROUTING=off で全て既定モデルに戻せる。
   const realFactCountForTier = facts.filter((f) => !String(f).startsWith("【AIによる推定】")).length;
-  const llmTier = (subject.type === "club" && subject.labelEn && realFactCountForTier >= 6) ? "heavy" : "light";
+  // v51: 選手の質問も、実成績が取得できていれば上位モデルで考察する
+  // (「返信が曖昧」という利用者の指摘への対応。選手は常に軽量モデルだった。
+  //  実成績1〜2件でも「その選手の実データで考える」価値があるため、件数ではなく
+  //  「実成績が取れたか」で判定する)。
+  const llmTier = ((subject.type === "club" && subject.labelEn && realFactCountForTier >= 6)
+    || (subject.type === "player" && typeof playerStatsFoundForTier !== "undefined" && playerStatsFoundForTier)) ? "heavy" : "light";
 
   let llmOut;
-  let llmModelUsed = null, llmTierUsed = null;
+  let llmModelUsed = null, llmTierUsed = null, llmWasTruncated = false;
   try {
-    const { text, tier: usedTier, model: usedModel } = await generateLLM({ systemPrompt: buildDiscussSystemPrompt(), userPrompt, maxTokens: 700, tier: llmTier });
+    // v51: 上限700では7項目の濃い日本語回答が途中で切れる(本番実画面で
+    // 「…むしろ得点・アシストという直結指」の尻切れを確認)。上限を引き上げ、
+    // それでも切れた場合はプロバイダー側が1回だけ書き直し、なお切れたら
+    // truncatedフラグで受け取って利用者に正直に注記する。
+    const { text, tier: usedTier, model: usedModel, truncated: llmTruncated } = await generateLLM({
+      systemPrompt: buildDiscussSystemPrompt(), userPrompt,
+      maxTokens: llmTier === "heavy" ? 1400 : 1100, tier: llmTier,
+    });
     llmTierUsed = usedTier || null;
     llmModelUsed = usedModel || null;
+    llmWasTruncated = !!llmTruncated;
     llmOut = parseDiscussLlmOutput(text);
   } catch (e) {
     // これまでここでエラーの中身(実際のAnthropic APIのHTTPステータス・応答本文)を
@@ -6060,7 +6123,9 @@ async function handleDiscuss(body, clientIp) {
       mostImportantOpinion: llmOut.mostImportantOpinion,
       confidence,
       followUpQuestions: llmOut.followUpQuestions,
-      meta: { ...knowledgeMeta, llmProvider: currentProviderName(), llmTier: llmTierUsed, llmModel: llmModelUsed, parsedOk: llmOut.parsedOk, intelligence: intelligenceForMeta },
+      // v51: 2回試しても切れた場合だけ、正直に注記する(黙って尻切れを見せない)
+      truncatedNoteJa: llmWasTruncated ? "※ 回答が長くなり、文字数上限のため末尾が一部省略されています。" : null,
+      meta: { ...knowledgeMeta, llmProvider: currentProviderName(), llmTier: llmTierUsed, llmModel: llmModelUsed, llmTruncated: llmWasTruncated, parsedOk: llmOut.parsedOk, intelligence: intelligenceForMeta },
     },
   };
 }
