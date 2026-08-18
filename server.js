@@ -92,7 +92,7 @@ const {
 const _LEAGUE_CFG = require("./learning/leagueConfig");
 const {
   EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, computeFeatureAvailability, predictOutcomeV2,
-  computeMatchProbabilities, mostLikelyScoreline, computeFactorImportance,
+  computeMatchProbabilities, mostLikelyScoreline, scorelineOutcome, computeFactorImportance,
 } = require("./learning/predictionModel");
 // 選手個人の実データ統計(2026年8月・知識拡張フェーズ)。
 const { computePlayerRealStats } = require("./learning/playerFeatures");
@@ -2239,7 +2239,10 @@ function buildTodayPredictionEntry(fixture, record, calibrationMap) {
     score: fixture.score || null,
     predictedWinner: record.predictedWinner || null,
     probs: probs ? { homeWinPct: pct(probs.homeWin), drawPct: pct(probs.draw), awayWinPct: pct(probs.awayWin) } : null,
-    predictedScoreline: record.predictedScoreline || null,
+    // 2026年8月18日: 予想勝敗と矛盾する旧スコア(ホーム勝利なのに1-1等)は出さない
+    predictedScoreline: (record.predictedScoreline
+      && scorelineOutcome(record.predictedScoreline) === record.predictedWinner)
+      ? record.predictedScoreline : null,
     topFactorJa: topFactor ? topFactor.labelJa : null,
     // 成長可視化ラウンド⑤: 判断根拠のスコア(この予測に実際に影響した要素と影響度)。
     // 予測記録のfactorImportance(モデルの重み×特徴量の実計算)から機械的に出す。
@@ -6208,7 +6211,13 @@ async function handleHttpRequest(req, res) {
                 homeEn: r.homeTeamEn || null, awayEn: r.awayTeamEn || null, league: r.league || null,
                 kickoff: r.kickoff || null, resolvedAt: r.resolvedAt || null,
                 predictedJa: r.predictedWinner === "home" ? `${r.homeTeamEn || "ホーム"}勝利` : r.predictedWinner === "away" ? `${r.awayTeamEn || "アウェイ"}勝利` : "引き分け",
-                predictedScoreline: r.predictedScoreline || null,
+                // 2026年8月18日: 修正前に保存された記録には、予想勝敗と矛盾する
+                // スコア(ホーム勝利なのに1-1等)が入っていることがある。
+                // 矛盾したスコアは1行表示では誤解しか生まないため出さない
+                // (新しい記録は保存時点で整合している)。
+                predictedScoreline: (r.predictedScoreline
+                  && (scorelineOutcome(r.predictedScoreline) === r.predictedWinner))
+                  ? r.predictedScoreline : null,
                 actualJa: r.actualWinner === "home" ? `${r.homeTeamEn || "ホーム"}勝利` : r.actualWinner === "away" ? `${r.awayTeamEn || "アウェイ"}勝利` : "引き分け",
                 actualScore: (r.actualScore && Number.isFinite(Number(r.actualScore.home))) ? `${r.actualScore.home}-${r.actualScore.away}` : null,
                 reasons: reasons.slice(0, 3),
