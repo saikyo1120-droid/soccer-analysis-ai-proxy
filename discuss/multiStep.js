@@ -28,7 +28,7 @@
 const { CLUB_UNIVERSE } = require("../learning/clubUniverse");
 
 const MULTISTEP_MAX_ACTIONS = 2;
-const ALLOWED_ACTION_TYPES = new Set(["club_knowledge", "own_prediction_history"]);
+const ALLOWED_ACTION_TYPES = new Set(["club_knowledge", "own_prediction_history", "player_stats"]);
 
 function isMultiStepEnabled() {
   return String(process.env.DISCUSS_MULTISTEP ?? "1") !== "0";
@@ -49,21 +49,24 @@ function resolveUniverseClub(name) {
 }
 
 function buildPlanPrompt(question, subject, factHeadings) {
+  const subjectJa = subject && subject.labelJa ? subject.labelJa
+    : (subject && subject.type === "player" && subject.playerName ? `選手: ${subject.playerName}` : "(特定対象なし)");
   return [
     "あなたはサッカー考察AIの「調査計画」担当です。回答はまだ書きません。",
     "利用者の質問と、すでに手元にある情報を見て、回答の質を上げるために追加で取得すべきデータを選んでください。",
     "",
     `利用者の質問: 「${question}」`,
-    `現在の考察対象: ${subject && subject.labelJa ? subject.labelJa : "(特定クラブなし)"}`,
+    `現在の考察対象: ${subjectJa}`,
     "すでに手元にある情報(見出しのみ):",
     (factHeadings && factHeadings.length ? factHeadings.map((h) => `- ${h}`).join("\n") : "- (なし)"),
     "",
     "使えるアクション(最大2つまで。不要なら空配列):",
     '1. {"type":"club_knowledge","club":"<クラブ名>"} — 別のクラブの実データ(フォーム・順位・怪我人など)を取得。比較の質問で有効。すでに手元にあるクラブには使わない。',
     '2. {"type":"own_prediction_history","club":"<クラブ名>"} — このAI自身がそのクラブに出した過去の予測と的中実績を読み出す。「AIの予想は当たるの?」等で有効。',
+    '3. {"type":"player_stats","player":"<選手名>"} — 別の選手の今シーズン実成績(出場・得点・アシスト・評価点など)を取得。選手同士の比較の質問で有効。すでに手元にある選手には使わない。',
     "",
     "出力は次の1行のJSONだけ。説明文・コードブロック・改行装飾は禁止:",
-    '{"actions":[{"type":"...","club":"..."}],"focusJa":"回答で最も重視すべき論点を1文で"}',
+    '{"actions":[{"type":"...","club":"..."} または {"type":"player_stats","player":"..."}],"focusJa":"回答で最も重視すべき論点を1文で"}',
   ].join("\n");
 }
 
@@ -91,12 +94,22 @@ async function planExtraDataNeeds({ question, subject, factHeadings, generateLLM
     for (const a of parsed.actions) {
       if (actions.length >= MULTISTEP_MAX_ACTIONS) break;
       if (!a || !ALLOWED_ACTION_TYPES.has(a.type)) continue;
+      if (a.type === "player_stats") {
+        // v51: 選手比較用。名前は自由入力だが、長さを制限し、考察対象と同じ選手は除く
+        const pname = String(a.player || "").trim();
+        if (!pname || pname.length > 60) continue;
+        if (subject && subject.type === "player" && subject.playerName
+          && pname.toLowerCase() === String(subject.playerName).toLowerCase()) continue;
+        if (actions.some((x) => x.type === "player_stats" && x.playerName.toLowerCase() === pname.toLowerCase())) continue;
+        actions.push({ type: "player_stats", playerName: pname });
+        continue;
+      }
       const club = resolveUniverseClub(a.club);
       if (!club) continue; // 解決できないクラブは実行しない(勝手なAPI呼び出し防止)
       // すでに考察対象として取得済みのクラブのclub_knowledgeは重複なので除く
       if (a.type === "club_knowledge" && subject && subject.labelEn
         && club.nameEn.toLowerCase() === String(subject.labelEn).toLowerCase()) continue;
-      if (actions.some((x) => x.type === a.type && x.club.nameEn === club.nameEn)) continue;
+      if (actions.some((x) => x.type === a.type && x.club && x.club.nameEn === club.nameEn)) continue;
       actions.push({ type: a.type, club });
     }
     return {
@@ -132,6 +145,19 @@ async function executePlannedActions(actions, deps) {
         }
       } catch (e) {
         executed.push({ type: a.type, clubJa: a.club.nameJa, ok: false, noteJa: `${a.club.nameJa}のデータ取得でエラーが発生しました。` });
+      }
+    } else if (a.type === "player_stats") {
+      try {
+        if (typeof deps.fetchPlayerStatsFacts !== "function") throw new Error("deps_missing");
+        const r = await deps.fetchPlayerStatsFacts(a.playerName);
+        if (r && r.found && Array.isArray(r.facts) && r.facts.length) {
+          r.facts.slice(0, 3).forEach((f) => addedFacts.push(`[多段思考で追加取得: ${a.playerName}] ${f}`));
+          executed.push({ type: a.type, clubJa: a.playerName, ok: true, noteJa: `${a.playerName}の実成績を追加取得しました。` });
+        } else {
+          executed.push({ type: a.type, clubJa: a.playerName, ok: false, noteJa: `${a.playerName}の実成績は見つかりませんでした(見つからないものを推測で補うことはしません)。` });
+        }
+      } catch (e) {
+        executed.push({ type: a.type, clubJa: a.playerName, ok: false, noteJa: `${a.playerName}の成績取得でエラーが発生しました。` });
       }
     } else if (a.type === "own_prediction_history") {
       try {
