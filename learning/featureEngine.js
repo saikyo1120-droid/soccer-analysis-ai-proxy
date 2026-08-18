@@ -105,10 +105,12 @@ function buildTeamContext(src) {
  * @returns {{features, homeCtx, awayCtx, supplied}} supplied は
  *   「4つの新特徴量に実際に値が入ったか」の検査結果(ご指示⑥の証明用)。
  */
-function buildMatchFeatures(homeSrc, awaySrc, h2h) {
+function buildMatchFeatures(homeSrc, awaySrc, h2h, market) {
   const homeCtx = buildTeamContext({ ...homeSrc, side: "home" });
   const awayCtx = buildTeamContext({ ...awaySrc, side: "away" });
-  const features = computeMatchFeatures(homeCtx, awayCtx, h2h);
+  // market(第4引数): 市場オッズの含意確率 {homePct, drawPct, awayPct}。
+  // v47で追加。渡さなければ marketEdge=0 で従来と完全に同じ挙動(劣化禁止)。
+  const features = computeMatchFeatures(homeCtx, awayCtx, h2h, market);
 
   // ご指示⑥「途中で0/null/undefinedになっていないことをログ付きで確認」のための
   // 自己申告。値が入らなかった項目は、なぜ入らなかったかを追跡できるようにする。
@@ -116,7 +118,7 @@ function buildMatchFeatures(homeSrc, awaySrc, h2h) {
   // 第5次監査での改善: これまでは新しい4項目しか検査していなかったため、
   // 「順位データが取れず0を入れてしまっていた」といった**古い特徴量の
   // でっち上げを誰も検知できなかった**。10項目すべてを検査する。
-  const supplied = computeFeatureAvailability(homeCtx, awayCtx, h2h);
+  const supplied = computeFeatureAvailability(homeCtx, awayCtx, h2h, market);
   return { features, homeCtx, awayCtx, supplied };
 }
 

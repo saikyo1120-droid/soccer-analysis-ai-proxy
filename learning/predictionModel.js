@@ -43,6 +43,12 @@ const EXTENDED_DEFAULT_WEIGHTS = {
   concededSumSensitivity: 0,  // 両チームの失点しやすさの合計
   fatigueSumSensitivity: 0,   // 両チームの過密日程の合計(疲れた試合は点が減るか)
   xgSumSensitivity: 0,        // 両チームのxG収支の合計
+  // ---- 市場オッズ(2026年8月18日・v47「予測モデルの根本強化」) ----
+  // ブックメーカーのオッズから計算した「市場が見るホーム優位度」。
+  // ブックメーカーの的中率(実測53〜55%)は現状の自前モデルより高いため、
+  // これを1つの特徴量として学習させる(丸写しではなく、重みは実データで学習)。
+  // 既定値0 = オッズを取れない試合・学習前は一切影響しない(劣化禁止)。
+  marketSensitivity: 0, // 市場オッズが示すホーム優位度(取得できなければ0)
   // ---- Dixon-Coles の低スコア補正(2026年8月) ----
   // 0-0 / 1-0 / 0-1 / 1-1 は、独立ポアソンが仮定するより実際には
   // 起こりやすい/にくい(得点が互いに独立ではない)。ρで補正する。
@@ -93,6 +99,7 @@ const FEATURE_WEIGHT_MAP = {
   suspensionDiff: "suspensionSensitivity",
   xgDiff: "xgSensitivity",
   topScorerDiff: "topScorerSensitivity",
+  marketEdge: "marketSensitivity",
 };
 
 const FEATURE_LABELS_JA = {
@@ -106,6 +113,7 @@ const FEATURE_LABELS_JA = {
   suspensionDiff: "出場停止",
   xgDiff: "xG(期待得点)の質",
   topScorerDiff: "エースの得点力",
+  marketEdge: "市場オッズ(ブックメーカーの評価)",
 };
 
 /**
@@ -143,7 +151,7 @@ function diffOrZero(a, b) {
  * および利用者向けの「このデータは取れなかったので考慮していません」という
  * 正直な注記(dataNotes)を出すために使う。
  */
-function computeFeatureAvailability(homeCtx, awayCtx, h2h) {
+function computeFeatureAvailability(homeCtx, awayCtx, h2h, market) {
   const h = homeCtx || {};
   const a = awayCtx || {};
   const both = (x, y) => (x ?? null) !== null && (y ?? null) !== null;
@@ -160,10 +168,12 @@ function computeFeatureAvailability(homeCtx, awayCtx, h2h) {
     suspensionDiff: both(h.suspensionCount, a.suspensionCount),
     xgDiff: both(h.xgNet, a.xgNet),
     topScorerDiff: both(h.topScorerGoals, a.topScorerGoals),
+    // 市場オッズはチームではなく試合に紐づくため、第4引数で受け取る。
+    marketEdge: !!(market && Number.isFinite(market.homePct) && Number.isFinite(market.awayPct)),
   };
 }
 
-function computeMatchFeatures(homeCtx, awayCtx, h2h) {
+function computeMatchFeatures(homeCtx, awayCtx, h2h, market) {
   const h = homeCtx || {};
   const a = awayCtx || {};
   const bothOk = (x, y) => (x ?? null) !== null && (y ?? null) !== null;
@@ -198,6 +208,12 @@ function computeMatchFeatures(homeCtx, awayCtx, h2h) {
     // topScorerDiff: 各チームのリーグ得点ランキング上位選手の得点数の差。
     //   「エースがいるか」を数値化する(架空のキーマン診断はしない)。
     topScorerDiff: diffOrZero(h.topScorerGoals, a.topScorerGoals),
+    // marketEdge: 市場オッズの含意確率(オーバーラウンド除去済み%)の
+    //   「ホーム − アウェイ」を-1〜+1へ正規化した値。2026年8月18日・v47。
+    //   オッズが取れない試合は0(=影響しない)。推測で埋めない。
+    marketEdge: market && Number.isFinite(market.homePct) && Number.isFinite(market.awayPct)
+      ? (market.homePct - market.awayPct) / 100
+      : 0,
     // ---- 和の特徴量(λの独立化。2026年8月) ----
     // 「どちらが強いか」ではなく「どれだけ点が入る試合か」を表す。
     // 片方でも欠けていれば0(=総得点を動かさない)。推測で埋めない。
@@ -355,6 +371,46 @@ function mostLikelyScoreline(homeLambda, awayLambda, maxGoals, rho, consistentWi
     }
   }
   return `${best.h}-${best.a}`;
+}
+
+/* ============================================================================
+ * 2026年8月18日・「AIが賢いと思えない」の原因の一つへの対処
+ * ----------------------------------------------------------------------------
+ * 本番実測: 的中率の集計に、親善試合(Friendlies Clubs)や2軍(Club Brugge II等)が
+ * 混ざっていた。親善試合は主力を休ませ交代も自由なため、プロでも当てられない。
+ * 当たらない試合を予想して正直に「外れ」と数え続けた結果、
+ * 「常にホーム勝ちと言うだけ(約45%)」を下回る42%という数字になっていた。
+ *
+ * 対処: 予想は今までどおり出す(隠さない)が、**公式戦とそれ以外を分けて集計**する。
+ * 画面の主表示は公式戦の的中率。親善等は「参考」と明記する。
+ * ========================================================================== */
+const UNOFFICIAL_LEAGUE_PATTERNS = [
+  /friendl/i,            // Friendlies Clubs / Club Friendlies / International Friendlies
+  /pre-?season/i,
+  /テストマッチ|親善/,
+];
+const RESERVE_TEAM_PATTERNS = [
+  /\s(II|III|B)$/,       // "Club Brugge II" "Barcelona B"
+  /\bU-?(17|18|19|21|23)\b/i,
+  /reserves?$/i,
+  /\bYouth\b/i,
+];
+/**
+ * この試合を「公式戦」として的中率の主集計に入れてよいかを判定する。
+ * @returns {{ official: boolean, reasonJa: string|null }}
+ */
+function classifyFixtureOfficial(leagueName, homeName, awayName) {
+  const league = String(leagueName || "");
+  for (const p of UNOFFICIAL_LEAGUE_PATTERNS) {
+    if (p.test(league)) return { official: false, reasonJa: "親善試合のため参考扱い(主力を休ませる試合はプロでも予測が難しく、公式集計から分けています)" };
+  }
+  for (const name of [homeName, awayName]) {
+    const n = String(name || "");
+    for (const p of RESERVE_TEAM_PATTERNS) {
+      if (p.test(n)) return { official: false, reasonJa: "2軍・ユースチームの試合のため参考扱い(編成が読めないため公式集計から分けています)" };
+    }
+  }
+  return { official: true, reasonJa: null };
 }
 
 /** スコア文字列("2-1")の勝敗が、予想した勝敗と整合しているか。 */
@@ -515,6 +571,7 @@ const LEARNABLE_KEYS = [
   "sensitivity", "goalRateSensitivity", "injurySensitivity",
   "standingsSensitivity", "headToHeadSensitivity", "fatigueSensitivity",
   "venueSensitivity", "suspensionSensitivity", "xgSensitivity", "topScorerSensitivity",
+  "marketSensitivity", // 市場オッズ(v47)。特徴量が全件0のデータでは勾配0=動かない
   // λの独立化(和の重み)と Dixon-Coles の低スコア補正も学習対象にする
   "attackSumSensitivity", "concededSumSensitivity", "fatigueSumSensitivity", "xgSumSensitivity",
   "rho",
@@ -531,6 +588,12 @@ function fitWeightsGradientDescent(records, initialWeights, opts) {
   const lr = (opts && opts.learningRate) || 0.08;
   const iterations = (opts && opts.iterations) || 40;
   const epsilon = 1e-3;
+  // v47: 学習対象キーを制限できるようにする(過去試合データセットには存在しない
+  // 特徴量=常に0の特徴量は勾配が厳密に0で動かないため、計算を省くのは
+  // 結果を1ビットも変えない純粋な高速化。省略時は従来どおり全キー)。
+  const keys = (opts && Array.isArray(opts.keys) && opts.keys.length)
+    ? opts.keys.filter((k) => LEARNABLE_KEYS.includes(k))
+    : LEARNABLE_KEYS;
   // 2026年8月・ご指示⑤: 信頼度の高いデータで行った予測ほど強く学習する
   // (opts.sampleWeightOf経由。渡さなければ従来どおり全件同じ重み)。
   const nllOpts = opts && opts.sampleWeightOf ? { sampleWeightOf: opts.sampleWeightOf } : undefined;
@@ -539,13 +602,13 @@ function fitWeightsGradientDescent(records, initialWeights, opts) {
     const baseLoss = computeNegativeLogLikelihood(usable, weights, nllOpts);
     if (baseLoss === null) break;
     const grad = {};
-    for (const k of LEARNABLE_KEYS) {
+    for (const k of keys) {
       const bumped = { ...weights, [k]: weights[k] + epsilon };
       const bumpedLoss = computeNegativeLogLikelihood(usable, bumped, nllOpts);
       grad[k] = bumpedLoss === null ? 0 : (bumpedLoss - baseLoss) / epsilon;
     }
     const next = { ...weights };
-    for (const k of LEARNABLE_KEYS) {
+    for (const k of keys) {
       const updated = weights[k] - lr * grad[k];
       // 2026年8月・第5次監査で発見した「NaN汚染」の修正。
       // Math.max(-1, Math.min(1, NaN)) は NaN をそのまま通してしまう。
@@ -607,6 +670,7 @@ const WEIGHT_LABELS_JA = {
   suspensionSensitivity: "出場停止の影響の重要度",
   xgSensitivity: "xG(期待得点)の重要度",
   topScorerSensitivity: "エースの得点力の重要度",
+  marketSensitivity: "市場オッズ(ブックメーカーの評価)の重要度",
 };
 const WEIGHT_CHANGE_THRESHOLD = 0.005; // これ未満の変化は「実質変化なし」として無視する
 
@@ -985,6 +1049,7 @@ function summarizeFailureReasons(records, limit) {
 module.exports = {
   EXTENDED_DEFAULT_WEIGHTS,
   FEATURE_WEIGHT_MAP,
+  FEATURE_SUM_WEIGHT_MAP,
   FEATURE_LABELS_JA,
   LEARNABLE_KEYS,
   WEIGHT_LABELS_JA,
@@ -997,7 +1062,7 @@ module.exports = {
   dixonColesTau, scoreGrid,
   computeMatchProbabilitiesRaw,
   computeMatchProbabilities,
-  mostLikelyScoreline, scorelineOutcome, topScorelinesFrom, marketProbabilities,
+  mostLikelyScoreline, scorelineOutcome, classifyFixtureOfficial, topScorelinesFrom, marketProbabilities,
   computeFactorImportance,
   backtestAccuracyV2,
   computeNegativeLogLikelihood,

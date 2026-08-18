@@ -177,6 +177,13 @@ function buildDailyAccuracy(scoredList) {
       const a = agg[m];
       a.n++;
       if (mk.hit) a.hits++;
+      // 2026年8月18日: 公式戦(親善・2軍を除く)だけの成績も並行して数える。
+      // 親善試合は当てられなくて当然なので、主表示は公式戦の的中率にする。
+      if (m === "oneX2" && s.official === true) {
+        a.official = a.official || { n: 0, hits: 0 };
+        a.official.n++;
+        if (mk.hit) a.official.hits++;
+      }
       a.brierSum = round4(a.brierSum + mk.brier);
       a.logLossSum = round4(a.logLossSum + mk.logLoss);
       if (m === "oneX2" && Number.isFinite(mk.confidence)) {
@@ -229,6 +236,13 @@ function mergeDailyAccuracy(a, b) {
     out[m].hits = (a[m]?.hits || 0) + (b[m]?.hits || 0);
     out[m].brierSum = round4((a[m]?.brierSum || 0) + (b[m]?.brierSum || 0));
     out[m].logLossSum = round4((a[m]?.logLossSum || 0) + (b[m]?.logLossSum || 0));
+    // 2026年8月18日: 公式戦だけのタリーも合算する(片方に無ければあるほうだけ)
+    if (m === "oneX2" && ((a[m] && a[m].official) || (b[m] && b[m].official))) {
+      out[m].official = {
+        n: ((a[m] && a[m].official && a[m].official.n) || 0) + ((b[m] && b[m].official && b[m].official.n) || 0),
+        hits: ((a[m] && a[m].official && a[m].official.hits) || 0) + ((b[m] && b[m].official && b[m].official.hits) || 0),
+      };
+    }
     for (const bin of Object.keys(out[m].calibration)) {
       out[m].calibration[bin].n = (a[m]?.calibration?.[bin]?.n || 0) + (b[m]?.calibration?.[bin]?.n || 0);
       out[m].calibration[bin].hits = (a[m]?.calibration?.[bin]?.hits || 0) + (b[m]?.calibration?.[bin]?.hits || 0);
@@ -329,6 +343,11 @@ function summarizeAccuracy(agg) {
     out.markets[m] = {
       labelJa: marketJa[m], measurable: true, n: a.n,
       hitRatePct: round1((a.hits / a.n) * 100),
+      // 2026年8月18日: 公式戦(親善・2軍を除く)だけの的中率。
+      // この区分の記録が始まる前のデータには無いので、無ければ正直にnull。
+      official: (m === "oneX2" && a.official && a.official.n > 0)
+        ? { n: a.official.n, hitRatePct: round1((a.official.hits / a.official.n) * 100) }
+        : null,
       avgBrier: round4(a.brierSum / a.n),
       avgLogLoss: round4(a.logLossSum / a.n),
       calibration: Object.entries(a.calibration)

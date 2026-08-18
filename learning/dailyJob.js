@@ -96,6 +96,7 @@ const {
   buildLearningSummary, classifyFailureReasons, summarizeFailureReasons,
   classifySuccessReasons, summarizeSuccessReasons, classifyContextualFailureReasons,
   computeFeatureEffectiveness, buildAblationCandidates, mostLikelyScoreline,
+  classifyFixtureOfficial,
 } = require("./predictionModel");
 // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ ----
 // ⑨ 予測精度の毎日測定(勝敗/BTTS/Over-Under、Brier・LogLoss・較正)
@@ -1141,7 +1142,13 @@ async function runDailyLearning(deps) {
       // 全市場の採点(Brier・LogLoss・的中)。予測時のポアソンλから機械的に導出。
       try {
         record.marketScores = scorePrediction(record);
-        if (record.marketScores) resolvedScoredToday.push(record.marketScores);
+        if (record.marketScores) {
+          // 公式戦かどうかを採点結果に添える(旧記録はflagが無いのでリーグ名から判定)
+          record.marketScores.official = record.official !== undefined
+            ? record.official !== false
+            : classifyFixtureOfficial(record.league, record.homeTeamEn, record.awayTeamEn).official;
+          resolvedScoredToday.push(record.marketScores);
+        }
       } catch (e) { errors.push(`accuracy_scoring_failed:${fixtureIdStr}:${e.message}`); }
 
       // ---- Failure Learning(ご要望①): 外れた場合は「何故外れたのか」を分類して保存する ----
@@ -1541,10 +1548,30 @@ async function runDailyLearning(deps) {
           teamTopScorerCache.set(key, r); return r;
         })(),
       ]);
+      // ---- 精度証明ラウンド⑤ → v47で予測の「前」へ移動: オッズの取得 ----
+      // 2026年8月18日・v47「予測モデルの根本強化」: これまでオッズは予測の後に
+      // 「記録のためだけ」に取得していた。市場オッズを特徴量(marketEdge)として
+      // 予測の入力に使うため、取得を予測の前へ移した(取得内容・件数は同じ)。
+      // 取得できなければ正直にnull(架空のオッズは作らない。特徴量は0=影響なし)。
+      let matchOdds = null, marketImplied = null, marketEdgePt = null;
+      try {
+        const oddsData = await callApiFootball("/odds", { fixture: fixtureId });
+        matchOdds = extractMatchWinnerOdds(oddsData);
+        if (matchOdds) marketImplied = impliedProbsPct(matchOdds);
+      } catch (e) {
+        // 2026年8月・第三者監査の指摘: ここだけ例外を完全に捨てていたため、
+        //   「この試合にオッズが無い」と「APIが失敗している/プランに含まれない」が
+        //   区別できず、ROIの説明が永久に
+        //   「オッズつきで答え合わせできた予測がまだありません」のままになる。
+        //   他のステージと同じく理由を残す(件数は capList で抑制される)。
+        errors.push(`odds_failed:${fixtureId}:${e.code || e.message}`);
+      }
+
       const built = buildMatchFeatures(
         { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXg, topScorer: homeTop },
         { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXg, topScorer: awayTop },
-        h2h
+        h2h,
+        marketImplied // v47: 市場オッズを特徴量 marketEdge として渡す(無ければ0)
       );
       const homeCtx = built.homeCtx;
       const awayCtx = built.awayCtx;
@@ -1583,28 +1610,16 @@ async function runDailyLearning(deps) {
         ? `${team.nameJa}(直近フォームスコア${(cached && cached.currentFormScore) ?? "不明"})と対戦相手の差(最も影響した要素: ${topFactor ? topFactor.labelJa : "フォーム"})から、${favoredSide}が優位という仮説`
         : `${team.nameJa}と対戦相手は拮抗しており、互角(引き分けに近い)という仮説`;
 
-      // ---- 精度証明ラウンド⑤: オッズの記録(市場比較・ROIの材料) ----
-      // 取得できなければ正直にnull(架空のオッズは作らない。ROI集計から除外される)。
-      let matchOdds = null, marketImplied = null, marketEdgePt = null;
-      try {
-        const oddsData = await callApiFootball("/odds", { fixture: fixtureId });
-        matchOdds = extractMatchWinnerOdds(oddsData);
-        if (matchOdds) {
-          marketImplied = impliedProbsPct(matchOdds);
-          const probsForEdge = computeMarketProbs(homeLambda, awayLambda);
-          if (probsForEdge && marketImplied) {
-            const ourPct = predictedWinner === "home" ? probsForEdge.homeWin * 100 : predictedWinner === "away" ? probsForEdge.awayWin * 100 : probsForEdge.draw * 100;
-            const mktPct = predictedWinner === "home" ? marketImplied.homePct : predictedWinner === "away" ? marketImplied.awayPct : marketImplied.drawPct;
-            marketEdgePt = Math.round((ourPct - mktPct) * 10) / 10;
-          }
+      // ---- 精度証明ラウンド⑤: 市場との差(エッジ)の記録 ----
+      // オッズ自体は予測の前に取得済み(上)。ここでは「自前モデルの確率」と
+      // 「市場の含意確率」の差だけを計算する(予測結果が必要なため予測の後)。
+      if (marketImplied) {
+        const probsForEdge = computeMarketProbs(homeLambda, awayLambda);
+        if (probsForEdge) {
+          const ourPct = predictedWinner === "home" ? probsForEdge.homeWin * 100 : predictedWinner === "away" ? probsForEdge.awayWin * 100 : probsForEdge.draw * 100;
+          const mktPct = predictedWinner === "home" ? marketImplied.homePct : predictedWinner === "away" ? marketImplied.awayPct : marketImplied.drawPct;
+          marketEdgePt = Math.round((ourPct - mktPct) * 10) / 10;
         }
-      } catch (e) {
-        // 2026年8月・第三者監査の指摘: ここだけ例外を完全に捨てていたため、
-        //   「この試合にオッズが無い」と「APIが失敗している/プランに含まれない」が
-        //   区別できず、ROIの説明が永久に
-        //   「オッズつきで答え合わせできた予測がまだありません」のままになる。
-        //   他のステージと同じく理由を残す(件数は capList で抑制される)。
-        errors.push(`odds_failed:${fixtureId}:${e.code || e.message}`);
       }
 
       // ---- 精度証明ラウンド①: 「似た試合」の検索(答え合わせ済みの実結果から) ----
@@ -1634,6 +1649,16 @@ async function runDailyLearning(deps) {
         // 自己矛盾が起こる(本番の反省画面で実際に発生)。予想した勝敗と
         // 整合するスコアの中での最頻値(条件付き最頻値)を保存する。
         predictedScoreline: mostLikelyScoreline(homeLambda, awayLambda, 6, undefined, predictedWinner),
+        // 2026年8月18日: 公式戦かどうかを保存時に判定する(親善・2軍は参考扱い。
+        // 予想は出し続けるが、的中率の主集計から分ける)。
+        ...(() => {
+          const cls = classifyFixtureOfficial(
+            (fx.league && fx.league.name) || null,
+            isHome ? team.nameEn : opponentName,
+            isHome ? opponentName : team.nameEn
+          );
+          return { official: cls.official, officialReasonJa: cls.reasonJa };
+        })(),
         // ご指示③④の証明: この予測がどのversionの重みで行われたか。
         weightsVersion: weights.version ?? 0,
         // ご指示⑤: この予測に使ったデータの信頼度(出所×鮮度)。
@@ -1648,6 +1673,9 @@ async function runDailyLearning(deps) {
             ? [{ key: "standings", source: "api-football", kind: "standings", computedAt: runAt.toISOString() }] : []),
           ...(homeXg && homeXg.xgNet !== null && awayXg && awayXg.xgNet !== null
             ? [{ key: "xg", source: "api-football", kind: "xg", computedAt: runAt.toISOString() }] : []),
+          // v47: 市場オッズも「実際に使えた場合だけ」信頼度に計上する(取得失敗時は載せない)
+          ...(marketImplied
+            ? [{ key: "odds", source: "api-football", kind: "odds", computedAt: runAt.toISOString() }] : []),
         ], runAt.getTime()),
         // 2026年8月・優先順位③: モデルの外側にある原因(監督交代・スタメン変更等)を
         // 試合後に特定できるよう、予測時点の文脈を保存しておく。

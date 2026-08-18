@@ -28,12 +28,24 @@ const {
   consistencyReport, shouldAdoptWithConsistency, formatLeagueTableJa,
 } = require("./modelBacktest");
 const { backfillSeasons, buildTrainingRows, saveDataset, loadDataset, DEFAULT_BACKFILL_LEAGUES } = require("./historicalBackfill");
+const { timeDecayWeight } = require("./historicalBackfill");
+// v47「予測モデルの根本強化」: 過去試合データセットで**全特徴量の重み**を
+// 勾配降下法で学習するために追加(従来はattackSum/concededSum/rhoの3個だけを
+// グリッド探索しており、formDiff等の差の重みは過去試合から一切学べていなかった)。
+const {
+  computeMatchFeatures, fitWeightsGradientDescent,
+  FEATURE_WEIGHT_MAP, FEATURE_SUM_WEIGHT_MAP, LEARNABLE_KEYS,
+} = require("./predictionModel");
 
 const TUNING_LOG_KEY = "learn:modeltuning:log";
 // 採用後も「最初のモデルと比べてどれだけ良くなったか」を毎日残すための基準。
 // 一度だけ保存し、以後は上書きしない(基準が動くと比較の意味が無くなる)。
 const BASELINE_KEY = "learn:model:baseline";
-const LEAGUE_NAMES_JA = { 39: "プレミアリーグ", 140: "ラ・リーガ", 78: "ブンデスリーガ", 135: "セリエA", 61: "リーグ・アン" };
+const LEAGUE_NAMES_JA = {
+  39: "プレミアリーグ", 140: "ラ・リーガ", 78: "ブンデスリーガ", 135: "セリエA", 61: "リーグ・アン",
+  // v47で拡張した4リーグ(historicalBackfill.jsのDEFAULT_BACKFILL_LEAGUESと対応)
+  88: "エールディヴィジ", 94: "プリメイラ・リーガ", 203: "シュペル・リグ", 144: "ベルギー・プロ・リーグ",
+};
 const TUNING_LOG_KEEP = 60;
 // データセットを作り直す間隔。毎日15リクエスト使う必要はない(過去試合は増えない)。
 const REFRESH_DAYS = 7;
@@ -68,7 +80,13 @@ async function ensureDataset(deps, runAt) {
     ? (runAt.getTime() - Date.parse(meta.builtAt)) / 86400000
     : Infinity;
 
-  if (existing.rows.length > 0 && ageDays < REFRESH_DAYS) {
+  // v47: 設定上のリーグ構成が保存済みデータと違う場合(リーグを増やした直後)は、
+  // 週1回の更新日を待たずに作り直す。そうしないと拡張が最長7日間反映されない。
+  const wantIds = DEFAULT_BACKFILL_LEAGUES.map((l) => l.id);
+  const haveIds = (meta && Array.isArray(meta.leagues)) ? meta.leagues : [];
+  const leagueSetChanged = existing.rows.length > 0 && wantIds.some((id) => !haveIds.includes(id));
+
+  if (existing.rows.length > 0 && ageDays < REFRESH_DAYS && !leagueSetChanged) {
     return { ...existing, refreshed: false, reasonJa: null };
   }
 
@@ -140,6 +158,63 @@ function searchParams(trainRows, baseWeights, grid) {
  * 本体。過去試合でパラメータを探索し、多指標で比較し、改善したときだけ採用する。
  * 採用しない場合も、なぜ採用しなかったかを必ず記録する。
  */
+/**
+ * v47「予測モデルの根本強化」の中核: 過去試合データセットで勾配降下法を回し、
+ * グリッド探索(3パラメータ)では学べなかった「差の重み」(formDiff・goalRateDiff・
+ * standingsDiff・venueDiff など)を実試合数千件から学習する。
+ *
+ * ■ でっち上げ防止・劣化禁止の設計
+ *   ・学習対象キーは「データセット内で実際に非ゼロ値が存在する特徴量」だけ。
+ *     過去試合に無いデータ(怪我人・出場停止・xG・市場オッズ等)の重みは
+ *     一切動かさない(勾配が厳密に0なので動かせもしない。計算だけ省く)。
+ *   ・古い試合ほど学習への影響を減衰(Dixon-Coles ξ=0.0065/日 ≒ 半減期107日)。
+ *   ・失敗したら null を返し、呼び出し側は従来のグリッド候補のみで続行する
+ *     (この関数がどんな失敗をしても、従来より悪くなる経路は存在しない)。
+ */
+function fitHistoryWeights(trainRows, initialWeights, runAt) {
+  try {
+    if (!Array.isArray(trainRows) || trainRows.length < 200) {
+      return { weights: null, detail: { ran: false, reasonJa: `学習用の過去試合が${(trainRows || []).length}件で、勾配学習に必要な200件未満のため実施しませんでした。` } };
+    }
+    // 特徴量は1回だけ前計算する(勾配降下法は同じ試合を何百回も評価するため)
+    const fitRows = trainRows.map((r) => ({
+      features: computeMatchFeatures(r.homeCtx, r.awayCtx, null),
+      actualWinner: r.actualWinner,
+      date: r.date,
+    }));
+    // データセット内に実在する特徴量だけを学習対象にする(動的判定)
+    const presentKeys = new Set();
+    const maps = { ...FEATURE_WEIGHT_MAP, ...FEATURE_SUM_WEIGHT_MAP };
+    for (const [fKey, wKey] of Object.entries(maps)) {
+      if (fitRows.some((r) => r.features && r.features[fKey])) presentKeys.add(wKey);
+    }
+    presentKeys.add("rho"); // ρは特徴量ではなくスコア分布の補正なので常に対象
+    const keys = [...presentKeys];
+    const refMs = runAt instanceof Date ? runAt.getTime() : Date.parse(runAt) || 0;
+    const fitted = fitWeightsGradientDescent(fitRows, initialWeights, {
+      keys,
+      iterations: 25, // 数千件×毎日実行のためのバランス。学習ジョブ内でのみ実行(方針⑥)
+      sampleWeightOf: (r) => timeDecayWeight(r.date, refMs, 0.0065),
+    });
+    if (!fitted) {
+      return { weights: null, detail: { ran: true, keys, reasonJa: "勾配学習が収束しなかった(または結果が保存基準を満たさなかった)ため、グリッド探索の候補のみで判定します。" } };
+    }
+    return {
+      weights: fitted,
+      detail: {
+        ran: true,
+        keys,
+        rows: fitRows.length,
+        iterations: 25,
+        decayXiPerDay: 0.0065,
+        noteJa: `過去試合${fitRows.length}件(時間減衰つき)で${keys.length}個の重みを勾配降下法で学習しました。`,
+      },
+    };
+  } catch (e) {
+    return { weights: null, detail: { ran: false, reasonJa: `勾配学習でエラーが発生したため見送りました(${e && e.message})。` } };
+  }
+}
+
 async function tuneModelOnHistory(deps, currentWeights, runAt) {
   const { upstashEnabled, upstashCmd, upstashSetJSON } = deps;
   const ds = await ensureDataset(deps, runAt);
@@ -180,17 +255,37 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   }
 
   const found = searchParams(train, base);
+
+  // ---- v47「予測モデルの根本強化」: 過去試合で全特徴量の重みを学習する ----
+  //   これまで過去試合データセット(数千件)は attackSum/concededSum/rho の
+  //   3パラメータのグリッド探索にしか使われず、formDiff・goalRateDiff・
+  //   standingsDiff・venueDiff などの「差の重み」は自分の予測記録
+  //   (数百件)からしか学べなかった。数千件の実試合で勾配降下法を回し、
+  //   差の重みも学習する。
+  //   ・学習対象キーは「データセット内に実際に値が存在する特徴量」だけに
+  //     動的に絞る(過去試合には怪我人・オッズ等が無い→それらの勾配は
+  //     厳密に0で動かないため、計算を省いても結果は1ビットも変わらない)。
+  //   ・古い試合ほど影響を弱める(Dixon-Colesの時間減衰 ξ=0.0065/日)。
+  //   ・候補の優劣は学習用データのLogLossで決め、採否は従来どおり
+  //     検証用データの関門(shouldAdoptWithConsistency)が判断する。
+  const gradFit = fitHistoryWeights(train, found.weights, runAt);
+  const trainEvalGrid = evaluate(train, found.weights);
+  const trainEvalGrad = gradFit.weights ? evaluate(train, gradFit.weights) : null;
+  const gradWon = !!(trainEvalGrad && trainEvalGrad.measurable && trainEvalGrid.measurable
+    && trainEvalGrad.logLoss < trainEvalGrid.logLoss);
+  const candidateWeights = gradWon ? gradFit.weights : found.weights;
+
   const oldEval = evaluate(test, base);
-  const newEval = evaluate(test, found.weights);
+  const newEval = evaluate(test, candidateWeights);
   const cmp = compare(oldEval, newEval);
 
   // ---- リーグ別・統計的一貫性の検証 ----
-  const consistency = consistencyReport(test, base, found.weights, LEAGUE_NAMES_JA);
+  const consistency = consistencyReport(test, base, candidateWeights, LEAGUE_NAMES_JA);
   const decision = shouldAdoptWithConsistency(cmp, consistency, { minSample: 200 });
 
   // ---- 基準モデルとの比較(採用の可否にかかわらず毎日記録する) ----
   //   「今日のモデルは、改修前と比べてどれだけ良いか」を継続的に残す。
-  const adoptedWeights = decision.adopt ? found.weights : base;
+  const adoptedWeights = decision.adopt ? candidateWeights : base;
   const baselineEval = evaluate(test, baseline);
   const currentEval = evaluate(test, adoptedWeights);
   const vsBaseline = compare(baselineEval, currentEval);
@@ -221,13 +316,18 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
       overallPairedLogLoss: vsBaselineConsistency.overallLogLoss,
       noteJa: "改修前のモデルと現在のモデルの比較です。採用の可否にかかわらず毎日記録しています。",
     },
+    // v47の修正: 従来はグリッド探索の3パラメータだけを保存していた。
+    // 勾配降下法の候補が勝った場合、formDiff等の学習結果が保存時に
+    // 静かに捨てられてしまうため、学習対象キー全部を保存する
+    // (グリッド候補が勝った場合も同じキー集合で、値が3個以外は元のまま)。
     newParams: decision.adopt
-      ? {
-        attackSumSensitivity: found.weights.attackSumSensitivity,
-        concededSumSensitivity: found.weights.concededSumSensitivity,
-        rho: found.weights.rho,
-      }
+      ? Object.fromEntries(LEARNABLE_KEYS
+          .filter((k) => Number.isFinite(candidateWeights[k]))
+          .map((k) => [k, candidateWeights[k]]))
       : null,
+    // どちらの候補が勝ったか(実測の記録。gradFit.detailは学習の中身の説明)
+    method: gradWon ? "history_gradient_descent" : "grid_search",
+    gradientFit: gradFit.detail,
   };
 
   if (upstashEnabled) {
@@ -280,5 +380,5 @@ async function getTuningHistory(deps, limit) {
 
 module.exports = {
   TUNING_LOG_KEY, BASELINE_KEY, LEAGUE_NAMES_JA, REFRESH_DAYS, COARSE_GRID,
-  seasonsToFetch, ensureDataset, searchParams, tuneModelOnHistory, getTuningHistory,
+  seasonsToFetch, ensureDataset, searchParams, tuneModelOnHistory, getTuningHistory, fitHistoryWeights,
 };

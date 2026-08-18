@@ -30,20 +30,29 @@
  */
 
 // 動作確認済みのリーグID(clubUniverse.jsと同じ基準。未確認IDは決め打ちしない)
+// 2026年8月18日・v47「予測モデルの根本強化」: 5リーグ→9リーグへ拡張。
+// 追加した4リーグ(88/94/203/144)はいずれも clubUniverse.js で実際に
+// 予測対象クラブが所属している確認済みリーグ(PSV・ベンフィカ・ガラタサライ・
+// クラブ・ブルッヘ等)。**予測を出しているのに学習データが無かったリーグ**を
+// 埋めるのが目的で、学習データはおよそ5,700件→9,000件超になる。
 const DEFAULT_BACKFILL_LEAGUES = [
   { id: 39, nameJa: "プレミアリーグ" },
   { id: 140, nameJa: "ラ・リーガ" },
   { id: 78, nameJa: "ブンデスリーガ" },
   { id: 135, nameJa: "セリエA" },
   { id: 61, nameJa: "リーグ・アン" },
+  { id: 88, nameJa: "エールディヴィジ" },
+  { id: 94, nameJa: "プリメイラ・リーガ" },
+  { id: 203, nameJa: "シュペル・リグ" },
+  { id: 144, nameJa: "ベルギー・プロ・リーグ" },
 ];
 
 const BACKFILL_KEY = "learn:backfill:dataset";
 const BACKFILL_META_KEY = "learn:backfill:meta";
-// 1シーズン380試合 × 5リーグ × 3シーズン ≒ 5,700件。
-// 1件あたり約200バイトに圧縮して保存するため、約1.1MB。Upstashの1キー上限に
-// 収まるよう、保存時は必要最小限のフィールドだけにする。
-const MAX_STORED_MATCHES = 8000;
+// v47: 9リーグ×3シーズン ≒ 9,300件(リーグにより306〜380試合/シーズン)。
+// 保存はブロック分割(下のBACKFILL_SHARD_SIZE)なので1キー上限の心配はなく、
+// 上限は「12ブロック×1,200件=14,400件」の範囲内に収める。
+const MAX_STORED_MATCHES = 12000;
 
 const FINISHED = new Set(["FT", "AET", "PEN"]);
 
