@@ -34,6 +34,8 @@ const { AsyncLocalStorage } = require("async_hooks");
 const { createKnowledgeSource } = require("./rag/knowledgeSource");
 // v47「会話を多段思考に」(2026年8月18日・利用者の選択③)
 const discussMultiStep = require("./discuss/multiStep");
+// v50「チームの地力レーティング」
+const { expGoalsFromRatings, RATINGS_KEY } = require("./learning/teamRatings");
 const { planInformationNeeds } = require("./discuss/planner");
 const { generateLLM, currentProviderName } = require("./llm");
 
@@ -2247,9 +2249,15 @@ function buildTodayPredictionEntry(fixture, record, calibrationMap) {
       && scorelineOutcome(record.predictedScoreline) === record.predictedWinner)
       ? record.predictedScoreline : null,
     topFactorJa: topFactor ? topFactor.labelJa : null,
+    // v50: 市場ブレンドで判定した予想は、その内訳(市場◯%+AI◯%)を必ず開示する
+    blend: record.blendUsed ? {
+      marketPct: record.blendUsed.marketPct, aiPct: record.blendUsed.aiPct,
+      noteJa: record.blendUsed.noteJa || null,
+    } : null,
     // 成長可視化ラウンド⑤: 判断根拠のスコア(この予測に実際に影響した要素と影響度)。
     // 予測記録のfactorImportance(モデルの重み×特徴量の実計算)から機械的に出す。
-    // 注: 市場オッズは予測の入力には使っていない(市場比較専用)ため、ここには出ない。
+    // 注(v47で更新): 市場オッズはv47から特徴量(marketEdge)としても予測に入る。
+    // 重みが学習で動けば、ここの要素一覧にも「市場オッズ」が自動的に現れる。
     factors: Array.isArray(record.factorImportance)
       ? record.factorImportance.filter((f) => f && f.stars > 0).slice(0, 5).map((f) => ({ labelJa: f.labelJa, stars: f.stars }))
       : [],
@@ -4434,8 +4442,21 @@ async function handleMatchAnalysis(query, clientIp) {
     }
     return out;
   };
-  const homeSrcRaw = { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXgInfo, topScorer: homeTopScorerInfo };
-  const awaySrcRaw = { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXgInfo, topScorer: awayTopScorerInfo };
+  // ---- v50: チームの地力レーティング(毎晩の学習で保存済み)を注入する ----
+  //   読み出しは10分キャッシュ(Redis 1キー)。レーティングが無いチームは
+  //   null=特徴量0で従来と同一(重み0の間はいずれにせよ挙動不変)。
+  let ratingEgAnalysis = null;
+  try {
+    const ratingsCacheKey = "ratings:v1:cache";
+    let ratingsData = cacheGet(ratingsCacheKey);
+    if (ratingsData === undefined) {
+      ratingsData = UPSTASH_ENABLED ? await upstashGetJSON(RATINGS_KEY).catch(() => null) : null;
+      cacheSet(ratingsCacheKey, ratingsData || null, 10 * 60 * 1000);
+    }
+    ratingEgAnalysis = expGoalsFromRatings(ratingsData, homeTeamId, awayTeamId);
+  } catch (e) { /* レーティングは付加情報。無くても分析は返す */ }
+  const homeSrcRaw = { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXgInfo, topScorer: homeTopScorerInfo, ratingExpGoals: ratingEgAnalysis ? ratingEgAnalysis.home : null };
+  const awaySrcRaw = { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXgInfo, topScorer: awayTopScorerInfo, ratingExpGoals: ratingEgAnalysis ? ratingEgAnalysis.away : null };
   const [homeSrc, awaySrc] = await Promise.all([
     dossierFill(home, home.nameJa, homeSrcRaw),
     dossierFill(away, away.nameJa, awaySrcRaw),

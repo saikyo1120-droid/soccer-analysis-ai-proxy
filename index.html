@@ -588,7 +588,7 @@
          ・過去試合の学習を5リーグ→9リーグ×3シーズンに拡張(実試合のみ)
          ・市場オッズを特徴量に追加(丸写しではなく、影響の強さはAIが実データから学習。
            オッズを取得できない試合では一切使わない=推測で埋めない) -->
-    <p class="value-note" style="margin:0 0 8px; opacity:.85;">🧠 予測モデルは9リーグ×3シーズンの実試合とAI自身の的中記録から毎日学習しています。2026年8月18日からは市場オッズ(ブックメーカーの評価)も学習の材料に加えました(オッズの影響の強さはAI自身が実データから学習し、取得できない試合では使いません)。</p>
+    <p class="value-note" style="margin:0 0 8px; opacity:.85;">🧠 予測モデルは9リーグ×3シーズンの実試合とAI自身の的中記録から毎日学習しています。2026年8月18日からは、①市場オッズ(ブックメーカーの評価) ②チーム別の地力レーティング(約200クラブの攻撃力・守備力を過去試合から学習) ③市場ブレンド(最終確率にオッズを混ぜる比率。使った予想には内訳を明記)も加わりました。影響の強さはすべてAI自身が実データから学習し、データが無い試合では使いません。</p>
     <div id="reflectionsBody" class="muted" style="font-size:13px;">読み込み中…</div>
   </div>
 
@@ -7696,13 +7696,21 @@ function predictionSummaryBlockHtml(p, titleJa) {
   const marketLine = (p.market && Number.isFinite(p.market.edgePt))
     ? `<div class="value-note" style="margin-top:2px;">🏦 市場(オッズ)比較: AIは市場より${p.market.edgePt > 0 ? "強気" : "弱気"}(${p.market.edgePt > 0 ? "+" : ""}${Number(p.market.edgePt)}pt)</div>`
     : "";
+  const blendLine = predBlendLineHtml(p);
   return `
     <div style="margin:8px 0; padding:10px 12px; border-left:4px solid var(--series-2); background:rgba(0,0,0,.03); border-radius:6px;">
       <div>${escapeHtml(titleJa || "🤖 AIの予想")}: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predResultBadgeHtml(p)}</div>
       ${predBarHtml(p)}
       <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-      ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${predFreshnessLineHtml(p)}
+      ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${blendLine}${predFreshnessLineHtml(p)}
     </div>`;
+}
+// ---- 2026年8月18日・v50「市場ブレンド」の開示 ----
+//   ブレンドで判定した予想は、内訳(市場◯%+AI◯%)を必ず表示する。
+//   「市場の受け売りに近づく」トレードオフを隠さないための行。
+function predBlendLineHtml(p) {
+  if (!p || !p.blend || !Number.isFinite(p.blend.marketPct)) return "";
+  return `<div class="value-note" style="margin-top:2px;">⚖️ この予想の判定: 市場${Number(p.blend.marketPct)}%+AI${Number(p.blend.aiPct)}%の合成(比率は実測で学習・毎日見直し)</div>`;
 }
 // 一覧の行に足す1行の予想ストリップ(軽さ優先: バー無し・テキストのみ)
 function predStripHtml(p) {
@@ -7766,7 +7774,7 @@ async function renderTodayPredictionsHero() {
         <div style="margin-top:2px;">🤖 AIの予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}</div>
         ${predBarHtml(p)}
         <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-        ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${predFreshnessLineHtml(p)}
+        ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${predBlendLineHtml(p)}${predFreshnessLineHtml(p)}
         <div style="margin-top:6px;"><button class="ghost-btn pred-share-btn" type="button" data-share-idx="${todayPredShareItems.indexOf(p)}" style="padding:5px 12px; font-size:12px;">📸 画像でシェア</button></div>
       </div>`;
   };
