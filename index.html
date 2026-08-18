@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>サッカー分析AI(プロトタイプ)</title>
+<title>サッカー分析AI — 外したら理由まで話す、毎日賢くなる予想AI</title>
 <!-- 精度証明ラウンド③: SNSでリンクを共有したときの表示(OGP)。軽量な静的タグのみ -->
 <meta name="description" content="毎日学習して賢くなるサッカー分析AI。今日の試合のAI予想(勝敗・勝率・根拠)を毎朝自動生成し、結果と答え合わせして精度を公開しています。">
 <meta property="og:type" content="website">
@@ -500,8 +500,10 @@
 
   <header class="top">
     <div>
-      <h1>⚽ サッカー分析AI(プロトタイプ)</h1>
-      <p class="sub">選手データとAIの解説で、サッカーをもっと身近に。毎日のぞきたくなる分析アプリを目指しています</p>
+      <!-- 2026年8月18日・ご指摘への対応: 「何のサイトか」が1秒で伝わらなかった。
+           このAIの一番の特徴(外れを隠さず、理由まで話す)を一文で言い切る。 -->
+      <h1>⚽ サッカー分析AI</h1>
+      <p class="sub">毎日の試合をAIが予想。<strong>外したら、理由まで正直に話します。</strong>昨日より今日、少しずつ賢くなるサッカーAIです。</p>
     </div>
     <div class="controls">
       <div class="segmented" id="levelSwitch">
@@ -564,30 +566,19 @@
     <div id="smarterBody" class="muted" style="font-size:13px;">確認中…</div>
   </div>
 
-
-  <!-- 2026年8月7日・ご指摘への対応:
-       「Knowledgeが増えた」「Memoryが増えた」と言われても利用者には
-       「だから何？」でしかない。ここには **利用者が自分で確かめられる変化**
-       だけを出す(実際のスコア・選手名・数値の差)。件数だけの指標は出さない。 -->
-  <div class="card" id="dailyDiffCard" style="padding:14px 18px; border:2px solid var(--accent);">
-    <h2 style="margin:0 0 6px;">📅 昨日から今日で変わったこと</h2>
-    <div id="dailyDiffBody" class="muted" style="font-size:13px;">読み込み中…</div>
+  <!-- ================================================================
+       2026年8月18日・「一番の武器が埋もれている」への対応:
+       外れを自分から見せる予想サイトはほとんど無い。ふつうは隠す。
+       このAIは「どの試合を、なぜ外したか」を独立したコンテンツとして出す。
+       理由は実測データ(監督交代・布陣変更・xGとの食い違いなど)から
+       機械的に分類したもので、LLMの作文ではない(でっち上げない)。
+       中身は /api/reflections の読み出しだけ。 -->
+  <div class="card" id="reflectionsCard" style="padding:16px 18px; border:1.5px solid var(--warning);">
+    <h2 style="margin:0 0 4px;">🙈 AIの反省 — 外した試合と、その理由</h2>
+    <p class="value-note" style="margin:0 0 8px;">外れを隠さないのがこのAIの方針です。理由は試合の実測データから機械的に分類したもので、言い訳の作文ではありません。</p>
+    <div id="reflectionsBody" class="muted" style="font-size:13px;">読み込み中…</div>
   </div>
 
-  <!-- 2026年8月・「本当に毎日賢くなるAI」フェーズ(ご指示②):
-       「学習しました」ではなく数字で証明する日次ダッシュボード。
-       すべてサーバーの実測値(/api/learning/daily-report)をそのまま表示する。 -->
-  <div class="card" id="dailyReportCard" style="padding:14px 18px;">
-    <h2 style="margin:0 0 6px;">📊 毎日の学習ダッシュボード</h2>
-    <div id="dailyReportSummary">📊 本日の学習の実測値を読み込み中…</div>
-    <div id="dailyReportDetails" style="display:none; margin-top:10px;"></div>
-  </div>
-
-  <div class="card" id="growthLogCard" style="padding:14px 18px;">
-    <h2 style="margin:0 0 6px;">📈 AIの成長レポート</h2>
-    <div id="growthLogSummary">🧠 昨日学んだことを読み込み中…</div>
-    <div id="growthLogDetails" style="display:none; margin-top:10px;"></div>
-  </div>
 
 
   <div class="card" id="realFixturesCard" style="display:none; border:1.5px solid var(--series-3);">
@@ -654,9 +645,41 @@
     </div>
   </div>
 
+  <!-- 2026年8月18日・ホーム整理: 開発の計器盤(学習ダッシュボード・成長レポート・
+       日々の差分)は「AIの裏側」タブへ。消したのではなく、置き場所を変えただけ。
+       サッカーを見に来た人が最初に見るのは、予想・質問・正答率・反省・賢くなったか。 -->
   <div class="segmented" id="modeSwitch" style="margin-bottom:16px;">
     <button data-mode="match" class="active">⚽ 試合分析AI</button>
     <button data-mode="player">🔍 選手検索</button>
+    <button data-mode="backstage">🛠 AIの裏側</button>
+  </div>
+
+  <div id="backstageSection" style="display:none;">
+    <p class="value-note" style="margin:0 0 12px;">ここは「AIが本当に毎日学習しているか」を確かめるための裏側ページです。すべて実測値で、加工していません。ふだんの利用には必要ありませんが、いつでも確認できます。</p>
+  <!-- 2026年8月7日・ご指摘への対応:
+       「Knowledgeが増えた」「Memoryが増えた」と言われても利用者には
+       「だから何？」でしかない。ここには **利用者が自分で確かめられる変化**
+       だけを出す(実際のスコア・選手名・数値の差)。件数だけの指標は出さない。 -->
+  <div class="card" id="dailyDiffCard" style="padding:14px 18px; border:2px solid var(--accent);">
+    <h2 style="margin:0 0 6px;">📅 昨日から今日で変わったこと</h2>
+    <div id="dailyDiffBody" class="muted" style="font-size:13px;">読み込み中…</div>
+  </div>
+
+  <!-- 2026年8月・「本当に毎日賢くなるAI」フェーズ(ご指示②):
+       「学習しました」ではなく数字で証明する日次ダッシュボード。
+       すべてサーバーの実測値(/api/learning/daily-report)をそのまま表示する。 -->
+  <div class="card" id="dailyReportCard" style="padding:14px 18px;">
+    <h2 style="margin:0 0 6px;">📊 毎日の学習ダッシュボード</h2>
+    <div id="dailyReportSummary">📊 本日の学習の実測値を読み込み中…</div>
+    <div id="dailyReportDetails" style="display:none; margin-top:10px;"></div>
+  </div>
+
+  <div class="card" id="growthLogCard" style="padding:14px 18px;">
+    <h2 style="margin:0 0 6px;">📈 AIの成長レポート</h2>
+    <div id="growthLogSummary">🧠 昨日学んだことを読み込み中…</div>
+    <div id="growthLogDetails" style="display:none; margin-top:10px;"></div>
+  </div>
+
   </div>
 
   <div id="matchSection">
@@ -944,6 +967,9 @@ document.getElementById("modeSwitch").addEventListener("click", (e) => {
   const mode = btn.dataset.mode;
   document.getElementById("matchSection").style.display = mode === "match" ? "block" : "none";
   document.getElementById("playerSection").style.display = mode === "player" ? "block" : "none";
+  // 2026年8月18日: 開発の計器盤(学習ダッシュボード等)は「AIの裏側」タブへ移動。
+  // 描画は今までどおりページ読み込み時に済ませてあるので、開いた瞬間に表示される。
+  document.getElementById("backstageSection").style.display = mode === "backstage" ? "block" : "none";
   // 選手検索の読み込みは「このタブを開いた最初の1回だけ」。
   // ホーム画面を見ているだけの人に通信させない(方針⑥)。
   if (mode === "player") psEnsureInit();
@@ -7049,9 +7075,20 @@ async function renderGrowthLogWidget() {
   //   古い記録では「的中率: undefined%」と表示されていた。数値かどうかで判定する。
   const accChanged = Number.isFinite(accBefore) && Number.isFinite(accAfter) && accBefore !== accAfter;
   let accLine = "";
-  if (Number.isFinite(accBefore) && Number.isFinite(accAfter)) {
+  // ---- 2026年8月18日: 意味のない精度の数字を出さない ----
+  //   検証6件で「的中率33.3%」と出していた。3件当たれば50%、
+  //   1件外れれば16.7%になる数字で、**実力を表していない**。
+  //   このプロジェクトは「でっち上げない」を原則にしているが、
+  //   少なすぎるデータから出した%も、精度を偽って伝える点では同じ。
+  //   統計的に意味が出る件数(既定20件)に達するまでは、%を出さずに
+  //   「あと何件で出せるか」を書く。
+  const ACC_MIN_SAMPLE = 20;
+  const accResolved = Number(log.totalOwnPredictionsResolved) || 0;
+  if (Number.isFinite(accBefore) && Number.isFinite(accAfter) && accResolved >= ACC_MIN_SAMPLE) {
     const arrow = accChanged ? `${accBefore}% → ${accAfter}%(${accAfter > accBefore ? "+" : ""}${Math.round((accAfter - accBefore) * 10) / 10}%)` : `${accAfter}%(検証データが少なく、今回はモデル更新なし)`;
-    accLine = `<div class="value-note" style="margin:4px 0;">📈 自社予測モデルの的中率(実験的): ${arrow}</div>`;
+    accLine = `<div class="value-note" style="margin:4px 0;">📈 自社予測モデルの的中率(実験的・検証${accResolved}件): ${arrow}</div>`;
+  } else if (Number.isFinite(accAfter)) {
+    accLine = `<div class="value-note" style="margin:4px 0;">📈 自社予測モデルの的中率: <b>まだ出せません</b>(検証済み${accResolved}件・あと${Math.max(0, ACC_MIN_SAMPLE - accResolved)}件で公開します)。少ない件数から出した%は、1件の当たり外れで大きく動くため、実力を表しません。</div>`;
   } else {
     accLine = `<div class="value-note" style="margin:4px 0;">📈 自社予測モデルの的中率: まだ検証データが十分ではありません(検証済み${log.totalOwnPredictionsResolved || 0}件)。</div>`;
   }
@@ -7481,6 +7518,104 @@ function fetchTodayPredictionsShared() {
   }
   return __todayPredictionsPromise;
 }
+/* ================================================================
+   📸 予想の共有画像(2026年8月18日)
+   ----------------------------------------------------------------
+   「サッカーは人と話すもの」への対応。試合ごとの予想と根拠を
+   1枚のPNG(1200x630)にして、LINEやXにそのまま貼れるようにする。
+   すべて端末内のcanvasで描く(サーバー負荷ゼロ・外部サービスなし)。
+   文字はcanvasのfillTextで描くため、HTMLとしての注入は起こらない。
+   ================================================================ */
+let todayPredShareItems = [];
+function buildPredictionShareImage(p) {
+  const W = 1200, H = 630;
+  const cv = document.createElement("canvas");
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext("2d");
+  // 背景(ピッチの深緑グラデーション)
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#0c1f14"); bg.addColorStop(1, "#123326");
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  // 上部帯
+  ctx.fillStyle = "rgba(255,255,255,0.08)"; ctx.fillRect(0, 0, W, 86);
+  ctx.fillStyle = "#ffffff"; ctx.font = "bold 34px system-ui, sans-serif"; ctx.textBaseline = "middle";
+  ctx.fillText("⚽ サッカー分析AI", 40, 44);
+  ctx.font = "24px system-ui, sans-serif"; ctx.fillStyle = "#9fd6b8";
+  const dateStr = p.kickoff ? new Date(p.kickoff).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" }) : "";
+  const meta = `${p.league || ""}${dateStr ? " ・ " + dateStr : ""}`;
+  ctx.textAlign = "right"; ctx.fillText(meta, W - 40, 44); ctx.textAlign = "left";
+  // 対戦カード
+  const homeName = (p.home && p.home.name) || "ホーム";
+  const awayName = (p.away && p.away.name) || "アウェイ";
+  ctx.fillStyle = "#ffffff"; ctx.textAlign = "center";
+  let size = 56;
+  ctx.font = `bold ${size}px system-ui, sans-serif`;
+  while (ctx.measureText(`${homeName}  vs  ${awayName}`).width > W - 120 && size > 26) {
+    size -= 4; ctx.font = `bold ${size}px system-ui, sans-serif`;
+  }
+  ctx.fillText(`${homeName}  vs  ${awayName}`, W / 2, 170);
+  // AIの予想
+  ctx.font = "bold 44px system-ui, sans-serif"; ctx.fillStyle = "#7ce7b0";
+  ctx.fillText(`AIの予想: ${predWinnerLabelJa(p)}${p.predictedScoreline ? `(${p.predictedScoreline})` : ""}`, W / 2, 260);
+  // 勝率バー
+  if (p.probs) {
+    const bx = 120, bw = W - 240, by = 330, bh = 56, r = 12;
+    const hw = bw * (Number(p.probs.homeWinPct) || 0) / 100;
+    const dw = bw * (Number(p.probs.drawPct) || 0) / 100;
+    const aw = bw - hw - dw;
+    ctx.save();
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(bx, by, bw, bh, r); else ctx.rect(bx, by, bw, bh);
+    ctx.clip();
+    ctx.fillStyle = "#2a78d6"; ctx.fillRect(bx, by, hw, bh);
+    ctx.fillStyle = "#8a97a3"; ctx.fillRect(bx + hw, by, dw, bh);
+    ctx.fillStyle = "#d95926"; ctx.fillRect(bx + hw + dw, by, aw, bh);
+    ctx.restore();
+    ctx.font = "bold 26px system-ui, sans-serif"; ctx.fillStyle = "#ffffff";
+    if (hw > 70) ctx.fillText(`${p.probs.homeWinPct}%`, bx + hw / 2, by + bh / 2);
+    if (dw > 70) ctx.fillText(`${p.probs.drawPct}%`, bx + hw + dw / 2, by + bh / 2);
+    if (aw > 70) ctx.fillText(`${p.probs.awayWinPct}%`, bx + hw + dw + aw / 2, by + bh / 2);
+    ctx.font = "22px system-ui, sans-serif"; ctx.fillStyle = "#c9e8d6";
+    ctx.textAlign = "left"; ctx.fillText(`${homeName}勝利`, bx, by + bh + 26);
+    ctx.textAlign = "center"; ctx.fillText("引分", bx + hw + dw / 2 < bx + 40 ? bx + bw / 2 : W / 2, by + bh + 26);
+    ctx.textAlign = "right"; ctx.fillText(`${awayName}勝利`, bx + bw, by + bh + 26);
+    ctx.textAlign = "center";
+  }
+  // 根拠(1行)
+  if (p.topFactorJa) {
+    ctx.font = "24px system-ui, sans-serif"; ctx.fillStyle = "#e8f5ee";
+    let factor = `根拠(最重要要素): ${p.topFactorJa}`;
+    while (ctx.measureText(factor).width > W - 120 && factor.length > 8) factor = factor.slice(0, -2);
+    ctx.fillText(factor, W / 2, 470);
+  }
+  // 下部帯: このAIの約束
+  ctx.fillStyle = "rgba(255,255,255,0.08)"; ctx.fillRect(0, H - 90, W, 90);
+  ctx.font = "bold 26px system-ui, sans-serif"; ctx.fillStyle = "#ffd97a";
+  ctx.fillText("外したら、理由まで正直に話します。", W / 2, H - 58);
+  ctx.font = "20px system-ui, sans-serif"; ctx.fillStyle = "#9fd6b8";
+  ctx.fillText("soccer-analysis-ai-proxy.onrender.com", W / 2, H - 26);
+  ctx.textAlign = "left";
+  return cv.toDataURL("image/png");
+}
+async function sharePredictionImage(idx) {
+  const p = todayPredShareItems[idx];
+  if (!p) return;
+  const dataUrl = buildPredictionShareImage(p);
+  const fileName = `AI予想_${((p.home && p.home.name) || "").replace(/\s+/g, "")}_vs_${((p.away && p.away.name) || "").replace(/\s+/g, "")}.png`;
+  try {
+    const blob = await (await fetch(dataUrl)).blob();
+    const file = new File([blob], fileName, { type: "image/png" });
+    // スマホの共有シート(LINE・X等に直接渡せる)。使えない環境ではダウンロード。
+    if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: "サッカー分析AI", text: "AIの予想です。外したら理由まで話すAIです。" });
+      return;
+    }
+  } catch (e) { /* 共有シートを閉じた場合など。ダウンロードに落ちる */ }
+  const a = document.createElement("a");
+  a.href = dataUrl; a.download = fileName;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
 function predWinnerLabelJa(p) {
   return p.predictedWinner === "home" ? `${(p.home && p.home.name) || "ホーム"} 勝利`
     : p.predictedWinner === "away" ? `${(p.away && p.away.name) || "アウェイ"} 勝利`
@@ -7602,8 +7737,11 @@ async function renderTodayPredictionsHero() {
         ${predBarHtml(p)}
         <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
         ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${predFreshnessLineHtml(p)}
+        <div style="margin-top:6px;"><button class="ghost-btn pred-share-btn" type="button" data-share-idx="${todayPredShareItems.indexOf(p)}" style="padding:5px 12px; font-size:12px;">📸 画像でシェア</button></div>
       </div>`;
   };
+  // 共有画像はこの一覧のデータから描くため、描画前に持っておく
+  todayPredShareItems = data.predictions.slice();
   // 精度証明ラウンド③: 今日のベスト予想(サーバーが機械的に選定・選定理由つき)を最初に出す
   const best = data.bestPick ? data.predictions.find((x) => x.fixtureId === data.bestPick.fixtureId) : null;
   const rest = data.predictions.filter((p) => !best || p.fixtureId !== best.fixtureId).slice(0, best ? 4 : 5);
@@ -7654,6 +7792,10 @@ async function renderTodayPredictionsHero() {
       } catch (e) { /* 共有のキャンセル等。何もしない */ }
     });
   }
+  // 📸 画像シェア(2026年8月18日): 行ごとのボタンにハンドラを張る
+  el.querySelectorAll(".pred-share-btn").forEach((b) => {
+    b.addEventListener("click", () => { sharePredictionImage(Number(b.dataset.shareIdx)); });
+  });
 }
 
 async function renderDailyReportWidget() {
@@ -8084,7 +8226,8 @@ function smarterQuestionBlock(it, esc) {
 
   return `<div class="smarter-q">
     <div class="smarter-q-head">${icon} ${esc(it.questionJa)}${it.subjectJa ? ` <span class="muted">(${esc(it.subjectJa)})</span>` : ""}</div>
-    ${it.volatile ? `<div class="value-note" style="margin:-2px 0 6px;">毎日必ず顔ぶれが変わるため、「増えた数」には入れていません。</div>` : ""}
+    ${it.churnNoteJa ? `<div class="value-note" style="margin:-2px 0 6px;">${esc(it.churnNoteJa)}</div>`
+      : it.volatile ? `<div class="value-note" style="margin:-2px 0 6px;">毎日必ず顔ぶれが変わるため、「増えた数」には入れていません。</div>` : ""}
     ${rows.join("")}
   </div>`;
 }
@@ -8298,6 +8441,61 @@ async function renderDailyDiff() {
   });
 }
 
+/* ================================================================
+   🙈 AIの反省 — 外した試合と、その理由
+   ----------------------------------------------------------------
+   外れを隠さないことが、このAIの一番の差別化。/api/reflections の
+   読み出しだけで、この画面は新しい計算を起こさない。
+   理由は答え合わせ時に実測データから機械的に分類済み(作文ではない)。
+   ================================================================ */
+function reflClubJa(en) {
+  if (!en) return "";
+  for (const [ja, e] of Object.entries(UNIVERSE_CLUB_JA_TO_EN)) { if (e === en) return ja; }
+  return en;
+}
+async function renderReflectionsCard() {
+  const el = document.getElementById("reflectionsBody");
+  if (!el) return;
+  const esc = escapeHtml;
+  let d = null;
+  try {
+    d = await fetchJsonWithTimeout(`${API_PROXY_BASE}/reflections`,
+      backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { d = null; }
+  if (!d) { el.textContent = "サーバーに接続できないため、反省の記録を読み込めませんでした。"; return; }
+  if (d.available === false) {
+    el.innerHTML = `<div class="value-note">${esc(d.reasonJa || "答え合わせが済んだ予測がまだありません。")}</div>`;
+    return;
+  }
+  const parts = [];
+  parts.push(`<div class="value-note" style="margin-bottom:8px;">検証済み ${Number(d.resolvedCount) || 0}件のうち、的中 ${Number(d.hitCount) || 0}件・外れ ${Number(d.missCount) || 0}件。外れた試合を新しい順に並べています。</div>`);
+  if (!d.items || !d.items.length) {
+    parts.push(`<div class="value-note">直近の記録に、外した試合がありません(外れが出たら、隠さずここに並びます)。</div>`);
+  } else {
+    parts.push(d.items.map((it) => {
+      const home = esc(reflClubJa(it.homeEn)); const away = esc(reflClubJa(it.awayEn));
+      const reasons = (it.reasons && it.reasons.length)
+        ? `<ul class="smarter-list" style="margin-top:4px;">${it.reasons.map((r) =>
+          `<li><b>${esc(r.labelJa)}</b>${r.detailJa ? `<div class="value-note" style="margin:1px 0 4px;">${esc(r.detailJa)}</div>` : ""}</li>`).join("")}</ul>`
+        : `<div class="value-note" style="margin-top:2px;">${esc(it.noReasonJa || "")}</div>`;
+      const when = it.kickoff ? new Date(it.kickoff).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" }) : "";
+      return `<div style="padding:10px 0; border-bottom:1px solid var(--border);">
+        <div><strong>${home} vs ${away}</strong> <span class="value-note">${esc(it.league || "")}${when ? " ・ " + when : ""}</span></div>
+        <div style="margin-top:2px;">AIの予想: <strong>${esc(reflClubJa(it.predictedJa.replace("勝利", "")) + (it.predictedJa.includes("勝利") ? "勝利" : ""))}</strong>${it.predictedScoreline ? `(予想スコア ${esc(it.predictedScoreline)})` : ""} → 実際: <strong style="color:var(--critical);">${esc(reflClubJa(it.actualJa.replace("勝利", "")) + (it.actualJa.includes("勝利") ? "勝利" : ""))}${it.actualScore ? `(${esc(it.actualScore)})` : ""}</strong> ❌</div>
+        <div class="value-note" style="margin-top:3px;">外した理由(実測データからの機械的な分類):</div>
+        ${reasons}
+      </div>`;
+    }).join(""));
+  }
+  if (d.topReasons && d.topReasons.length) {
+    parts.push(`<div style="margin-top:10px;"><span class="value-note">よく外す理由(累計): </span>${
+      d.topReasons.map((r) => `<span class="smarter-tag smarter-tag-lost" style="margin-right:6px;">${esc(r.labelJa)} ×${Number(r.count)}</span>`).join("")}</div>`);
+  }
+  parts.push(`<p class="value-note" style="margin-top:10px;">${esc(d.honestyJa || "")}</p>`);
+  el.innerHTML = parts.join("");
+}
+
+renderReflectionsCard();
 renderSmarterCard();
 renderDailyDiff();
 renderDailyReportWidget();

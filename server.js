@@ -556,15 +556,85 @@ function currentPerMinuteCap() {
 }
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** 毎分の上限を超えないように、必要なぶんだけ待ってから通す。 */
-async function waitForApiSlot() {
-  for (let guard = 0; guard < 120; guard++) {
+// ---- 2026年8月8日・429が消えなかった本当の理由 ----
+//   前回、直近60秒の回数だけを見て制御した。ところが API-Football の上限は
+//   「300回/分」であると同時に **「毎秒5回」** でもある(公式の表記が
+//   "300 requests/minute (5/second)")。
+//   学習ジョブは1試合ぶんの特徴量を Promise.all でまとめて取りに行くため、
+//     ・怪我/順位/直接対戦        …  5本同時
+//     ・xG(直近5試合ぶん)×2クラブ … 最大10本同時
+//   のように **一瞬で10〜15本** が飛ぶ。1分の合計は上限に遠く届かないのに、
+//   その一瞬だけ毎秒5回を超えるため429になっていた。
+//   「1分の合計」だけを見ていた前回の対策では、この山を平らにできていなかった。
+//
+//   → 呼び出しを **等間隔に並べる**。同時に来ても、順番に枠を予約させる。
+//     JavaScriptは1つずつしか処理しないので、awaitより前で枠を確定させれば
+//     取り合いは起きない。
+let nextSlotAt = 0;
+function minGapMs() {
+  // 上限(回/分)から、1回あたりの最小間隔を出す。既定では 180回/分 = 約3回/秒
+  //(公式の毎秒5回に対して余裕を持たせる)
+  return Math.ceil(60000 / Math.max(1, currentPerMinuteCap()));
+}
+
+// 誰であっても、1秒間にこの本数を超えて外部APIを呼ばない。
+// API-Footballの上限は「300回/分 = 毎秒5回」と、分と秒が連動している。
+// なので毎秒の上限も、実際に使う毎分の上限から機械的に決める(1分の1/60)。
+//   Pro(300回/分)→ 安全率0.6で180回/分 → 毎秒3回
+// こうしておけば、プランが変わっても、テストで上限を緩めても、
+// 分と秒の判定が食い違わない。
+function hardPerSecond() {
+  if (process.env.API_HARD_PER_SECOND) return Number(process.env.API_HARD_PER_SECOND);
+  return Math.max(1, Math.floor(currentPerMinuteCap() / 60));
+}
+
+/**
+ * 毎分・毎秒の上限を超えないように、必要なぶんだけ待ってから通す。
+ *
+ * ---- 2026年8月18日・検証で見つかった自分の劣化 ----
+ *   等間隔(334ミリ秒)を全部の呼び出しに掛けたところ、
+ *   **利用者が待っている処理まで遅くなった**。
+ *   試合分析は最大11回APIを呼ぶので、それだけで+3.7秒。
+ *   429を出していたのは学習ジョブの一斉呼び出し(Promise.allで10〜15本)であって、
+ *   利用者のリクエストではなかった。同じ扱いにする理由が無い。
+ *
+ *   → 裏の処理は今までどおり等間隔に並べる(429の直接の対策)。
+ *     利用者の処理は「直近1秒に余裕があれば待たない」。
+ *     どちらの場合も、毎秒5回の上限は超えない。
+ */
+async function waitForApiSlot(opts) {
+  const isJob = !!(opts && opts.jobCall);
+  const prune = (t) => { while (apiCallTimestamps.length && t - apiCallTimestamps[0] > 60000) apiCallTimestamps.shift(); };
+  const inLastSecond = (t) => apiCallTimestamps.reduce((n, x) => (t - x < 1000 ? n + 1 : n), 0);
+
+  // ---- ① 裏の処理だけは等間隔に並べる ----
+  //   429を出していたのは学習ジョブの一斉呼び出し(Promise.allで10〜15本)。
+  //   ここを平らにするのが直接の対策。利用者の処理は対象にしない
+  //   (全部に掛けたら試合分析が+3.7秒遅くなった。自分で入れた劣化だった)。
+  if (isJob) {
     const now = Date.now();
-    while (apiCallTimestamps.length && now - apiCallTimestamps[0] > 60000) apiCallTimestamps.shift();
-    const cap = currentPerMinuteCap();
-    if (apiCallTimestamps.length < cap) { apiCallTimestamps.push(now); return; }
-    // いちばん古い呼び出しが60秒を抜けるまで待つ
-    const waitMs = Math.max(50, 60000 - (now - apiCallTimestamps[0]) + 20);
+    const slot = Math.max(now, nextSlotAt);
+    nextSlotAt = slot + minGapMs();   // await より前に確定させるので、同時呼び出しでも重ならない
+    const gapWait = slot - now;
+    if (gapWait > 0) { apiRateWaitTotalMs += gapWait; await sleepMs(gapWait); }
+  }
+
+  // ---- ② 誰であっても「1秒間に HARD_PER_SECOND 本まで」を必ず守る ----
+  //   実際に使う毎分の上限の1/60(Proなら毎秒3回)。
+  //   利用者の処理は、空きがあれば待たずに通り、混んでいる時だけ短く待つ。
+  for (let guard = 0; guard < 200; guard++) {
+    const t = Date.now();
+    prune(t);
+    if (inLastSecond(t) < hardPerSecond() && apiCallTimestamps.length < currentPerMinuteCap()) {
+      apiCallTimestamps.push(t);
+      return;
+    }
+    // 直近1秒がいっぱい → いちばん古い1本が1秒を抜けるまで待つ(通常250ミリ秒以下)
+    const oldestInWindow = apiCallTimestamps.find((x) => t - x < 1000);
+    const perMinuteFull = apiCallTimestamps.length >= currentPerMinuteCap();
+    const waitMs = perMinuteFull
+      ? Math.max(50, 60000 - (t - apiCallTimestamps[0]) + 20)
+      : Math.max(30, 1000 - (t - oldestInWindow) + 15);
     apiRateWaitTotalMs += waitMs;
     await sleepMs(waitMs);
   }
@@ -576,11 +646,13 @@ function apiRateSnapshot() {
   const recent = apiCallTimestamps.filter((t) => now - t <= 60000).length;
   return {
     perMinuteCapUsed: currentPerMinuteCap(),
+    minGapMs: minGapMs(),
+    hardPerSecond: hardPerSecond(),
     perMinuteLimitObserved: observedPerMinuteLimit,
     callsLastMinute: recent,
     waitedTotalMs: apiRateWaitTotalMs,
     retriedOn429: apiRate429Count,
-    noteJa: "1分あたりの上限に当たらないよう、必要なときだけ間隔を空けています(取得する件数は減らしていません)。",
+    noteJa: `1分あたり・毎秒どちらの上限にも当たらないよう、呼び出しを${minGapMs()}ミリ秒ずつ等間隔に並べています(取得する件数は減らしていません)。`,
   };
 }
 
@@ -997,8 +1069,8 @@ async function callApiFootball(endpoint, params, opts) {
   //   成功・失敗にかかわらず必ず書き戻し対象に含める。
   //   (タイムアウトしたリクエストもAPI-Football側では消費として数えられるため、
   //    「失敗したら返却する」ではなく「数える」のが安全側の判断)
-  // 1分あたりの上限を超えないよう、必要なときだけ待つ(取得件数は減らさない)
-  await waitForApiSlot();
+  // 1分あたり・毎秒の上限を超えないよう、必要なときだけ待つ(取得件数は減らさない)
+  await waitForApiSlot({ jobCall: isJobCall });
 
   let res;
   try {
@@ -1011,6 +1083,9 @@ async function callApiFootball(endpoint, params, opts) {
     while (res && res.status === 429 && attempt < API_RETRY_ON_429) {
       attempt++;
       apiRate429Count++;
+      // 429が出た = まだ速すぎる。以後の間隔を広げて、同じことを繰り返さない。
+      // (次の枠を1秒ぶん後ろへずらす。上限の検出値そのものは変えない)
+      nextSlotAt = Math.max(nextSlotAt, Date.now() + 1000);
       const retryAfterSec = parseInt(res.headers && typeof res.headers.get === "function" ? res.headers.get("retry-after") : null, 10);
       const waitMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
         ? Math.min(60000, retryAfterSec * 1000)
@@ -1022,7 +1097,7 @@ async function callApiFootball(endpoint, params, opts) {
       const again = isJobCall ? budget.tryReserve(1, `${endpoint}#retry`) : budget.tryReserveUser(1, `${endpoint}#retry`);
       if (!again.allowed) break;
       if (!isJobCall) { try { noteHeavyApiCall(); } catch (e2) { /* 計測は本処理を妨げない */ } }
-      await waitForApiSlot();
+      await waitForApiSlot({ jobCall: isJobCall });
       res = await fetchWithTimeout(url.toString(), { headers }, API_FOOTBALL_TIMEOUT_MS);
     }
   } catch (e) {
@@ -2778,7 +2853,14 @@ async function handleAutoCollectPredictions(opts) {
       pendingIds.forEach((id, i) => {
         const raw = rows[i];
         let parsed = null;
-        if (raw !== null && raw !== undefined) { try { parsed = JSON.parse(raw); } catch (e) { parsed = null; } }
+        // 検証で判明: まとめ読みの戻り値は、環境によって
+        // 「JSON文字列」のことも「すでに解釈済みのオブジェクト」のこともある。
+        // JSON.parse だけを前提にすると、後者の環境で全件が「記録なし」に見え、
+        // 答え合わせが1件も進まなくなる(upstashGetJSON は両方を扱えていた)。
+        if (raw !== null && raw !== undefined) {
+          if (typeof raw === "object") parsed = raw;
+          else { try { parsed = JSON.parse(raw); } catch (e) { parsed = null; } }
+        }
         preloaded.set(String(id), parsed);
       });
     }
@@ -4046,7 +4128,8 @@ function buildPublicQaReport(rep) {
         countingNoteJa: diff.countingNoteJa || null,
         verdictJa: diff.verdictJa || null,
         items: (diff.items || []).map((i) => ({
-          id: i.id, questionJa: i.questionJa, subjectJa: i.subjectJa || null, volatile: i.volatile === true,
+          id: i.id, questionJa: i.questionJa, subjectJa: i.subjectJa || null,
+          volatile: i.volatile === true, churn: i.churn || null, churnNoteJa: i.churnNoteJa || null,
           hadYesterday: i.hadYesterday, canAnswerToday: i.canAnswerToday, newlyAnswerable: i.newlyAnswerable,
           factCountToday: i.factCountToday, factCountYesterday: i.factCountYesterday,
           newFacts: (i.newFacts || []).slice(0, 5),
@@ -6088,6 +6171,75 @@ async function handleHttpRequest(req, res) {
       // ---- 2026年8月7日・毎日の学習が「どこまで進んだか」を見る ----
       //   本番で「収集は進んだのに成長ログは前日のまま」= 途中で止まっている
       //   ことが分かったが、どこで止まったのかが分からなかった。
+      if (pathname === "/api/reflections") {
+        // ---- 2026年8月18日・「AIの反省」を独立したコンテンツにする ----
+        //   外れを自分から見せる予想サイトはほとんど無い。このAIの差別化の核。
+        //   中身は learn:ownpred:recent(答え合わせ済みの自社予測)の読み出しだけで、
+        //   理由は答え合わせ時に実測データから機械的に分類したもの
+        //   (contextualFailureReasons / failureReasons)。ここでLLMは呼ばない。
+        //   トップページの全訪問者が読むため、10分キャッシュ(Redisは10分に1回)。
+        const refCached = cacheGet("reflections:public");
+        if (refCached) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
+          res.end(JSON.stringify(refCached));
+          return;
+        }
+        let body;
+        if (!UPSTASH_ENABLED) {
+          body = { ok: true, available: false, reasonJa: "保存先(Upstash)が未設定のため、答え合わせの記録がありません。" };
+        } else {
+          try {
+            const raw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "-300", "-1"])) || [];
+            const recs = raw.map((x) => { try { return typeof x === "object" ? x : JSON.parse(x); } catch (e) { return null; } })
+              .filter((r) => r && r.resolved);
+            recs.sort((a, b) => String(b.resolvedAt || "").localeCompare(String(a.resolvedAt || "")));
+            const misses = recs.filter((r) => r.correct === false);
+            const hits = recs.filter((r) => r.correct === true);
+            const reasonTally = new Map();
+            const items = misses.slice(0, 6).map((r) => {
+              const reasons = [];
+              (Array.isArray(r.contextualFailureReasons) ? r.contextualFailureReasons : []).forEach((x) => {
+                if (x && x.labelJa) reasons.push({ labelJa: String(x.labelJa), detailJa: String(x.detail || "") });
+              });
+              (Array.isArray(r.failureReasons) ? r.failureReasons : []).forEach((x) => {
+                if (x && x.labelJa && reasons.length < 3) reasons.push({ labelJa: String(x.labelJa), detailJa: String(x.detail || x.detailJa || "") });
+              });
+              return {
+                homeEn: r.homeTeamEn || null, awayEn: r.awayTeamEn || null, league: r.league || null,
+                kickoff: r.kickoff || null, resolvedAt: r.resolvedAt || null,
+                predictedJa: r.predictedWinner === "home" ? `${r.homeTeamEn || "ホーム"}勝利` : r.predictedWinner === "away" ? `${r.awayTeamEn || "アウェイ"}勝利` : "引き分け",
+                predictedScoreline: r.predictedScoreline || null,
+                actualJa: r.actualWinner === "home" ? `${r.homeTeamEn || "ホーム"}勝利` : r.actualWinner === "away" ? `${r.awayTeamEn || "アウェイ"}勝利` : "引き分け",
+                actualScore: (r.actualScore && Number.isFinite(Number(r.actualScore.home))) ? `${r.actualScore.home}-${r.actualScore.away}` : null,
+                reasons: reasons.slice(0, 3),
+                noReasonJa: reasons.length ? null
+                  : "この試合については、原因を特定できる実測データ(監督交代・布陣変更・xGの食い違いなど)が見つかりませんでした。分類できない外れがあることも正直に残します。",
+              };
+            });
+            // 理由の集計(機械的な分類の合計。作文ではない)
+            misses.forEach((r) => {
+              [...(r.contextualFailureReasons || []), ...(r.failureReasons || [])].forEach((x) => {
+                if (x && x.labelJa) reasonTally.set(x.labelJa, (reasonTally.get(x.labelJa) || 0) + 1);
+              });
+            });
+            const topReasons = [...reasonTally.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4)
+              .map(([labelJa, count]) => ({ labelJa, count }));
+            body = {
+              ok: true, available: recs.length > 0,
+              resolvedCount: recs.length, hitCount: hits.length, missCount: misses.length,
+              items, topReasons,
+              honestyJa: "理由は、答え合わせの時点で実測データから機械的に分類したものです。AIが後から言い訳の文章を作っているのではありません。",
+              reasonJa: recs.length ? null : "答え合わせが済んだ自社予測がまだありません(試合が終わり次第、自動で増えます)。",
+            };
+          } catch (e) {
+            body = { ok: false, available: false, reasonJa: "答え合わせの記録を読み出せませんでした(0件だったのではなく、測れていません)。" };
+          }
+        }
+        cacheSet("reflections:public", body, 10 * 60 * 1000);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
+        res.end(JSON.stringify(body));
+        return;
+      }
       if (pathname === "/api/qa/latest") {
         // 自動QAの最新結果(画面の「AIは昨日より賢くなったか」カードが読む)。
         // ---- 2026年8月7日・監査で見つかった規模の問題 ----
@@ -7306,6 +7458,8 @@ function __setTestHooks(hooks) {
 module.exports = {
   server,
   __setTestHooks,
+  // テスト専用: プロセス内キャッシュの特定キーを消す(本番では誰も呼ばない)
+  __clearCacheForTest: (key) => { try { cache.delete(key); } catch (e) { /* noop */ } },
   // 2026年8月7日: 1分あたりの上限(HTTP 429)への対処の検証用
   callApiFootball, apiRateSnapshot,
   handlePlayerSeasonStats,
