@@ -5160,6 +5160,15 @@ function tryConsumeLlmBudgetForIp(ip) {
   return true;
 }
 
+// 第9次監査(v49): 全体上限で回答を返せなかったときに個人の1回を返す(上の修正とセット)
+function refundLlmBudgetForIp(ip) {
+  const today = appDateKey();
+  if (llmIpDailyBudget.day !== today) return; // 日付が変わっていたら返す意味がない
+  const key = ip || "unknown";
+  const current = llmIpDailyBudget.counts.get(key) || 0;
+  if (current > 0) llmIpDailyBudget.counts.set(key, current - 1);
+}
+
 function formatClubFacts(knowledge, needs) {
   const facts = [];
   const needSet = new Set(needs);
@@ -5409,6 +5418,10 @@ async function handleDiscuss(body, clientIp) {
     };
   }
   if (!(await tryConsumeLlmBudget())) {
+    // 第9次監査(v49)の修正: サイト全体の上限で断る場合、直前に消費した
+    // 「この利用者個人の1回ぶん」を返金する。回答を返せていないのに個人の
+    // 残り回数だけ減るのは不公平だった(全体上限の日は特に)。
+    refundLlmBudgetForIp(clientIp);
     return {
       status: 200,
       body: {
@@ -6253,7 +6266,7 @@ async function handleHttpRequest(req, res) {
           const dig = await upstashGetJSON("learn:digest:latest").catch(() => null);
           dBody = dig
             ? { ok: true, available: true, digest: dig }
-            : { ok: true, available: false, reasonJa: "最初のダイジェストは、次の月曜の朝の学習後に公開されます(週1回、直前の1週間分を実測から自動生成します)。" };
+            : { ok: true, available: false, reasonJa: "最初のダイジェストは、次の毎朝の学習のあとに自動生成されます(直前の1週間分)。以降は毎週月曜に新しい週のぶんへ更新されます。" };
         }
         cacheSet("digest:latest:public", dBody, 10 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
@@ -6296,10 +6309,20 @@ async function handleHttpRequest(req, res) {
               const pendingIds = (await upstashCmd(["LRANGE", "learn:ownpred:pending", "-40", "-1"]).catch(() => [])) || [];
               const got = await Promise.all(pendingIds.map((id) => upstashGetJSON(`learn:ownpred:${id}`).catch(() => null)));
               pendingRecs = got.filter(Boolean);
-              cacheSet("clubsummary:pendingrecs", pendingRecs, 10 * 60 * 1000);
+              // v49: 保留中の予測は日次学習でしか増えないため、30分キャッシュで十分。
+              // (10分だと最悪 40GET×144回/日=5,760コマンドとUpstash無料枠1万/日の
+              //  半分を食い得た。30分なら最悪1,920コマンドで安全圏。方針⑥にも適合)
+              cacheSet("clubsummary:pendingrecs", pendingRecs, 30 * 60 * 1000);
             }
             const nameLc = club.nameEn.toLowerCase();
-            const involves = (r) => String(r.homeTeamEn || "").toLowerCase() === nameLc || String(r.awayTeamEn || "").toLowerCase() === nameLc;
+            // 第9次監査(v49)の修正: 記録のチーム名は「予測対象クラブ側=このアプリの
+            // 表記」「相手側=API-Footballの表記」が混在する(例: Bayern Munich と
+            // Bayern München)。originTeamEn(その予測を作った対象クラブ名=必ず
+            // このアプリの表記)も照合しないと、表記が違うクラブは自分の予測すら
+            // 「0件」に見えてしまう。
+            const involves = (r) => String(r.homeTeamEn || "").toLowerCase() === nameLc
+              || String(r.awayTeamEn || "").toLowerCase() === nameLc
+              || String(r.originTeamEn || "").toLowerCase() === nameLc;
 
             const mine = recentRecs.filter(involves);
             const hits = mine.filter((r) => r.correct === true);
@@ -6370,7 +6393,8 @@ async function handleHttpRequest(req, res) {
             csBody = { ok: true, clubEn: club.nameEn, clubJa: club.nameJa, available: false, reasonJa: "記録の読み出しに一時的に失敗しました。しばらくして再度お試しください。" };
           }
         }
-        cacheSet(csCacheKey, csBody, 10 * 60 * 1000);
+        // v49: 一時的な読み出し失敗を10分も固定表示しない(失敗時だけ2分で再挑戦)
+        cacheSet(csCacheKey, csBody, (csBody && csBody.available === false && UPSTASH_ENABLED) ? 2 * 60 * 1000 : 10 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
         res.end(JSON.stringify(csBody));
         return;

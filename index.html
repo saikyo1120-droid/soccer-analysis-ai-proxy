@@ -8562,15 +8562,35 @@ function renderMyClubPicker(el) {
   const btn = document.getElementById("myClubSaveBtn");
   if (btn) btn.addEventListener("click", () => {
     const sel = document.getElementById("myClubSelect");
-    if (sel && sel.value) { myClubSet(sel.value); renderMyClubCard(); }
+    if (!sel || !sel.value) return;
+    myClubSet(sel.value);
+    // v49: プライベートブラウズ等で端末保存が効かない場合、黙って元の画面に
+    // 戻ると「押したのに何も起きない」ように見える。保存できなかったことを
+    // 正直に伝える(この場では表示だけ続行する)。
+    // 注: 描画(innerHTML差し替え)の「後」に注記を足すこと。先に足すと消える。
+    if (myClubGet() !== sel.value) {
+      renderMyClubCardWith(sel.value).then(() => {
+        const note = document.createElement("p");
+        note.className = "value-note";
+        note.textContent = "この端末には保存できませんでした(プライベートモード等)。表示はしますが、再読み込みすると登録は消えます。";
+        el.appendChild(note);
+      });
+      return;
+    }
+    renderMyClubCard();
   });
 }
 async function renderMyClubCard() {
+  const clubEn = myClubGet();
+  const el = document.getElementById("myClubBody");
+  if (!el) return;
+  if (!clubEn) { renderMyClubPicker(el); return; }
+  return renderMyClubCardWith(clubEn);
+}
+async function renderMyClubCardWith(clubEn) {
   const el = document.getElementById("myClubBody");
   if (!el) return;
   const esc = escapeHtml;
-  const clubEn = myClubGet();
-  if (!clubEn) { renderMyClubPicker(el); return; }
   const clubJaGuess = reflClubJa(clubEn);
   el.innerHTML = `<h2 style="margin:0 0 4px;">⭐ マイクラブ: ${esc(clubJaGuess)}</h2><p class="value-note">実測データを読み込み中…</p>`;
   let d = null;
@@ -8606,7 +8626,8 @@ async function renderMyClubCard() {
   // 次の試合
   if (d.nextPrediction) {
     const np = d.nextPrediction;
-    const when = np.kickoff ? new Date(np.kickoff).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+    // v49: 「日本時間」と書く以上、端末のタイムゾーンに関わらず本当に日本時間で出す
+    const when = np.kickoff ? new Date(np.kickoff).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
     parts.push(`<div style="margin-top:6px; padding:8px 10px; background:rgba(0,0,0,.04); border-radius:8px;">
       <div class="value-note">次の試合(日本時間 ${esc(when)})${np.official === false ? ' <span class="smarter-tag smarter-tag-ai">参考(親善など)</span>' : ""}</div>
       <div style="margin-top:2px;"><strong>${esc(reflClubJa(np.homeEn))} vs ${esc(reflClubJa(np.awayEn))}</strong></div>
@@ -8631,7 +8652,7 @@ async function renderMyClubCard() {
     parts.push(`<div style="margin-top:8px;"><span class="value-note">このクラブが絡む試合でのAIの成績: </span><strong>${Number(rec.n)}件中${Number(rec.hits)}件的中(${Number(rec.hitRatePct)}%)</strong> <span class="value-note">${offTxt}</span></div>`);
     if (rec.last && rec.last.length) {
       parts.push(`<div style="margin-top:4px;">${rec.last.map((r) => {
-        const when = r.kickoff ? new Date(r.kickoff).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" }) : "";
+        const when = r.kickoff ? new Date(r.kickoff).toLocaleDateString("ja-JP", { timeZone: "Asia/Tokyo", month: "numeric", day: "numeric" }) : "";
         return `<div class="value-note" style="margin:2px 0;">${r.correct ? "⭕" : "❌"} ${esc(when)} ${esc(reflClubJa(r.homeEn))} ${r.actualScore ? esc(r.actualScore) : "-"} ${esc(reflClubJa(r.awayEn))}${r.official === false ? ' <span class="smarter-tag smarter-tag-ai">参考</span>' : ""}</div>`;
       }).join("")}</div>`);
     }
@@ -8707,7 +8728,7 @@ async function renderDigestCard() {
   parts.push(`<div class="value-note" style="margin-bottom:6px;">${esc(dg.periodJa || "")}のAIの1週間(実測記録からの自動生成・作文なし)</div>`);
   parts.push(`<div style="margin-bottom:6px;"><strong>${esc((dg.summary && dg.summary.lineJa) || "")}</strong></div>`);
   if (dg.bestHit) {
-    parts.push(`<div style="margin-top:6px;">🎯 <strong>ベスト的中:</strong> ${esc(dg.bestHit.matchJa)}<div class="value-note" style="margin:1px 0 0;">${esc(dg.bestHit.lineJa || "")}</div></div>`);
+    parts.push(`<div style="margin-top:6px;">🎯 <strong>ベスト的中:</strong> ${esc(dg.bestHit.matchJa)}${dg.bestHit.official === false ? ' <span class="smarter-tag smarter-tag-ai">参考(親善など)</span>' : ""}<div class="value-note" style="margin:1px 0 0;">${esc(dg.bestHit.lineJa || "")}</div></div>`);
   } else {
     parts.push(`<div class="value-note" style="margin-top:6px;">🎯 この週の的中はありませんでした(隠さずそのまま書いています)。</div>`);
   }
@@ -8721,7 +8742,7 @@ async function renderDigestCard() {
   }
   if (dg.upcoming && dg.upcoming.length) {
     parts.push(`<div style="margin-top:6px;">📅 <strong>来週の注目:</strong>${dg.upcoming.map((u) => {
-      const when = u.kickoff ? new Date(u.kickoff).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" }) : "";
+      const when = u.kickoff ? new Date(u.kickoff).toLocaleDateString("ja-JP", { timeZone: "Asia/Tokyo", month: "numeric", day: "numeric" }) : "";
       return `<div class="value-note" style="margin:2px 0;">${esc(when)} ${esc(u.matchJa)} — AI予想: ${esc(u.predictedJa)}${u.official === false ? "(参考)" : ""}</div>`;
     }).join("")}</div>`);
   }
