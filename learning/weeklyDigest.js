@@ -132,6 +132,7 @@ function buildWeeklyDigest(p) {
       matchJa: `${clubJa(r.homeTeamEn)} ${scoreStr(r) || ""} ${clubJa(r.awayTeamEn)}`.trim(),
       predictedJa: winnerJa(r, r.predictedWinner),
       marketPctForPick: mkt,
+      official: isOfficialRec(r), // v49: ベスト的中にも公式/参考の区別を付ける(外れ側と同じ基準)
       kickoff: r.kickoff || null,
       lineJa: `市場(ブックメーカー)は${winnerJa(r, r.predictedWinner)}を${mkt}%しか見ていませんでしたが、AIは当てました。`,
     };
@@ -141,6 +142,7 @@ function buildWeeklyDigest(p) {
       matchJa: `${clubJa(r.homeTeamEn)} ${scoreStr(r) || ""} ${clubJa(r.awayTeamEn)}`.trim(),
       predictedJa: winnerJa(r, r.predictedWinner),
       marketPctForPick: null,
+      official: isOfficialRec(r),
       kickoff: r.kickoff || null,
       lineJa: "今週の的中から1試合(この週はオッズ付きで比較できた的中がありませんでした)。",
     };

@@ -1550,6 +1550,25 @@ async function runDailyLearning(deps) {
           teamTopScorerCache.set(key, r); return r;
         })(),
       ]);
+      // ---- 第9次監査(v49)の修正: 重みの読み出しをオッズ取得の「前」へ移動 ----
+      // v47でオッズ取得を予測の前へ移した際、重みの読み出し失敗→見送り(continue)の
+      // 判定がオッズ取得の後ろに残っていた。そのため、Upstash障害の日は
+      // 「見送る予測のためにオッズのAPI予算だけ消費する」無駄があった。
+      // 見送り判定を先に行い、無駄なAPI呼び出しをなくす(挙動は他に一切変えない)。
+      // ---- 第8次監査の修正: 重みの読み取り失敗を「学習前の初期重み」と区別する ----
+      // upstashGetJSONは失敗を握りつぶしてnullを返すため、Upstash一時障害の日に
+      // 初期重み(未学習状態)で予測が記録され、learningProofの「必ず反映されます」
+      // という説明と食い違っていた。読み取れない日は正直に予測を見送る
+      // (/api/match-analysis側の第5次修正と同じ方針)。
+      let storedWeightsRaw = null;
+      try {
+        const rawStr = await upstashCmd(["GET", "learn:weights"]); // 失敗時はthrowする生コマンドで読む
+        storedWeightsRaw = rawStr ? JSON.parse(rawStr) : {}; // null=キー未作成(初回)は正当な初期状態
+      } catch (e) {
+        errors.push(`weights_read_failed_prediction_skipped:${team.nameEn}:保存済みの重みを読み出せなかったため、学習前の重みでの予測記録を避けて今回は見送りました`);
+        continue;
+      }
+
       // ---- 精度証明ラウンド⑤ → v47で予測の「前」へ移動: オッズの取得 ----
       // 2026年8月18日・v47「予測モデルの根本強化」: これまでオッズは予測の後に
       // 「記録のためだけ」に取得していた。市場オッズを特徴量(marketEdge)として
@@ -1579,19 +1598,7 @@ async function runDailyLearning(deps) {
       const awayCtx = built.awayCtx;
       const features = built.features;
 
-      // ---- 第8次監査の修正: 重みの読み取り失敗を「学習前の初期重み」と区別する ----
-      // upstashGetJSONは失敗を握りつぶしてnullを返すため、Upstash一時障害の日に
-      // 初期重み(未学習状態)で予測が記録され、learningProofの「必ず反映されます」
-      // という説明と食い違っていた。読み取れない日は正直に予測を見送る
-      // (/api/match-analysis側の第5次修正と同じ方針)。
-      let storedWeightsRaw = null;
-      try {
-        const rawStr = await upstashCmd(["GET", "learn:weights"]); // 失敗時はthrowする生コマンドで読む
-        storedWeightsRaw = rawStr ? JSON.parse(rawStr) : {}; // null=キー未作成(初回)は正当な初期状態
-      } catch (e) {
-        errors.push(`weights_read_failed_prediction_skipped:${team.nameEn}:保存済みの重みを読み出せなかったため、学習前の重みでの予測記録を避けて今回は見送りました`);
-        continue;
-      }
+
       const weights = { ...EXTENDED_DEFAULT_WEIGHTS, ...storedWeightsRaw }; // 過去バージョンの重みにも新しいキーを補完
       // 2026年8月・ご指示①③④の証明: 「昨日の学習が今日の予測に反映された」を
       // ログで示せるよう、今日の予測が実際に使った重みのversion/更新時刻を記録する。

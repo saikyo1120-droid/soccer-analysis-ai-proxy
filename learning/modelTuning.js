@@ -191,11 +191,13 @@ function fitHistoryWeights(trainRows, initialWeights, runAt) {
     presentKeys.add("rho"); // ρは特徴量ではなくスコア分布の補正なので常に対象
     const keys = [...presentKeys];
     const refMs = runAt instanceof Date ? runAt.getTime() : Date.parse(runAt) || 0;
+    const t0 = Date.now(); // v49: 実行時間を実測して記録に残す(説明責任・本番の観測用)
     const fitted = fitWeightsGradientDescent(fitRows, initialWeights, {
       keys,
       iterations: 25, // 数千件×毎日実行のためのバランス。学習ジョブ内でのみ実行(方針⑥)
       sampleWeightOf: (r) => timeDecayWeight(r.date, refMs, 0.0065),
     });
+    const fitMs = Date.now() - t0;
     if (!fitted) {
       return { weights: null, detail: { ran: true, keys, reasonJa: "勾配学習が収束しなかった(または結果が保存基準を満たさなかった)ため、グリッド探索の候補のみで判定します。" } };
     }
@@ -207,7 +209,8 @@ function fitHistoryWeights(trainRows, initialWeights, runAt) {
         rows: fitRows.length,
         iterations: 25,
         decayXiPerDay: 0.0065,
-        noteJa: `過去試合${fitRows.length}件(時間減衰つき)で${keys.length}個の重みを勾配降下法で学習しました。`,
+        ms: fitMs, // 実測の所要時間(ミリ秒)
+        noteJa: `過去試合${fitRows.length}件(時間減衰つき)で${keys.length}個の重みを勾配降下法で学習しました(所要${(fitMs / 1000).toFixed(1)}秒)。`,
       },
     };
   } catch (e) {
