@@ -576,6 +576,11 @@
   <div class="card" id="reflectionsCard" style="padding:16px 18px; border:1.5px solid var(--warning);">
     <h2 style="margin:0 0 4px;">🙈 AIの反省 — 外した試合と、その理由</h2>
     <p class="value-note" style="margin:0 0 8px;">外れを隠さないのがこのAIの方針です。理由は試合の実測データから機械的に分類したもので、言い訳の作文ではありません。</p>
+    <!-- 2026年8月18日・v47「予測モデルの根本強化」の正直な開示:
+         ・過去試合の学習を5リーグ→9リーグ×3シーズンに拡張(実試合のみ)
+         ・市場オッズを特徴量に追加(丸写しではなく、影響の強さはAIが実データから学習。
+           オッズを取得できない試合では一切使わない=推測で埋めない) -->
+    <p class="value-note" style="margin:0 0 8px; opacity:.85;">🧠 予測モデルは9リーグ×3シーズンの実試合とAI自身の的中記録から毎日学習しています。2026年8月18日からは市場オッズ(ブックメーカーの評価)も学習の材料に加えました(オッズの影響の強さはAI自身が実データから学習し、取得できない試合では使いません)。</p>
     <div id="reflectionsBody" class="muted" style="font-size:13px;">読み込み中…</div>
   </div>
 
@@ -6457,6 +6462,15 @@ function renderDiscussReplyHtml(resp) {
       }</ol>${del.counterArgumentJa ? `<p class="value-note" style="margin-top:4px;">🔄 反論の検討: ${escapeHtml(del.counterArgumentJa)}</p>` : ""}${
         del.changedFromPrevious ? `<p class="value-note">※ 前回の結論から変更しています。</p>` : ""}</details>`
     : "";
+  // ---- 2026年8月18日・v47「多段思考」: AIが追加調査をしたことを正直に見せる ----
+  //   noteJaはサーバーが実行結果から機械的に組み立てた文(でっち上げ無し)。
+  //   多段思考が走らなかった場合(計画失敗・予算節約・無効化)は何も出さない
+  //   (通常の1段構成=従来どおりの回答であり、特別な注記は不要)。
+  const msMeta = resp.meta && resp.meta.multiStep;
+  const multiStepHtml = (msMeta && msMeta.ran && msMeta.noteJa)
+    ? `<div class="value-note" style="margin-top:4px;">🔁 ${escapeHtml(msMeta.noteJa)}${
+        msMeta.focusJa ? ` 論点: ${escapeHtml(msMeta.focusJa)}` : ""}</div>`
+    : "";
   const ragU = resp.meta && resp.meta.intelligence && resp.meta.intelligence.ragUtilization;
   const ragNum = (v) => (Number.isFinite(Number(v)) ? Number(v) : "—");
   const ragHtml = ragU
@@ -6471,7 +6485,7 @@ function renderDiscussReplyHtml(resp) {
   const followupsHtml = resp.followUpQuestions && resp.followUpQuestions.length
     ? `<div class="followup-chip-row">${resp.followUpQuestions.map(q => `<button class="chat-followup-btn" data-q="${escapeHtml(q)}">・${escapeHtml(q)}</button>`).join("")}</div>`
     : "";
-  return { text: body + thoughtChangeHtml, extras: `${confidenceHtml}${ragHtml}${deliberationHtml}${graphHtml}${timelineHtml}${factsHtml}${followupsHtml}` };
+  return { text: body + thoughtChangeHtml, extras: `${confidenceHtml}${multiStepHtml}${ragHtml}${deliberationHtml}${graphHtml}${timelineHtml}${factsHtml}${followupsHtml}` };
 }
 
 // hero chat・選手個別チャット共通の議論モードフロー。
@@ -8468,6 +8482,14 @@ async function renderReflectionsCard() {
     return;
   }
   const parts = [];
+  // 2026年8月18日: 公式戦の成績を主表示に。親善・2軍は「参考」と明記して分ける
+  // (親善試合は主力を休ませるため、プロでも当てられない。混ぜると実力より低く見える)。
+  const off = d.officialSummary || null;
+  if (off && off.n > 0) {
+    parts.push(`<div style="margin-bottom:4px;"><span style="font-size:15px; font-weight:700;">公式戦の的中率: ${Number(off.hitRatePct)}%</span> <span class="value-note">(${Number(off.hits)}/${Number(off.n)}件)</span>${
+      off.referenceN ? ` <span class="value-note">・ほかに親善試合など参考扱いが${Number(off.referenceN)}件</span>` : ""}</div>`);
+    parts.push(`<div class="value-note" style="margin-bottom:8px;">${esc(off.noteJa || "")}</div>`);
+  }
   parts.push(`<div class="value-note" style="margin-bottom:8px;">検証済み ${Number(d.resolvedCount) || 0}件のうち、的中 ${Number(d.hitCount) || 0}件・外れ ${Number(d.missCount) || 0}件。外れた試合を新しい順に並べています。</div>`);
   if (!d.items || !d.items.length) {
     parts.push(`<div class="value-note">直近の記録に、外した試合がありません(外れが出たら、隠さずここに並びます)。</div>`);
@@ -8479,8 +8501,11 @@ async function renderReflectionsCard() {
           `<li><b>${esc(r.labelJa)}</b>${r.detailJa ? `<div class="value-note" style="margin:1px 0 4px;">${esc(r.detailJa)}</div>` : ""}</li>`).join("")}</ul>`
         : `<div class="value-note" style="margin-top:2px;">${esc(it.noReasonJa || "")}</div>`;
       const when = it.kickoff ? new Date(it.kickoff).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" }) : "";
+      const refTag = it.official === false
+        ? ` <span class="smarter-tag smarter-tag-ai" title="${esc(it.referenceJa || "")}">参考(親善など)</span>`
+        : "";
       return `<div style="padding:10px 0; border-bottom:1px solid var(--border);">
-        <div><strong>${home} vs ${away}</strong> <span class="value-note">${esc(it.league || "")}${when ? " ・ " + when : ""}</span></div>
+        <div><strong>${home} vs ${away}</strong>${refTag} <span class="value-note">${esc(it.league || "")}${when ? " ・ " + when : ""}</span></div>
         <div style="margin-top:2px;">AIの予想: <strong>${esc(reflClubJa(it.predictedJa.replace("勝利", "")) + (it.predictedJa.includes("勝利") ? "勝利" : ""))}</strong>${it.predictedScoreline ? `(予想スコア ${esc(it.predictedScoreline)})` : ""} → 実際: <strong style="color:var(--critical);">${esc(reflClubJa(it.actualJa.replace("勝利", "")) + (it.actualJa.includes("勝利") ? "勝利" : ""))}${it.actualScore ? `(${esc(it.actualScore)})` : ""}</strong> ❌</div>
         <div class="value-note" style="margin-top:3px;">外した理由(実測データからの機械的な分類):</div>
         ${reasons}

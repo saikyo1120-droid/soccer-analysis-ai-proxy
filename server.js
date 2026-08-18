@@ -32,6 +32,8 @@ const { AsyncLocalStorage } = require("async_hooks");
 // server/llm/ にあり、ここではモジュールとして読み込むだけ(利用箇所は下の方の
 // 「Stage C」セクションを参照)。
 const { createKnowledgeSource } = require("./rag/knowledgeSource");
+// v47「会話を多段思考に」(2026年8月18日・利用者の選択③)
+const discussMultiStep = require("./discuss/multiStep");
 const { planInformationNeeds } = require("./discuss/planner");
 const { generateLLM, currentProviderName } = require("./llm");
 
@@ -93,6 +95,7 @@ const _LEAGUE_CFG = require("./learning/leagueConfig");
 const {
   EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, computeFeatureAvailability, predictOutcomeV2,
   computeMatchProbabilities, mostLikelyScoreline, scorelineOutcome, computeFactorImportance,
+  classifyFixtureOfficial,
 } = require("./learning/predictionModel");
 // 選手個人の実データ統計(2026年8月・知識拡張フェーズ)。
 const { computePlayerRealStats } = require("./learning/playerFeatures");
@@ -4502,6 +4505,12 @@ async function handleMatchAnalysis(query, clientIp) {
     }
   }
 
+  // v47: 市場オッズ特徴量はfixture(実際の試合日程)に紐づくため、任意の2チームを
+  // 比較できるこのオンデマンド分析では使わない(でっち上げたオッズを入れない)。
+  // 学習でオッズの重みが実際に効き始めた後は、その差を利用者に正直に伝える。
+  if (Math.abs(weights.marketSensitivity || 0) >= 0.005) {
+    dataNotes.push("毎日の事前予測では市場オッズも参考にしていますが、この対戦分析は特定の試合日程を前提としないため、オッズは使わずに計算しています。");
+  }
   const { homeLambda, awayLambda, predictedWinner } = predictOutcomeV2(features, weights);
   const winProbability = computeMatchProbabilities(homeLambda, awayLambda);
   const predictedScoreline = mostLikelyScoreline(homeLambda, awayLambda);
@@ -5766,7 +5775,61 @@ async function handleDiscuss(body, clientIp) {
     confidence = { stars: 2, reasonJa: "特定の実データによる裏付けができないため、確信度は控えめにしています。" };
   }
 
+  // ---- 2026年8月18日・v47「会話を多段思考に」(利用者の選択③) ----
+  // ステージ1(計画・軽量LLM)→ステージ2(許可済みデータ取得・最大2件)を実行し、
+  // 追加の実データを最終回答(ステージ3)へ渡す。設計はdiscuss/multiStep.js参照。
+  //   ・比較の質問でも、これまでは片方のクラブの実データしか渡っていなかった。
+  //   ・計画の失敗(JSONが壊れている等)は従来の1段構成へのフォールバック。
+  //   ・追加のLLM呼び出しはサイト全体の日次予算へ正直に計上する(利用者ごとの
+  //     回数は「質問1回=1回」のまま数える。二重に取らない)。
+  //   ・DISCUSS_MULTISTEP=0 で完全無効化(従来と同一動作)。
+  let multiStepMeta = null;
+  if (discussMultiStep.isMultiStepEnabled() && (subject.type === "club" || !subject.type)) {
+    // 「最後の1枠」を計画に使わないための予約ルール:
+    //   計画の呼び出し(+1)をしても、他の誰かの回答用に最低1枠が残る場合だけ
+    //   多段思考を実行する。残り予算が少ない日は、多段思考より「より多くの
+    //   質問に答えること」を優先する(全体の体験を守る)。
+    const budgetLeavesRoom = (llmDailyBudget.day !== appDateKey())
+      || (llmDailyBudget.count + 2 <= MAX_LLM_CALLS_PER_DAY);
+    if (!budgetLeavesRoom || !(await tryConsumeLlmBudget())) {
+      multiStepMeta = { enabled: true, ran: false, reasonJa: "本日のサイト全体のAI利用予算が残り少ないため、多段思考を省略して通常の1段構成で回答しました。" };
+    } else {
+      const factHeadings = facts.slice(0, 12).map((f) => String(f).slice(0, 48));
+      const msPlan = await discussMultiStep.planExtraDataNeeds({ question, subject, factHeadings, generateLLM });
+      if (!msPlan.ok) {
+        multiStepMeta = { enabled: true, ran: false, reasonJa: "調査計画の生成に失敗したため、通常の1段構成で回答しました(壊れた計画を無理に実行することはしません)。", planError: msPlan.reason };
+      } else {
+        const exec = await discussMultiStep.executePlannedActions(msPlan.actions, {
+          gatherClubKnowledge: (en, needs, ja) => knowledgeSource.gatherClubKnowledge(en, needs, ja),
+          formatClubFacts,
+          // 追加クラブに対しても「元の質問が求めている種類のデータ」を取得する
+          // (比較の質問なら、両クラブに同じ観点のデータが揃うのが筋)。
+          defaultNeeds: plan.needs,
+          upstashCmd: UPSTASH_ENABLED ? upstashCmd : null,
+        });
+        if (exec.addedFacts.length) facts.push(...exec.addedFacts);
+        multiStepMeta = {
+          enabled: true, ran: true,
+          plannedActions: msPlan.actions.map((a) => ({ type: a.type, clubJa: a.club.nameJa })),
+          focusJa: msPlan.focusJa,
+          executed: exec.executed,
+          extraFacts: exec.addedFacts.length,
+          noteJa: msPlan.actions.length
+            ? `多段思考: 調査計画AIが追加データ${msPlan.actions.length}件を要求し、実データ${exec.addedFacts.length}件を追加取得しました。`
+            : "多段思考: 調査計画AIは「追加データは不要」と判断しました(手元の実データで十分)。",
+        };
+      }
+    }
+  } else if (!discussMultiStep.isMultiStepEnabled()) {
+    multiStepMeta = { enabled: false };
+  }
+  knowledgeMeta.multiStep = multiStepMeta;
+
   let reasoningPromptBlock = reasoningBundle ? formatReasoningForPrompt(reasoningBundle, previousConclusion) : "";
+  // v47: 計画AIが特定した論点を、回答AIへ明示的に渡す(多段思考の連結)
+  if (multiStepMeta && multiStepMeta.ran && multiStepMeta.focusJa) {
+    reasoningPromptBlock += `\n\n【調査計画AIが特定した、この質問で最も重視すべき論点】${multiStepMeta.focusJa}`;
+  }
   // 優先順位④: 6段階の検討結果をLLMへ渡し、「私は○○が最も重要だと考えます」で
   // 締めることを明示的に指示する(テンプレート化を避けるため、根拠の状況に
   // 応じて内容が毎回変わる内部メモをそのまま添える)。
@@ -6198,6 +6261,15 @@ async function handleHttpRequest(req, res) {
             recs.sort((a, b) => String(b.resolvedAt || "").localeCompare(String(a.resolvedAt || "")));
             const misses = recs.filter((r) => r.correct === false);
             const hits = recs.filter((r) => r.correct === true);
+            // ---- 2026年8月18日: 公式戦と親善・2軍(参考)を分けて数える ----
+            //   親善試合は主力を休ませるためプロでも当てられない。混ぜて集計すると
+            //   実力より低い的中率に見える(本番実測: 全体42%)。
+            //   旧記録には official フラグが無いので、リーグ名・チーム名から判定する。
+            const isOfficialRec = (r) => (r.official !== undefined
+              ? r.official !== false
+              : classifyFixtureOfficial(r.league, r.homeTeamEn, r.awayTeamEn).official);
+            const officialRecs = recs.filter(isOfficialRec);
+            const officialHits = officialRecs.filter((r) => r.correct === true);
             const reasonTally = new Map();
             const items = misses.slice(0, 6).map((r) => {
               const reasons = [];
@@ -6207,7 +6279,11 @@ async function handleHttpRequest(req, res) {
               (Array.isArray(r.failureReasons) ? r.failureReasons : []).forEach((x) => {
                 if (x && x.labelJa && reasons.length < 3) reasons.push({ labelJa: String(x.labelJa), detailJa: String(x.detail || x.detailJa || "") });
               });
+              const clsOfficial = isOfficialRec(r);
               return {
+                official: clsOfficial,
+                referenceJa: clsOfficial ? null
+                  : (r.officialReasonJa || classifyFixtureOfficial(r.league, r.homeTeamEn, r.awayTeamEn).reasonJa || "参考扱いの試合です"),
                 homeEn: r.homeTeamEn || null, awayEn: r.awayTeamEn || null, league: r.league || null,
                 kickoff: r.kickoff || null, resolvedAt: r.resolvedAt || null,
                 predictedJa: r.predictedWinner === "home" ? `${r.homeTeamEn || "ホーム"}勝利` : r.predictedWinner === "away" ? `${r.awayTeamEn || "アウェイ"}勝利` : "引き分け",
@@ -6236,6 +6312,13 @@ async function handleHttpRequest(req, res) {
             body = {
               ok: true, available: recs.length > 0,
               resolvedCount: recs.length, hitCount: hits.length, missCount: misses.length,
+              officialSummary: {
+                n: officialRecs.length,
+                hits: officialHits.length,
+                hitRatePct: officialRecs.length ? Math.round((officialHits.length / officialRecs.length) * 1000) / 10 : null,
+                referenceN: recs.length - officialRecs.length,
+                noteJa: "公式戦のみの成績です。親善試合・2軍戦は主力を休ませるため予測が難しく、参考扱いとして分けています(予想自体は出し続けています)。",
+              },
               items, topReasons,
               honestyJa: "理由は、答え合わせの時点で実測データから機械的に分類したものです。AIが後から言い訳の文章を作っているのではありません。",
               reasonJa: recs.length ? null : "答え合わせが済んだ自社予測がまだありません(試合が終わり次第、自動で増えます)。",
