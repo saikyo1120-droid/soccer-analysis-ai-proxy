@@ -127,6 +127,8 @@ const { computeMarketProbs } = require("./accuracyTracker");
 const { CLUB_UNIVERSE, clubsForPrediction } = require("./clubUniverse");
 // 2026年8月: 過去試合を使ったモデル調整(λの独立化・Dixon-Coles・採用ゲート)
 const { tuneModelOnHistory, getTuningHistory } = require("./modelTuning");
+// v48「週間AIダイジェスト」(2026年8月18日・利用者の選択)
+const { generateAndStoreWeeklyDigest } = require("./weeklyDigest");
 // ① 学習によって「予測がどう変わったか」の記録
 const { computePredictionShift } = require("./predictionShift");
 // ⑩ AIが自分で「次に何を学ぶか」を決める
@@ -2135,7 +2137,26 @@ async function runDailyLearning(deps) {
     } catch (e) { errors.push(`agenda_build_failed:${e.message}`); }
   } catch (e) { /* ベストエフォート */ }
 
+  // ---- 2026年8月18日・v48: 週間AIダイジェストの生成(週1回・Redis読み書きのみ) ----
+  //   直前の完了週(月曜〜日曜 JST)のダイジェストが未生成のときだけ作る。
+  //   API呼び出しゼロ・LLMゼロ。失敗しても学習全体は止めない(理由をerrorsへ)。
+  let weeklyDigestResult = null;
+  try {
+    weeklyDigestResult = await generateAndStoreWeeklyDigest({ upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON }, runAt);
+    if (weeklyDigestResult && weeklyDigestResult.generated === false && /失敗/.test(weeklyDigestResult.reasonJa || "")) {
+      errors.push(`weekly_digest_save_failed:${weeklyDigestResult.reasonJa}`);
+    }
+  } catch (e) {
+    errors.push(`weekly_digest_failed:${e && (e.code || e.message)}`);
+  }
+
   const growthLog = {
+    // v48: 週間ダイジェストの生成結果(生成した週・見送り理由)を実測のまま残す
+    weeklyDigest: weeklyDigestResult ? {
+      generated: !!weeklyDigestResult.generated,
+      weekKey: weeklyDigestResult.weekKey || null,
+      reasonJa: weeklyDigestResult.reasonJa || null,
+    } : null,
     date: dateKey,
     ranAt: runAt.toISOString(),
     teamsAnalyzed: REGISTERED_TEAMS.length,
