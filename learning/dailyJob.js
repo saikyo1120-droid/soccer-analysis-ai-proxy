@@ -1638,9 +1638,13 @@ async function runDailyLearning(deps) {
       const favoredSide = predictedWinner === "home" ? (isHome ? team.nameJa : `${team.nameJa}の対戦相手`)
         : predictedWinner === "away" ? (isHome ? `${team.nameJa}の対戦相手` : team.nameJa)
         : null;
+      // 第10次監査(v52)の修正: 市場ブレンドが勝敗判定を変えた予測なのに、仮説文が
+      // 「特徴量の差から導いた」とだけ主張すると、判断根拠の説明として不正直になる。
+      // ブレンド使用時はその旨を仮説文にも明記する。
+      const blendNoteForHypothesis = blendUsed ? `(市場オッズ${blendUsed.marketPct}%+AI${blendUsed.aiPct}%の合成判定を含む)` : "";
       const stateHypothesis = favoredSide
-        ? `${team.nameJa}(直近フォームスコア${(cached && cached.currentFormScore) ?? "不明"})と対戦相手の差(最も影響した要素: ${topFactor ? topFactor.labelJa : "フォーム"})から、${favoredSide}が優位という仮説`
-        : `${team.nameJa}と対戦相手は拮抗しており、互角(引き分けに近い)という仮説`;
+        ? `${team.nameJa}(直近フォームスコア${(cached && cached.currentFormScore) ?? "不明"})と対戦相手の差(最も影響した要素: ${topFactor ? topFactor.labelJa : "フォーム"})から、${favoredSide}が優位という仮説${blendNoteForHypothesis}`
+        : `${team.nameJa}と対戦相手は拮抗しており、互角(引き分けに近い)という仮説${blendNoteForHypothesis}`;
 
       // ---- 精度証明ラウンド⑤: 市場との差(エッジ)の記録 ----
       // オッズ自体は予測の前に取得済み(上)。ここでは「自前モデルの確率」と

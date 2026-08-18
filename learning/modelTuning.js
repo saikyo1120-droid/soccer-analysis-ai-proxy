@@ -27,7 +27,7 @@ const {
   evaluate, compare, shouldAdopt, splitByTime, formatComparisonJa,
   consistencyReport, shouldAdoptWithConsistency, formatLeagueTableJa,
 } = require("./modelBacktest");
-const { backfillSeasons, buildTrainingRows, saveDataset, loadDataset, DEFAULT_BACKFILL_LEAGUES } = require("./historicalBackfill");
+const { backfillSeasons, buildTrainingRows, saveDataset, loadDataset, DEFAULT_BACKFILL_LEAGUES, ROWS_VERSION, buildTeamNamesById } = require("./historicalBackfill");
 const { timeDecayWeight } = require("./historicalBackfill");
 // v47「予測モデルの根本強化」: 過去試合データセットで**全特徴量の重み**を
 // 勾配降下法で学習するために追加(従来はattackSum/concededSum/rhoの3個だけを
@@ -88,9 +88,9 @@ async function ensureDataset(deps, runAt) {
   const wantIds = DEFAULT_BACKFILL_LEAGUES.map((l) => l.id);
   const haveIds = (meta && Array.isArray(meta.leagues)) ? meta.leagues : [];
   const leagueSetChanged = existing.rows.length > 0 && wantIds.some((id) => !haveIds.includes(id));
-  // v50: 行フォーマットが古い(チームIDが無い=レーティング学習に使えない)場合も
+  // v50/v53: 行フォーマットが古い(チームIDやチーム名対応表が無い)場合も
   // 更新日を待たずに作り直す(1回だけ約29リクエスト。以降は週1回に戻る)。
-  const rowsFormatOld = existing.rows.length > 0 && (!meta || meta.rowsVersion !== 2);
+  const rowsFormatOld = existing.rows.length > 0 && (!meta || meta.rowsVersion !== ROWS_VERSION);
 
   if (existing.rows.length > 0 && ageDays < REFRESH_DAYS && !leagueSetChanged && !rowsFormatOld) {
     return { ...existing, refreshed: false, reasonJa: null };
@@ -116,6 +116,8 @@ async function ensureDataset(deps, runAt) {
   const rows = buildTrainingRows(fetched.matches, 10);
   const newMeta = {
     builtAt: runAt.toISOString(),
+    // v53: 地力ランキングの表示用(teamId→チーム名)。約200件・数KB。
+    namesById: buildTeamNamesById(fetched.matches),
     seasons,
     leagues: DEFAULT_BACKFILL_LEAGUES.map((l) => l.id),
     matchesFetched: fetched.matches.length,
@@ -375,7 +377,32 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     const ratingsFull = fitTeamRatings(ds.rows, { nowMs: nowMsForRatings });
     if (ratingsFull.available && upstashEnabled) {
       ratingsFull.builtAt = runAt.toISOString();
+      // v53: 表示用のチーム名(データセットのメタから。無ければ省略=IDのみ)
+      if (ds.meta && ds.meta.namesById) {
+        const names = {};
+        for (const id of Object.keys(ratingsFull.byTeam)) {
+          if (ds.meta.namesById[id]) names[id] = ds.meta.namesById[id];
+        }
+        ratingsFull.namesById = names;
+      }
       ratingsSaved = (await upstashSetJSON(RATINGS_KEY, ratingsFull)) !== false;
+      // ---- v53「地力ランキング」の週次スナップショット(↑↓表示用) ----
+      //   今週の順位表を learn:ratings:ranks:latest に保存し、週が替わった最初の
+      //   保存時に、前週分を learn:ratings:ranks:prev へ退避する。
+      try {
+        const { lastCompletedWeekRange, weekKeyOf } = require("./weeklyDigest");
+        const curWeekKey = weekKeyOf(lastCompletedWeekRange(nowMsForRatings).endMs); // 今週の月曜
+        const ranked = Object.entries(ratingsFull.byTeam)
+          .map(([id, t]) => ({ id, strength: t.att + t.def }))
+          .sort((a, b) => b.strength - a.strength);
+        const ranks = {};
+        ranked.forEach((t, i) => { ranks[t.id] = i + 1; });
+        const latest = await deps.upstashGetJSON("learn:ratings:ranks:latest").catch(() => null);
+        if (latest && latest.weekKey && latest.weekKey !== curWeekKey) {
+          await upstashSetJSON("learn:ratings:ranks:prev", latest);
+        }
+        await upstashSetJSON("learn:ratings:ranks:latest", { weekKey: curWeekKey, ranks, savedAt: runAt.toISOString() });
+      } catch (e) { /* スナップショットはベストエフォート(ランキング表示は変動なしで出る) */ }
     }
     record.teamRatings.fullFit = { available: ratingsFull.available, teams: ratingsFull.teamsRated, matches: ratingsFull.matchesUsed, saved: ratingsSaved, reasonJa: ratingsFull.reasonJa || null };
   } catch (e) {

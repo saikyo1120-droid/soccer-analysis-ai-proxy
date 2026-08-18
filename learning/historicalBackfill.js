@@ -237,6 +237,9 @@ function timeDecayWeight(matchDateIso, referenceMs, xi) {
 //     翌日また15リクエストを使って取り直す
 //   という自己強化ループになりうる状態だった(週1回のはずが毎日15件)。
 //   選手索引と同じくブロック分割で保存し、**保存できたかどうかを必ず返す**。
+// v53: 保存フォーマットの版。3 = チームID(hi/ai)+meta.namesById(チームID→名前)。
+// 版が上がると modelTuning 側が週1回の更新日を待たずに作り直す。
+const ROWS_VERSION = 3;
 const BACKFILL_SHARD_SIZE = 1200;                       // 1ブロックあたりの試合数
 const BACKFILL_MAX_SHARDS = 12;                          // 上限14,400件
 const backfillShardKey = (i) => `${BACKFILL_KEY}:s${i}`;
@@ -277,7 +280,7 @@ async function saveDataset(deps, rows, meta) {
   }
   // v50: 行フォーマットの版。チームID(hi/ai)を含む形式は2。
   // modelTuning側はこれを見て、古い形式の保存分を作り直す(週1回の更新日を待たない)。
-  const fullMeta = { ...(meta || {}), rowsVersion: 2, shardCount, shardSize: BACKFILL_SHARD_SIZE, storedRows: stored.length, truncatedRows: truncated };
+  const fullMeta = { ...(meta || {}), rowsVersion: ROWS_VERSION, shardCount, shardSize: BACKFILL_SHARD_SIZE, storedRows: stored.length, truncatedRows: truncated };
   const okMeta = (await upstashSetJSON(BACKFILL_META_KEY, fullMeta)) !== false;
   return {
     saved: okMeta, shardCount, storedRows: stored.length, truncatedRows: truncated, meta: fullMeta,
@@ -310,8 +313,18 @@ async function loadDataset(deps) {
   return { rows, meta };
 }
 
+/** v53: 取得済み試合からチームID→チーム名の対応表を作る(地力ランキングの表示用)。 */
+function buildTeamNamesById(matches) {
+  const names = {};
+  for (const m of (matches || [])) {
+    if (Number.isFinite(m.homeId) && m.homeName) names[m.homeId] = m.homeName;
+    if (Number.isFinite(m.awayId) && m.awayName) names[m.awayId] = m.awayName;
+  }
+  return names;
+}
+
 module.exports = {
-  DEFAULT_BACKFILL_LEAGUES, BACKFILL_KEY, BACKFILL_META_KEY, MAX_STORED_MATCHES,
+  DEFAULT_BACKFILL_LEAGUES, BACKFILL_KEY, BACKFILL_META_KEY, MAX_STORED_MATCHES, ROWS_VERSION, buildTeamNamesById,
   BACKFILL_SHARD_SIZE, BACKFILL_MAX_SHARDS, backfillShardKey,
   fetchSeason, backfillSeasons, buildTrainingRows, timeDecayWeight,
   saveDataset, loadDataset,
