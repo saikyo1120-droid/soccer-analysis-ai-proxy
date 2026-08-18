@@ -52,9 +52,15 @@ async function generateLLM({ systemPrompt, userPrompt, maxTokens, tier }) {
   }
   const provider = loader();
   const usedTier = resolveTier(tier);
-  const text = await provider.generate({ systemPrompt: systemPrompt || "", userPrompt: userPrompt || "", maxTokens: maxTokens || 700, tier: usedTier });
-  const model = typeof provider.resolveModel === "function" ? provider.resolveModel(usedTier) : null;
-  return { text, provider: name, tier: usedTier, model };
+  const out = await provider.generate({ systemPrompt: systemPrompt || "", userPrompt: userPrompt || "", maxTokens: maxTokens || 700, tier: usedTier });
+  // v51: プロバイダーは従来どおり文字列を返してもよいし、{text, model, fallbackFrom}を
+  // 返してもよい(予備モデルで答えた場合、実際に使ったモデルを正直に開示するため)。
+  const isObj = out && typeof out === "object";
+  const text = isObj ? out.text : out;
+  const model = (isObj && out.model)
+    ? out.model
+    : (typeof provider.resolveModel === "function" ? provider.resolveModel(usedTier) : null);
+  return { text, provider: name, tier: usedTier, model, modelFallbackFrom: (isObj && out.fallbackFrom) || null, truncated: !!(isObj && out.truncated) };
 }
 
 module.exports = { generateLLM, currentProviderName, resolveTier, PROVIDERS };
