@@ -36,6 +36,8 @@ const { createKnowledgeSource } = require("./rag/knowledgeSource");
 const discussMultiStep = require("./discuss/multiStep");
 // v50「チームの地力レーティング」
 const { expGoalsFromRatings, RATINGS_KEY } = require("./learning/teamRatings");
+// v54「対決の全国ランキング」
+const duelLb = require("./learning/duelLeaderboard");
 const { planInformationNeeds } = require("./discuss/planner");
 const { generateLLM, currentProviderName } = require("./llm");
 
@@ -5207,6 +5209,20 @@ async function fetchPlayerStatsFactsForMultiStep(playerName) {
 }
 
 // 第9次監査(v49): 全体上限で回答を返せなかったときに個人の1回を返す(上の修正とセット)
+// ---- v54: 対決ピック登録のIP別上限(1日60件。スパムとUpstash枠の保護) ----
+let duelPickIpDaily = { day: null, counts: new Map() };
+const DUEL_PICKS_PER_IP_PER_DAY = parseInt(process.env.DUEL_PICKS_PER_IP_PER_DAY, 10) || 60;
+function tryConsumeDuelPickForIp(ip) {
+  const today = appDateKey();
+  if (duelPickIpDaily.day !== today) duelPickIpDaily = { day: today, counts: new Map() };
+  const key = ip || "unknown";
+  const cur = duelPickIpDaily.counts.get(key) || 0;
+  if (cur >= DUEL_PICKS_PER_IP_PER_DAY) return false;
+  if (duelPickIpDaily.counts.size > 20000 && !duelPickIpDaily.counts.has(key)) return false; // メモリ保護
+  duelPickIpDaily.counts.set(key, cur + 1);
+  return true;
+}
+
 function refundLlmBudgetForIp(ip) {
   const today = appDateKey();
   if (llmIpDailyBudget.day !== today) return; // 日付が変わっていたら返す意味がない
@@ -6395,6 +6411,60 @@ async function handleHttpRequest(req, res) {
         res.end(JSON.stringify(rkBody));
         return;
       }
+      // ---- 2026年8月18日・v54「対決の全国ランキング」: TOP20+自分の順位 ----
+      //   TOP20は5分キャッシュ(全訪問者で共有)。自分の順位は2コマンド/回。
+      if (pathname === "/api/duel/leaderboard") {
+        let top = cacheGet("duel:lb:top:public");
+        if (top === undefined) {
+          if (!UPSTASH_ENABLED) {
+            top = { available: false, reasonJa: "保存先(Upstash)が未設定のため、ランキングはまだありません。" };
+          } else {
+            try {
+              const z = (await upstashCmd(["ZREVRANGE", duelLb.LB_ALLTIME_KEY, "0", "19", "WITHSCORES"])) || [];
+              const rows = [];
+              for (let i = 0; i + 1 < z.length; i += 2) rows.push({ playerId: z[i], wins: Number(z[i + 1]) });
+              const players = await Promise.all(rows.map((r) => upstashGetJSON(`${duelLb.PLAYER_KEY_PREFIX}${r.playerId}`).catch(() => null)));
+              const total = await upstashCmd(["ZCARD", duelLb.LB_ALLTIME_KEY]).catch(() => null);
+              top = {
+                available: true,
+                totalPlayers: Number.isFinite(Number(total)) ? Number(total) : rows.length,
+                top: rows.map((r, i) => {
+                  const pl = players[i] || {};
+                  return {
+                    rank: i + 1,
+                    nickname: duelLb.sanitizeNickname(pl.nickname) || "名無しのファン",
+                    wins: r.wins, d: pl.d ?? null, l: pl.l ?? null, n: pl.n ?? null,
+                    hitRatePct: pl.n ? Math.round((pl.userHits / pl.n) * 1000) / 10 : null,
+                  };
+                }),
+                noteJa: "AI撃破数(自分は的中・AIは外れ、の試合数)の通算ランキングです。予想はキックオフ1分前までにサーバーへ登録された分だけが集計され、後出しはできません。アカウントが無いため複数端末での参加は仕組み上防げません(遊びとしてお楽しみください)。",
+              };
+            } catch (e) {
+              top = { available: false, reasonJa: "ランキングの読み出しに一時的に失敗しました。しばらくして再度お試しください。" };
+            }
+          }
+          cacheSet("duel:lb:top:public", top, (top && top.available) ? 5 * 60 * 1000 : 60 * 1000);
+        }
+        // 自分の順位(playerId付きのときだけ・キャッシュしない)
+        let me = null;
+        const meId = String(parsed.searchParams.get("player") || "");
+        if (UPSTASH_ENABLED && /^[a-z0-9][a-z0-9-]{7,39}$/.test(meId)) {
+          try {
+            const rank = await upstashCmd(["ZREVRANK", duelLb.LB_ALLTIME_KEY, meId]);
+            if (rank !== null && rank !== undefined) {
+              const pl = await upstashGetJSON(`${duelLb.PLAYER_KEY_PREFIX}${meId}`).catch(() => null);
+              me = {
+                rank: Number(rank) + 1,
+                nickname: (pl && duelLb.sanitizeNickname(pl.nickname)) || "名無しのファン",
+                wins: pl ? pl.w : null, d: pl ? pl.d : null, l: pl ? pl.l : null, n: pl ? pl.n : null,
+              };
+            }
+          } catch (e) { /* 自分の順位は付加情報 */ }
+        }
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+        res.end(JSON.stringify({ ok: true, ...top, me }));
+        return;
+      }
       // ---- 2026年8月18日・v53「AIと予想対決」: 過去の対決の答え合わせ ----
       //   端末内に保存された自分の予想(fixtureId)を、保存済みの予測記録と照合する。
       //   Redisの読み出しのみ・最大30件・確定した結果は60分キャッシュ(結果は不変)。
@@ -6925,6 +6995,57 @@ async function handleHttpRequest(req, res) {
         const { status, body } = await handleMatchAnalysis(parsed.searchParams, maRequestIp);
         res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
+        return;
+      }
+      // ---- 2026年8月18日・v54「対決の全国ランキング」: ピック登録(POST) ----
+      //   キックオフ1分前まで。後出しはサーバー時刻+保存済み記録で構造的に拒否。
+      if (pathname === "/api/duel/pick") {
+        if (req.method !== "POST") {
+          res.writeHead(405, { "Content-Type": "application/json; charset=utf-8", "Allow": "POST" });
+          res.end(JSON.stringify({ ok: false, error: "method not allowed, use POST" }));
+          return;
+        }
+        let duelBody;
+        try {
+          duelBody = await readJsonBody(req);
+        } catch (e) {
+          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+          return;
+        }
+        const duelIp = clientKeyFromRequest(req);
+        if (!tryConsumeDuelPickForIp(duelIp)) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, reason: "rate_limited", messageJa: `本日のピック登録が上限(${DUEL_PICKS_PER_IP_PER_DAY}件)に達しました。日付が変わるとまた登録できます。` }));
+          return;
+        }
+        if (!UPSTASH_ENABLED) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, reason: "no_storage", messageJa: "保存先(Upstash)が未設定のため、ランキング参加は利用できません。" }));
+          return;
+        }
+        const b = duelBody || {};
+        // 対象試合の記録を読む(キックオフ・解決済みかの判定に使う)
+        const duelRecord = /^\d{1,12}$/.test(String(b.fixtureId || ""))
+          ? await upstashGetJSON(`learn:ownpred:${b.fixtureId}`).catch(() => null)
+          : null;
+        const v = duelLb.validatePick({
+          playerId: b.playerId, nickname: b.nickname, fixtureId: b.fixtureId,
+          pick: b.pick, record: duelRecord, nowMs: Date.now(),
+        });
+        if (!v.ok) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, reason: v.reason, messageJa: v.messageJa }));
+          return;
+        }
+        const stored = await duelLb.storePick({ upstashCmd }, {
+          playerId: b.playerId, nickname: b.nickname, fixtureId: b.fixtureId,
+          pick: b.pick, nowMs: Date.now(),
+        });
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(stored.ok
+          ? { ok: true, registered: true, noteJa: stored.closesAtNote }
+          : { ok: false, reason: stored.reason, messageJa: stored.messageJa }));
         return;
       }
       if (pathname === "/api/discuss") {

@@ -7858,9 +7858,21 @@ function duelScoreboardHtml() {
   const head = rec.n
     ? `🤜🤛 <strong>AIとの対決: あなた${rec.w}勝${rec.d}分${rec.l}敗</strong>${rec.streak >= 2 ? ` <span style="color:var(--series-2); font-weight:700;">🔥${rec.streak}連勝中</span>` : ""} <span class="value-note">(的中数: あなた${rec.userHits} vs AI${rec.aiHits})</span>`
     : `🤜🤛 <strong>AIと予想対決</strong> <span class="value-note">AIの予想を見る前に、自分の予想をタップ。試合後に自動で答え合わせします。</span>`;
+  // v54: 全国ランキング(参加は任意。参加中は自分のピックが自動登録される)
+  const lbLine = duelLbJoined()
+    ? `<span class="value-note">🏆 「${escapeHtml(duelLbNickname() || "")}」として全国ランキング参加中</span> <button class="ghost-btn" id="duelLbToggleBtn" type="button" style="padding:2px 10px; font-size:12px;">🏆 全国ランキングを見る</button>`
+    : `<button class="ghost-btn" id="duelLbJoinBtn" type="button" style="padding:2px 10px; font-size:12px;">🏆 全国ランキングに参加(ニックネームだけ)</button> <button class="ghost-btn" id="duelLbToggleBtn" type="button" style="padding:2px 10px; font-size:12px;">ランキングを見る</button>`;
   return `<div id="duelScoreboard" style="margin:0 0 8px; padding:8px 10px; border:1.5px solid var(--series-home); border-radius:8px; background:rgba(0,0,0,.03);">
     <div>${head}</div>
     <div class="value-note" style="margin-top:3px;">記録はこの端末の中だけに保存されます ・ <button class="ghost-btn" id="duelShareBtn" type="button" style="padding:2px 10px; font-size:12px;"${rec.n ? "" : " disabled"}>📸 対戦成績をシェア</button> <button class="ghost-btn" id="duelModeOffBtn" type="button" style="padding:2px 10px; font-size:12px;">対決をOFF</button></div>
+    <div style="margin-top:4px;">${lbLine}</div>
+    ${duelLastRegisterNote ? `<div class="value-note" style="margin-top:3px;">${escapeHtml(duelLastRegisterNote)}</div>` : ""}
+    <div id="duelJoinForm" style="display:none; margin-top:6px;">
+      <input type="text" id="duelNickInput" maxlength="12" placeholder="ニックネーム(12文字まで)" style="padding:7px 10px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary); font-size:13px; width:200px;">
+      <button class="apply-btn" id="duelJoinSubmitBtn" type="button" style="margin-top:0; width:auto; padding:7px 12px; font-size:13px;">参加する</button>
+      <div class="value-note" style="margin-top:3px;">参加は任意です。ニックネームと匿名の端末IDだけで参加でき、本名やアカウントは不要です(機種変更で記録は引き継げません)。キックオフ1分前までに選んだ予想だけが集計されます(後出し防止)。</div>
+    </div>
+    <div id="duelLbView" style="display:none; margin-top:6px;"></div>
   </div>`;
 }
 function buildDuelShareImage() {
@@ -7916,6 +7928,78 @@ function duelMyPickLineHtml(p) {
   if (!mine || mine.pick === "SKIP") return "";
   const same = mine.pick === p.predictedWinner;
   return `<div class="value-note" style="margin-top:2px;">🫵 あなたの予想: <strong>${escapeHtml(DUEL_PICK_LABELS[mine.pick] || mine.pick)}</strong> ${same ? "— AIと同じ予想です 🤝" : "— AIと勝負! 🤜🤛"}</div>`;
+}
+
+// ---- v54「対決の全国ランキング」: 参加(任意)・登録・表示 ----
+//   参加すると端末内に匿名ID+ニックネームを持ち、以後のピックが自動で
+//   サーバーに登録される(キックオフ1分前まで)。記録の集計はサーバー側。
+const DUEL_PID_KEY = "duelPlayerId";
+const DUEL_NICK_KEY = "duelNickname";
+let duelLastRegisterNote = null; // 直近の登録結果(正直に表示する)
+function duelLbPlayerId() {
+  try { return localStorage.getItem(DUEL_PID_KEY) || null; } catch (e) { return null; }
+}
+function duelLbNickname() {
+  try { return localStorage.getItem(DUEL_NICK_KEY) || null; } catch (e) { return null; }
+}
+function duelLbJoined() { return !!(duelLbPlayerId() && duelLbNickname()); }
+function duelLbJoin(nickname) {
+  try {
+    let pid = localStorage.getItem(DUEL_PID_KEY);
+    if (!pid) {
+      const bytes = new Uint8Array(12);
+      (window.crypto || {}).getRandomValues ? crypto.getRandomValues(bytes) : bytes.forEach((_, i) => { bytes[i] = Math.floor(Math.random() * 256); });
+      pid = "d" + Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+      localStorage.setItem(DUEL_PID_KEY, pid);
+    }
+    localStorage.setItem(DUEL_NICK_KEY, String(nickname).slice(0, 12));
+    return true;
+  } catch (e) { return false; }
+}
+async function duelLbRegisterPick(p, pick) {
+  if (!duelLbJoined() || pick === "SKIP") return;
+  try {
+    const res = await fetchJsonWithTimeout(`${API_PROXY_BASE}/duel/pick`,
+      backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ playerId: duelLbPlayerId(), nickname: duelLbNickname(), fixtureId: String(p.fixtureId), pick }),
+      });
+    duelLastRegisterNote = res && res.ok
+      ? `🏆 全国ランキングに登録しました(${res.noteJa || ""})`
+      : `⚠️ ランキング登録できませんでした: ${(res && res.messageJa) || "通信に失敗しました"}(端末内の対戦成績には数えます)`;
+  } catch (e) {
+    duelLastRegisterNote = "⚠️ ランキング登録の通信に失敗しました(端末内の対戦成績には数えます)";
+  }
+  renderTodayPredictionsHero(true);
+}
+async function renderDuelLeaderboard(container) {
+  container.innerHTML = `<p class="value-note">読み込み中…</p>`;
+  let d = null;
+  try {
+    const pid = duelLbPlayerId();
+    d = await fetchJsonWithTimeout(`${API_PROXY_BASE}/duel/leaderboard${pid ? `?player=${encodeURIComponent(pid)}` : ""}`,
+      backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+  } catch (e) { d = null; }
+  if (!d || d.ok === false) { container.innerHTML = `<p class="value-note">ランキングを取得できませんでした。しばらくして再度お試しください。</p>`; return; }
+  if (d.available === false) { container.innerHTML = `<p class="value-note">${escapeHtml(d.reasonJa || "ランキングはまだありません。")}</p>`; return; }
+  const esc = escapeHtml;
+  const rows = (d.top || []).map((t) => `
+    <tr${d.me && t.rank === d.me.rank ? ' style="background:rgba(179,84,30,.08); font-weight:700;"' : ""}>
+      <td style="padding:4px 8px; text-align:right;">${Number(t.rank)}</td>
+      <td style="padding:4px 8px;">${esc(t.nickname)}</td>
+      <td style="padding:4px 8px; text-align:right;"><strong>${Number(t.wins)}</strong></td>
+      <td style="padding:4px 8px; text-align:right;" class="value-note">${t.n !== null ? `${Number(t.n)}戦` : "-"}${t.hitRatePct !== null ? `・的中${Number(t.hitRatePct)}%` : ""}</td>
+    </tr>`).join("");
+  container.innerHTML = `
+    ${(d.top || []).length ? `
+    <table style="width:100%; border-collapse:collapse; font-size:13px; margin-top:4px;">
+      <thead><tr class="value-note"><th style="padding:4px 8px; text-align:right;">順位</th><th style="padding:4px 8px; text-align:left;">ニックネーム</th><th style="padding:4px 8px; text-align:right;">AI撃破</th><th style="padding:4px 8px;"></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>` : `<p class="value-note" style="margin-top:4px;">まだ誰も採点されていません。最初のAI撃破者になりましょう(採点は試合後、毎朝の学習で行われます)。</p>`}
+    ${d.me ? `<div class="value-note" style="margin-top:6px;">🫵 あなた: <strong>${Number(d.me.rank)}位</strong> / ${Number(d.totalPlayers)}人(撃破${Number(d.me.wins)}・${Number(d.me.n)}戦)</div>`
+      : (duelLbJoined() ? `<div class="value-note" style="margin-top:6px;">🫵 あなたの初採点はまだです(登録したピックの試合が終わり、毎朝の学習で採点されると載ります)。</div>` : "")}
+    <p class="value-note" style="margin-top:6px; opacity:.85;">${esc(d.noteJa || "")}</p>`;
 }
 
 // ================================================================
@@ -8095,7 +8179,12 @@ async function renderTodayPredictionsHero(reuseCached) {
     b.addEventListener("click", () => {
       const fid = Number(b.dataset.fixture);
       const p = (data.predictions || []).find((x) => Number(x.fixtureId) === fid);
-      if (p) { duelRecordPick(p, b.dataset.pick); renderTodayPredictionsHero(true); }
+      if (p) {
+        duelRecordPick(p, b.dataset.pick);
+        // v54: 参加者はサーバーにも登録(結果は非同期で盤面に正直に表示される)
+        duelLbRegisterPick(p, b.dataset.pick);
+        renderTodayPredictionsHero(true);
+      }
     });
   });
   el.querySelectorAll(".duel-skip-btn").forEach((b) => {
@@ -8107,6 +8196,31 @@ async function renderTodayPredictionsHero(reuseCached) {
   });
   const duelShareBtn = document.getElementById("duelShareBtn");
   if (duelShareBtn) duelShareBtn.addEventListener("click", shareDuelImage);
+  // ---- v54: 全国ランキングの配線 ----
+  const duelLbJoinBtn = document.getElementById("duelLbJoinBtn");
+  if (duelLbJoinBtn) duelLbJoinBtn.addEventListener("click", () => {
+    const f = document.getElementById("duelJoinForm");
+    if (f) f.style.display = f.style.display === "none" ? "block" : "none";
+  });
+  const duelJoinSubmitBtn = document.getElementById("duelJoinSubmitBtn");
+  if (duelJoinSubmitBtn) duelJoinSubmitBtn.addEventListener("click", () => {
+    const inp = document.getElementById("duelNickInput");
+    const nick = inp ? inp.value.trim() : "";
+    if (!nick) { if (inp) inp.placeholder = "ニックネームを入れてください"; return; }
+    if (duelLbJoin(nick)) {
+      duelLastRegisterNote = "🏆 参加登録しました。ここから先のピックが自動でランキングに登録されます。";
+    } else {
+      duelLastRegisterNote = "⚠️ この端末には保存できませんでした(プライベートモード等)。参加にはニックネームの保存が必要です。";
+    }
+    renderTodayPredictionsHero(true);
+  });
+  const duelLbToggleBtn = document.getElementById("duelLbToggleBtn");
+  if (duelLbToggleBtn) duelLbToggleBtn.addEventListener("click", () => {
+    const v = document.getElementById("duelLbView");
+    if (!v) return;
+    if (v.style.display === "none") { v.style.display = "block"; renderDuelLeaderboard(v); }
+    else v.style.display = "none";
+  });
   const duelOffBtn = document.getElementById("duelModeOffBtn");
   if (duelOffBtn) duelOffBtn.addEventListener("click", () => { duelSetMode(false); renderTodayPredictionsHero(true); });
   const duelOnBtn = document.getElementById("duelModeOnBtn");
