@@ -132,6 +132,8 @@ const { tuneModelOnHistory, getTuningHistory } = require("./modelTuning");
 const { generateAndStoreWeeklyDigest } = require("./weeklyDigest");
 // v50「チームの地力レーティング」(2026年8月18日・利用者の選択①)
 const { expGoalsFromRatings, RATINGS_KEY } = require("./teamRatings");
+// v54「対決の全国ランキング」(2026年8月18日・利用者の選択)
+const { scoreFixtureDuels } = require("./duelLeaderboard");
 // ① 学習によって「予測がどう変わったか」の記録
 const { computePredictionShift } = require("./predictionShift");
 // ⑩ AIが自分で「次に何を学ぶか」を決める
@@ -1068,6 +1070,7 @@ async function runDailyLearning(deps) {
   // 2026年8月・ご指示⑨: 解決した予測はその場で全市場(勝敗/BTTS/Over-Under/
   // スコア)の採点を行い、日次の精度記録(learn:accuracy:<date>)に積む。
   const resolvedScoredToday = [];
+  let duelScoredToday = 0; // v54: 今日採点した対決ピック数(実測)
   const pendingIds = (await upstashCmd(["LRANGE", "learn:ownpred:pending", "0", String(OWN_PREDICT_RESOLVE_CAP - 1)]).catch(() => [])) || [];
   for (const fixtureIdStr of pendingIds) {
     try {
@@ -1155,6 +1158,18 @@ async function runDailyLearning(deps) {
           resolvedScoredToday.push(record.marketScores);
         }
       } catch (e) { errors.push(`accuracy_scoring_failed:${fixtureIdStr}:${e.message}`); }
+
+      // ---- v54「対決の全国ランキング」: この試合に登録された利用者ピックを採点する ----
+      //   キックオフ前に登録された分だけが対象(後出し不可はAPI側で保証済み)。
+      //   採点後はピックを削除するため二重採点は起こらない。失敗しても学習は止めない。
+      try {
+        const duelRes = await scoreFixtureDuels(
+          { upstashCmd, upstashGetJSON, upstashSetJSON },
+          fixtureIdStr, record.predictedWinner, actualWinner, runAt.getTime()
+        );
+        if (duelRes.scored > 0) duelScoredToday += duelRes.scored;
+        duelRes.errors.slice(0, 3).forEach((e2) => errors.push(e2));
+      } catch (e) { errors.push(`duel_scoring_failed:${fixtureIdStr}`); }
 
       // ---- Failure Learning(ご要望①): 外れた場合は「何故外れたのか」を分類して保存する ----
       // 従来は正解/不正解のカウントだけで、原因は一切記録していなかった。
@@ -2210,6 +2225,7 @@ async function runDailyLearning(deps) {
   //   直前の完了週(月曜〜日曜 JST)のダイジェストが未生成のときだけ作る。
   //   API呼び出しゼロ・LLMゼロ。失敗しても学習全体は止めない(理由をerrorsへ)。
   let weeklyDigestResult = null;
+  // (v54の対決採点数は答え合わせループ内で加算される)
   try {
     weeklyDigestResult = await generateAndStoreWeeklyDigest({ upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON }, runAt);
     if (weeklyDigestResult && weeklyDigestResult.generated === false && /失敗/.test(weeklyDigestResult.reasonJa || "")) {
@@ -2220,6 +2236,8 @@ async function runDailyLearning(deps) {
   }
 
   const growthLog = {
+    // v54: 今日採点した対決ピック数(全国ランキングへの反映数)
+    duelPicksScoredToday: duelScoredToday,
     // v50: 市場ブレンドの学習結果(採否・w・検証NLL)を実測のまま残す
     marketBlendFit: marketBlendFitToday ? {
       adopted: !!marketBlendFitToday.adopted, w: marketBlendFitToday.w ?? 0,
