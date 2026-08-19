@@ -134,6 +134,15 @@ const { generateAndStoreWeeklyDigest } = require("./weeklyDigest");
 const { expGoalsFromRatings, RATINGS_KEY } = require("./teamRatings");
 // v54「対決の全国ランキング」(2026年8月18日・利用者の選択)
 const { scoreFixtureDuels } = require("./duelLeaderboard");
+// v57: 複数ブックメーカーのコンセンサスオッズ(The Odds API。キー未設定なら不活性)
+const oddsApiMod = require("./oddsApi");
+// v57: クラブElo(clubelo.com・無料の独立レーティング。取得失敗は特徴量0に倒す)
+const clubEloMod = require("./clubElo");
+// v57: xGの前向き収集(昨日の9リーグの試合統計から。上限つき・jobCall)
+const xgCollectMod = require("./xgCollect");
+// v57: スタメン確定ウォッチ(答え合わせ時に朝版vs直前版のBrierを両方採点)
+const lineupWatchMod = require("./lineupWatch");
+const { DEFAULT_BACKFILL_LEAGUES } = require("./historicalBackfill");
 // ① 学習によって「予測がどう変わったか」の記録
 const { computePredictionShift } = require("./predictionShift");
 // ⑩ AIが自分で「次に何を学ぶか」を決める
@@ -1171,6 +1180,18 @@ async function runDailyLearning(deps) {
         duelRes.errors.slice(0, 3).forEach((e2) => errors.push(e2));
       } catch (e) { errors.push(`duel_scoring_failed:${fixtureIdStr}`); }
 
+      // ---- v57「スタメン確定ウォッチ」: 朝版と直前版のBrierを両方採点する ----
+      //   直前版が実測で朝版を上回り続けるかを、この累積だけで判断できるようにする
+      //   (直前情報レイヤーは表示のみで、公式の予想・学習は朝版のまま)。
+      try {
+        const pkScore = lineupWatchMod.scoreResolvedPreKick(record);
+        if (pkScore) {
+          lineupWatchScored.n++;
+          lineupWatchScored.morningSum += pkScore.morningBrier;
+          lineupWatchScored.preKickSum += pkScore.preKickBrier;
+        }
+      } catch (e) { /* 採点は付加情報。失敗しても答え合わせ本体は続行 */ }
+
       // ---- Failure Learning(ご要望①): 外れた場合は「何故外れたのか」を分類して保存する ----
       // 従来は正解/不正解のカウントだけで、原因は一切記録していなかった。
       // 予測時点の特徴量(record.features)と重み(record.weightsSnapshot)だけを
@@ -1440,6 +1461,9 @@ async function runDailyLearning(deps) {
     return recentRecordsShared;
   }
 
+  let clubEloBackfillResult = null; // v57: クラブElo履歴の一度きりバックフィル結果
+  const lineupWatchScored = { n: 0, morningSum: 0, preKickSum: 0 }; // v57: 朝版vs直前版
+  let xgCollectResult = null; // v57: xG前向き収集の実測
   await stage("③ 新しい予測を立てる");
   // ---- v50: チーム別レーティング(前回の学習で保存済み)を1回だけ読み込む ----
   //   無ければnull=レーティング特徴量は0(影響なし)。ここで新しい計算はしない。
@@ -1447,6 +1471,52 @@ async function runDailyLearning(deps) {
   // v55: 地力ランキングの表示用に、この巡回で確定した teamId→チーム名 を集める
   // (レーティングのIDに名前を紐づける最も確実な供給源。試合予定から実名を取る)
   const teamNamesCollected = new Map();
+  // ---- v57「複数ブックメーカーのコンセンサスオッズ」(The Odds API) ----
+  //   ODDS_API_KEY設定時のみ動く(未設定なら従来と完全同一)。リーグ単位で
+  //   1回だけ取得(=1クレジット)し、その日の対象試合すべてで使い回す。
+  //   照合できない試合は従来どおりAPI-Footballの1社オッズ。
+  // ---- v57「クラブElo」: 日次一覧を1日1回だけ取得(保存を再利用) ----
+  //   取れない日は7日以内の保存で継続(staleDaysを開示)。それも無ければ特徴量0。
+  let clubEloDailyRows = [], clubEloByNormMap = null, clubEloMeta = null, clubEloUsedToday = 0;
+  try {
+    clubEloMeta = await clubEloMod.getDailyElo({ fetchFn: (u) => fetch(u), upstashGetJSON, upstashSetJSON }, runAt.getTime());
+    clubEloDailyRows = clubEloMeta.rows || [];
+    clubEloByNormMap = clubEloMod.buildEloByNorm(clubEloDailyRows);
+    if (clubEloMeta.error && !clubEloDailyRows.length) errors.push(`clubelo_daily_failed:${clubEloMeta.error}`);
+  } catch (e) {
+    errors.push(`clubelo_daily_failed:${String((e && e.message) || e).slice(0, 40)}`);
+  }
+  const eloOfName = (name) => (clubEloByNormMap && clubEloDailyRows.length)
+    ? clubEloMod.eloForTeamName(clubEloByNormMap, clubEloDailyRows, name) : null;
+  const oddsConsensusByLeague = new Map(); // leagueId -> events[] | null(取得失敗)
+  const oddsApiStats = { enabled: oddsApiMod.isEnabled(process.env), leaguesFetched: 0, eventsTotal: 0, used: 0, failures: [] };
+  async function consensusForFixture(fx) {
+    if (!oddsApiStats.enabled) return null;
+    const lgId = fx && fx.league ? Number(fx.league.id) : NaN;
+    if (!Number.isFinite(lgId) || !oddsApiMod.SPORT_KEYS[lgId]) return null;
+    if (!oddsConsensusByLeague.has(lgId)) {
+      const r = await oddsApiMod.fetchLeagueConsensus(
+        { fetchFn: (u) => fetch(u), upstashCmd: upstashEnabled ? upstashCmd : null, env: process.env },
+        lgId, runAt.getTime());
+      if (r && r.ok) {
+        oddsApiStats.leaguesFetched++;
+        oddsApiStats.eventsTotal += r.events.length;
+        oddsConsensusByLeague.set(lgId, r.events);
+      } else {
+        if (r && r.reason) oddsApiStats.failures.push(`league${lgId}:${r.reason}`);
+        oddsConsensusByLeague.set(lgId, null);
+      }
+    }
+    const events = oddsConsensusByLeague.get(lgId);
+    if (!events) return null;
+    const hit = oddsApiMod.matchFixture(
+      events,
+      fx.teams && fx.teams.home && fx.teams.home.name,
+      fx.teams && fx.teams.away && fx.teams.away.name,
+      fx.fixture && fx.fixture.date);
+    if (!hit) return null;
+    return { implied: { homePct: hit.consensus.homePct, drawPct: hit.consensus.drawPct, awayPct: hit.consensus.awayPct }, nBooks: hit.nBooks };
+  }
   // ---- ③ TOP100クラブの直近の試合について、新しく自社予測を立てる ----
   // 2026年8月の調査で修正: 旧実装はここを REGISTERED_TEAMS(11クラブ)で回して
   // いたため、知識収集は毎日100クラブ回っているのに **予測はTOP100のうち9クラブ
@@ -1598,7 +1668,7 @@ async function runDailyLearning(deps) {
       // 「記録のためだけ」に取得していた。市場オッズを特徴量(marketEdge)として
       // 予測の入力に使うため、取得を予測の前へ移した(取得内容・件数は同じ)。
       // 取得できなければ正直にnull(架空のオッズは作らない。特徴量は0=影響なし)。
-      let matchOdds = null, marketImplied = null, marketEdgePt = null;
+      let matchOdds = null, marketImplied = null, marketEdgePt = null, oddsSource = null;
       try {
         const oddsData = await callApiFootball("/odds", { fixture: fixtureId });
         matchOdds = extractMatchWinnerOdds(oddsData);
@@ -1611,15 +1681,34 @@ async function runDailyLearning(deps) {
         //   他のステージと同じく理由を残す(件数は capList で抑制される)。
         errors.push(`odds_failed:${fixtureId}:${e.code || e.message}`);
       }
+      // v57: 複数社コンセンサスが取れた試合は、そちらを市場確率として使う
+      // (1社の声→市場の合意。どちらを使ったかは record.oddsSource で必ず開示)
+      try {
+        const cons = await consensusForFixture(fx);
+        if (cons) {
+          marketImplied = cons.implied;
+          oddsSource = { kind: "consensus", provider: "the-odds-api", nBooks: cons.nBooks };
+          oddsApiStats.used++;
+        } else if (marketImplied) {
+          oddsSource = { kind: "single", provider: "api-football" };
+        }
+      } catch (e) {
+        errors.push(`oddsapi_failed:${fixtureId}:${String((e && e.message) || e).slice(0, 40)}`);
+        if (marketImplied) oddsSource = { kind: "single", provider: "api-football" };
+      }
 
       // v50: 地力レーティング由来の期待得点(両チームのレーティングがあるときだけ)
       const ratingEg = expGoalsFromRatings(teamRatingsData, homeTeamId, awayTeamId);
       // v55: teamId→名前の採集(レーティング表示用)
       if (Number.isFinite(homeTeamId) && fx.teams && fx.teams.home && fx.teams.home.name) teamNamesCollected.set(homeTeamId, fx.teams.home.name);
       if (Number.isFinite(awayTeamId) && fx.teams && fx.teams.away && fx.teams.away.name) teamNamesCollected.set(awayTeamId, fx.teams.away.name);
+      // v57: クラブElo(両チームぶん引けたときだけ特徴量になる。片方でも無ければ0)
+      const homeClubElo = eloOfName(fx.teams && fx.teams.home && fx.teams.home.name);
+      const awayClubElo = eloOfName(fx.teams && fx.teams.away && fx.teams.away.name);
+      if (Number.isFinite(homeClubElo) && Number.isFinite(awayClubElo)) clubEloUsedToday++;
       const built = buildMatchFeatures(
-        { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXg, topScorer: homeTop, ratingExpGoals: ratingEg ? ratingEg.home : null },
-        { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXg, topScorer: awayTop, ratingExpGoals: ratingEg ? ratingEg.away : null },
+        { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXg, topScorer: homeTop, ratingExpGoals: ratingEg ? ratingEg.home : null, clubElo: homeClubElo },
+        { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXg, topScorer: awayTop, ratingExpGoals: ratingEg ? ratingEg.away : null, clubElo: awayClubElo },
         h2h,
         marketImplied // v47: 市場オッズを特徴量 marketEdge として渡す(無ければ0)
       );
@@ -1691,6 +1780,8 @@ async function runDailyLearning(deps) {
         fixtureId, homeTeamEn: isHome ? team.nameEn : opponentName, awayTeamEn: isHome ? opponentName : team.nameEn,
         // 自己改善ループ①: リーグ別の精度診断のためにリーグ名も記録する
         league: (fx.league && fx.league.name) ? fx.league.name : null,
+        // v57: 直前ウォッチがコンセンサスオッズをリーグ単位で引くためのID
+        leagueId: (fx.league && Number.isFinite(Number(fx.league.id))) ? Number(fx.league.id) : null,
         homeFormScore, awayFormScore, predictedWinner, // v1互換フィールド(既存のバックテスト・テストとの互換性のため維持)
         homeLambda, awayLambda, features, weightsSnapshot: weights, factorImportance: importance,
         kickoff: fx.fixture.date, loggedAt: runAt.toISOString(),
@@ -1698,6 +1789,7 @@ async function runDailyLearning(deps) {
         originTeamEn: team.nameEn, stateHypothesis,
         // 精度証明ラウンド: オッズ(市場比較・ROI用)と「似た試合」(RAG強化)
         odds: matchOdds, marketImplied, marketEdgePt,
+        oddsSource, // v57: 市場確率の出典(consensus=複数社平均 / single=API-Football 1社)
         blendUsed, // v50: 市場ブレンドで判定した場合の内訳(nullなら純自前モデル)
         similarPast: similarPast.length ? similarPast : null,
         similarPastJa: summarizeSimilarMatchesJa(similarPast),
@@ -1733,7 +1825,7 @@ async function runDailyLearning(deps) {
             ? [{ key: "xg", source: "api-football", kind: "xg", computedAt: runAt.toISOString() }] : []),
           // v47: 市場オッズも「実際に使えた場合だけ」信頼度に計上する(取得失敗時は載せない)
           ...(marketImplied
-            ? [{ key: "odds", source: "api-football", kind: "odds", computedAt: runAt.toISOString() }] : []),
+            ? [{ key: "odds", source: (oddsSource && oddsSource.provider) || "api-football", kind: "odds", computedAt: runAt.toISOString() }] : []),
         ], runAt.getTime()),
         // 2026年8月・優先順位③: モデルの外側にある原因(監督交代・スタメン変更等)を
         // 試合後に特定できるよう、予測時点の文脈を保存しておく。
@@ -2103,6 +2195,7 @@ async function runDailyLearning(deps) {
     //   learn:modeltuning:log に同じ日付の記録が二重に積まれていた。
     //   1日1回だけ実行する(採用済みの重みはその日じゅう有効なので劣化しない)。
     const tunedKey = `learn:modeltuning:ran:${dateKey}`;
+    // v57: クラブElo履歴バックフィルの結果(growthLogで開示)
     const alreadyTuned = upstashEnabled ? await upstashGetJSON(tunedKey).catch(() => null) : null;
     if (alreadyTuned && alreadyTuned.ranAt) {
       modelTuning = {
@@ -2113,8 +2206,54 @@ async function runDailyLearning(deps) {
     } else {
       const storedForTune = await upstashGetJSON("learn:weights");
       const baseForTune = { ...EXTENDED_DEFAULT_WEIGHTS, ...DEFAULT_WEIGHTS, ...(storedForTune || {}) };
+      // ---- v57: xGの前向き収集(昨日ぶん)と、日付+チームIDで引くlookup ----
+      try {
+        const yesterday = new Date(runAt.getTime() - 86400000).toISOString().slice(0, 10);
+        const seasonGuess = (runAt.getUTCMonth() + 1) >= 7 ? runAt.getUTCFullYear() : runAt.getUTCFullYear() - 1;
+        xgCollectResult = await xgCollectMod.collectRecentXg(
+          { callApiFootball, upstashGetJSON, upstashSetJSON, apiBudget },
+          { leagueIds: DEFAULT_BACKFILL_LEAGUES.map((l) => l.id), season: seasonGuess, dateStr: yesterday, nowIso: runAt.toISOString() });
+      } catch (e) {
+        errors.push(`xg_collect_failed:${String((e && e.message) || e).slice(0, 40)}`);
+      }
+      let xgLookup = null;
+      try {
+        const xgMapSaved = upstashEnabled ? await upstashGetJSON(xgCollectMod.XG_MAP_KEY).catch(() => null) : null;
+        if (xgMapSaved && xgMapSaved.entries && Object.keys(xgMapSaved.entries).length) {
+          xgLookup = xgCollectMod.makeXgLookup(xgMapSaved);
+        }
+      } catch (e) { /* xGはあくまで追加材料。無くても学習は従来どおり進む */ }
+      // ---- v57: クラブEloの履歴(一度きりのバックフィル)と、当時のEloを引くlookup ----
+      //   名簿(レーティングのnamesById→learn:teamnames)が揃っていれば約190クラブの
+      //   履歴CSVを一度だけ取得して保存する(150ms間隔・失敗クラブは正直に記録)。
+      let clubEloLookup = null;
+      try {
+        let ceHist = upstashEnabled ? await upstashGetJSON(clubEloMod.HIST_KEY).catch(() => null) : null;
+        if (!ceHist || !ceHist.byTeamId || !Object.keys(ceHist.byTeamId).length) {
+          const teamsForElo = [];
+          const nm = (teamRatingsData && teamRatingsData.namesById) || {};
+          for (const id of Object.keys(nm)) teamsForElo.push({ id: Number(id), name: nm[id] });
+          if (!teamsForElo.length && upstashEnabled) {
+            const tn = (await upstashGetJSON("learn:teamnames").catch(() => null)) || {};
+            for (const id of Object.keys(tn)) teamsForElo.push({ id: Number(id), name: tn[id] });
+          }
+          if (teamsForElo.length >= 20) {
+            clubEloBackfillResult = await clubEloMod.backfillHistory(
+              { fetchFn: (u) => fetch(u), upstashCmd, upstashGetJSON, upstashSetJSON },
+              teamsForElo, runAt.getTime() - Math.round(3.3 * 365 * 86400000), runAt.getTime());
+            if (clubEloBackfillResult && clubEloBackfillResult.ran) {
+              ceHist = await upstashGetJSON(clubEloMod.HIST_KEY).catch(() => null);
+            }
+          } else {
+            clubEloBackfillResult = { ran: false, reasonJa: "チーム名簿がまだ無いため見送り(名簿が揃うと自動実行)。" };
+          }
+        }
+        if (ceHist && ceHist.byTeamId) clubEloLookup = clubEloMod.makeHistoryLookup(ceHist);
+      } catch (e) {
+        errors.push(`clubelo_hist_failed:${String((e && e.message) || e).slice(0, 40)}`);
+      }
       modelTuning = await tuneModelOnHistory(
-        { upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON, callApiFootball, apiBudget },
+        { upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON, callApiFootball, apiBudget, clubEloLookup, xgLookup },
         baseForTune, runAt
       );
       if (upstashEnabled) {
@@ -2257,6 +2396,49 @@ async function runDailyLearning(deps) {
   const growthLog = {
     // v54: 今日採点した対決ピック数(全国ランキングへの反映数)
     duelPicksScoredToday: duelScoredToday,
+    // v57: クラブEloの実測(取得可否・鮮度・予測で使えた試合数・バックフィル)
+    clubElo: {
+      dailyAvailable: clubEloDailyRows.length > 0,
+      dailyDate: clubEloMeta ? clubEloMeta.date : null,
+      staleDays: clubEloMeta ? clubEloMeta.staleDays : null,
+      usedInPredictions: clubEloUsedToday,
+      backfill: clubEloBackfillResult,
+    },
+    // v57: スタメン確定ウォッチの実測(朝版vs直前版のBrier比較。低いほど良い)
+    lineupWatch: await (async () => {
+      let cum = null;
+      try {
+        if (upstashEnabled) {
+          cum = (await upstashGetJSON(lineupWatchMod.SCORE_KEY).catch(() => null)) || { n: 0, morningBrierSum: 0, preKickBrierSum: 0 };
+          if (lineupWatchScored.n > 0) {
+            cum.n += lineupWatchScored.n;
+            cum.morningBrierSum += lineupWatchScored.morningSum;
+            cum.preKickBrierSum += lineupWatchScored.preKickSum;
+            await upstashSetJSON(lineupWatchMod.SCORE_KEY, cum);
+          }
+        }
+      } catch (e) { errors.push("lineupwatch_score_save_failed"); }
+      return {
+        comparedToday: lineupWatchScored.n,
+        morningBrierAvgToday: lineupWatchScored.n ? Math.round((lineupWatchScored.morningSum / lineupWatchScored.n) * 1000) / 1000 : null,
+        preKickBrierAvgToday: lineupWatchScored.n ? Math.round((lineupWatchScored.preKickSum / lineupWatchScored.n) * 1000) / 1000 : null,
+        cumulative: cum ? {
+          n: cum.n,
+          morningBrierAvg: cum.n ? Math.round((cum.morningBrierSum / cum.n) * 1000) / 1000 : null,
+          preKickBrierAvg: cum.n ? Math.round((cum.preKickBrierSum / cum.n) * 1000) / 1000 : null,
+        } : null,
+      };
+    })(),
+    // v57: xG前向き収集の実測(何件見て・何件取得し・何件保存したか)
+    xgCollect: xgCollectResult,
+    // v57: コンセンサスオッズの実測(キー未設定ならenabled:false・使用0)
+    oddsApi: {
+      enabled: oddsApiStats.enabled,
+      leaguesFetched: oddsApiStats.leaguesFetched,
+      eventsTotal: oddsApiStats.eventsTotal,
+      usedInPredictions: oddsApiStats.used,
+      failures: oddsApiStats.failures.slice(0, 5),
+    },
     // v50: 市場ブレンドの学習結果(採否・w・検証NLL)を実測のまま残す
     marketBlendFit: marketBlendFitToday ? {
       adopted: !!marketBlendFitToday.adopted, w: marketBlendFitToday.w ?? 0,

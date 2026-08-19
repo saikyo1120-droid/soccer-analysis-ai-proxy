@@ -48,6 +48,18 @@ function fitTeamRatings(rows, opts) {
     return { available: false, byTeam: {}, matchesUsed: usable.length, teamsRated: 0, reasonJa: `チームID付きの過去試合が${usable.length}件で、レーティング学習に必要な300件に達していません。` };
   }
 
+  // ---- v57: xGブレンド(有効ゴール) ----
+  //   g_eff = α×xG + (1−α)×実ゴール。xGが無い行は実ゴールのまま。
+  //   α=0(既定)では従来と1ビットも変わらない(劣化禁止)。
+  const xgAlpha = Number.isFinite(o.xgAlpha) ? Math.max(0, Math.min(1, o.xgAlpha)) : 0;
+  const effGoals = (r) => {
+    if (xgAlpha > 0 && Number.isFinite(r.xgH) && Number.isFinite(r.xgA)) {
+      return [xgAlpha * r.xgH + (1 - xgAlpha) * r.actualHomeGoals,
+              xgAlpha * r.xgA + (1 - xgAlpha) * r.actualAwayGoals];
+    }
+    return [r.actualHomeGoals, r.actualAwayGoals];
+  };
+
   // 時間減衰の重み(古い試合ほど軽く)
   const xi = o.decayXiPerDay ?? 0.0065;
   const nowMs = o.nowMs ?? 0;
@@ -87,8 +99,9 @@ function fitTeamRatings(rows, opts) {
       totalW += w;
       const lh = Math.exp(mu + homeAdv + att.get(r.homeId) - def.get(r.awayId));
       const la = Math.exp(mu + att.get(r.awayId) - def.get(r.homeId));
-      const dh = (lh - r.actualHomeGoals) * w; // ∂NLL/∂(logλH)
-      const da = (la - r.actualAwayGoals) * w;
+      const [gH, gA] = effGoals(r); // v57: xGブレンド(α=0なら実ゴールそのもの)
+      const dh = (lh - gH) * w; // ∂NLL/∂(logλH)
+      const da = (la - gA) * w;
       gMu += dh + da;
       gHome += dh;
       gAtt.set(r.homeId, (gAtt.get(r.homeId) || 0) + dh);
@@ -127,6 +140,7 @@ function fitTeamRatings(rows, opts) {
   }
   return {
     available: Object.keys(byTeam).length >= 20,
+    xgAlpha, // v57: 学習に使ったxGブレンド率(0=実ゴールのみ)
     byTeam, mu: Math.round(mu * 1000) / 1000, homeAdv: Math.round(homeAdv * 1000) / 1000,
     matchesUsed: train.length, teamsRated: Object.keys(byTeam).length,
     reasonJa: null,

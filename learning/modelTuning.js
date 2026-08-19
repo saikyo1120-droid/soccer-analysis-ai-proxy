@@ -230,6 +230,35 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   const { upstashEnabled, upstashCmd, upstashSetJSON } = deps;
   const ds = await ensureDataset(deps, runAt);
 
+  // ---- v57: クラブElo(clubelo.com)の履歴を各試合の文脈へ付与 ----
+  //   deps.clubEloLookup(teamId, dateMs) が渡された場合のみ。当時のEloが
+  //   両チームぶん引けた試合にだけ付く(引けない試合は特徴量0=影響なし)。
+  //   これにより clubEloSensitivity が既存の勾配学習+採用ゲートの中で
+  //   自動的に学習対象になる(presentKeysの動的検出)。
+  let clubEloRowsCount = 0;
+  if (typeof deps.clubEloLookup === "function" && ds.rows.length) {
+    ds.rows = ds.rows.map((r) => {
+      const dMs = Date.parse(r.date);
+      const he = deps.clubEloLookup(r.homeId, dMs);
+      const ae = deps.clubEloLookup(r.awayId, dMs);
+      if (!Number.isFinite(he) || !Number.isFinite(ae)) return r;
+      clubEloRowsCount++;
+      return { ...r, homeCtx: { ...r.homeCtx, clubElo: he }, awayCtx: { ...r.awayCtx, clubElo: ae } };
+    });
+  }
+  // ---- v57: xG(前向き収集ぶん)を行へ付与(レーティングの有効ゴール用) ----
+  let xgRowsCount = 0;
+  if (typeof deps.xgLookup === "function" && ds.rows.length) {
+    for (const r of ds.rows) {
+      const xg = deps.xgLookup(r.date, r.homeId, r.awayId);
+      if (xg && Number.isFinite(xg[0]) && Number.isFinite(xg[1])) {
+        r.xgH = xg[0]; r.xgA = xg[1]; xgRowsCount++;
+      }
+    }
+  }
+  // αの既定は0(=実ゴールのみ)。選択は後段のグリッドで行う(早期returnでも0を開示)
+  let xgAlphaChosen = 0, xgAlphaDetail = null;
+
   if (!ds.rows.length) {
     return {
       ran: false, adopted: false,
@@ -244,6 +273,8 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
       ran: false, adopted: false,
       reasonJa: `検証に使える過去試合が${test.length}件で、判断に必要な200件に達していないため、モデルは変更しません(蓄積: ${ds.rows.length}件)。`,
       datasetSize: ds.rows.length,
+      clubEloRows: clubEloRowsCount, // v57: Elo付きで学習に使えた試合数(実測)
+      xgAlpha: xgAlphaChosen, xgAlphaDetail, xgRows: xgRowsCount, // v57: xGブレンドの実測
       datasetNoteJa: ds.reasonJa,
     };
   }
@@ -270,7 +301,6 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   //   学習する(testの結果を知っているレーティングでtestを評価しない)。
   //   本番保存用は最後に全データで学習し直す(使えるデータは全部使う)。
   const nowMsForRatings = runAt.getTime();
-  const ratingsTrain = fitTeamRatings(train, { nowMs: nowMsForRatings });
   const attachRatings = (rows, ratings) => {
     if (!ratings || !ratings.available) return 0;
     let attached = 0;
@@ -284,6 +314,26 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     }
     return attached;
   };
+  // ---- v57: xGブレンド率αの選択(xG付き試合が300件以上のときだけ) ----
+  //   各αで学習用データだけからレーティングを学習し、検証用データのLogLossで
+  //   比較する(リークなし)。改善しなければα=0のまま(=従来と完全同一)。
+  if (xgRowsCount >= 300) {
+    const candidates = [0, 0.3, 0.5, 0.7];
+    const scores = [];
+    for (const a of candidates) {
+      const rt = fitTeamRatings(train, { nowMs: nowMsForRatings, xgAlpha: a });
+      const testCopy = test.map((r) => ({ ...r }));
+      attachRatings(testCopy, rt);
+      const ev = evaluate(testCopy, base);
+      scores.push({ alpha: a, logLoss: ev.measurable ? ev.logLoss : Infinity });
+    }
+    scores.sort((x, y) => x.logLoss - y.logLoss);
+    if (Number.isFinite(scores[0].logLoss) && scores[0].alpha !== 0) xgAlphaChosen = scores[0].alpha;
+    xgAlphaDetail = { candidates: scores, chosen: xgAlphaChosen, xgRows: xgRowsCount };
+  } else if (xgRowsCount > 0) {
+    xgAlphaDetail = { chosen: 0, xgRows: xgRowsCount, reasonJa: `xG付きの過去試合が${xgRowsCount}件で、α選択に必要な300件に達していません(それまで実ゴールのみで学習)。` };
+  }
+  const ratingsTrain = fitTeamRatings(train, { nowMs: nowMsForRatings, xgAlpha: xgAlphaChosen });
   const ratingsAttachedTrain = attachRatings(train, ratingsTrain);
   const ratingsAttachedTest = attachRatings(test, ratingsTrain);
 
@@ -328,6 +378,8 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     date: runAt.toISOString().slice(0, 10),
     ranAt: runAt.toISOString(),
     datasetSize: ds.rows.length,
+      clubEloRows: clubEloRowsCount, // v57: Elo付きで学習に使えた試合数(実測)
+      xgAlpha: xgAlphaChosen, xgAlphaDetail, xgRows: xgRowsCount, // v57: xGブレンドの実測
     trainSize: train.length,
     testSize: test.length,
     combinationsEvaluated: found.evaluated,
@@ -374,7 +426,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   //   保存に失敗したら既存のレーティングが残る(読み出し側は無ければ影響0)。
   let ratingsSaved = false;
   try {
-    const ratingsFull = fitTeamRatings(ds.rows, { nowMs: nowMsForRatings });
+    const ratingsFull = fitTeamRatings(ds.rows, { nowMs: nowMsForRatings, xgAlpha: xgAlphaChosen });
     if (ratingsFull.available && upstashEnabled) {
       ratingsFull.builtAt = runAt.toISOString();
       // v53: 表示用のチーム名(データセットのメタから)。
@@ -437,6 +489,8 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     consistencyChecked: record.consistencyChecked,
     reasonJa: record.reasonJa,
     datasetSize: ds.rows.length,
+      clubEloRows: clubEloRowsCount, // v57: Elo付きで学習に使えた試合数(実測)
+      xgAlpha: xgAlphaChosen, xgAlphaDetail, xgRows: xgRowsCount, // v57: xGブレンドの実測
     datasetNoteJa: ds.reasonJa,
     trainSize: train.length,
     testSize: test.length,

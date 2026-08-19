@@ -48,6 +48,10 @@ const EXTENDED_DEFAULT_WEIGHTS = {
   // (λ̂H・λ̂A)の差と和。既定値0 = レーティングが無い試合・学習前は影響しない。
   ratingSensitivity: 0,     // 地力の差(どちらが強いか)
   ratingSumSensitivity: 0,  // 地力ベースの点の入りやすさ(総得点)
+  // ---- クラブElo(2026年8月19日・v57) ----
+  // clubelo.com(無料の独立系Eloレーティング)の差。自前のDixon-Coles地力とは
+  // 独立な「第二の意見」。既定値0 = 取得前・未学習では予測に一切影響しない。
+  clubEloSensitivity: 0,
   // ---- 市場オッズ(2026年8月18日・v47「予測モデルの根本強化」) ----
   // ブックメーカーのオッズから計算した「市場が見るホーム優位度」。
   // ブックメーカーの的中率(実測53〜55%)は現状の自前モデルより高いため、
@@ -113,6 +117,7 @@ const FEATURE_WEIGHT_MAP = {
   topScorerDiff: "topScorerSensitivity",
   marketEdge: "marketSensitivity",
   ratingLambdaDiff: "ratingSensitivity",
+  clubEloDiff: "clubEloSensitivity", // v57: クラブElo(外部レーティング)の差
 };
 
 const FEATURE_LABELS_JA = {
@@ -128,6 +133,7 @@ const FEATURE_LABELS_JA = {
   topScorerDiff: "エースの得点力",
   marketEdge: "市場オッズ(ブックメーカーの評価)",
   ratingLambdaDiff: "チームの地力(長期レーティング)",
+  clubEloDiff: "クラブElo(独立の外部レーティング)",
 };
 
 /**
@@ -185,6 +191,7 @@ function computeFeatureAvailability(homeCtx, awayCtx, h2h, market) {
     // 市場オッズはチームではなく試合に紐づくため、第4引数で受け取る。
     marketEdge: !!(market && Number.isFinite(market.homePct) && Number.isFinite(market.awayPct)),
     ratingLambdaDiff: both(h.ratingExpGoals, a.ratingExpGoals),
+    clubEloDiff: both(h.clubElo, a.clubElo),
   };
 }
 
@@ -234,6 +241,11 @@ function computeMatchFeatures(homeCtx, awayCtx, h2h, market) {
     //   どちらかのレーティングが無ければ0(=影響しない。推測で埋めない)。
     ratingLambdaDiff: diffOrZero(h.ratingExpGoals, a.ratingExpGoals),
     ratingLambdaSum: sumOrZero(h.ratingExpGoals, a.ratingExpGoals, SUM_CENTERS.ratingLambdaSum),
+    // clubEloDiff: clubelo.com のEloの差を約±1.5に正規化(Elo400差 = 1.0)。
+    //   どちらかのEloが無ければ0(=影響しない。推測で埋めない)。v57。
+    clubEloDiff: (Number.isFinite(h.clubElo) && Number.isFinite(a.clubElo))
+      ? Math.max(-1.5, Math.min(1.5, (h.clubElo - a.clubElo) / 400))
+      : 0,
     // ---- 和の特徴量(λの独立化。2026年8月) ----
     // 「どちらが強いか」ではなく「どれだけ点が入る試合か」を表す。
     // 片方でも欠けていれば0(=総得点を動かさない)。推測で埋めない。
@@ -593,6 +605,7 @@ const LEARNABLE_KEYS = [
   "venueSensitivity", "suspensionSensitivity", "xgSensitivity", "topScorerSensitivity",
   "marketSensitivity", // 市場オッズ(v47)。特徴量が全件0のデータでは勾配0=動かない
   "ratingSensitivity", "ratingSumSensitivity", // チームの地力(v50)
+  "clubEloSensitivity", // クラブElo(v57)。特徴量が全件0のデータでは勾配0=動かない
   // λの独立化(和の重み)と Dixon-Coles の低スコア補正も学習対象にする
   "attackSumSensitivity", "concededSumSensitivity", "fatigueSumSensitivity", "xgSumSensitivity",
   "rho",
@@ -696,6 +709,7 @@ const WEIGHT_LABELS_JA = {
   marketSensitivity: "市場オッズ(ブックメーカーの評価)の重要度",
   ratingSensitivity: "チームの地力(長期レーティング)の重要度",
   ratingSumSensitivity: "地力ベースの総得点予想の重要度",
+  clubEloSensitivity: "クラブElo(独立の外部レーティング)の重要度",
   marketBlend: "市場ブレンド比率(最終確率にオッズをどれだけ混ぜるか)",
 };
 const WEIGHT_CHANGE_THRESHOLD = 0.005; // これ未満の変化は「実質変化なし」として無視する
