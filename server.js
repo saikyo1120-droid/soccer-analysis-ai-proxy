@@ -5331,7 +5331,27 @@ function computeClubConfidence(knowledge, needs) {
 // さらにご要望④(Memory Engineの活用)に対応し、②AI独自の意見の中で、前回との
 // 評価の変化(あれば)に必ず触れさせる(userPromptに前回結論を渡すreasoning
 // PromptBlock/previousConclusionと連動。formatReasoningForPrompt参照)。
-function buildDiscussSystemPrompt() {
+// ---- v56: 言語設定(初回起動時に選択・あとから変更可能) ----
+//   対応言語はこの4つだけ(白名単)。不明な値は必ず日本語に倒す=既存動作と完全一致。
+//   見出しマーカー(###一般論###など)は画面の解析に使う「機械の目印」なので、
+//   どの言語でも日本語のまま出力させ、本文だけを利用者の言語で書かせる。
+const APP_LANGS = new Set(["ja", "en", "zh", "es"]);
+const APP_LANG_NAMES_JA = { en: "英語(English)", zh: "簡体字中国語(简体中文)", es: "スペイン語(Español)" };
+function normalizeAppLang(v) {
+  const s = String(v || "").toLowerCase().trim();
+  return APP_LANGS.has(s) ? s : "ja";
+}
+
+function buildDiscussSystemPrompt(lang) {
+  const l = normalizeAppLang(lang);
+  const langLines = l === "ja"
+    ? ["必ず次の形式で、日本語で出力してください。見出し以外の余計な文章は含めないでください。"]
+    : [
+      `必ず次の形式で出力してください。見出し以外の余計な文章は含めないでください。本文は必ず${APP_LANG_NAMES_JA[l]}で書いてください(利用者がその言語を選択しています)。`,
+      "【言語の厳守】###一般論### のような見出しマーカー(###で挟まれた行)は画面の解析に使う機械用の目印です。一字も変えず日本語のまま出力し、見出しの中身の文章だけを回答言語で書いてください。",
+      "クラブ名・選手名・大会名は、回答言語で一般的な表記を使ってください。",
+      "「最も重要だと考える点」の欄は、「私は○○が最も重要だと考えます。」に相当する自然な一文を回答言語で書いてください。",
+    ];
   return [
     "あなたはサッカーの分析官です。以下に与えられた「事実」だけを根拠として、利用者の質問に答えてください。",
     "事実に無い具体的な数字・固有名詞(スコア・日付・移籍額・選手名など)を新たに作ってはいけません。",
@@ -5345,7 +5365,7 @@ function buildDiscussSystemPrompt() {
     "「AIが前回下した結論」が与えられていて、かつ今回の結論が変わった場合は、②AI独自の意見の中で必ず",
     "「以前は〜と評価していましたが、今回は〜に評価を変えました」という趣旨の文を含めてください。",
     "前回の結論が無い、または今回と同じ場合は、変化した体で書かない(でっち上げない)でください。",
-    "必ず次の形式で、日本語で出力してください。見出し以外の余計な文章は含めないでください。",
+    ...langLines,
     "",
     "###一般論###",
     "(この話題について、サッカー界で一般的に言われている見方・定説を2〜4文で)",
@@ -5497,6 +5517,8 @@ async function handleDiscuss(body, clientIp) {
   }
 
   const subject = (body.subject && typeof body.subject === "object") ? body.subject : { type: null };
+  // v56: 利用者の言語設定(未指定・不正値は日本語=これまでと完全に同じ動作)
+  const appLang = normalizeAppLang(body.lang);
   // v51(第10次監査でvarから昇格): 実成績が取れた選手の質問は上位モデルで考察する
   let playerStatsFoundForTier = false;
   const plan = planInformationNeeds(question, subject);
@@ -5936,6 +5958,7 @@ async function handleDiscuss(body, clientIp) {
   if (deliberationResult) {
     reasoningPromptBlock += `\n\n${deliberationResult.promptNote}\n` +
       `【必ず守ること】最後は必ず「${deliberationResult.stages.step6_finalConclusion.headlineJa}」という趣旨の一文で締めてください。` +
+      (appLang !== "ja" ? "(この趣旨を、利用者が選択した回答言語で自然に述べてください)" : "") +
       `根拠が不足している場合は、無理に断定せず不足していることを正直に述べてください。`;
   }
   const userPrompt = [
@@ -5974,7 +5997,7 @@ async function handleDiscuss(body, clientIp) {
     // それでも切れた場合はプロバイダー側が1回だけ書き直し、なお切れたら
     // truncatedフラグで受け取って利用者に正直に注記する。
     const { text, tier: usedTier, model: usedModel, truncated: llmTruncated } = await generateLLM({
-      systemPrompt: buildDiscussSystemPrompt(), userPrompt,
+      systemPrompt: buildDiscussSystemPrompt(appLang), userPrompt,
       maxTokens: llmTier === "heavy" ? 1400 : 1100, tier: llmTier,
     });
     llmTierUsed = usedTier || null;
@@ -6141,6 +6164,7 @@ async function handleDiscuss(body, clientIp) {
       followUpQuestions: llmOut.followUpQuestions,
       // v51: 2回試しても切れた場合だけ、正直に注記する(黙って尻切れを見せない)
       truncatedNoteJa: llmWasTruncated ? "※ 回答が長くなり、文字数上限のため末尾が一部省略されています。" : null,
+      lang: appLang, // v56: どの言語設定で回答したか(既定はja)
       meta: { ...knowledgeMeta, llmProvider: currentProviderName(), llmTier: llmTierUsed, llmModel: llmModelUsed, llmTruncated: llmWasTruncated, parsedOk: llmOut.parsedOk, intelligence: intelligenceForMeta },
     },
   };

@@ -496,6 +496,641 @@
 </style>
 </head>
 <body>
+<script>
+/* ================================================================
+   2026年8月19日・v56「言語設定」(利用者のご要望)
+   ・初回起動時に言語選択(日本語 / English / 中文(简体) / Español)
+   ・あとからヘッダーの🌐ボタンでいつでも変更できる(端末内に保存)
+   ・仕組み: 画面は日本語で描画し、日本語以外が選ばれている場合だけ
+     「対訳辞書(完全一致)+型テンプレート(変数入り)」でDOMの文字を
+     置き換える。辞書に無い文はそのまま(=機械翻訳で誤訳をでっち上げない)。
+     残っている日本語の範囲は画面に正直に注記する。
+   ・日本語選択時は一切の置き換えをしない(従来と完全に同じ動作=劣化禁止)。
+   ・AIチャットの回答はサーバー側で選択言語のまま生成される(lang送信)。
+   ================================================================ */
+(function () {
+  "use strict";
+  if (typeof document === "undefined") return; // Node評価(テスト)環境では何もしない
+  var LANGS = ["ja", "en", "zh", "es"];
+  var LANG_LABELS = { ja: "日本語", en: "English", zh: "中文(简体)", es: "Español" };
+  var ORDER = { en: 0, zh: 1, es: 2 };
+  function readLang() {
+    try { var v = localStorage.getItem("appLang"); return LANGS.indexOf(v) >= 0 ? v : null; } catch (e) { return null; }
+  }
+  var appLang = readLang() || "ja";
+  try { window.appLang = appLang; window.appLangIsSet = (readLang() !== null); } catch (e) {}
+
+  // ---- 対訳辞書(完全一致)。値は [英語, 中文(简体), Español] ----
+  var X = {};
+  function add(map) { for (var k in map) X[k] = map[k]; }
+  // ---- 型テンプレート(変数入り)。[正規表現, 英語, 中文, Español]($1〜$9で参照) ----
+  var P = [];
+
+  function tr(s, depth) {
+    if (appLang === "ja") return null;
+    var d0 = depth || 0;
+    var i = ORDER[appLang];
+    var e = X[s];
+    if (e && e[i]) return e[i];
+    if (d0 >= 3) return null;
+    // 箇条書きの「・」は先に剥がして中身を翻訳する(質問チップなど)
+    if (s.charAt(0) === "\u30fb") {
+      var inner = tr(s.slice(1).trim(), d0 + 1);
+      if (inner !== null) return "\u30fb" + inner;
+    }
+    for (var k = 0; k < P.length; k++) {
+      var m = P[k][0].exec(s);
+      if (m) {
+        var tpl = P[k][1 + i];
+        if (tpl) {
+          return tpl.replace(/\$(\d)/g, function (_, d) {
+            var v = m[+d];
+            if (v == null) return "";
+            // 入れ子の既知フレーズ(要素ラベル・注記など)も翻訳する(深さ3まで)
+            var sub = tr(String(v).trim(), d0 + 1);
+            return sub === null ? v : sub;
+          });
+        }
+      }
+    }
+    return null;
+  }
+  // どこからでも使える翻訳関数(辞書に無ければ原文のまま返す)
+  window.t = function (s) {
+    var str = String(s == null ? "" : s);
+    var r = tr(str.trim());
+    return r === null ? str : r;
+  };
+
+  var seen = (typeof WeakSet === "function") ? new WeakSet() : null;
+  function translateTextNode(n) {
+    if (seen) { if (seen.has(n)) return; seen.add(n); }
+    var raw = n.nodeValue;
+    if (!raw || !/[ぁ-んァ-ヶ一-龥]/.test(raw)) return;
+    var s = raw.trim();
+    if (!s) return;
+    var rep = tr(s);
+    if (rep !== null && rep !== s) n.nodeValue = raw.replace(s, rep);
+  }
+  var ATTRS = ["placeholder", "title", "aria-label"];
+  function translateAttrs(el) {
+    for (var a = 0; a < ATTRS.length; a++) {
+      var v = el.getAttribute && el.getAttribute(ATTRS[a]);
+      if (v && /[ぁ-んァ-ヶ一-龥]/.test(v)) {
+        var r = tr(v.trim());
+        if (r !== null) el.setAttribute(ATTRS[a], r);
+      }
+    }
+  }
+  function walk(root) {
+    if (appLang === "ja" || !root) return;
+    try {
+      if (root.nodeType === 3) { translateTextNode(root); return; }
+      if (root.nodeType !== 1 && root.nodeType !== 9 && root.nodeType !== 11) return;
+      var w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+      var n;
+      while ((n = w.nextNode())) translateTextNode(n);
+      if (root.nodeType === 1) translateAttrs(root);
+      var els = root.querySelectorAll ? root.querySelectorAll("[placeholder],[title],[aria-label]") : [];
+      for (var i = 0; i < els.length; i++) translateAttrs(els[i]);
+    } catch (e) { /* 翻訳は付加機能。失敗しても本体を壊さない */ }
+  }
+  function startObserver() {
+    if (appLang === "ja" || typeof MutationObserver !== "function") return;
+    try {
+      var mo = new MutationObserver(function (muts) {
+        for (var i = 0; i < muts.length; i++) {
+          var ad = muts[i].addedNodes;
+          if (!ad) continue;
+          for (var j = 0; j < ad.length; j++) walk(ad[j]);
+        }
+      });
+      mo.observe(document.body, { childList: true, subtree: true });
+    } catch (e) {}
+  }
+
+  // ---- 言語選択モーダル(初回は必ず表示。以後は🌐ボタンから) ----
+  var HONEST_NOTE = {
+    en: "The AI chat answers fully in your language. Some analysis texts (match reasoning, glossary, diagnostics page) are still Japanese-only — full translation is rolling out honestly, step by step.",
+    zh: "AI问答会完全使用你选择的语言回答。部分分析文字(比赛推理说明、术语表、后台诊断页)目前仍为日语——完整翻译正在诚实地分阶段推进。",
+    es: "El chat de IA responde completamente en tu idioma. Algunos textos de análisis (razonamiento de partidos, glosario, página de diagnóstico) siguen solo en japonés; la traducción completa avanza por etapas, con honestidad.",
+  };
+  function applyLangChoice(lang, wasFirst) {
+    try { localStorage.setItem("appLang", lang); } catch (e) {}
+    var prev = appLang;
+    var modal = document.getElementById("langModal");
+    if (modal && modal.parentNode) modal.parentNode.removeChild(modal);
+    if (lang === prev) { syncLangButton(); return; }
+    if (prev === "ja") {
+      // 画面はまだ日本語のまま → その場で置き換えれば良い(再読込不要)
+      appLang = lang;
+      try { window.appLang = lang; } catch (e) {}
+      applyToWholePage();
+      syncLangButton();
+    } else {
+      // 既に別言語へ置き換え済み → 原文(日本語)から引き直すため再読込
+      try { location.reload(); } catch (e) {}
+    }
+  }
+  function showLangModal(isFirst) {
+    if (document.getElementById("langModal")) return;
+    var ov = document.createElement("div");
+    ov.id = "langModal";
+    ov.setAttribute("style", "position:fixed; inset:0; z-index:99999; background:rgba(10,16,26,.66); display:flex; align-items:center; justify-content:center; padding:18px;");
+    var rows = [
+      { lang: "ja", main: "日本語", sub: "すべての機能・文章に対応" },
+      { lang: "en", main: "English", sub: "UI + AI chat in English (some analysis texts still in Japanese)" },
+      { lang: "zh", main: "中文(简体)", sub: "界面+AI问答为中文(部分分析文字暂为日语)" },
+      { lang: "es", main: "Español", sub: "Interfaz y chat de IA en español (algunos análisis aún en japonés)" },
+    ];
+    var btnsHtml = rows.map(function (r) {
+      return '<button type="button" class="lang-choice-btn" data-lang="' + r.lang + '" style="display:block; width:100%; text-align:left; margin:0 0 8px; padding:12px 14px; border-radius:12px; border:1.5px solid var(--border,#ccd3dd); background:var(--surface-2,#f4f6f9); color:var(--text-primary,#16202e); cursor:pointer;">' +
+        '<span style="font-size:16px; font-weight:700;">' + r.main + '</span>' +
+        '<span style="display:block; font-size:11.5px; opacity:.72; margin-top:2px;">' + r.sub + '</span></button>';
+    }).join("");
+    ov.innerHTML = '<div style="background:var(--surface-1,#ffffff); color:var(--text-primary,#16202e); border-radius:16px; max-width:430px; width:100%; padding:20px 18px; box-shadow:0 18px 60px rgba(0,0,0,.4);">' +
+      '<div style="font-size:19px; font-weight:800; margin-bottom:2px;">🌐 言語 / Language / 语言 / Idioma</div>' +
+      '<div style="font-size:12px; opacity:.75; margin-bottom:14px;">使用する言語を選んでください ・ Choose your language ・ 请选择语言 ・ Elige tu idioma</div>' +
+      btnsHtml +
+      '</div>';
+    document.body.appendChild(ov);
+    var btns = ov.querySelectorAll(".lang-choice-btn");
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].addEventListener("click", function (ev) {
+        var lg = ev.currentTarget.getAttribute("data-lang");
+        applyLangChoice(lg, !!isFirst);
+      });
+    }
+  }
+  function syncLangButton() {
+    var sel = document.getElementById("langSwitchSel");
+    if (sel && sel.value !== appLang) sel.value = appLang;
+  }
+  function injectHonestNote() {
+    if (appLang === "ja") return;
+    if (document.getElementById("langHonestNote")) return;
+    var host = document.querySelector("header.top");
+    if (!host || !host.parentNode) return;
+    var d = document.createElement("div");
+    d.id = "langHonestNote";
+    d.setAttribute("style", "margin:0 0 10px; padding:7px 11px; border-radius:8px; border:1px dashed var(--border,#ccd3dd); font-size:11.5px; opacity:.85;");
+    d.textContent = "🌐 " + (HONEST_NOTE[appLang] || "");
+    host.parentNode.insertBefore(d, host.nextSibling);
+  }
+  function applyToWholePage() {
+    if (appLang === "ja") return;
+    try {
+      document.documentElement.lang = appLang === "zh" ? "zh-CN" : appLang;
+      var tt = tr(String(document.title || "").trim());
+      if (tt) document.title = tt;
+      walk(document.body);
+      injectHonestNote();
+      startObserver();
+    } catch (e) {}
+  }
+  function storageOk() {
+    // 保存できない環境(プライベートモード等)では初回モーダルを出さない。
+    // 選択を覚えられず毎回出てしまうため。🌐ボタンからはその場限りで変更できる。
+    try { localStorage.setItem("__lang_probe", "1"); localStorage.removeItem("__lang_probe"); return true; } catch (e) { return false; }
+  }
+  function boot() {
+    try {
+      syncLangButton();
+      var sel = document.getElementById("langSwitchSel");
+      if (sel) sel.addEventListener("change", function () { applyLangChoice(sel.value, false); });
+      applyToWholePage();
+      if (!window.appLangIsSet && storageOk()) showLangModal(true);
+    } catch (e) {}
+  }
+  /* ==== ここから対訳辞書(add: 完全一致 / P.push: 変数入りの型) ==== */
+  // ---- ① タイトル・ヘッダー・タブ・共通ボタン ----
+  add({
+    "サッカー分析AI — 外したら理由まで話す、毎日賢くなる予想AI": ["Football Analysis AI — honest about misses, smarter every day", "足球分析AI — 预测失误也坦诚说明原因、每天变聪明的AI", "IA de Análisis de Fútbol — honesta cuando falla, más inteligente cada día"],
+    "⚽ サッカー分析AI": ["⚽ Football Analysis AI", "⚽ 足球分析AI", "⚽ IA de Análisis de Fútbol"],
+    "毎日の試合をAIが予想。": ["AI predicts every day's matches. ", "AI每天预测比赛。", "La IA predice los partidos de cada día. "],
+    "外したら、理由まで正直に話します。": ["When it misses, it honestly explains why. ", "预测失误时,会诚实说明原因。", "Cuando falla, explica honestamente por qué. "],
+    "昨日より今日、少しずつ賢くなるサッカーAIです。": ["A football AI that gets a little smarter every day.", "一个每天都变得更聪明的足球AI。", "Una IA de fútbol que mejora un poco cada día."],
+    "超入門": ["Beginner", "入门", "Básico"],
+    "標準": ["Standard", "标准", "Estándar"],
+    "戦術": ["Tactics", "战术", "Táctico"],
+    "🔰 初心者モード: OFF": ["🔰 Beginner mode: OFF", "🔰 新手模式: 关", "🔰 Modo principiante: OFF"],
+    "🔰 初心者モード: ON": ["🔰 Beginner mode: ON", "🔰 新手模式: 开", "🔰 Modo principiante: ON"],
+    "🌙 ダーク": ["🌙 Dark", "🌙 深色", "🌙 Oscuro"],
+    "☀️ ライト": ["☀️ Light", "☀️ 浅色", "☀️ Claro"],
+    "専門用語を初心者向けの言い回しに置き換えます": ["Replaces technical terms with beginner-friendly wording", "将专业术语替换为适合新手的说法", "Sustituye términos técnicos por expresiones para principiantes"],
+    "⚽ 試合分析AI": ["⚽ Match Analysis", "⚽ 比赛分析AI", "⚽ Análisis de partidos"],
+    "🔍 選手検索": ["🔍 Player Search", "🔍 球员搜索", "🔍 Buscar jugadores"],
+    "🏆 地力ランキング": ["🏆 Power Rankings", "🏆 实力排行榜", "🏆 Ranking de fuerza"],
+    "🛠 AIの裏側": ["🛠 Behind the AI", "🛠 AI的幕后", "🛠 Detrás de la IA"],
+    "読み込み中…": ["Loading…", "加载中…", "Cargando…"],
+    "確認中…": ["Checking…", "确认中…", "Comprobando…"],
+    "検索中…": ["Searching…", "搜索中…", "Buscando…"],
+    "閉じる": ["Close", "关闭", "Cerrar"],
+    "詳しく見る": ["Details", "查看详情", "Ver detalles"],
+    "詳しく見る ▶": ["Details ▶", "查看详情 ▶", "Ver detalles ▶"],
+    "詳しく見る ▼": ["Details ▼", "查看详情 ▼", "Ver detalles ▼"],
+    "▼ もっと見る": ["▼ Show more", "▼ 查看更多", "▼ Ver más"],
+    "▼ もっと見る(詳細分析)": ["▼ Show more (detailed analysis)", "▼ 查看更多(详细分析)", "▼ Ver más (análisis detallado)"],
+    "もう一度試す": ["Try again", "重试", "Reintentar"],
+    "すべて": ["All", "全部", "Todos"],
+    "該当なし": ["None", "无", "Ninguno"],
+    "勝利": ["Win", "胜", "Victoria"],
+    "引分": ["Draw", "平", "Empate"],
+    "引き分け": ["Draw", "平局", "Empate"],
+    "勝ち": ["Win", "胜", "Victoria"],
+    "✅ 的中": ["✅ Hit", "✅ 命中", "✅ Acierto"],
+    "❌ 外れ": ["❌ Miss", "❌ 未中", "❌ Fallo"],
+    "答え合わせ待ち": ["Awaiting result", "等待核对结果", "Esperando resultado"],
+    "分析する ▶": ["Analyze ▶", "分析 ▶", "Analizar ▶"],
+    "送信": ["Send", "发送", "Enviar"],
+    "聞く ▶": ["Ask ▶", "提问 ▶", "Preguntar ▶"],
+    "検索する": ["Search", "搜索", "Buscar"],
+    "条件をリセット": ["Reset filters", "重置条件", "Restablecer filtros"],
+    "比較する": ["Compare", "对比", "Comparar"],
+    "クリア": ["Clear", "清除", "Limpiar"],
+    "登録する": ["Register", "登记", "Registrar"],
+    "変更": ["Change", "更改", "Cambiar"],
+    "解除": ["Remove", "解除", "Quitar"],
+    "参加する": ["Join", "参加", "Unirme"],
+    "ONにする": ["Turn ON", "开启", "Activar"],
+    "上向き(+0.15以上)": ["Rising (+0.15 or more)", "上升(+0.15以上)", "En alza (+0,15 o más)"],
+    "下向き(-0.15以下)": ["Falling (-0.15 or less)", "下滑(-0.15以下)", "A la baja (-0,15 o menos)"],
+  });
+  // ---- ② ホームの主要カード見出し・注記 ----
+  add({
+    "🔮 今日のAI予想": ["🔮 Today's AI Picks", "🔮 今日AI预测", "🔮 Predicciones de hoy"],
+    "今日のAI予想を読み込み中…": ["Loading today's AI picks…", "正在加载今日AI预测…", "Cargando las predicciones de hoy…"],
+    "🤖 AIに質問する": ["🤖 Ask the AI", "🤖 向AI提问", "🤖 Pregunta a la IA"],
+    "何について知りたいですか？選手・クラブ・今日の試合について、思いついたまま聞いてみてください。": ["What would you like to know? Ask anything about players, clubs, or today's matches.", "你想了解什么?球员、俱乐部、今天的比赛,想到什么就问什么。", "¿Qué quieres saber? Pregunta lo que sea sobre jugadores, clubes o los partidos de hoy."],
+    "🔥 今話題の質問": ["🔥 Trending questions", "🔥 热门问题", "🔥 Preguntas del momento"],
+    "📈 今日人気の質問": ["📈 Popular today", "📈 今日热问", "📈 Populares hoy"],
+    "🤖 AIおすすめ質問": ["🤖 AI suggestions", "🤖 AI推荐问题", "🤖 Sugerencias de la IA"],
+    "例: 久保建英はどんな選手？ / レアルはなぜ強い？": ["e.g.: What kind of player is Kubo? / Why is Real Madrid strong?", "例如: 久保建英是怎样的球员?/皇马为什么强?", "p. ej.: ¿Cómo juega Kubo? / ¿Por qué es fuerte el Real Madrid?"],
+    "🤖 AI予測の実績を読み込み中…": ["🤖 Loading the AI's track record…", "🤖 正在加载AI预测战绩…", "🤖 Cargando el historial de la IA…"],
+    "🧠 AIは昨日より賢くなったか": ["🧠 Is the AI smarter than yesterday?", "🧠 AI比昨天更聪明了吗", "🧠 ¿Es la IA más lista que ayer?"],
+    "🙈 AIの反省 — 外した試合と、その理由": ["🙈 AI's reflections — missed matches and why", "🙈 AI的反思 — 预测失误的比赛及原因", "🙈 Autocrítica de la IA — fallos y sus motivos"],
+    "外れを隠さないのがこのAIの方針です。理由は試合の実測データから機械的に分類したもので、言い訳の作文ではありません。": ["This AI never hides its misses. Reasons are classified mechanically from real match data — not excuses.", "不隐瞒失误是这个AI的原则。原因由比赛实测数据机械分类得出,不是找借口。", "Esta IA nunca oculta sus fallos. Los motivos se clasifican mecánicamente a partir de datos reales del partido, no son excusas."],
+    "📰 今週のAIダイジェスト": ["📰 This Week's AI Digest", "📰 本周AI周报", "📰 Resumen semanal de la IA"],
+    "📡 本日の実際の試合": ["📡 Today's Real Matches", "📡 今日实际比赛", "📡 Partidos reales de hoy"],
+    "🧠 AIマッチ分析(クラブ対戦シミュレーション)": ["🧠 AI Match Analysis (club vs club simulation)", "🧠 AI比赛分析(俱乐部对战模拟)", "🧠 Análisis de partido IA (simulación entre clubes)"],
+    "🏠 今日のサッカー": ["🏠 Today's Football", "🏠 今日足球", "🏠 Fútbol de hoy"],
+    "ホーム画面を開くだけで、今日ピックアップされた注目の試合・選手が分かります(登録データから毎日自動で選出)。": ["Open the home screen to see today's featured matches and players (auto-selected daily from registered data).", "打开主页即可看到今日精选的焦点比赛和球员(每天从已登记数据中自动挑选)。", "Abre la pantalla de inicio para ver los partidos y jugadores destacados de hoy (selección automática diaria)."],
+    "⚽ 今日の注目試合": ["⚽ Featured Match Today", "⚽ 今日焦点比赛", "⚽ Partido destacado de hoy"],
+    "⭐ 今日の注目選手": ["⭐ Featured Player Today", "⭐ 今日焦点球员", "⭐ Jugador destacado de hoy"],
+    "📈 急上昇選手(AI将来性評価より)": ["📈 Rising players (by AI potential rating)", "📈 上升最快球员(按AI潜力评估)", "📈 Jugadores en ascenso (según potencial IA)"],
+    "🧠 今日のAI豆知識": ["🧠 AI Fact of the Day", "🧠 今日AI小知识", "🧠 Dato curioso de la IA"],
+    "🎯 AIが見るべき試合カード": ["🎯 Match Cards Worth Watching", "🎯 AI推荐关注的对阵卡", "🎯 Enfrentamientos recomendados por la IA"],
+    "🕘 最近見た選手・試合(このセッション)": ["🕘 Recently viewed (this session)", "🕘 最近查看的球员/比赛(本次会话)", "🕘 Vistos recientemente (esta sesión)"],
+    "🏆 AIが見る世界クラブ地力ランキング": ["🏆 AI World Club Power Rankings", "🏆 AI眼中的世界俱乐部实力榜", "🏆 Ranking mundial de fuerza de clubes según la IA"],
+    "⚽ 注目の試合カード": ["⚽ Featured Match Cards", "⚽ 焦点对阵卡", "⚽ Enfrentamientos destacados"],
+    "⭐ 今日AIが注目する選手": ["⭐ Players the AI is watching today", "⭐ 今日AI关注的球员", "⭐ Jugadores que la IA sigue hoy"],
+    "🔥 よく見られている選手": ["🔥 Most viewed players", "🔥 最多人查看的球员", "🔥 Jugadores más vistos"],
+    "📈 急上昇": ["📈 Rising", "📈 上升", "📈 En ascenso"],
+    "選手名": ["Player", "球员", "Jugador"],
+    "国籍": ["Nationality", "国籍", "Nacionalidad"],
+    "所属クラブ": ["Club", "俱乐部", "Club"],
+  });
+  // ---- ③ 今日の予想・対決・ストリーク・全国ランキング・地力ランキング ----
+  add({
+    "🤖 AI予想:": ["🤖 AI pick:", "🤖 AI预测:", "🤖 Predicción IA:"],
+    "AI予想スコア:": ["Predicted score:", "AI预测比分:", "Marcador previsto:"],
+    "AI予想スコア": ["Predicted score", "AI预测比分", "Marcador previsto"],
+    "・ AIが一番気にしていること:": ["・ What the AI weighs most:", "・ AI最看重的因素:", "・ Lo que más pesa para la IA:"],
+    "対決中 — 上の「今日のAI予想」で自分の予想を先に選ぶと表示されます": ["Duel on — make your own pick first in \"Today's AI Picks\" above to reveal it", "对决进行中 — 先在上方「今日AI预测」中选出你的预测后即可显示", "Duelo activo — elige primero tu pronóstico en \"Predicciones de hoy\" para verlo"],
+    "🤜🤛 AIとの予想対決はOFFです": ["🤜🤛 Duel vs the AI is OFF", "🤜🤛 与AI的预测对决已关闭", "🤜🤛 El duelo contra la IA está desactivado"],
+    "AIと予想対決": ["Beat the AI", "与AI预测对决", "Duelo de pronósticos contra la IA"],
+    "AIの予想を見る前に、自分の予想をタップ。試合後に自動で答え合わせします。": ["Tap your own pick before seeing the AI's. Results are checked automatically after each match.", "在看到AI预测之前先点选你的预测。比赛结束后自动核对结果。", "Elige tu pronóstico antes de ver el de la IA. Tras el partido se comprueba automáticamente."],
+    "🏆 全国ランキングを見る": ["🏆 View national ranking", "🏆 查看全国排行榜", "🏆 Ver ranking nacional"],
+    "🏆 全国ランキングに参加(ニックネームだけ)": ["🏆 Join national ranking (nickname only)", "🏆 参加全国排行榜(只需昵称)", "🏆 Unirme al ranking nacional (solo apodo)"],
+    "ランキングを見る": ["View ranking", "查看排行榜", "Ver ranking"],
+    "記録はこの端末の中だけに保存されます ・": ["Your record is stored only on this device ・", "记录只保存在本设备中 ・", "Tu registro se guarda solo en este dispositivo ・"],
+    "📸 対戦成績をシェア": ["📸 Share my record", "📸 分享对战成绩", "📸 Compartir mi historial"],
+    "対決をOFF": ["Turn duel OFF", "关闭对决", "Desactivar duelo"],
+    "ニックネーム(12文字まで)": ["Nickname (max 12 chars)", "昵称(最多12字)", "Apodo (máx. 12 caracteres)"],
+    "参加は任意です。ニックネームと匿名の端末IDだけで参加でき、本名やアカウントは不要です(機種変更で記録は引き継げません)。キックオフ1分前までに選んだ予想だけが集計されます(後出し防止)。": ["Joining is optional. You only need a nickname and an anonymous device ID — no real name or account (records don't transfer to a new device). Only picks made up to 1 minute before kickoff count (no after-the-fact picks).", "参加完全自愿。只需昵称和匿名设备ID,无需真名或账号(换设备后记录无法继承)。只统计开球1分钟前提交的预测(防止马后炮)。", "Participar es opcional. Solo necesitas un apodo y un ID anónimo del dispositivo, sin nombre real ni cuenta (el registro no se transfiere a otro dispositivo). Solo cuentan los pronósticos hechos hasta 1 minuto antes del inicio (nada de pronósticos a posteriori)."],
+    "AIより先に、あなたの予想は?": ["Before the AI reveals its pick — what's yours?", "在AI公布预测之前,你的预测是?", "Antes de que la IA revele su pick, ¿cuál es el tuyo?"],
+    "(選ぶとAIの予想が見えます)": ["(pick to reveal the AI's prediction)", "(选择后即可看到AI的预测)", "(elige para ver la predicción de la IA)"],
+    "予想せずAIの答えを見る": ["Skip and see the AI's pick", "不预测,直接看AI答案", "Saltar y ver el pick de la IA"],
+    "🫵 あなたの予想:": ["🫵 Your pick:", "🫵 你的预测:", "🫵 Tu pronóstico:"],
+    "ランキングを取得できませんでした。しばらくして再度お試しください。": ["Couldn't load the ranking. Please try again later.", "无法获取排行榜,请稍后重试。", "No se pudo cargar el ranking. Inténtalo más tarde."],
+    "ランキングを取得できませんでした(サーバー起動待ちの可能性があります)。": ["Couldn't load the ranking (the server may still be waking up).", "无法获取排行榜(服务器可能正在启动)。", "No se pudo cargar el ranking (el servidor puede estar arrancando)."],
+    "最終更新:": ["Last updated:", "最后更新:", "Última actualización:"],
+    "順位": ["Rank", "排名", "Puesto"],
+    "前週比": ["vs last wk", "较上周", "vs sem. ant."],
+    "クラブ": ["Club", "俱乐部", "Club"],
+    "地力": ["Power", "实力", "Fuerza"],
+    "攻/守": ["Att/Def", "攻/守", "Ata/Def"],
+    "🔗 このランキングをシェア": ["🔗 Share this ranking", "🔗 分享此排行榜", "🔗 Compartir este ranking"],
+    "🔗 この予想をシェア": ["🔗 Share this pick", "🔗 分享此预测", "🔗 Compartir esta predicción"],
+    "📸 画像でシェア": ["📸 Share as image", "📸 以图片分享", "📸 Compartir como imagen"],
+    "🎯 今日のベスト予想": ["🎯 Today's best pick", "🎯 今日最佳预测", "🎯 Mejor predicción de hoy"],
+    "🤖 AIの予想:": ["🤖 AI's pick:", "🤖 AI的预测:", "🤖 Pick de la IA:"],
+    "AIの予想:": ["AI's pick:", "AI的预测:", "Pick de la IA:"],
+    "AI予想を取得できませんでした(サーバー起動待ちの可能性があります。しばらくして再読み込みしてください)。": ["Couldn't load AI picks (the server may be waking up — reload in a moment).", "无法获取AI预测(服务器可能正在启动,请稍后刷新)。", "No se pudieron cargar las predicciones (el servidor puede estar arrancando; recarga en un momento)."],
+    "直近の公式戦は外しました。": ["The AI missed its latest competitive match.", "最近一场正式比赛预测失误。", "La IA falló su último partido oficial."],
+    "次で仕切り直しです": ["Time for a fresh start", "下一场重新出发", "A por la próxima"],
+  });
+  // ---- ④ AIチャット・議論(見出しはクライアント描画のためここで対応) ----
+  add({
+    "🌍 一般論:": ["🌍 Common view:", "🌍 普遍观点:", "🌍 Visión general:"],
+    "AI独自の意見:": ["AI's own take:", "AI独家观点:", "Opinión propia de la IA:"],
+    "🔄 反対意見:": ["🔄 Counter-argument:", "🔄 反方观点:", "🔄 Contraargumento:"],
+    "結論:": ["Conclusion:", "结论:", "Conclusión:"],
+    "📈 今後:": ["📈 Outlook:", "📈 展望:", "📈 Perspectiva:"],
+    "🧠 私の考えが変わった理由:": ["🧠 Why I changed my view:", "🧠 我改变看法的原因:", "🧠 Por qué cambié de opinión:"],
+    "🧠 AIが考えています…(実データを確認し、考察を組み立てています)": ["🧠 The AI is thinking… (checking real data and building its analysis)", "🧠 AI思考中…(正在核对实测数据并组织分析)", "🧠 La IA está pensando… (verificando datos reales y construyendo su análisis)"],
+    "(↑参考として、登録データに基づく要約を表示しています。AIによる考察ではありません)": ["(↑ shown for reference: a summary from registered data, not AI reasoning)", "(↑仅供参考:基于已登记数据的摘要,并非AI的分析)", "(↑ solo como referencia: un resumen de datos registrados, no un análisis de la IA)"],
+    "上のボタンから質問を選ぶか、下の入力欄に自由に質問を入力してください。AIは答えるだけでなく、一緒に考える質問も返します。": ["Pick a question above or type your own below. The AI answers and also asks questions to think together with you.", "从上方选择问题,或在下方输入框自由提问。AI不仅回答,还会提出一起思考的问题。", "Elige una pregunta arriba o escribe la tuya abajo. La IA responde y también propone preguntas para pensar juntos."],
+    "※ 回答が長くなり、文字数上限のため末尾が一部省略されています。": ["※ The answer hit the length limit, so its ending was partially cut.", "※ 回答较长,因字数上限结尾部分被省略。", "※ La respuesta alcanzó el límite de longitud y el final quedó parcialmente recortado."],
+  });
+  // ---- ⑤ 推しクラブ・週間ダイジェスト ----
+  add({
+    "⭐ 推しクラブを登録": ["⭐ Set your favorite club", "⭐ 登记主队", "⭐ Registra tu club favorito"],
+    "好きなクラブを1つ選ぶと、この場所が「あなたのクラブ」専用の見出しになります(次の試合のAI予想・調子・このクラブでのAIの成績)。登録はこの端末の中だけに保存されます。": ["Pick one club and this area becomes your club's own header (next match AI pick, form, and the AI's record for this club). Saved only on this device.", "选择一家俱乐部后,这里会变成「你的俱乐部」专区(下一场比赛的AI预测、状态、AI在该队的战绩)。仅保存在本设备。", "Elige un club y esta zona se convierte en su cabecera exclusiva (próximo partido, forma y el historial de la IA con ese club). Se guarda solo en este dispositivo."],
+    "クラブを選ぶ(予測対象100クラブ)…": ["Choose a club (100 covered clubs)…", "选择俱乐部(覆盖100家)…", "Elige un club (100 clubes cubiertos)…"],
+    "⭐ マイクラブ:": ["⭐ My club:", "⭐ 我的俱乐部:", "⭐ Mi club:"],
+    "実測データを読み込み中…": ["Loading real data…", "正在加载实测数据…", "Cargando datos reales…"],
+    "サーバーに接続できないため、このクラブの実測データを読み込めませんでした(起動直後の可能性があります。少し待って再読み込みしてください)。": ["Couldn't reach the server for this club's data (it may have just started — wait a moment and reload).", "无法连接服务器,读取不到该俱乐部的实测数据(可能刚启动,请稍候刷新)。", "No se pudo conectar con el servidor para los datos de este club (puede estar arrancando; espera un momento y recarga)."],
+    "保存済みの「次の試合の予想」は今はありません(毎朝の学習で、次の試合が近づくと自動で作られます)。": ["No saved next-match prediction right now (it's created automatically in the morning learning run as the match approaches).", "目前没有已保存的「下一场比赛预测」(临近比赛时会在每天早晨的学习中自动生成)。", "Ahora no hay predicción guardada del próximo partido (se crea automáticamente en el aprendizaje matinal cuando se acerca el partido)."],
+    "このクラブが絡む試合でのAIの成績:": ["AI's record in this club's matches:", "AI在该队相关比赛中的战绩:", "Historial de la IA en partidos de este club:"],
+    "すべて実測値です(10分ごとに更新)。登録クラブはこの端末にだけ保存されます。": ["All real measured values (updated every 10 min). Your club choice is saved only on this device.", "全部为实测值(每10分钟更新)。所选俱乐部仅保存在本设备。", "Todo son valores reales medidos (se actualizan cada 10 min). Tu club se guarda solo en este dispositivo."],
+    "ベスト的中:": ["Best hit:", "最佳命中:", "Mejor acierto:"],
+    "🎯 この週の的中はありませんでした(隠さずそのまま書いています)。": ["🎯 No hits this week (we show it as it is, nothing hidden).", "🎯 本周没有命中(如实呈现,绝不隐瞒)。", "🎯 Ningún acierto esta semana (lo mostramos tal cual, sin ocultar nada)."],
+    "一番の外れ:": ["Biggest miss:", "最大失误:", "Mayor fallo:"],
+    "AIが学んだこと:": ["What the AI learned:", "AI学到了什么:", "Lo que aprendió la IA:"],
+    "来週の注目:": ["Next week's watch:", "下周关注:", "A seguir la próxima semana:"],
+  });
+  // ---- ⑥ 本日の実際の試合・試合詳細 ----
+  add({
+    "有料API(API-Football)から取得した、本日の実際の試合日程です。「🔴 試合中」「⏰ これから」「✅ 終了」に整理して表示します。試合前は注目ポイントのAIプレビュー(90分ストーリー予想つき)、試合終了後は実際の選手評価・タイムラインをもとにした振り返りを見られます。": ["Today's real match schedule from API-Football (paid API), organized into \"🔴 Live\", \"⏰ Upcoming\" and \"✅ Finished\". Before kickoff you get an AI preview (with a 90-minute story forecast); after full time, a review based on real player ratings and the timeline.", "来自API-Football(付费API)的今日实际赛程,分为「🔴 进行中」「⏰ 即将开始」「✅ 已结束」。赛前可看AI焦点预览(含90分钟剧本预测),赛后可看基于真实球员评分和时间线的复盘。", "Calendario real de hoy desde API-Football (API de pago), organizado en \"🔴 En juego\", \"⏰ Próximos\" y \"✅ Finalizados\". Antes del partido, una previa de la IA (con guion de los 90 minutos); al final, una revisión basada en valoraciones reales y la cronología."],
+    "本日はAPI-Footballで確認できる試合がありませんでした。": ["No matches found on API-Football today.", "今天在API-Football上没有查到比赛。", "Hoy no se encontraron partidos en API-Football."],
+    "▼ 終了した試合を表示(": ["▼ Show finished matches (", "▼ 显示已结束的比赛(", "▼ Ver partidos finalizados ("],
+    "🤖 AI試合プレビュー:": ["🤖 AI match preview:", "🤖 AI赛前预览:", "🤖 Previa del partido por la IA:"],
+    "🔮 試合前プレビュー:": ["🔮 Pre-match preview:", "🔮 赛前预览:", "🔮 Previa del partido:"],
+    "※これはAIによる展開予想であり、実際の試合結果を保証するものではありません。": ["※ This is the AI's forecast of how the match may unfold — it doesn't guarantee the actual result.", "※ 这是AI对比赛走势的预测,不保证实际结果。", "※ Es la previsión de la IA sobre el desarrollo del partido; no garantiza el resultado real."],
+    "この試合のイベント情報は取得できませんでした。": ["Couldn't load this match's event data.", "无法获取本场比赛的事件信息。", "No se pudieron cargar los eventos de este partido."],
+    "(API-Footballの実データに基づく、試合中の途中経過です。まだ結果は確定していません)": ["(Live progress based on real API-Football data. The result is not final yet.)", "(基于API-Football实测数据的比赛中实时进展,结果尚未确定)", "(Progreso en vivo basado en datos reales de API-Football. El resultado aún no es definitivo.)"],
+    "現在の選手評価": ["Current player ratings", "当前球员评分", "Valoraciones actuales"],
+    "ここまでの試合の流れ": ["Match flow so far", "目前比赛进程", "Desarrollo hasta ahora"],
+    "🔄 この画面を開き直すと、最新の状況(最大1分前まで)に更新されます。": ["🔄 Reopen this view to refresh to the latest state (up to 1 minute ago).", "🔄 重新打开此页面即可更新到最新状态(最多1分钟前)。", "🔄 Vuelve a abrir esta vista para actualizar al estado más reciente (hasta hace 1 minuto)."],
+    "🤖 試合前のAI予測記録:": ["🤖 The AI's pre-match prediction:", "🤖 AI赛前预测记录:", "🤖 Predicción previa de la IA:"],
+    "📝 試合後の振り返り:": ["📝 Post-match review:", "📝 赛后复盘:", "📝 Revisión posterior:"],
+    "(API-Footballの実データに基づく、試合終了後の振り返りです)": ["(A post-match review based on real API-Football data.)", "(基于API-Football实测数据的赛后复盘)", "(Revisión posterior basada en datos reales de API-Football.)"],
+    "🤖 何が勝敗を分けたか:": ["🤖 What decided it:", "🤖 胜负关键:", "🤖 Qué decidió el partido:"],
+    "選手評価": ["Player ratings", "球员评分", "Valoraciones"],
+    "試合の流れ(詳細)": ["Match flow (detail)", "比赛进程(详细)", "Desarrollo del partido (detalle)"],
+    "🔄 実データを取得中です…(サーバーが休止していた場合、初回は最大1分ほどかかることがあります)": ["🔄 Fetching real data… (if the server was asleep, the first load can take up to a minute)", "🔄 正在获取实测数据…(若服务器处于休眠,首次最长约1分钟)", "🔄 Obteniendo datos reales… (si el servidor estaba dormido, la primera carga puede tardar hasta un minuto)"],
+    "🔄 実データ連携サーバーを確認中…(サーバーが休止していた場合、初回は最大1分ほどかかることがあります)": ["🔄 Checking the data server… (if it was asleep, the first load can take up to a minute)", "🔄 正在确认数据服务器…(若处于休眠,首次最长约1分钟)", "🔄 Comprobando el servidor de datos… (si estaba dormido, la primera carga puede tardar hasta un minuto)"],
+    "この試合の詳細データを取得できませんでした。時間をおいて再度お試しください。": ["Couldn't load this match's detailed data. Please try again later.", "无法获取本场比赛的详细数据,请稍后重试。", "No se pudieron cargar los datos detallados de este partido. Inténtalo más tarde."],
+    "📖 90分ストーリー予想": ["📖 90-Minute Story Forecast", "📖 90分钟剧本预测", "📖 Guion previsto de los 90 minutos"],
+    "0〜30分": ["0–30 min", "0〜30分钟", "0–30 min"],
+    "(序盤)": ["(early)", "(开局)", "(inicio)"],
+    "30〜70分": ["30–70 min", "30〜70分钟", "30–70 min"],
+    "(中盤)": ["(middle)", "(中段)", "(tramo medio)"],
+    "70〜90分+": ["70–90+ min", "70〜90分钟+", "70–90+ min"],
+    "(終盤)": ["(late)", "(尾声)", "(final)"],
+    "AIの展開予想:": ["AI's forecast:", "AI走势预测:", "Previsión de la IA:"],
+    "🎯 AIが今回もっとも重要だと判断した要因": ["🎯 The factor the AI judged most important", "🎯 AI认为本场最关键的因素", "🎯 El factor que la IA consideró más importante"],
+    "📋 AIが重視した要素(重要度順)": ["📋 Factors the AI weighed (by importance)", "📋 AI重视的因素(按重要度)", "📋 Factores que ponderó la IA (por importancia)"],
+    "🗣️ 試合展開予想": ["🗣️ Match flow forecast", "🗣️ 比赛走势预测", "🗣️ Previsión del desarrollo"],
+    "🔄 もし予想と違ったら": ["🔄 If it goes differently", "🔄 如果与预测不符", "🔄 Si sale distinto"],
+    "🚑 怪我人・出場停止の影響": ["🚑 Injuries & suspensions impact", "🚑 伤停影响", "🚑 Impacto de bajas y sanciones"],
+    "🧩 直近フォーメーション": ["🧩 Recent formations", "🧩 近期阵型", "🧩 Formaciones recientes"],
+    "👤 注目選手(今シーズンの得点ランキング上位)": ["👤 Players to watch (top scorers this season)", "👤 焦点球员(本赛季射手榜前列)", "👤 Jugadores a seguir (máximos goleadores)"],
+    "🧠 前回この対戦を見たときとの違い:": ["🧠 What changed since the AI last saw this fixture:", "🧠 与上次分析该对阵时的变化:", "🧠 Cambios desde la última vez que la IA vio este cruce:"],
+    ": 負傷・出場停止の情報を取得できませんでした": [": couldn't load injury/suspension info", ": 无法获取伤停信息", ": no se pudo cargar la información de bajas"],
+    ": 負傷・出場停止者なし": [": no injuries or suspensions", ": 无伤停", ": sin bajas ni sanciones"],
+  });
+  // ---- ⑦ クラブ対戦シミュレーション ----
+  add({
+    "登録クラブ同士を選ぶと、実データ(直近フォーム・得失点・怪我人数・順位・過去対戦・過密日程)をもとに、AIが勝率・重視した要素・試合展開・予想スコアまで読み解きます。単なる勝敗ではなく「AIがどう試合を読んだか」を見られる分析です。": ["Pick two covered clubs and the AI reads the match from real data (recent form, goals, injuries, standings, head-to-head, fixture congestion): win probability, weighted factors, likely flow and predicted score. Not just a result — you see how the AI read the game.", "选择两家已覆盖的俱乐部,AI将基于实测数据(近期状态、进失球、伤病人数、排名、历史交锋、赛程密度)解读比赛:胜率、重视因素、走势与预测比分。不只给结果,还能看到AI如何解读比赛。", "Elige dos clubes cubiertos y la IA lee el partido con datos reales (forma reciente, goles, lesionados, clasificación, cara a cara, congestión de calendario): probabilidad de victoria, factores ponderados, desarrollo probable y marcador. No es solo un resultado: ves cómo la IA leyó el partido."],
+    "⚠️ 異なる2クラブを選んでください。": ["⚠️ Please choose two different clubs.", "⚠️ 请选择两家不同的俱乐部。", "⚠️ Elige dos clubes distintos."],
+    "🔄 AIが実データを分析しています…(初回はサーバー起動のため最大1分ほどかかることがあります)": ["🔄 The AI is analyzing real data… (first run may take up to a minute while the server wakes)", "🔄 AI正在分析实测数据…(首次因服务器启动最长约1分钟)", "🔄 La IA está analizando datos reales… (la primera vez puede tardar hasta un minuto)"],
+    "この対戦は、どちらかのチームに登録選手データが無いため、能力値にもとづく分析ができませんでした(架空の数値で比較することはしません)。": ["One of these teams has no registered player data, so an attribute-based analysis isn't possible (we never compare with made-up numbers).", "由于其中一队没有已登记的球员数据,无法进行基于能力值的分析(我们绝不用虚构数字来比较)。", "Uno de los equipos no tiene datos de jugadores registrados, así que no es posible un análisis por atributos (nunca comparamos con números inventados)."],
+    "AIの自信度:": ["AI confidence:", "AI置信度:", "Confianza de la IA:"],
+    "予想ボール支配率": ["Predicted possession", "预测控球率", "Posesión prevista"],
+    "✅ 予想勝因 / ⚠️ 予想の弱点": ["✅ Likely winning factors / ⚠️ Weak points", "✅ 预测取胜因素 / ⚠️ 预测弱点", "✅ Claves para ganar / ⚠️ Puntos débiles"],
+    "📈 試合の流れ(予想)": ["📈 Match flow (forecast)", "📈 比赛走势(预测)", "📈 Desarrollo del partido (previsto)"],
+    "🔑 予想ターニングポイント": ["🔑 Predicted turning point", "🔑 预测转折点", "🔑 Punto de inflexión previsto"],
+    "🌟 AI予想MVP": ["🌟 Predicted MVP", "🌟 AI预测MVP", "🌟 MVP previsto"],
+    "➡️ 予想される攻撃方向": ["➡️ Expected attacking directions", "➡️ 预计进攻方向", "➡️ Direcciones de ataque previstas"],
+    "📋 戦術ボード(予想布陣)": ["📋 Tactics board (predicted line-ups)", "📋 战术板(预测阵容)", "📋 Pizarra táctica (onces previstos)"],
+    "(下から攻撃) /": ["(attacking upward) /", "(自下向上进攻) /", "(ataca hacia arriba) /"],
+    "(上から攻撃)": ["(attacking downward)", "(自上向下进攻)", "(ataca hacia abajo)"],
+    "予想フォーメーション": ["Predicted formation", "预测阵型", "Formación prevista"],
+    "選手名をタップすると、その選手の詳細を直接見られます(「🔍 選手検索」タブに切り替わります)。": ["Tap a player's name to open their details (switches to the \"🔍 Player Search\" tab).", "点击球员姓名即可直接查看详情(会切换到「🔍 球员搜索」标签)。", "Toca el nombre de un jugador para ver sus detalles (cambia a la pestaña \"🔍 Buscar jugadores\")."],
+    "⚠️ これは実際の試合結果ではありません。登録選手のデータをもとにAIが生成した予測プレビューで、「分析する」を押すたびに新しく生成されます(今日この試合が実際に開催されるとは限りません)。": ["⚠️ This is not a real result. It's an AI-generated preview based on registered player data, regenerated each time you press \"Analyze\" (this fixture may not actually be played today).", "⚠️ 这不是真实比赛结果。它是AI基于已登记球员数据生成的预测预览,每次点击「分析」都会重新生成(该对阵今天未必真的进行)。", "⚠️ No es un resultado real. Es una previa generada por la IA con datos de jugadores registrados, que se regenera cada vez que pulsas \"Analizar\" (puede que este cruce no se juegue hoy)."],
+    "まだ強く学習された要素はありません(毎日学習エンジンの検証データが十分に蓄積されると、ここに表示されます)。": ["No strongly learned factors yet (they'll appear once the daily learning engine has accumulated enough validation data).", "还没有被充分学习的因素(每日学习引擎积累足够验证数据后会显示在这里)。", "Aún no hay factores aprendidos con fuerza (aparecerán cuando el motor de aprendizaje diario acumule suficientes datos de validación)."],
+  });
+  // ---- ⑧ 選手検索(フィルター・一覧・カード) ----
+  add({
+    "詳細条件(ポジション・年齢・身長・リーグ・怪我・評価・出場・得点・アシスト・調子・スタメン率など)": ["Advanced filters (position, age, height, league, injuries, rating, minutes, goals, assists, form, starting rate, etc.)", "高级筛选(位置、年龄、身高、联赛、伤病、评分、出场、进球、助攻、状态、首发率等)", "Filtros avanzados (posición, edad, altura, liga, lesiones, nota, minutos, goles, asistencias, forma, titularidades, etc.)"],
+    "ポジション": ["Position", "位置", "Posición"],
+    "細かいポジション": ["Detailed position", "细分位置", "Posición detallada"],
+    "リーグ": ["League", "联赛", "Liga"],
+    "怪我": ["Injury", "伤病", "Lesión"],
+    "指定しない": ["Any", "不限", "Cualquiera"],
+    "出場できる状態": ["Available to play", "可出场", "Disponible"],
+    "負傷者リストに掲載中": ["On the injury list", "在伤病名单中", "En la lista de lesionados"],
+    "調子": ["Form", "状态", "Forma"],
+    "年齢": ["Age", "年龄", "Edad"],
+    "身長(cm)": ["Height (cm)", "身高(cm)", "Altura (cm)"],
+    "平均評価": ["Avg rating", "平均评分", "Nota media"],
+    "出場時間(分)": ["Minutes played", "出场时间(分钟)", "Minutos jugados"],
+    "ゴール": ["Goals", "进球", "Goles"],
+    "アシスト": ["Assists", "助攻", "Asistencias"],
+    "スタメン率(%)": ["Starting rate (%)", "首发率(%)", "Titularidades (%)"],
+    "平均出場時間(分)": ["Avg minutes (per match)", "场均出场时间(分钟)", "Minutos por partido"],
+    "直近5試合の評価": ["Last-5-match rating", "近5场评分", "Nota últimos 5 partidos"],
+    "並び替え": ["Sort by", "排序", "Ordenar por"],
+    "平均評価が高い順": ["Highest avg rating", "平均评分从高到低", "Mayor nota media"],
+    "直近5試合の評価が高い順": ["Best last-5 rating", "近5场评分从高到低", "Mejor nota en últimos 5"],
+    "得点が多い順": ["Most goals", "进球最多", "Más goles"],
+    "アシストが多い順": ["Most assists", "助攻最多", "Más asistencias"],
+    "出場時間が長い順": ["Most minutes", "出场时间最长", "Más minutos"],
+    "スタメン出場が多い順": ["Most starts", "首发最多", "Más titularidades"],
+    "調子が良い順": ["Best form", "状态最佳", "Mejor forma"],
+    "年齢が高い順": ["Oldest first", "年龄从大到小", "Mayor edad"],
+    "名前順": ["Name", "按姓名", "Por nombre"],
+    "順序": ["Order", "顺序", "Orden"],
+    "大きい順": ["High → low", "从大到小", "Mayor → menor"],
+    "小さい順": ["Low → high", "从小到大", "Menor → mayor"],
+    "下限": ["Min", "下限", "Mínimo"],
+    "🤖 この条件でAIのおすすめを見る": ["🤖 See AI recommendations for these filters", "🤖 按此条件查看AI推荐", "🤖 Ver recomendaciones de la IA con estos filtros"],
+    "登録選手が見つかりませんでした。": ["No registered players found.", "未找到已登记的球员。", "No se encontraron jugadores registrados."],
+    "負傷者リスト": ["Injury list", "伤病名单", "Lista de lesionados"],
+    "怪我なし": ["No injury", "无伤病", "Sin lesión"],
+    "怪我は未確認": ["Injury status unknown", "伤情未确认", "Lesión sin confirmar"],
+    "調子は未測定": ["Form not measured", "状态未测定", "Forma sin medir"],
+    "調子↑": ["Form ↑", "状态↑", "Forma ↑"],
+    "調子↓": ["Form ↓", "状态↓", "Forma ↓"],
+    "調子 横ばい": ["Form steady", "状态持平", "Forma estable"],
+    "評価": ["Rating", "评分", "Nota"],
+    "日付": ["Date", "日期", "Fecha"],
+    "対戦": ["Opponent", "对阵", "Rival"],
+    "時間": ["Minutes", "时间", "Minutos"],
+    "得点": ["Goals", "进球", "Goles"],
+    "出場した試合のみを新しい順に並べています(出番が無かった試合は行になりません)。": ["Only matches actually played, newest first (unused matches are not listed).", "只列出实际出场的比赛,按最新在前(未出场的比赛不显示)。", "Solo partidos realmente jugados, del más reciente al más antiguo (los no jugados no aparecen)."],
+    "選手の情報を読み込んでいます…": ["Loading player info…", "正在加载球员信息…", "Cargando información del jugador…"],
+    "比較に追加": ["Add to compare", "加入对比", "Añadir a comparación"],
+    "似た選手を探す": ["Find similar players", "查找相似球员", "Buscar jugadores similares"],
+    "👤 基本情報": ["👤 Basic info", "👤 基本信息", "👤 Datos básicos"],
+    "最終更新": ["Last updated", "最后更新", "Última actualización"],
+    "📊 今シーズンの成績": ["📊 This season", "📊 本赛季数据", "📊 Esta temporada"],
+    "🗓️ 最近5試合": ["🗓️ Last 5 matches", "🗓️ 最近5场", "🗓️ Últimos 5 partidos"],
+    "💪 長所": ["💪 Strengths", "💪 优点", "💪 Puntos fuertes"],
+    "🩹 弱点": ["🩹 Weaknesses", "🩹 弱点", "🩹 Puntos débiles"],
+    "🤖 AIの分析": ["🤖 AI analysis", "🤖 AI分析", "🤖 Análisis de la IA"],
+    "成長": ["Growth", "成长", "Progresión"],
+    "実測できた項目": ["Measured items", "已实测项目", "Datos medidos"],
+    "📋 向いている使われ方": ["📋 Best-suited roles", "📋 适合的使用方式", "📋 Roles más adecuados"],
+    "🏅 同じポジションの中での順位": ["🏅 Rank within position", "🏅 同位置内排名", "🏅 Puesto dentro de su posición"],
+    "出場時間": ["Minutes", "出场时间", "Minutos"],
+    "母集団:": ["Sample:", "样本:", "Muestra:"],
+    "👥 似ている選手": ["👥 Similar players", "👥 相似球员", "👥 Jugadores similares"],
+    "🔁 移籍の記録": ["🔁 Transfer history", "🔁 转会记录", "🔁 Historial de traspasos"],
+    "🩹 怪我の記録": ["🩹 Injury history", "🩹 伤病记录", "🩹 Historial de lesiones"],
+    "🏟️ 出番を得やすいクラブ(実測の並び替え)": ["🏟️ Clubs where minutes come easier (sorted from real data)", "🏟️ 更容易获得出场机会的俱乐部(实测排序)", "🏟️ Clubes donde es más fácil jugar (orden por datos reales)"],
+    "この選手は手作業で詳しく整備した登録選手です。能力値・ヒートマップ・解説つきのカードを、このすぐ下に表示しました。": ["This player has a hand-curated detailed profile. The full card (attributes, heatmap, commentary) is shown just below.", "该球员拥有人工精心整理的详细档案。完整卡片(能力值、热图、解说)显示在下方。", "Este jugador tiene un perfil detallado curado a mano. La ficha completa (atributos, mapa de calor, comentario) está justo debajo."],
+    "比較しています…": ["Comparing…", "对比中…", "Comparando…"],
+    "長所": ["Strengths", "优点", "Puntos fuertes"],
+    "弱点": ["Weaknesses", "弱点", "Puntos débiles"],
+    "クラブの所属選手を読み込んでいます…": ["Loading the club's players…", "正在加载俱乐部球员…", "Cargando los jugadores del club…"],
+    "このクラブで絞り込んで検索する": ["Filter search by this club", "按该俱乐部筛选搜索", "Filtrar búsqueda por este club"],
+    "索引にあるこのクラブの選手:": ["Players of this club in the index:", "索引中该俱乐部的球员:", "Jugadores de este club en el índice:"],
+    "AIが条件に合う選手を選んでいます…": ["The AI is picking players that match your filters…", "AI正在挑选符合条件的球员…", "La IA está eligiendo jugadores según tus filtros…"],
+    "条件:": ["Filters:", "条件:", "Filtros:"],
+    "似ている選手を探しています…": ["Finding similar players…", "正在查找相似球员…", "Buscando jugadores similares…"],
+    "AIのおすすめ:": ["AI recommends:", "AI推荐:", "Recomendación de la IA:"],
+    "比較できるのは4人までです。どれかを外してから追加してください。": ["You can compare up to 4 players. Remove one before adding another.", "最多可对比4名球员。请先移除一人再添加。", "Puedes comparar hasta 4 jugadores. Quita uno antes de añadir otro."],
+    "まだ選手・試合を見ていません。上のダッシュボードやチャットから見てみましょう。": ["You haven't viewed any players or matches yet. Try the dashboard or chat above.", "你还没有查看过球员或比赛。试试上方的仪表盘或聊天吧。", "Aún no has visto jugadores ni partidos. Prueba el panel o el chat de arriba."],
+    "登録選手がいません。": ["No registered players.", "没有已登记的球员。", "No hay jugadores registrados."],
+    "登録カードがありません。": ["No registered cards.", "没有已登记的对阵卡。", "No hay enfrentamientos registrados."],
+    "登録選手が不足しています。": ["Not enough registered players.", "已登记球员不足。", "No hay suficientes jugadores registrados."],
+    "候補が見つかりませんでした": ["No candidates found", "未找到候选", "No se encontraron candidatos"],
+  });
+  // ---- ⑨ AI予測の実績・反省・特徴量ラベル ----
+  add({
+    "AI予測の実績": ["AI prediction track record", "AI预测战绩", "Historial de predicciones de la IA"],
+    "実績データを取得できませんでした(サーバー起動待ちの可能性があります。しばらくして再読み込みしてください)。": ["Couldn't load the track record (the server may be waking up — reload in a moment).", "无法获取战绩数据(服务器可能正在启动,请稍后刷新)。", "No se pudo cargar el historial (el servidor puede estar arrancando; recarga en un momento)."],
+    "まだ結果が確定した予測はありません。": ["No predictions have been settled yet.", "还没有已出结果的预测。", "Aún no hay predicciones con resultado confirmado."],
+    "AI予測の正答率:": ["AI accuracy:", "AI预测正确率:", "Precisión de la IA:"],
+    "公式戦の的中率:": ["Competitive-match accuracy:", "正式比赛命中率:", "Acierto en partidos oficiales:"],
+    "直近の記録に、外した試合がありません(外れが出たら、隠さずここに並びます)。": ["No misses in the recent record (when they happen, they'll be listed here, never hidden).", "近期记录中没有失误(一旦出现,会毫不隐瞒地列在这里)。", "Sin fallos en el registro reciente (cuando ocurran, se listarán aquí, sin ocultarlos)."],
+    "参考(親善など)": ["Reference (friendlies etc.)", "参考(友谊赛等)", "Referencia (amistosos, etc.)"],
+    "外した理由(実測データからの機械的な分類):": ["Why it missed (mechanically classified from real data):", "失误原因(由实测数据机械分类):", "Por qué falló (clasificado mecánicamente con datos reales):"],
+    "よく外す理由(累計):": ["Common miss reasons (cumulative):", "常见失误原因(累计):", "Motivos de fallo frecuentes (acumulado):"],
+    "直近フォーム": ["Recent form", "近期状态", "Forma reciente"],
+    "得点力・失点率": ["Scoring & concession rates", "进攻与失球率", "Goles a favor y en contra"],
+    "怪我人": ["Injuries", "伤病", "Lesionados"],
+    "順位・勝点": ["Standings & points", "排名与积分", "Clasificación y puntos"],
+    "過去対戦成績": ["Head-to-head", "历史交锋", "Cara a cara"],
+    "過密日程(疲労)": ["Fixture congestion (fatigue)", "赛程密集(疲劳)", "Congestión de calendario (fatiga)"],
+    "ホーム/アウェイ別の成績": ["Home/away splits", "主客场战绩", "Rendimiento local/visitante"],
+    "出場停止": ["Suspensions", "停赛", "Sanciones"],
+    "xG(期待得点)の質": ["xG (expected goals) quality", "xG(预期进球)质量", "Calidad de xG (goles esperados)"],
+    "エースの得点力": ["Star striker's scoring", "核心射手的得分力", "Pegada del killer"],
+    "市場オッズ(ブックメーカーの評価)": ["Market odds (bookmakers' view)", "市场赔率(博彩公司评估)", "Cuotas del mercado (visión de las casas)"],
+    "チームの地力(長期レーティング)": ["Team's underlying strength (long-term rating)", "球队实力(长期评级)", "Fuerza de fondo del equipo (rating a largo plazo)"],
+    "市場ブレンド比率(最終確率にオッズをどれだけ混ぜるか)": ["Market blend ratio (how much odds mix into the final probability)", "市场混合比例(最终概率中掺入赔率的比重)", "Proporción de mezcla de mercado (cuánto pesan las cuotas en la probabilidad final)"],
+  });
+  // ---- ⑩ サーバー固定文(チャット予算・対決登録・多段思考の注記) ----
+  add({
+    "本日はサイト全体でのAI考察の利用が集中しているため、一時的に利用を制限しています。しばらくしてから再度お試しください。": ["Site-wide AI analysis is in heavy use today, so it's temporarily limited. Please try again later.", "今天全站AI考察使用集中,暂时限流。请稍后再试。", "El análisis de IA está muy solicitado hoy en todo el sitio y se limita temporalmente. Inténtalo más tarde."],
+    "どんなことを知りたいか、もう少しだけ教えていただけますか?(例:「レアル・マドリードの調子はどう?」「今日はどんな試合がある?」)": ["Could you tell me a bit more about what you'd like to know? (e.g. \"How is Real Madrid doing?\" / \"What matches are on today?\")", "能再多说一点你想了解什么吗?(例:「皇马状态怎么样?」「今天有什么比赛?」)", "¿Puedes contarme un poco más sobre lo que quieres saber? (p. ej.: \"¿Cómo está el Real Madrid?\" / \"¿Qué partidos hay hoy?\")"],
+    "AIの考察生成に失敗しました。しばらくしてから再度お試しください。": ["Failed to generate the AI's analysis. Please try again later.", "AI分析生成失败,请稍后重试。", "No se pudo generar el análisis de la IA. Inténtalo más tarde."],
+    "多段思考: 調査計画AIは「追加データは不要」と判断しました(手元の実データで十分)。": ["Multi-step thinking: the planner AI decided no extra data was needed (the data at hand was enough).", "多段思考: 调查规划AI判断无需额外数据(手头实测数据已足够)。", "Pensamiento multietapa: la IA planificadora decidió que no hacían falta más datos (los disponibles bastaban)."],
+    "締切: キックオフ1分前(それまで何度でも変更できます)": ["Deadline: 1 minute before kickoff (you can change your pick until then)", "截止: 开球前1分钟(在此之前可随时更改)", "Cierre: 1 minuto antes del inicio (puedes cambiarlo hasta entonces)"],
+    "この試合はすでに結果が出ているため、登録できません(後出しは不正防止のためできません)。": ["This match already has a result, so picks are closed (no after-the-fact picks, to keep it fair).", "该比赛已出结果,无法登记(为防作弊,不允许马后炮)。", "Este partido ya tiene resultado, así que no se admiten pronósticos (nada a posteriori, por juego limpio)."],
+    "キックオフ直前・開始後は登録できません(後出し防止のため、締切は開始1分前です)。": ["Picks close just before and after kickoff (deadline is 1 minute before the start, to prevent after-the-fact picks).", "临近开球及开球后无法登记(为防马后炮,截止为开赛前1分钟)。", "No se admiten pronósticos justo antes ni después del inicio (el cierre es 1 minuto antes, para evitar pronósticos a posteriori)."],
+    "そのニックネームは使えません(12文字以内・URLや不適切な言葉は不可)。": ["That nickname can't be used (max 12 characters; no URLs or inappropriate words).", "该昵称不可用(12字以内,不可含URL或不当词语)。", "Ese apodo no se puede usar (máx. 12 caracteres; sin URLs ni palabras inapropiadas)."],
+    "この試合はAIの予想対象ではないため、対決の対象外です。": ["This match isn't covered by the AI's predictions, so it's outside the duel.", "该比赛不在AI预测范围内,因此不参与对决。", "Este partido no está cubierto por las predicciones de la IA, así que queda fuera del duelo."],
+    "強気": ["more bullish", "更乐观", "más optimista"],
+    "弱気": ["more cautious", "更保守", "más prudente"],
+  });
+  // ---- ⑩b 追加(実バイト抽出キー: ホーム説明・接続不可メッセージ・質問チップ) ----
+  add({
+    "🧠 予測モデルは9リーグ×3シーズンの実試合とAI自身の的中記録から毎日学習しています。2026年8月18日からは、①市場オッズ(ブックメーカーの評価) ②チーム別の地力レーティング(約200クラブの攻撃力・守備力を過去試合から学習) ③市場ブレンド(最終確率にオッズを混ぜる比率。使った予想には内訳を明記)も加わりました。影響の強さはすべてAI自身が実データから学習し、データが無い試合では使いません。": ["🧠 The prediction model learns daily from real matches across 9 leagues × 3 seasons plus its own hit/miss record. Since Aug 18, 2026 it also uses ① market odds (bookmakers' view), ② per-club power ratings (attack/defence of ~200 clubs learned from past matches) and ③ a market blend (how much odds mix into the final probability — every blended pick discloses its ratio). All influence strengths are learned by the AI itself from real data, and none are used for matches without data.","🧠 预测模型每天从9个联赛×3个赛季的实际比赛及AI自身的命中记录中学习。自2026年8月18日起还加入了:①市场赔率(博彩公司评估)②各俱乐部实力评级(从过往比赛学习约200家俱乐部的攻防)③市场混合(最终概率中掺入赔率的比例,使用时必在预测中注明构成)。所有影响强度均由AI自己从实测数据学习,无数据的比赛不使用。","🧠 El modelo de predicción aprende a diario de partidos reales de 9 ligas × 3 temporadas y de su propio historial de aciertos. Desde el 18/8/2026 usa además ① cuotas del mercado (visión de las casas), ② ratings de fuerza por club (ataque/defensa de ~200 clubes aprendidos de partidos pasados) y ③ una mezcla de mercado (cuánto pesan las cuotas en la probabilidad final; cada predicción mezclada declara su proporción). Todas las influencias las aprende la propia IA de datos reales y no se usan en partidos sin datos."],
+    "サーバーに接続できないため、昨日との比較を読み込めませんでした。": ["Couldn't reach the server, so yesterday's comparison couldn't be loaded.","无法连接服务器,无法加载与昨日的对比。","No se pudo conectar con el servidor; no se cargó la comparación con ayer."],
+    "サーバーに接続できないため、昨日との違いを読み込めませんでした。": ["Couldn't reach the server, so the changes since yesterday couldn't be loaded.","无法连接服务器,无法加载与昨日的变化。","No se pudo conectar con el servidor; no se cargaron los cambios desde ayer."],
+    "サーバーに接続できないため、反省の記録を読み込めませんでした。": ["Couldn't reach the server, so the reflections couldn't be loaded.","无法连接服务器,无法加载反思记录。","No se pudo conectar con el servidor; no se cargaron las reflexiones."],
+    "サーバーに接続できないため、ダイジェストを読み込めませんでした。": ["Couldn't reach the server, so the digest couldn't be loaded.","无法连接服务器,无法加载周报。","No se pudo conectar con el servidor; no se cargó el resumen."],
+    "サーバーに接続できないため、選手データを読み込めませんでした。時間をおいて再度お試しください。": ["Couldn't reach the server, so player data couldn't be loaded. Please try again later.","无法连接服务器,无法加载球员数据。请稍后重试。","No se pudo conectar con el servidor; no se cargaron los datos de jugadores. Inténtalo más tarde."],
+    "サーバーに接続できないため、注目選手を読み込めませんでした。": ["Couldn't reach the server, so featured players couldn't be loaded.","无法连接服务器,无法加载焦点球员。","No se pudo conectar con el servidor; no se cargaron los jugadores destacados."],
+    "久保建英はどんな選手？": ["What kind of player is Takefusa Kubo?","久保建英是怎样的球员?","¿Cómo juega Takefusa Kubo?"],
+    "ヤマルはなぜ評価が高い？": ["Why is Lamine Yamal rated so highly?","为什么亚马尔评价这么高?","¿Por qué está tan bien valorado Lamine Yamal?"],
+    "ムバッペの弱点は？": ["What are Mbappé's weaknesses?","姆巴佩的弱点是什么?","¿Cuáles son los puntos débiles de Mbappé?"],
+    "メッシとロナウドどっち？": ["Messi or Ronaldo?","梅西还是C罗?","¿Messi o Cristiano?"],
+    "レアルはなぜ強い？": ["Why is Real Madrid so strong?","皇马为什么这么强?","¿Por qué es tan fuerte el Real Madrid?"],
+    "バイエルンとアーセナルどっちが強い？": ["Bayern or Arsenal — who's stronger?","拜仁和阿森纳谁更强?","¿Quién es más fuerte, el Bayern o el Arsenal?"],
+    "今日見るべき試合は？": ["Which match should I watch today?","今天该看哪场比赛?","¿Qué partido debería ver hoy?"],
+  });
+  // ---- ⑪ 型テンプレート(実ソースから機械抽出・⦿=変数スロット) ----
+  function pat(t) {
+    var esc = t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp("^" + esc.replace(/⦿/g, "(.*?)") + "$");
+  }
+  var RAWP = [
+    ["⚖️ この予想の判定: 市場⦿%+AI⦿%の合成(比率は実測で学習・毎日見直し)", "⚖️ This verdict blends market $1% + AI $2% (ratio learned from real results, reviewed daily)", "⚖️ 本预测为市场$1%+AI$2%的合成判定(比例由实测学习、每日复核)", "⚖️ Este veredicto combina mercado $1 % + IA $2 % (proporción aprendida de resultados reales, revisada a diario)"],
+    ["🏦 市場(オッズ)比較: AIは市場より⦿(⦿pt)", "🏦 Market (odds) check: the AI is $1 than the market ($2pt)", "🏦 市场(赔率)对比: AI比市场$1($2pt)", "🏦 Frente al mercado (cuotas): la IA es $1 que el mercado ($2pt)"],
+    ["(モデル生値⦿%・同じ自信帯の実測⦿件に基づく補正)", "(raw model $1% — corrected using $2 measured cases in the same confidence band)", "(模型原始值$1%——基于同置信区间$2场实测的校正)", "(valor bruto del modelo $1 %, corregido con $2 casos medidos de la misma banda de confianza)"],
+    ["(モデル生値⦿%・実測⦿件に基づく補正)", "(raw model $1% — corrected using $2 measured cases)", "(模型原始值$1%——基于$2场实测的校正)", "(valor bruto del modelo $1 %, corregido con $2 casos medidos)"],
+    ["🕓 予想生成: ⦿(毎朝の学習時。フォーム・怪我などの材料もその時点の実測)", "🕓 Prediction generated: $1 (during the morning learning run; form, injuries etc. as measured then)", "🕓 预测生成: $1(每日早晨学习时。状态、伤病等材料也是当时的实测)", "🕓 Predicción generada: $1 (en el aprendizaje matinal; forma, lesiones, etc. medidos en ese momento)"],
+    ["AIはいま公式戦⦿連続的中中", "The AI is on a $1-hit streak in competitive games", "AI正式比赛连续命中$1场", "La IA lleva $1 aciertos seguidos en partidos oficiales"],
+    ["(保存範囲内の最長: ⦿連続 ・ ⦿)", "(best in stored window: $1 in a row ・ $2)", "(保存范围内最长: 连续$1场 ・ $2)", "(mejor racha registrada: $1 seguidos ・ $2)"],
+    ["— 連続なるか?", "— can it become a streak?", "— 能连起来吗?", "— ¿empieza una racha?"],
+    ["(保存範囲内の最長: ⦿連続)", "(best in stored window: $1 in a row)", "(保存范围内最长: 连续$1场)", "(mejor racha registrada: $1 seguidos)"],
+    ["(保存範囲内の最長: ⦿連続的中)", "(best in stored window: $1 hits in a row)", "(保存范围内最长: 连续命中$1场)", "(mejor racha registrada: $1 aciertos seguidos)"],
+    ["・ほかに親善試合など参考扱いが⦿件", "・plus $1 friendlies etc. counted as reference only", "・另有$1场友谊赛等仅作参考", "・más $1 amistosos, solo como referencia"],
+    ["検証済み ⦿件のうち、的中 ⦿件・外れ ⦿件。外れた試合を新しい順に並べています。", "Of $1 settled predictions: $2 hits, $3 misses. Missed matches are listed newest first.", "已核对$1场中: 命中$2场、失误$3场。失误的比赛按最新在前排列。", "De $1 predicciones resueltas: $2 aciertos y $3 fallos. Los fallos se listan del más reciente al más antiguo."],
+    ["🏆 「⦿」として全国ランキング参加中", "🏆 In the national ranking as \"$1\"", "🏆 正以「$1」参加全国排行榜", "🏆 En el ranking nacional como \"$1\""],
+    ["(的中数: あなた⦿ vs AI⦿)", "(hits: you $1 vs AI $2)", "(命中数: 你$1 vs AI$2)", "(aciertos: tú $1 vs IA $2)"],
+    ["🔥⦿連勝中", "🔥 $1-win streak", "🔥 $1连胜中", "🔥 racha de $1 victorias"],
+    ["AIとの対決: あなた⦿勝⦿分⦿敗", "Duel vs the AI: you $1W-$2D-$3L", "与AI对决: 你$1胜$2平$3负", "Duelo contra la IA: llevas $1V-$2E-$3D"],
+    ["・⦿日前の実測", "・measured $1 days ago", "・$1天前实测", "・medido hace $1 días"],
+    ["・⦿時間前の実測", "・measured $1 hours ago", "・$1小时前实测", "・medido hace $1 horas"],
+    ["が条件に一致しました(全 ⦿人中)。⦿人を表示中。", "matched your filters (of $1 total). Showing $2.", "符合条件(共$1名)。正在显示$2名。", "coinciden con tus filtros (de $1 en total). Mostrando $2."],
+    ["すべて表示しました(⦿人)", "All shown ($1 players)", "已全部显示($1名)", "Mostrados todos ($1 jugadores)"],
+    ["(最有力スコア ⦿)", "(most likely score $1)", "(最可能比分 $1)", "(marcador más probable $1)"],
+    ["📊 根拠にした事実を見る(⦿件)", "📊 View the facts used ($1)", "📊 查看依据的事实($1条)", "📊 Ver los hechos utilizados ($1)"],
+    ["🔴 試合中(⦿試合)", "🔴 Live ($1)", "🔴 进行中($1场)", "🔴 En juego ($1)"],
+    ["⏰ これから(⦿試合)", "⏰ Upcoming ($1)", "⏰ 即将开始($1场)", "⏰ Próximos ($1)"],
+    ["▼ 終了した試合を表示(⦿試合)", "▼ Show finished matches ($1)", "▼ 显示已结束的比赛($1场)", "▼ Ver partidos finalizados ($1)"],
+    ["ℹ️ その他(延期・中止など、⦿試合)", "ℹ️ Other (postponed/cancelled etc., $1)", "ℹ️ 其他(延期/取消等,$1场)", "ℹ️ Otros (aplazados/cancelados, $1)"],
+    ["⦿件中⦿件的中(⦿%)", "$2 hits out of $1 ($3%)", "$1场中命中$2场($3%)", "$2 aciertos de $1 ($3 %)"],
+    ["⦿人選択中(2〜4人で比較できます)", "$1 selected (compare 2–4 players)", "已选择$1人(可对比2〜4人)", "$1 seleccionados (compara de 2 a 4)"],
+    ["⦿のAIの1週間(実測記録からの自動生成・作文なし)", "$1 — the AI's week (auto-generated from measured records, no creative writing)", "$1的AI一周(由实测记录自动生成,非人工作文)", "La semana de la IA — $1 (generada automáticamente de registros medidos, sin redacción inventada)"],
+    ["最終更新: ⦿(毎朝の学習後に自動更新)", "Last updated: $1 (auto-updated after each morning's learning run)", "最后更新: $1(每天早晨学习后自动更新)", "Última actualización: $1 (se actualiza tras el aprendizaje de cada mañana)"],
+    ["次の試合(日本時間 ⦿)⦿", "Next match (Japan time $1)", "下一场比赛(日本时间 $1)", "Próximo partido (hora de Japón: $1)"],
+    ["⦿ 勝利", "$1 to win", "$1获胜", "Gana $1"],
+    ["※一部クラブ(⦿件)の名前を提供元から自動取得しています。数分後に再読み込みすると表示されます。", "※ Names of some clubs ($1) are being fetched automatically from the data provider. Reload in a few minutes to see them.", "※ 部分俱乐部($1家)的名称正在从数据源自动获取。几分钟后刷新即可显示。", "※ Los nombres de algunos clubes ($1) se están obteniendo automáticamente del proveedor. Recarga en unos minutos para verlos."],
+    ["本日、あなたがご利用いただけるAI考察の回数の上限(⦿回)に達しました。日付が変わると(日本時間の朝ごろ)また使えるようになります。", "You've reached today's personal limit for AI analysis ($1). It resets when the date changes (around morning, Japan time).", "你已达到今日个人AI考察次数上限($1)。日期更替后(日本时间早晨前后)即可再次使用。", "Has alcanzado tu límite diario de análisis de IA ($1). Se restablece al cambiar la fecha (por la mañana, hora de Japón)."],
+    ["多段思考: 調査計画AIが追加データ⦿件を要求し、実データ⦿件を追加取得しました。", "Multi-step thinking: the planner AI requested $1 extra data items and $2 real data items were fetched.", "多段思考: 调查规划AI要求追加$1项数据,实际补充获取了$2项实测数据。", "Pensamiento multietapa: la IA planificadora pidió $1 datos extra y se obtuvieron $2 datos reales adicionales."],
+    ["この試合の参加が上限(⦿人)に達しました。", "This match reached its participant cap ($1).", "该比赛参与人数已达上限($1人)。", "Este partido alcanzó el límite de participantes ($1)."],
+    ["9リーグ×3シーズンの実試合⦿から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。⦿", "Learned by the AI from real matches across 9 leagues × 3 seasons$1: each club's attack and defence strength (Dixon-Coles method, time-decayed, updated daily). Power = attack + defence. ↑↓ compares with last week. Not a subjective ranking — a purely mechanical calculation from measured data, with no manual adjustment.$2", "由AI从9个联赛×3个赛季的实际比赛$1中学习得出: 各俱乐部的攻击力与防守力(Dixon-Coles法、含时间衰减、每日更新)。实力=攻击+防守。↑↓为与上周对比。这不是主观排名——全部由实测数据机械计算,无人工调整。$2", "Aprendido por la IA de partidos reales de 9 ligas × 3 temporadas$1: fuerza ofensiva y defensiva de cada club (método Dixon-Coles, con decaimiento temporal, actualización diaria). Fuerza = ataque + defensa. ↑↓ compara con la semana pasada. No es un ranking subjetivo: cálculo puramente mecánico de datos medidos, sin ajustes manuales.$2"],
+    ["(⦿試合)", "($1 matches)", "($1场)", "($1 partidos)"],
+    ["(⦿/⦿件)", "($1/$2)", "($1/$2)", "($1/$2)"],
+    ["公式戦の的中率: ⦿%", "Competitive-match accuracy: $1%", "正式比赛命中率: $1%", "Acierto en partidos oficiales: $1%"],
+    ["根拠(最重要要素): ⦿ ・ 学習v⦿の重みで予測", "Basis (top factor): $1 ・ predicted with learning-v$2 weights", "依据(最重要因素): $1 ・ 使用学习v$2的权重预测", "Base (factor principal): $1 ・ predicho con pesos del aprendizaje v$2"],
+    ["根拠(最重要要素): ⦿ ・", "Basis (top factor): $1 ・", "依据(最重要因素): $1 ・", "Base (factor principal): $1 ・"],
+    ["根拠(最重要要素): ⦿", "Basis (top factor): $1", "依据(最重要因素): $1", "Base (factor principal): $1"],
+    ["学習v⦿の重みで予測", "predicted with learning-v$1 weights", "使用学习v$1的权重预测", "predicho con pesos del aprendizaje v$1"],
+    ["(勝点⦿)", "($1 pts)", "($1分)", "($1 pts)"],
+    ["⦿位", "#$1", "第$1名", "$1.º"],
+    ["⦿人", "$1", "$1名", "$1"],
+    ["もっと見る(あと⦿ページ)", "Show more ($1 pages left)", "查看更多(还剩$1页)", "Ver más (quedan $1 páginas)"],
+    ["⦿ / 近さ ⦿(⦿項目で比較)", "$1 / distance $2 (compared on $3 attributes)", "$1 / 距离 $2(按$3项对比)", "$1 / distancia $2 (comparado en $3 atributos)"],
+    ["⦿に似ている選手", "Players similar to $1", "与$1相似的球员", "Jugadores similares a $1"],
+    ["⦿はどんな選手？", "What kind of player is $1?", "$1是怎样的球员?", "¿Cómo juega $1?"],
+    ["⦿の今後は？", "What does the future hold for $1?", "$1今后会怎样?", "¿Qué futuro le espera a $1?"],
+    ["⦿と⦿どっちが勝つ？", "$1 vs $2 — who wins?", "$1和$2谁会赢?", "$1 contra $2: ¿quién gana?"],
+  ];
+  for (var rp = 0; rp < RAWP.length; rp++) P.push([pat(RAWP[rp][0]), RAWP[rp][1], RAWP[rp][2], RAWP[rp][3]]);
+  /* ==== 辞書ここまで ==== */
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
+  else boot();
+})();
+</script>
 <div class="app">
 
   <header class="top">
@@ -513,6 +1148,12 @@
       </div>
       <button class="icon-btn" id="beginnerModeToggle" title="専門用語を初心者向けの言い回しに置き換えます">🔰 初心者モード: OFF</button>
       <button class="icon-btn" id="themeToggle">🌙 ダーク</button>
+        <select class="icon-btn" id="langSwitchSel" title="Language / 语言 / Idioma" aria-label="Language">
+          <option value="ja">🌐 日本語</option>
+          <option value="en">🌐 English</option>
+          <option value="zh">🌐 中文(简体)</option>
+          <option value="es">🌐 Español</option>
+        </select>
     </div>
   </header>
 
@@ -6426,10 +7067,12 @@ const DISCUSS_TIMEOUT_MS = 15000;
 async function fetchDiscussApi(question, subject, playerHint) {
   try {
     const url = `${API_PROXY_BASE}/discuss`;
+    // v56: 利用者の言語設定を渡す(AIの回答はサーバー側で選択言語のまま生成される)
+    const lang = (typeof window !== "undefined" && window.appLang) ? window.appLang : "ja";
     return await fetchJsonWithTimeout(url, DISCUSS_TIMEOUT_MS, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, subject, playerHint }),
+      body: JSON.stringify({ question, subject, playerHint, lang }),
     });
   } catch (e) {
     return null;
