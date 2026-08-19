@@ -478,6 +478,39 @@ function marketProbabilities(homeLambda, awayLambda, maxGoals, rho) {
   return { over25, under25: 1 - over25, btts, noBtts: 1 - btts };
 }
 
+/* ----------------------------------------------------------------------------
+ * 2026年8月19日・v59「派生指標」(利用者のご要望③)。
+ * marketProbabilities と同じスコア格子から、表示用の指標をまとめて取り出す。
+ *   ・btts        … 両チーム得点
+ *   ・over25      … 合計3点以上
+ *   ・homeCleanSheet / awayCleanSheet … その側が無失点で終わる確率
+ *   ・expTotalGoals … 期待合計得点(格子の期待値。λH+λAとτ補正の反映後)
+ * いずれも「モデルが計算した確率」であって、外部から持ってきた数字でも
+ * 人手で決めた数字でもない(既存の勝敗確率と同一の分布から取り出している)。
+ * -------------------------------------------------------------------------- */
+function derivedMatchMetrics(homeLambda, awayLambda, maxGoals, rho) {
+  if (!Number.isFinite(homeLambda) || !Number.isFinite(awayLambda)) return null;
+  const cap = maxGoals || 8;
+  const grid = scoreGrid(homeLambda, awayLambda, cap, rho);
+  let over25 = 0, btts = 0, homeCs = 0, awayCs = 0, expTotal = 0;
+  for (let h = 0; h <= cap; h++) {
+    for (let a = 0; a <= cap; a++) {
+      const p = grid[h][a];
+      if (h + a > 2.5) over25 += p;
+      if (h > 0 && a > 0) btts += p;
+      if (a === 0) homeCs += p; // ホームが無失点
+      if (h === 0) awayCs += p; // アウェイが無失点
+      expTotal += (h + a) * p;
+    }
+  }
+  return {
+    btts, noBtts: 1 - btts,
+    over25, under25: 1 - over25,
+    homeCleanSheet: homeCs, awayCleanSheet: awayCs,
+    expTotalGoals: expTotal,
+  };
+}
+
 // この試合において、どの特徴量がどれだけ予測に効いたか(★1〜5)。
 // 重みが0(＝まだ学習されていない特徴量)は★0とし、「まだ学習していない
 // ため考慮していません」と正直に区別する(でっち上げの重要度を出さない)。
@@ -1218,6 +1251,7 @@ module.exports = {
   computeMatchProbabilitiesRaw,
   computeMatchProbabilities,
   mostLikelyScoreline, scorelineOutcome, classifyFixtureOfficial, topScorelinesFrom, marketProbabilities,
+  derivedMatchMetrics,
   computeFactorImportance,
   backtestAccuracyV2,
   computeNegativeLogLikelihood,

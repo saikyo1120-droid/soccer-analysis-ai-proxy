@@ -2518,6 +2518,8 @@ async function runDailyLearning(deps) {
       overallPairedLogLoss: modelTuning.overallPairedLogLoss ?? null,
       vsBaseline: modelTuning.vsBaseline ?? null,
       newParams: modelTuning.newParams ?? null,
+      // v59: 派生指標(BTTS率・クリーンシート率・荒れやすさ)の集計結果(実測)
+      teamStats: modelTuning.teamStats ?? null,
     } : null,
     // 実行中の重複APIをどれだけ削れたか(実測)。データ量は減らしていない。
     apiRunMemo: {

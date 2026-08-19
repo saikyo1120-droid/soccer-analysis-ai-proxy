@@ -39,6 +39,9 @@ const {
 // v50「チームの地力レーティング」: 過去試合からチーム別の攻撃力・守備力を学習し、
 // 期待得点(λ̂)を特徴量として既存モデルへ渡す(重みは実測で学習・初期0)。
 const { fitTeamRatings, expGoalsFromRatings, RATINGS_KEY } = require("./teamRatings");
+// v59「派生指標」: 同じデータセットからBTTS率・クリーンシート率・荒れやすさを
+// 1回だけ集計して保存する(利用者の質問時は読み出すだけ。方針⑥)。
+const { buildTeamStats, TEAM_STATS_KEY } = require("./teamStats");
 
 const TUNING_LOG_KEY = "learn:modeltuning:log";
 // 採用後も「最初のモデルと比べてどれだけ良くなったか」を毎日残すための基準。
@@ -475,6 +478,27 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     record.teamRatings.fullFit = { available: false, saved: false, reasonJa: `レーティング学習でエラー(${e && e.message})` };
   }
 
+  // ---- v59: 派生指標(BTTS率・クリーンシート率・荒れやすさ)の事前集計 ----
+  //   レーティングと同じく「データから測った事実」なので、重みの採否とは独立に
+  //   毎回更新する。ここで1回だけ数えて保存し、利用者の質問時は読み出すだけに
+  //   する(方針⑥: 質問した瞬間に重い処理を行わない)。
+  let teamStatsResult = { available: false, saved: false, teamsCounted: 0 };
+  try {
+    const stats = buildTeamStats(ds.rows, { builtAt: runAt.toISOString() });
+    let statsSaved = false;
+    if (stats.available && upstashEnabled) {
+      statsSaved = (await upstashSetJSON(TEAM_STATS_KEY, stats)) !== false;
+    }
+    teamStatsResult = {
+      available: stats.available, saved: statsSaved,
+      teamsCounted: stats.teamsCounted, matches: stats.matchesUsed,
+      reasonJa: stats.reasonJa || null,
+    };
+  } catch (e) {
+    teamStatsResult = { available: false, saved: false, teamsCounted: 0, reasonJa: `派生指標の集計でエラー(${e && e.message})` };
+  }
+  record.teamStats = teamStatsResult;
+
   if (upstashEnabled) {
     await upstashCmd(["LPUSH", TUNING_LOG_KEY, JSON.stringify(record)]).catch(() => {});
     await upstashCmd(["LTRIM", TUNING_LOG_KEY, "0", String(TUNING_LOG_KEEP - 1)]).catch(() => {});
@@ -492,6 +516,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     ran: true,
     adopted: record.adopted,
     teamRatings: record.teamRatings,
+    teamStats: record.teamStats, // v59: 派生指標の集計結果(実測)
     consistencyChecked: record.consistencyChecked,
     reasonJa: record.reasonJa,
     datasetSize: ds.rows.length,
