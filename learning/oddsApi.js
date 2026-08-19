@@ -37,6 +37,10 @@ const SPORT_KEYS = {
   94: "soccer_portugal_primeira_liga",
   203: "soccer_turkey_super_league",
   144: "soccer_belgium_first_div",
+  // v58: 欧州カップ戦(The Odds APIの公式sport key・実表で確認済み)
+  2: "soccer_uefa_champs_league",
+  3: "soccer_uefa_europa_league",
+  848: "soccer_uefa_europa_conference_league",
 };
 
 const DEFAULT_MONTHLY_BUDGET = 480; // 無料枠500に対する安全マージン

@@ -45,14 +45,23 @@ const DEFAULT_BACKFILL_LEAGUES = [
   { id: 94, nameJa: "プリメイラ・リーガ" },
   { id: 203, nameJa: "シュペル・リグ" },
   { id: 144, nameJa: "ベルギー・プロ・リーグ" },
+  // ---- v58「リーグ間の橋」(利用者のご指摘への根治) ----
+  // 国内リーグだけの学習では、リーグ間の対戦データが1件も無いため
+  // 「国内で無双するクラブ(ベンフィカ・ブルッヘ等)」が強豪リーグの
+  // 上位クラブより高く出てしまう(地力ランキングの違和感の根本原因)。
+  // 欧州カップ戦を学習対象に加えることで、リーグをまたぐ実対戦が
+  // レーティングを相互に較正する(でっち上げのリーグ係数は使わない)。
+  { id: 2, nameJa: "チャンピオンズリーグ", cup: true },
+  { id: 3, nameJa: "ヨーロッパリーグ", cup: true },
+  { id: 848, nameJa: "カンファレンスリーグ", cup: true },
 ];
 
 const BACKFILL_KEY = "learn:backfill:dataset";
 const BACKFILL_META_KEY = "learn:backfill:meta";
-// v47: 9リーグ×3シーズン ≒ 9,300件(リーグにより306〜380試合/シーズン)。
+// v58: 12大会×5シーズン ≒ 18,000〜20,000件(国内306〜380試合/シーズン+カップ戦)。
 // 保存はブロック分割(下のBACKFILL_SHARD_SIZE)なので1キー上限の心配はなく、
 // 上限は「12ブロック×1,200件=14,400件」の範囲内に収める。
-const MAX_STORED_MATCHES = 12000;
+const MAX_STORED_MATCHES = 22000;
 
 const FINISHED = new Set(["FT", "AET", "PEN"]);
 
@@ -241,7 +250,7 @@ function timeDecayWeight(matchDateIso, referenceMs, xi) {
 // 版が上がると modelTuning 側が週1回の更新日を待たずに作り直す。
 const ROWS_VERSION = 3;
 const BACKFILL_SHARD_SIZE = 1200;                       // 1ブロックあたりの試合数
-const BACKFILL_MAX_SHARDS = 12;                          // 上限14,400件
+const BACKFILL_MAX_SHARDS = 19;                          // 上限22,800件(v58: 5シーズン+カップ戦ぶん)
 const backfillShardKey = (i) => `${BACKFILL_KEY}:s${i}`;
 
 async function saveDataset(deps, rows, meta) {

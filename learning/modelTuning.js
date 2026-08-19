@@ -48,6 +48,8 @@ const LEAGUE_NAMES_JA = {
   39: "プレミアリーグ", 140: "ラ・リーガ", 78: "ブンデスリーガ", 135: "セリエA", 61: "リーグ・アン",
   // v47で拡張した4リーグ(historicalBackfill.jsのDEFAULT_BACKFILL_LEAGUESと対応)
   88: "エールディヴィジ", 94: "プリメイラ・リーガ", 203: "シュペル・リグ", 144: "ベルギー・プロ・リーグ",
+  // v58で追加した欧州カップ戦(リーグ間の実対戦=レーティングの相互較正用)
+  2: "チャンピオンズリーグ", 3: "ヨーロッパリーグ", 848: "カンファレンスリーグ",
 };
 const TUNING_LOG_KEEP = 60;
 // データセットを作り直す間隔。毎日15リクエスト使う必要はない(過去試合は増えない)。
@@ -97,7 +99,7 @@ async function ensureDataset(deps, runAt) {
   }
 
   // 15リクエスト程度。余裕が無ければ次回に回す。
-  const NEEDED = (DEFAULT_BACKFILL_LEAGUES.length * 3) + 2;
+  const NEEDED = (DEFAULT_BACKFILL_LEAGUES.length * 5) + 2; // v58: 12大会×5シーズン+予備 ≒ 62件(週1回/構成変更時のみ)
   if (apiBudget && typeof apiBudget.canAfford === "function" && !apiBudget.canAfford(NEEDED)) {
     return {
       ...existing, refreshed: false,
@@ -105,7 +107,11 @@ async function ensureDataset(deps, runAt) {
     };
   }
 
-  const seasons = seasonsToFetch(runAt, 3);
+  // v58: 3→5シーズンへ拡張(利用者のご要望「ここ何年かの過去データを全て」)。
+  // 時間減衰(ξ=0.0065/日)により古いシーズンの影響は自然に小さくなる
+  // (それが正しい設計: 3年前の強さは今の強さではない)が、リーグ間較正の
+  // 実対戦サンプルと、直近データが薄いクラブの土台としては効く。
+  const seasons = seasonsToFetch(runAt, 5);
   const fetched = await backfillSeasons(deps, { seasons });
   if (!fetched.matches.length) {
     return {
