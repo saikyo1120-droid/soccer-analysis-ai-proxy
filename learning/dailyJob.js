@@ -1444,6 +1444,9 @@ async function runDailyLearning(deps) {
   // ---- v50: チーム別レーティング(前回の学習で保存済み)を1回だけ読み込む ----
   //   無ければnull=レーティング特徴量は0(影響なし)。ここで新しい計算はしない。
   const teamRatingsData = upstashEnabled ? await upstashGetJSON(RATINGS_KEY).catch(() => null) : null;
+  // v55: 地力ランキングの表示用に、この巡回で確定した teamId→チーム名 を集める
+  // (レーティングのIDに名前を紐づける最も確実な供給源。試合予定から実名を取る)
+  const teamNamesCollected = new Map();
   // ---- ③ TOP100クラブの直近の試合について、新しく自社予測を立てる ----
   // 2026年8月の調査で修正: 旧実装はここを REGISTERED_TEAMS(11クラブ)で回して
   // いたため、知識収集は毎日100クラブ回っているのに **予測はTOP100のうち9クラブ
@@ -1611,6 +1614,9 @@ async function runDailyLearning(deps) {
 
       // v50: 地力レーティング由来の期待得点(両チームのレーティングがあるときだけ)
       const ratingEg = expGoalsFromRatings(teamRatingsData, homeTeamId, awayTeamId);
+      // v55: teamId→名前の採集(レーティング表示用)
+      if (Number.isFinite(homeTeamId) && fx.teams && fx.teams.home && fx.teams.home.name) teamNamesCollected.set(homeTeamId, fx.teams.home.name);
+      if (Number.isFinite(awayTeamId) && fx.teams && fx.teams.away && fx.teams.away.name) teamNamesCollected.set(awayTeamId, fx.teams.away.name);
       const built = buildMatchFeatures(
         { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXg, topScorer: homeTop, ratingExpGoals: ratingEg ? ratingEg.home : null },
         { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXg, topScorer: awayTop, ratingExpGoals: ratingEg ? ratingEg.away : null },
@@ -1782,6 +1788,19 @@ async function runDailyLearning(deps) {
     };
   } catch (e) {
     predictionCoverage = { error: e.message, noteJa: "予測カバー率を取得できませんでした(Upstashの読み出しに失敗)" };
+  }
+
+  // ---- v55: 採集した teamId→名前 を保存(既存とマージ・上限800件) ----
+  //   地力ランキング(/api/ratings/rankings)が、名前対応表の無い旧レーティングでも
+  //   ここから名前を補完できるようにする(表示の自己回復)。
+  if (upstashEnabled && teamNamesCollected.size) {
+    try {
+      const existingNames = (await upstashGetJSON("learn:teamnames").catch(() => null)) || {};
+      for (const [id, name] of teamNamesCollected) existingNames[id] = name;
+      const ids = Object.keys(existingNames);
+      if (ids.length > 800) ids.slice(0, ids.length - 800).forEach((id) => delete existingNames[id]);
+      await upstashSetJSON("learn:teamnames", existingNames);
+    } catch (e) { errors.push("teamnames_save_failed"); }
   }
 
   await stage("③-b TOP100クラブの収集(選手索引もここ)");

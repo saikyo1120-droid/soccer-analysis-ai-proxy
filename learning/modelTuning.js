@@ -377,14 +377,22 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     const ratingsFull = fitTeamRatings(ds.rows, { nowMs: nowMsForRatings });
     if (ratingsFull.available && upstashEnabled) {
       ratingsFull.builtAt = runAt.toISOString();
-      // v53: 表示用のチーム名(データセットのメタから。無ければ省略=IDのみ)
-      if (ds.meta && ds.meta.namesById) {
-        const names = {};
+      // v53: 表示用のチーム名(データセットのメタから)。
+      // v55: さらに日次巡回が集めた learn:teamnames ともマージする(メタに名前が
+      // 無い旧データセットでも、翌日から名前が自己回復する)。
+      const names = {};
+      try {
+        const collected = (await deps.upstashGetJSON("learn:teamnames").catch(() => null)) || {};
         for (const id of Object.keys(ratingsFull.byTeam)) {
-          if (ds.meta.namesById[id]) names[id] = ds.meta.namesById[id];
+          if (collected[id]) names[id] = collected[id];
         }
-        ratingsFull.namesById = names;
+      } catch (e) { /* 採集名簿が無くても続行 */ }
+      if (ds.meta && ds.meta.namesById) {
+        for (const id of Object.keys(ratingsFull.byTeam)) {
+          if (ds.meta.namesById[id]) names[id] = ds.meta.namesById[id]; // データセット由来を優先
+        }
       }
+      if (Object.keys(names).length) ratingsFull.namesById = names;
       ratingsSaved = (await upstashSetJSON(RATINGS_KEY, ratingsFull)) !== false;
       // ---- v53「地力ランキング」の週次スナップショット(↑↓表示用) ----
       //   今週の順位表を learn:ratings:ranks:latest に保存し、週が替わった最初の
