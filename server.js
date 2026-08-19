@@ -6374,16 +6374,58 @@ async function handleHttpRequest(req, res) {
             const prev = await upstashGetJSON("learn:ratings:ranks:prev").catch(() => null);
             const prevRanks = (prev && prev.ranks) || {};
             const jaByEnLc = new Map(CLUB_UNIVERSE.map((c) => [c.nameEn.toLowerCase(), c.nameJa]));
-            const teams = Object.entries(ratings.byTeam)
+            // v55: レーティング本体に名前が無い(または一部欠けている)場合、
+            // 日次巡回・自動取得の採集名簿(learn:teamnames)から補完する
+            // (本番で「チームID 211」と表示された問題の自己回復経路)
+            const namesById = ratings.namesById || {};
+            let teams = Object.entries(ratings.byTeam)
               .map(([id, t]) => ({
                 id: Number(id),
-                name: (ratings.namesById && ratings.namesById[id]) || `チームID ${id}`,
+                name: namesById[id] || `チームID ${id}`,
                 att: t.att, def: t.def,
                 strength: Math.round((t.att + t.def) * 1000) / 1000,
                 matches: t.n,
               }))
               .sort((a, b) => b.strength - a.strength)
-              .slice(0, 50)
+              .slice(0, 50);
+            // 表示対象50件に名前の無いクラブがあれば、採集名簿で埋める(部分欠けにも効く)
+            if (teams.some((t) => String(t.name).startsWith("チームID "))) {
+              const collectedNames = (await upstashGetJSON("learn:teamnames").catch(() => null)) || {};
+              teams = teams.map((t) => (String(t.name).startsWith("チームID ") && collectedNames[t.id])
+                ? { ...t, name: collectedNames[t.id] } : t);
+            }
+            // 表示対象50件のうち、名前がまだ無い件数(全191件ではなく画面に出る分だけを数える)
+            const unnamedCount = teams.filter((t) => String(t.name).startsWith("チームID ")).length;
+            // ---- v55: 名前の即時自己回復 ----
+            //   名前が無いIDは、API-Footballの /teams?id= で正式名を1回だけ裏で取得して
+            //   learn:teamnames に保存する(推測の静的対応表は使わない=でっち上げ防止)。
+            //   ・裏で実行(この応答はブロックしない。方針⑥)
+            //   ・二重実行はロック(2時間)で防止。取得は表示対象の不明ID(最大50件)のみ
+            //   ・利用者の重い処理予算には数えない(runInBackgroundCtx)
+            if (unnamedCount > 0 && UPSTASH_ENABLED) {
+              const missingIds = teams.filter((t) => String(t.name).startsWith("チームID ")).map((t) => t.id).slice(0, 50);
+              runInBackgroundCtx(async () => {
+                const lock = await upstashCmd(["SET", "learn:teamnames:fill:lock", "1", "NX", "EX", "7200"]).catch(() => null);
+                if (lock !== "OK") return; // 誰かが実行中/直近に実行済み
+                const merged = (await upstashGetJSON("learn:teamnames").catch(() => null)) || {};
+                let fetched = 0;
+                for (const id of missingIds) {
+                  if (merged[id]) continue;
+                  try {
+                    // jobCall: 裏の保守作業なので、利用者用の予約枠には手を付けない
+                    const resp = await callApiFootball("/teams", { id }, { jobCall: true });
+                    const nm = resp && resp.response && resp.response[0] && resp.response[0].team && resp.response[0].team.name;
+                    if (nm) { merged[id] = nm; fetched++; }
+                  } catch (e) { /* 取れないIDは次の機会に(推測で埋めない) */ }
+                }
+                if (fetched) {
+                  await upstashSetJSON("learn:teamnames", merged);
+                  cacheSet("ratings:rankings:public", undefined, 1); // 次のアクセスで名前つきを再構築
+                }
+                console.log(`[ratings] チーム名の自動取得: ${fetched}/${missingIds.length}件`);
+              });
+            }
+            const teamsRanked = teams
               .map((t, i) => {
                 const rank = i + 1;
                 const prevRank = prevRanks[t.id];
@@ -6401,12 +6443,13 @@ async function handleHttpRequest(req, res) {
               matchesUsed: ratings.matchesUsed || null,
               teamsRated: ratings.teamsRated || teams.length,
               prevWeekKey: (prev && prev.weekKey) || null,
-              teams,
-              noteJa: `9リーグ×3シーズンの実試合${ratings.matchesUsed ? `(${ratings.matchesUsed}試合)` : ""}から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。`,
+              teams: teamsRanked,
+              noteJa: `9リーグ×3シーズンの実試合${ratings.matchesUsed ? `(${ratings.matchesUsed}試合)` : ""}から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。${unnamedCount > 0 ? `※一部クラブ(${unnamedCount}件)の名前を提供元から自動取得しています。数分後に再読み込みすると表示されます。` : ""}`,
             };
           }
         }
-        cacheSet("ratings:rankings:public", rkBody, 30 * 60 * 1000);
+        // v55: 名前の自動取得中は3分キャッシュ(数分で名前つきに切り替わる)。通常は30分。
+        cacheSet("ratings:rankings:public", rkBody, (rkBody && rkBody.available && /自動取得/.test(rkBody.noteJa || "")) ? 3 * 60 * 1000 : 30 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=300" });
         res.end(JSON.stringify(rkBody));
         return;
