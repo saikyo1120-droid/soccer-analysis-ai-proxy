@@ -767,7 +767,7 @@
     "🔥 今話題の質問": ["🔥 Trending questions", "🔥 热门问题", "🔥 Preguntas del momento"],
     "📈 今日人気の質問": ["📈 Popular today", "📈 今日热问", "📈 Populares hoy"],
     "🤖 AIおすすめ質問": ["🤖 AI suggestions", "🤖 AI推荐问题", "🤖 Sugerencias de la IA"],
-    "例: 久保建英はどんな選手？ / レアルはなぜ強い？": ["e.g.: What kind of player is Kubo? / Why is Real Madrid strong?", "例如: 久保建英是怎样的球员?/皇马为什么强?", "p. ej.: ¿Cómo juega Kubo? / ¿Por qué es fuerte el Real Madrid?"],
+    "例: レアル・マドリード vs バルセロナ / 久保建英はどんな選手？": ["e.g.: Real Madrid vs Barcelona / What kind of player is Kubo?", "例如: 皇家马德里 vs 巴塞罗那 / 久保建英是怎样的球员?", "p. ej.: Real Madrid vs Barcelona / ¿Cómo juega Kubo?"],
     "🤖 AI予測の実績を読み込み中…": ["🤖 Loading the AI's track record…", "🤖 正在加载AI预测战绩…", "🤖 Cargando el historial de la IA…"],
     "🧠 AIは昨日より賢くなったか": ["🧠 Is the AI smarter than yesterday?", "🧠 AI比昨天更聪明了吗", "🧠 ¿Es la IA más lista que ayer?"],
     "🙈 AIの反省 — 外した試合と、その理由": ["🙈 AI's reflections — missed matches and why", "🙈 AI的反思 — 预测失误的比赛及原因", "🙈 Autocrítica de la IA — fallos y sus motivos"],
@@ -1073,6 +1073,34 @@
     "バイエルンとアーセナルどっちが強い？": ["Bayern or Arsenal — who's stronger?","拜仁和阿森纳谁更强?","¿Quién es más fuerte, el Bayern o el Arsenal?"],
     "今日見るべき試合は？": ["Which match should I watch today?","今天该看哪场比赛?","¿Qué partido debería ver hoy?"],
   });
+  // ---- ⑫ v59「どんな対戦でも1行で分析」+ スコアシナリオ・派生指標 ----
+  add({
+    "AIの見立て": ["The AI's read", "AI的看法", "La lectura de la IA"],
+    "最有力スコア": ["most likely score", "最可能比分", "marcador más probable"],
+    "この対戦を、AIが学習した中身で分析しました。": ["Here's this matchup, analysed with what the AI has actually learned.", "已用AI实际学到的内容分析了这场对阵。", "Aquí tienes este enfrentamiento, analizado con lo que la IA ha aprendido de verdad."],
+    "📊 もっと見る(スコアの可能性・傾向・根拠)": ["📊 More (score possibilities, tendencies, basis)", "📊 查看更多(比分可能性・倾向・依据)", "📊 Ver más (marcadores posibles, tendencias, base)"],
+    "📊 スコアの可能性・傾向": ["📊 Score possibilities & tendencies", "📊 比分可能性与倾向", "📊 Marcadores posibles y tendencias"],
+    "スコアの可能性(上位5件)": ["Score possibilities (top 5)", "比分可能性(前5)", "Marcadores posibles (top 5)"],
+    "両チーム得点": ["Both teams score", "两队均进球", "Ambos marcan"],
+    "3点以上": ["3+ goals", "3球以上", "3+ goles"],
+    "完封": ["Clean sheet", "零封", "Portería a cero"],
+    "無失点": ["clean sheets", "零失球", "portería a cero"],
+    "試合": ["matches", "场比赛", "partidos"],
+    "荒れやすさ(実測)": ["Volatility (measured)", "波动性(实测)", "Volatilidad (medida)"],
+    "1試合の合計得点のばらつきが、学習対象クラブの中で上位": ["spread of total goals per match ranks in the top ", "每场总进球的波动在学习对象俱乐部中位居前", "la dispersión de goles por partido está en el top "],
+    "荒れやすい": ["volatile", "易波动", "volátil"],
+    "落ち着いた": ["steady", "稳定", "estable"],
+    "平均的": ["average", "中等", "media"],
+    "過去の実測": ["Measured history", "过往实测", "Historial medido"],
+    "クラブElo(外部の独立レーティング)": ["Club Elo (independent external rating)", "俱乐部Elo(外部独立评级)", "Elo de club (rating externo independiente)"],
+    "もとにしたもの": ["Based on", "依据", "Basado en"],
+    "地力レーティング(実試合": ["power ratings (learned from ", "实力评级(从实际比赛", "ratings de fuerza (aprendidos de "],
+    "件から学習)": [" real matches)", "场中学习)", " partidos reales)"],
+    "学習v": ["learned v", "学习v", "pesos v"],
+    "の重み": [" weights", "的权重", " (aprendidos)"],
+    "この分析は「地力レーティング(過去の実試合から学習)」と「実測の傾向」で計算しています。当日の怪我人・出場停止・移籍・市場オッズは含みません(今日の試合の予想カードにはそれらも入ります)。": ["This analysis uses power ratings (learned from past real matches) and measured tendencies. It does not include today's injuries, suspensions, transfers or market odds (today's prediction cards do include those).", "本分析基于实力评级(从过往实际比赛学习)与实测倾向计算,不包含当日伤停、转会及市场赔率(今日预测卡片则包含这些)。", "Este análisis usa ratings de fuerza (aprendidos de partidos reales pasados) y tendencias medidas. No incluye lesiones, sanciones, fichajes ni cuotas de hoy (las predicciones de hoy sí los incluyen)."],
+    "「クラブA vs クラブB」の形で教えていただけると分析できます(例: レアル・マドリード vs バルセロナ)。": ["Write it as \"Club A vs Club B\" and I'll analyse it (e.g. Real Madrid vs Barcelona).", "请以「俱乐部A vs 俱乐部B」的形式输入即可分析(例如: 皇家马德里 vs 巴塞罗那)。", "Escríbelo como \"Club A vs Club B\" y lo analizo (p. ej. Real Madrid vs Barcelona)."],
+  });
   // ---- ⑪ 型テンプレート(実ソースから機械抽出・⦿=変数スロット) ----
   function pat(t) {
     var esc = t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1198,7 +1226,7 @@
     </div>
     <div class="chat-suggest-row" id="heroSuggestRow" style="margin-top:8px;"></div>
     <div class="chat-input-row">
-      <input type="text" id="heroChatInput" placeholder="例: 久保建英はどんな選手？ / レアルはなぜ強い？">
+      <input type="text" id="heroChatInput" placeholder="例: レアル・マドリード vs バルセロナ / 久保建英はどんな選手？">
       <button class="apply-btn" id="heroChatBtn" style="margin-top:0; width:auto; padding:9px 18px;">聞く ▶</button>
     </div>
     <div id="heroChatMessages" style="margin-top:12px;"></div>
@@ -7239,6 +7267,121 @@ async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn, forced
   renderFn();
 }
 
+/* ============================================================================
+ * 2026年8月19日・v59「どんな対戦でも1行で分析」(利用者のご要望①)
+ * ----------------------------------------------------------------------------
+ * 「レアル vs バルサ」と書くだけで、今日の試合予定に無い対戦でも、AIの中身
+ * (地力レーティング・学習済みρ・クラブElo・実測の傾向)で分析を返す。
+ *
+ * ■ 既存の挙動を壊さないための設計
+ *   ・ここでは「対戦の形をしているか」を軽く見るだけ。判定と名寄せはサーバー。
+ *   ・サーバーが「分からない/曖昧」と答えたら、**従来の会話フローにそのまま
+ *     流す**(この機能が原因で答えられなくなる経路を作らない)。
+ *   ・選手名が含まれる質問は、これまで通り選手の導線を優先する。
+ *
+ * ■ 画面のつくり(利用者のご指示「情報が溢れて見にくくなるのは避ける」)
+ *   常時見えるのは「対戦名・勝率バー・最有力スコアの1行」だけ。
+ *   スコア上位5件・派生指標・実測の傾向・根拠は「もっと見る」の中に畳む。
+ * ========================================================================== */
+const MATCHUP_STRONG_SEP = /(?:\svs\.?\s)|(?:vs\.?)|[×✕]|対(?![戦決応策象照抗話面])|(?:\s[-–—]\s)/i;
+const MATCHUP_SOFT_SEP = /と/;
+const MATCHUP_COMPARE_HINT = /(どっち|どちら|勝つ|強い|有利|対戦|試合|予想|分析)/;
+function looksLikeMatchupQuestion(q) {
+  const s = String(q || "").trim();
+  if (!s || s.length > 60) return false;
+  // 選手の質問は従来どおり(選手カード・選手比較の導線を壊さない)
+  try {
+    if (typeof findAllMentionedPlayers === "function" && findAllMentionedPlayers(s, 2).length) return false;
+  } catch (e) { /* 判定できない場合は対戦として試す */ }
+  if (MATCHUP_STRONG_SEP.test(s)) return true;
+  return MATCHUP_SOFT_SEP.test(s) && MATCHUP_COMPARE_HINT.test(s);
+}
+
+const MATCHUP_COLD_TIMEOUT_MS = 12000;
+async function fetchMatchupApi(q) {
+  try {
+    // 失敗しても従来の会話フローへ流れるだけなので、ここでは長く待たせない。
+    // (サーバーが冷えている場合の長い待ちは、この後の既存フロー側が受け持つ)
+    return await fetchJsonWithTimeout(
+      `${API_PROXY_BASE}/matchup?q=${encodeURIComponent(q)}`,
+      backendConfirmedWarm ? FAST_TIMEOUT_MS : MATCHUP_COLD_TIMEOUT_MS
+    );
+  } catch (e) { return null; }
+}
+
+/** 表示に使うクラブ名(日本語表示のときは日本語名を優先) */
+function matchupSideName(side) {
+  if (!side) return "";
+  let lang = "ja";
+  try { lang = window.appLang || "ja"; } catch (e) { /* 既定は日本語 */ }
+  return (lang === "ja" && side.nameJa) ? side.nameJa : (side.name || side.nameJa || "");
+}
+
+/** 対戦分析カード(常時表示は3行だけ。残りは折りたたみ) */
+function matchupCardHtml(d) {
+  if (!d || !d.available) return "";
+  const homeName = escapeHtml(matchupSideName(d.home));
+  const awayName = escapeHtml(matchupSideName(d.away));
+  const barP = { probs: d.probs, home: { name: matchupSideName(d.home) }, away: { name: matchupSideName(d.away) } };
+  const winnerLabel = d.predictedWinner === "home" ? `${homeName} <span>勝利</span>`
+    : d.predictedWinner === "away" ? `${awayName} <span>勝利</span>` : "<span>引き分け</span>";
+  const dv = d.derived;
+  const derivedLine = dv
+    ? `<div class="value-note" style="margin-top:4px;"><span>両チーム得点</span> <strong>${Number(dv.bttsPct)}%</strong> ・ <span>3点以上</span> <strong>${Number(dv.over25Pct)}%</strong> ・ <span>完封</span> ${homeName} <strong>${Number(dv.homeCleanSheetPct)}%</strong> / ${awayName} <strong>${Number(dv.awayCleanSheetPct)}%</strong></div>`
+    : "";
+  const scenarioLine = (Array.isArray(d.scenarios) && d.scenarios.length)
+    ? `<div class="value-note" style="margin-top:4px;"><span>スコアの可能性(上位5件)</span>: ${d.scenarios.map((s) => `${escapeHtml(s.scoreline)} <strong>${Number(s.pct)}%</strong>`).join(" ・ ")}</div>`
+    : "";
+  const h = d.history || {};
+  const vol = h.volatility;
+  const volLine = vol
+    ? `<div class="value-note" style="margin-top:4px;"><span>荒れやすさ(実測)</span>: <strong>${escapeHtml(vol.labelJa)}</strong>(<span>1試合の合計得点のばらつきが、学習対象クラブの中で上位</span>${Number(vol.pct)}%)</div>`
+    : "";
+  const histLine = (h.home || h.away)
+    ? `<div class="value-note" style="margin-top:2px;"><span>過去の実測</span>: ${h.home ? `${homeName} <span>両チーム得点</span>${Number(h.home.bttsPct)}% ・ <span>無失点</span>${Number(h.home.csPct)}%(${Number(h.home.n)}<span>試合</span>)` : ""}${(h.home && h.away) ? " / " : ""}${h.away ? `${awayName} <span>両チーム得点</span>${Number(h.away.bttsPct)}% ・ <span>無失点</span>${Number(h.away.csPct)}%(${Number(h.away.n)}<span>試合</span>)` : ""}</div>`
+    : "";
+  const eloLine = d.clubElo
+    ? `<div class="value-note" style="margin-top:2px;"><span>クラブElo(外部の独立レーティング)</span>: ${homeName} ${Number(d.clubElo.home)} / ${awayName} ${Number(d.clubElo.away)}</div>`
+    : "";
+  const b = d.basis || {};
+  const basisLine = `<div class="value-note" style="margin-top:2px; opacity:.85;"><span>もとにしたもの</span>: <span>地力レーティング(実試合</span>${Number(b.ratingMatches || 0)}<span>件から学習)</span>${Number.isFinite(b.weightsVersion) ? ` ・ <span>学習v</span>${Number(b.weightsVersion)}<span>の重み</span>` : ""}</div>`;
+  const limitLine = `<div class="value-note" style="margin-top:2px; opacity:.85;">${escapeHtml(d.limitsJa || "")}</div>`;
+  return `
+    <div style="margin-top:8px; padding:10px 12px; border:1px solid var(--border); border-left:4px solid var(--series-2); border-radius:8px;">
+      <div><strong>${homeName} vs ${awayName}</strong></div>
+      ${predBarHtml(barP)}
+      <div style="margin-top:4px;">🤖 <span>AIの見立て</span>: <strong>${winnerLabel}</strong>${d.topScoreline ? `(<span>最有力スコア</span> ${escapeHtml(d.topScoreline)})` : ""}</div>
+      <details style="margin-top:6px;">
+        <summary style="cursor:pointer; font-size:12px; color:var(--series-2);">📊 もっと見る(スコアの可能性・傾向・根拠)</summary>
+        ${scenarioLine}${derivedLine}${volLine}${histLine}${eloLine}${basisLine}${limitLine}
+      </details>
+    </div>`;
+}
+
+/**
+ * 「A vs B」を検出したら対戦分析を返す。
+ * @returns true = この関数が回答を出した(呼び出し側は以降の処理を行わない)
+ */
+async function tryMatchupFlow(q, pushMsg, renderFn) {
+  if (!looksLikeMatchupQuestion(q)) return false;
+  // 保存済みデータの読み出しだけなので待ち時間は短い。空の吹き出しを先に出さず、
+  // 答えが出たときだけ表示する(失敗しても画面に痕跡を残さない=従来の会話へ戻す)。
+  const d = await fetchMatchupApi(q);
+  if (d && d.ok && d.available) {
+    pushMsg({ role: "ai", text: `<span>この対戦を、AIが学習した中身で分析しました。</span>`, extras: matchupCardHtml(d) });
+    renderFn();
+    return true;
+  }
+  // 「曖昧で1つに絞れない」だけは、正直に伝えたほうが利用者の役に立つ
+  if (d && d.ok && d.available === false && d.reason === "ambiguous") {
+    pushMsg({ role: "ai", text: escapeHtml(d.messageJa || "") });
+    renderFn();
+    return true;
+  }
+  // それ以外(形が違う・知らないクラブ・レーティング未生成)は従来の会話へ流す
+  return false;
+}
+
 async function heroAskAI(question) {
   const q = (question || "").trim();
   if (!q) return;
@@ -7246,6 +7389,10 @@ async function heroAskAI(question) {
   renderHeroChatUI();
 
   const dLevel = effectiveDialogueLevel(q, state.level);
+
+  // v59: 「クラブA vs クラブB」の1行なら、まず対戦分析で答える。
+  // 分析できなければ何も表示せず、下の既存フローへそのまま進む(挙動の劣化なし)。
+  if (await tryMatchupFlow(q, (msg) => heroChatHistory.push(msg), renderHeroChatUI)) return;
 
   // Stage C: 議論トリガー(「〜だと思う」「なぜ？」等)を検出したら、単純な
   // キーワード回答ではなくRAG+LLMの議論エンジンへ切り替える。それ以外は
@@ -8406,7 +8553,7 @@ function predictionSummaryBlockHtml(p, titleJa) {
       <div>${escapeHtml(titleJa || "🤖 AIの予想")}: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predResultBadgeHtml(p)}</div>
       ${predBarHtml(p)}
       <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-      ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${blendLine}${predPreKickLineHtml(p)}${predFreshnessLineHtml(p)}
+      ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${blendLine}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
     </div>`;
 }
 // ---- 2026年8月18日・v50「市場ブレンド」の開示 ----
@@ -8439,6 +8586,25 @@ function predPreKickLineHtml(p) {
     verdict = ` → <strong>${label} ${Number(pct)}%</strong>${pk.blended.changedFromMorning ? ` <span style="color:var(--series-2); font-weight:700;">(朝から変化)</span>` : ""}`;
   }
   return `<div class="value-note" style="margin-top:2px;">⚡ <span>直前情報</span>(<span>${kind}</span>${src})${verdict} <span style="opacity:.8;">(公式の予想は朝のまま)</span></div>`;
+}
+// ---- 2026年8月19日・v59「スコアシナリオ上位5件と派生指標」(ご要望②③) ----
+//   すでに出している予想と**同じ確率分布**から取り出した数字。新しい推定は無い。
+//   利用者のご指示(情報が溢れて見にくくなるのを避ける)に従い、
+//   既定は折りたたみ1行。押した人にだけ中身を見せる。
+function predScenarioLineHtml(p) {
+  if (!p) return "";
+  const hasScenarios = Array.isArray(p.scenarios) && p.scenarios.length;
+  const d = p.derived;
+  if (!hasScenarios && !d) return "";
+  const scenarioLine = hasScenarios
+    ? `<div class="value-note" style="margin-top:2px;"><span>スコアの可能性(上位5件)</span>: ${p.scenarios.map((s) => `${escapeHtml(String(s.scoreline))} <strong>${Number(s.pct)}%</strong>`).join(" ・ ")}</div>`
+    : "";
+  const homeName = escapeHtml((p.home && p.home.name) || "ホーム");
+  const awayName = escapeHtml((p.away && p.away.name) || "アウェイ");
+  const derivedLine = d
+    ? `<div class="value-note" style="margin-top:2px;"><span>両チーム得点</span> <strong>${Number(d.bttsPct)}%</strong> ・ <span>3点以上</span> <strong>${Number(d.over25Pct)}%</strong> ・ <span>完封</span> ${homeName} <strong>${Number(d.homeCleanSheetPct)}%</strong> / ${awayName} <strong>${Number(d.awayCleanSheetPct)}%</strong></div>`
+    : "";
+  return `<details style="margin-top:2px;"><summary style="cursor:pointer; font-size:12px; color:var(--series-2);">📊 スコアの可能性・傾向</summary>${scenarioLine}${derivedLine}</details>`;
 }
 // 一覧の行に足す1行の予想ストリップ(軽さ優先: バー無し・テキストのみ)
 function predStripHtml(p) {
@@ -8814,7 +8980,7 @@ async function renderTodayPredictionsHero(reuseCached) {
         ${duelMyPickLineHtml(p)}
         ${predBarHtml(p)}
         <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-        ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${predBlendLineHtml(p)}${predPreKickLineHtml(p)}${predFreshnessLineHtml(p)}
+        ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${predBlendLineHtml(p)}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
         <div style="margin-top:6px;"><button class="ghost-btn pred-share-btn" type="button" data-share-idx="${todayPredShareItems.indexOf(p)}" style="padding:5px 12px; font-size:12px;">📸 画像でシェア</button></div>
       </div>`;
   };

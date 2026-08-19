@@ -104,7 +104,13 @@ const {
   EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, computeFeatureAvailability, predictOutcomeV2,
   computeMatchProbabilities, mostLikelyScoreline, scorelineOutcome, computeFactorImportance,
   classifyFixtureOfficial,
+  // v59: スコアシナリオ上位5件と派生指標(同じスコア分布から取り出す)
+  topScorelinesFrom, derivedMatchMetrics,
 } = require("./learning/predictionModel");
+// v59「どんな対戦でも1行で分析」: クラブ名の解決と分析の組み立て(外部通信なし)
+const matchupLib = require("./learning/matchupAnalysis");
+const { TEAM_STATS_KEY, combineVolatility: _combineVolatility } = require("./learning/teamStats");
+const { buildEloByNorm: buildEloByNormMU, DAILY_KEY: CLUBELO_DAILY_KEY } = require("./learning/clubElo");
 // 選手個人の実データ統計(2026年8月・知識拡張フェーズ)。
 const { computePlayerRealStats } = require("./learning/playerFeatures");
 const { createPlayerProfileEngine } = require("./knowledge/playerProfileEngine");
@@ -2218,6 +2224,31 @@ function prioritizeFixturesForDisplay(fixtures, cap) {
 // 試合一覧は handleFixturesToday の既存キャッシュを共有する。
 
 /** 今日の試合1件 + 保存済みのAI予測レコード → 画面表示用の1行(純関数・テスト対象) */
+/**
+ * v59: 保存済みの予測記録から「スコアシナリオ上位5件」と「派生指標」を作る(純関数)。
+ * λが記録されていない古い記録では、どちらも null(でっち上げない)。
+ */
+function buildScenarioFields(record) {
+  if (!record || !Number.isFinite(record.homeLambda) || !Number.isFinite(record.awayLambda)) {
+    return { scenarios: null, derived: null };
+  }
+  const rho = (record.weightsSnapshot && Number.isFinite(record.weightsSnapshot.rho))
+    ? record.weightsSnapshot.rho : 0;
+  const scenarios = topScorelinesFrom(record.homeLambda, record.awayLambda, 6, rho, 5)
+    .map((s) => ({ scoreline: s.scoreline, pct: Math.round(s.p * 1000) / 10 }));
+  const d = derivedMatchMetrics(record.homeLambda, record.awayLambda, 8, rho);
+  return {
+    scenarios,
+    derived: d ? {
+      bttsPct: Math.round(d.btts * 100),
+      over25Pct: Math.round(d.over25 * 100),
+      homeCleanSheetPct: Math.round(d.homeCleanSheet * 100),
+      awayCleanSheetPct: Math.round(d.awayCleanSheet * 100),
+      expTotalGoals: Math.round(d.expTotalGoals * 100) / 100,
+    } : null,
+  };
+}
+
 function buildTodayPredictionEntry(fixture, record, calibrationMap) {
   if (!fixture || !record) return null;
   const probs = (Number.isFinite(record.homeLambda) && Number.isFinite(record.awayLambda))
@@ -2255,6 +2286,11 @@ function buildTodayPredictionEntry(fixture, record, calibrationMap) {
       && scorelineOutcome(record.predictedScoreline) === record.predictedWinner)
       ? record.predictedScoreline : null,
     topFactorJa: topFactor ? topFactor.labelJa : null,
+    // ---- v59: スコアシナリオ上位5件と派生指標(利用者のご要望②③) ----
+    //   すでに記録済みのλ(期待得点)と学習済みρから、既存の予想と**同一の
+    //   スコア分布**を取り出すだけ。新しい推定も外部データも足していない。
+    //   画面では折りたたみ1行に収める(情報過多を避けるため)。
+    ...buildScenarioFields(record),
     // v50: 市場ブレンドで判定した予想は、その内訳(市場◯%+AI◯%)を必ず開示する
     blend: record.blendUsed ? {
       marketPct: record.blendUsed.marketPct, aiPct: record.blendUsed.aiPct,
@@ -4384,6 +4420,109 @@ async function gatherTeamMatchContext(teamId, nowMs) {
 function starsDisplay(stars) {
   const s = Math.max(0, Math.min(5, stars || 0));
   return "★".repeat(s) + "☆".repeat(5 - s);
+}
+
+/* ============================================================================
+ * 2026年8月19日・v59「どんな対戦でも1行で分析」(利用者のご要望①)
+ * ----------------------------------------------------------------------------
+ * 「レアル・マドリード vs バルセロナ」の1行から、今日の試合予定に無い対戦でも
+ * AIの中身(地力レーティング・学習済みρ・クラブElo・実測の傾向)で分析を返す。
+ *
+ * ■ 設計上の約束
+ *   ・**外部APIを1件も呼ばない**。読むのは毎朝の学習が保存したデータだけ
+ *     (方針⑥: 質問した瞬間に重い処理を行う設計は禁止。10万人規模でも成立する)。
+ *   ・Redis読み出しは10分キャッシュ+対戦ごとの結果キャッシュ。
+ *   ・クラブ名が1つに定まらない/レーティングが無い場合は、
+ *     推測せずに理由を返す(でっち上げ禁止)。
+ * ========================================================================== */
+const MATCHUP_CTX_TTL_MS = 10 * 60 * 1000;
+
+/** 分析に必要な保存済みデータ(レーティング・名前索引・重み・派生指標・Elo)をまとめて読む */
+async function loadMatchupContext() {
+  const cached = cacheGet("matchup:ctx");
+  if (cached !== undefined && cached !== null) return cached;
+  const ctx = {
+    ratings: null, weights: null, teamStats: null,
+    index: [], jaMap: matchupLib.buildJaMap(CLUB_UNIVERSE), ratedIds: new Set(),
+    elo: null,
+  };
+  if (UPSTASH_ENABLED) {
+    const [ratings, teamNames, teamStats, weightsRaw, eloDaily] = await Promise.all([
+      upstashGetJSON(RATINGS_KEY).catch(() => null),
+      upstashGetJSON("learn:teamnames").catch(() => null),
+      upstashGetJSON(TEAM_STATS_KEY).catch(() => null),
+      upstashCmd(["GET", "learn:weights"]).catch(() => null),
+      upstashGetJSON(CLUBELO_DAILY_KEY).catch(() => null),
+    ]);
+    ctx.ratings = ratings || null;
+    ctx.teamStats = teamStats || null;
+    try { ctx.weights = weightsRaw ? { ...EXTENDED_DEFAULT_WEIGHTS, ...JSON.parse(weightsRaw) } : EXTENDED_DEFAULT_WEIGHTS; }
+    catch (e) { ctx.weights = EXTENDED_DEFAULT_WEIGHTS; }
+    // 名前索引: レーティング付属の名前 → 日次巡回の採集名簿 の順に統合
+    ctx.index = matchupLib.buildNameIndex((ratings && ratings.namesById) || {}, teamNames || {});
+    if (ratings && ratings.byTeam) ctx.ratedIds = new Set(Object.keys(ratings.byTeam).map(Number));
+    // クラブElo: その日ぶんが保存されているときだけ使う(ここでは取得しない)
+    if (eloDaily && Array.isArray(eloDaily.list) && eloDaily.list.length) {
+      const rows = eloDaily.list.map(([club, country, elo]) => ({ club, country, elo }));
+      ctx.elo = { byNorm: buildEloByNormMU(rows), rows, date: eloDaily.date || null };
+    }
+  }
+  cacheSet("matchup:ctx", ctx, MATCHUP_CTX_TTL_MS);
+  return ctx;
+}
+
+async function handleMatchup(query) {
+  const qRaw = (query.get("q") || "").trim();
+  let homeRaw = (query.get("home") || "").trim();
+  let awayRaw = (query.get("away") || "").trim();
+  if (!homeRaw && !awayRaw && qRaw) {
+    const parsed = matchupLib.parseMatchupText(qRaw);
+    if (!parsed) {
+      return { status: 200, body: { ok: true, available: false, reason: "unparsed", messageJa: "「クラブA vs クラブB」の形で教えていただけると分析できます(例: レアル・マドリード vs バルセロナ)。" } };
+    }
+    homeRaw = parsed.home; awayRaw = parsed.away;
+  }
+  if (!homeRaw || !awayRaw) {
+    return { status: 400, body: { ok: false, error: "home and away (or q) are required" } };
+  }
+  if (homeRaw.length > matchupLib.MAX_SIDE_LEN || awayRaw.length > matchupLib.MAX_SIDE_LEN) {
+    return { status: 400, body: { ok: false, error: "club name is too long" } };
+  }
+  const ckey = cacheKeyOf("matchup", [homeRaw.toLowerCase(), awayRaw.toLowerCase()]);
+  const hit = cacheGet(ckey);
+  if (hit) return { status: 200, body: hit };
+
+  const ctx = await loadMatchupContext();
+  if (!UPSTASH_ENABLED || !ctx.index.length) {
+    return { status: 200, body: { ok: true, available: false, reason: "not_ready", messageJa: "学習データ(地力レーティング)がまだ読み込めないため、この対戦は分析できません。毎朝の学習のあとに再度お試しください。" } };
+  }
+  const home = matchupLib.resolveClub(homeRaw, ctx);
+  const away = matchupLib.resolveClub(awayRaw, ctx);
+  const failed = !home.ok ? { side: "home", raw: homeRaw, r: home } : (!away.ok ? { side: "away", raw: awayRaw, r: away } : null);
+  if (failed) {
+    const messageJa = failed.r.reason === "ambiguous"
+      ? `「${failed.raw}」はどのクラブか1つに絞れませんでした(候補: ${(failed.r.candidates || []).join(" / ")})。正式名称で教えてください。`
+      : `「${failed.raw}」に一致するクラブが、AIが学習しているクラブの中に見つかりませんでした。学習対象は欧州の12大会に出場したクラブです。`;
+    const body = { ok: true, available: false, reason: failed.r.reason, side: failed.side, queryJa: failed.raw, candidates: failed.r.candidates || null, messageJa };
+    cacheSet(ckey, body, MATCHUP_CTX_TTL_MS);
+    return { status: 200, body };
+  }
+  const result = matchupLib.buildMatchup({
+    home, away, ratings: ctx.ratings, weights: ctx.weights, teamStats: ctx.teamStats, elo: ctx.elo,
+  });
+  if (!result.available) {
+    const messageJa = result.reason === "same_club"
+      ? "同じクラブ同士の対戦は分析できません。"
+      : result.reason === "no_rating"
+        ? `${(result.missing || []).join("・")}は、AIが学習した実試合の数がまだ足りないため、地力レーティングがありません(推測値は作りません)。`
+        : "この対戦はまだ分析できません。";
+    const body = { ok: true, available: false, reason: result.reason, messageJa };
+    cacheSet(ckey, body, MATCHUP_CTX_TTL_MS);
+    return { status: 200, body };
+  }
+  const body = { ok: true, ...result };
+  cacheSet(ckey, body, MATCHUP_CTX_TTL_MS);
+  return { status: 200, body };
 }
 
 async function handleMatchAnalysis(query, clientIp) {
@@ -7153,6 +7292,15 @@ async function handleHttpRequest(req, res) {
         res.end(JSON.stringify(body));
         return;
       }
+      // ---- v59「どんな対戦でも1行で分析」 ----
+      //   ?q=「A vs B」 または ?home=&away=。保存済みの学習結果だけで答えるため
+      //   外部APIは0件・LLMも使わない(予算を一切消費しない)。
+      if (pathname === "/api/matchup") {
+        const { status, body } = await handleMatchup(parsed.searchParams);
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
       if (pathname === "/api/match-analysis") {
         // 「AIマッチ分析」カード: ?home=<クラブ名>&away=<クラブ名>(日本語名/英語名どちらも可)。
         // GET(副作用が無い読み取り専用の分析リクエストのため、/api/fixtures/analysis等と
@@ -8221,6 +8369,7 @@ module.exports = {
   perfSnapshot, // 最終方針: 性能の常時計測(テスト・負荷試験から参照)
   handleDiscuss,
   maybeWatchLineups, // v57: スタメン確定ウォッチ(テストから直接駆動する)
+  handleMatchup, buildScenarioFields, // v59: 任意対戦の分析・スコアシナリオ(テスト対象)
   getOrLogPrediction,
   resolvePrediction,
   outcomeFromScore,
