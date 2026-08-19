@@ -38,6 +38,10 @@ const discussMultiStep = require("./discuss/multiStep");
 const { expGoalsFromRatings, RATINGS_KEY } = require("./learning/teamRatings");
 // v54「対決の全国ランキング」
 const duelLb = require("./learning/duelLeaderboard");
+// v57「スタメン確定ウォッチ」: 直前情報レイヤー(朝の予想は凍結)
+const lineupWatchLib = require("./learning/lineupWatch");
+const oddsApiLib = require("./learning/oddsApi");
+const { extractMatchWinnerOdds: extractMatchWinnerOddsLW, impliedProbsPct: impliedProbsPctLW } = require("./learning/roiTracker");
 const { planInformationNeeds } = require("./discuss/planner");
 const { generateLLM, currentProviderName } = require("./llm");
 
@@ -2256,6 +2260,17 @@ function buildTodayPredictionEntry(fixture, record, calibrationMap) {
       marketPct: record.blendUsed.marketPct, aiPct: record.blendUsed.aiPct,
       noteJa: record.blendUsed.noteJa || null,
     } : null,
+    // v57: 市場確率の出典(コンセンサス=複数社平均かどうか)を開示する
+    oddsSource: record.oddsSource || null,
+    // v57「直前情報」: スタメン確定・直前オッズによる参考判定(朝の予想は不変)
+    preKick: record.preKick ? {
+      at: record.preKick.at || null,
+      confirmed: record.preKick.confirmed === true,
+      formations: record.preKick.formations || null,
+      oddsSource: record.preKick.oddsSource || null,
+      blended: record.preKick.blended || null,
+      noteJa: record.preKick.noteJa || null,
+    } : null,
     // 成長可視化ラウンド⑤: 判断根拠のスコア(この予測に実際に影響した要素と影響度)。
     // 予測記録のfactorImportance(モデルの重み×特徴量の実計算)から機械的に出す。
     // 注(v47で更新): 市場オッズはv47から特徴量(marketEdge)としても予測に入る。
@@ -3175,6 +3190,90 @@ const AUTO_SWEEP_CHECK_INTERVAL_MS = Number.isFinite(Number(process.env.AUTO_SWE
 //   1回の処理量は照合の問い合わせ数回・記録3件で、APIの1日予算(7,500)に対して
 //   十分小さい。取得量を減らすのではなく、**動く回数を増やして追いつかせる**。
 const AUTO_SWEEP_STALE_MS = Number(process.env.AUTO_SWEEP_STALE_MS) || 60 * 60 * 1000;
+
+// ================================================================
+// 2026年8月19日・v57「スタメン確定ウォッチ」
+//   利用者のアクセスをきっかけに、キックオフ10〜70分前の対象試合について
+//   ①確定スタメン ②直前の市場オッズ を取り、学習済みブレンド比率で
+//   「直前版の判定」を record.preKick に記録する(裏で実行・応答は遅らせない)。
+//   **朝の予想は書き換えない**(対決の公平性と学習の整合性。lineupWatch.js参照)。
+//   Redisコマンド節約: キックオフ表は30分ごとに1回だけ作り直し、
+//   窓内の試合が無い時間帯は1コマンドも使わない。
+// ================================================================
+let lineupWatchLastTickMs = 0;
+const lineupKickoffCache = { at: 0, byId: new Map() };
+async function maybeWatchLineups() {
+  try {
+    if (process.env.LINEUP_WATCH === "0" || !UPSTASH_ENABLED || !API_KEY) return;
+    const nowMs = Date.now();
+    if (nowMs - lineupWatchLastTickMs < 3 * 60 * 1000) return;
+    lineupWatchLastTickMs = nowMs;
+    if (nowMs - lineupKickoffCache.at > 30 * 60 * 1000) {
+      const ids = (await upstashCmd(["LRANGE", "learn:ownpred:pending", "-60", "-1"]).catch(() => [])) || [];
+      const recs = await Promise.all(ids.map((id) => upstashGetJSON(`learn:ownpred:${id}`).catch(() => null)));
+      lineupKickoffCache.byId = new Map();
+      recs.forEach((r, i) => {
+        if (r && !r.resolved && r.kickoff) lineupKickoffCache.byId.set(String(ids[i]), Date.parse(r.kickoff));
+      });
+      lineupKickoffCache.at = nowMs;
+    }
+    const inWindow = [...lineupKickoffCache.byId.entries()].filter(([, ko]) =>
+      Number.isFinite(ko)
+      && (ko - nowMs) >= lineupWatchLib.WINDOW_MIN_MS
+      && (ko - nowMs) <= lineupWatchLib.WINDOW_MAX_MS);
+    if (!inWindow.length) return;
+    // 多重実行の防止(3分ロック)。取れなければ他が実行中
+    const lock = await upstashCmd(["SET", "learn:lineupwatch:tick", "1", "NX", "EX", "170"]).catch(() => null);
+    if (lock !== "OK") return;
+    const fresh = await Promise.all(inWindow.map(([id]) => upstashGetJSON(`learn:ownpred:${id}`).catch(() => null)));
+    const candidates = lineupWatchLib.findCandidates(fresh.filter(Boolean), nowMs);
+    if (!candidates.length) return;
+    const consensusCache = new Map(); // leagueId -> events | null
+    let updatedAny = false;
+    for (const rec of candidates) {
+      try {
+        // ① 確定スタメン(未発表なら未確定のまま次の機会に)
+        let lineups = { available: false, home: null, away: null };
+        try {
+          const resp = await callApiFootball("/fixtures/lineups", { fixture: rec.fixtureId }, { jobCall: true });
+          lineups = lineupWatchLib.extractLineups(resp, NaN, NaN, rec.homeTeamEn, rec.awayTeamEn);
+        } catch (e) { /* 未発表・失敗は「未確定」として正直に扱う */ }
+        // ② 直前オッズ: コンセンサス(設定時)→ API-Football 1社
+        let freshImplied = null, oddsSource = null;
+        const lgId = Number(rec.leagueId);
+        if (oddsApiLib.isEnabled(process.env) && Number.isFinite(lgId) && oddsApiLib.SPORT_KEYS[lgId]) {
+          if (!consensusCache.has(lgId)) {
+            const r = await oddsApiLib.fetchLeagueConsensus(
+              { fetchFn: (u) => fetch(u), upstashCmd, env: process.env }, lgId, nowMs);
+            consensusCache.set(lgId, r && r.ok ? r.events : null);
+          }
+          const events = consensusCache.get(lgId);
+          const hit = events ? oddsApiLib.matchFixture(events, rec.homeTeamEn, rec.awayTeamEn, rec.kickoff) : null;
+          if (hit) {
+            freshImplied = { homePct: hit.consensus.homePct, drawPct: hit.consensus.drawPct, awayPct: hit.consensus.awayPct };
+            oddsSource = { kind: "consensus", provider: "the-odds-api", nBooks: hit.nBooks };
+          }
+        }
+        if (!freshImplied) {
+          try {
+            const oddsData = await callApiFootball("/odds", { fixture: rec.fixtureId }, { jobCall: true });
+            const mo = extractMatchWinnerOddsLW(oddsData);
+            if (mo) { freshImplied = impliedProbsPctLW(mo); oddsSource = { kind: "single", provider: "api-football" }; }
+          } catch (e) { /* オッズ無しでも(スタメンが取れていれば)記録する */ }
+        }
+        const preKick = lineupWatchLib.buildPreKick({ record: rec, lineups, freshImplied, oddsSource, nowMs });
+        const updated = { ...rec, preKickTries: (rec.preKickTries || 0) + 1, ...(preKick ? { preKick } : {}) };
+        await upstashSetJSON(`learn:ownpred:${rec.fixtureId}`, updated);
+        if (preKick) updatedAny = true;
+        console.log(`[lineupwatch] fixture=${rec.fixtureId} confirmed=${preKick ? preKick.confirmed : false} market=${freshImplied ? (oddsSource && oddsSource.kind) : "none"}`);
+      } catch (e) {
+        console.log(`[lineupwatch] failed fixture=${rec && rec.fixtureId}: ${String((e && e.message) || e).slice(0, 80)}`);
+      }
+    }
+    // 直前情報がついたら「今日のAI予想」のキャッシュを破棄(次のアクセスで表示される)
+    if (updatedAny) cacheSet(`predictions-today:${appDateKey()}`, undefined, 1);
+  } catch (e) { /* 監視は付加機能。本体のリクエスト処理に影響させない */ }
+}
 
 async function maybeSelfHealAutoCollect() {
   if (!UPSTASH_ENABLED) return;
@@ -6339,6 +6438,8 @@ async function handleHttpRequest(req, res) {
     // 学習ぶんの外部API回数まで課金されてしまう。
     runInBackgroundCtx(() => maybeSelfHealAutoCollect());
     runInBackgroundCtx(() => maybeSelfHealDailyLearning());
+    // v57: キックオフ直前の試合のスタメン・直前オッズを裏で確認(3分に1回まで)
+    runInBackgroundCtx(() => maybeWatchLineups());
 
     try {
       if (pathname === "/api/health") {
@@ -8119,6 +8220,7 @@ module.exports = {
   handlePredictMatch,
   perfSnapshot, // 最終方針: 性能の常時計測(テスト・負荷試験から参照)
   handleDiscuss,
+  maybeWatchLineups, // v57: スタメン確定ウォッチ(テストから直接駆動する)
   getOrLogPrediction,
   resolvePrediction,
   outcomeFromScore,

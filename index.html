@@ -722,6 +722,8 @@
     "🔍 選手検索": ["🔍 Player Search", "🔍 球员搜索", "🔍 Buscar jugadores"],
     "🏆 地力ランキング": ["🏆 Power Rankings", "🏆 实力排行榜", "🏆 Ranking de fuerza"],
     "🛠 AIの裏側": ["🛠 Behind the AI", "🛠 AI的幕后", "🛠 Detrás de la IA"],
+    "🙈 AIの反省": ["🙈 AI Reflections", "🙈 AI的反思", "🙈 Autocrítica"],
+    "🧠 賢くなったか": ["🧠 Getting Smarter?", "🧠 变聪明了吗", "🧠 ¿Más lista?"],
     "読み込み中…": ["Loading…", "加载中…", "Cargando…"],
     "確認中…": ["Checking…", "确认中…", "Comprobando…"],
     "検索中…": ["Searching…", "搜索中…", "Buscando…"],
@@ -1047,6 +1049,12 @@
     "この試合はAIの予想対象ではないため、対決の対象外です。": ["This match isn't covered by the AI's predictions, so it's outside the duel.", "该比赛不在AI预测范围内,因此不参与对决。", "Este partido no está cubierto por las predicciones de la IA, así que queda fuera del duelo."],
     "強気": ["more bullish", "更乐观", "más optimista"],
     "弱気": ["more cautious", "更保守", "más prudente"],
+    "直前情報": ["Pre-kickoff update", "临场速报", "Actualización previa"],
+    "スタメン確定": ["line-ups confirmed", "首发确定", "onces confirmados"],
+    "オッズ更新": ["odds refreshed", "赔率更新", "cuotas actualizadas"],
+    "市場1社": ["1 bookmaker", "1家博彩", "1 casa"],
+    "(朝から変化)": ["(changed since morning)", "(与早间不同)", "(cambió desde la mañana)"],
+    "(公式の予想は朝のまま)": ["(the official pick stays the morning one)", "(官方预测仍为早间版)", "(la predicción oficial sigue siendo la de la mañana)"],
   });
   // ---- ⑩b 追加(実バイト抽出キー: ホーム説明・接続不可メッセージ・質問チップ) ----
   add({
@@ -1124,6 +1132,9 @@
     ["⦿はどんな選手？", "What kind of player is $1?", "$1是怎样的球员?", "¿Cómo juega $1?"],
     ["⦿の今後は？", "What does the future hold for $1?", "$1今后会怎样?", "¿Qué futuro le espera a $1?"],
     ["⦿と⦿どっちが勝つ？", "$1 vs $2 — who wins?", "$1和$2谁会赢?", "$1 contra $2: ¿quién gana?"],
+    ["⦿社平均", "$1-bookmaker average", "$1家平均", "media de $1 casas"],
+    ["⦿ 勝利 ⦿%", "$1 to win $2%", "$1获胜 $2%", "Gana $1: $2%"],
+    ["引き分け ⦿%", "Draw $1%", "平局 $1%", "Empate: $1%"],
   ];
   for (var rp = 0; rp < RAWP.length; rp++) P.push([pat(RAWP[rp][0]), RAWP[rp][1], RAWP[rp][2], RAWP[rp][3]]);
   /* ==== 辞書ここまで ==== */
@@ -1213,9 +1224,12 @@
        中身は /api/qa/latest(毎日の学習の直後にサーバー自身が実行した
        自動検証の結果)をそのまま読むだけで、この画面が新しい計算を
        起こすことはない。 -->
+  <!-- v57: ご要望により「賢くなったか」は専用タブへ(ホームでは隠す) -->
+  <div id="smarterSection" style="display:none;">
   <div class="card" id="smarterCard" style="padding:16px 18px; border:2px solid var(--series-3);">
     <h2 style="margin:0 0 4px;">🧠 AIは昨日より賢くなったか</h2>
     <div id="smarterBody" class="muted" style="font-size:13px;">確認中…</div>
+  </div>
   </div>
 
   <!-- ================================================================
@@ -1225,6 +1239,8 @@
        理由は実測データ(監督交代・布陣変更・xGとの食い違いなど)から
        機械的に分類したもので、LLMの作文ではない(でっち上げない)。
        中身は /api/reflections の読み出しだけ。 -->
+  <!-- v57: ご要望により「AIの反省」も専用タブへ(ホームでは隠す) -->
+  <div id="reflectionsSection" style="display:none;">
   <div class="card" id="reflectionsCard" style="padding:16px 18px; border:1.5px solid var(--warning);">
     <h2 style="margin:0 0 4px;">🙈 AIの反省 — 外した試合と、その理由</h2>
     <p class="value-note" style="margin:0 0 8px;">外れを隠さないのがこのAIの方針です。理由は試合の実測データから機械的に分類したもので、言い訳の作文ではありません。</p>
@@ -1234,6 +1250,7 @@
            オッズを取得できない試合では一切使わない=推測で埋めない) -->
     <p class="value-note" style="margin:0 0 8px; opacity:.85;">🧠 予測モデルは9リーグ×3シーズンの実試合とAI自身の的中記録から毎日学習しています。2026年8月18日からは、①市場オッズ(ブックメーカーの評価) ②チーム別の地力レーティング(約200クラブの攻撃力・守備力を過去試合から学習) ③市場ブレンド(最終確率にオッズを混ぜる比率。使った予想には内訳を明記)も加わりました。影響の強さはすべてAI自身が実データから学習し、データが無い試合では使いません。</p>
     <div id="reflectionsBody" class="muted" style="font-size:13px;">読み込み中…</div>
+  </div>
   </div>
 
   <!-- 2026年8月18日・v48「週間AIダイジェスト」: AIの1週間を実測記録だけから
@@ -1317,6 +1334,8 @@
     <button data-mode="match" class="active">⚽ 試合分析AI</button>
     <button data-mode="player">🔍 選手検索</button>
     <button data-mode="rankings">🏆 地力ランキング</button>
+    <button data-mode="reflections">🙈 AIの反省</button>
+    <button data-mode="smarter">🧠 賢くなったか</button>
     <button data-mode="backstage">🛠 AIの裏側</button>
   </div>
 
@@ -1647,6 +1666,9 @@ document.getElementById("modeSwitch").addEventListener("click", (e) => {
   document.getElementById("backstageSection").style.display = mode === "backstage" ? "block" : "none";
   // v53: 地力ランキング(開いた最初の1回だけ読み込む=方針⑥)
   document.getElementById("rankingsSection").style.display = mode === "rankings" ? "block" : "none";
+  // v57: 「AIの反省」「賢くなったか」タブ(中身はページ読込時に描画済み=開いた瞬間に出る)
+  document.getElementById("reflectionsSection").style.display = mode === "reflections" ? "block" : "none";
+  document.getElementById("smarterSection").style.display = mode === "smarter" ? "block" : "none";
   if (mode === "rankings") rankingsEnsureInit();
   // 選手検索の読み込みは「このタブを開いた最初の1回だけ」。
   // ホーム画面を見ているだけの人に通信させない(方針⑥)。
@@ -8377,7 +8399,7 @@ function predictionSummaryBlockHtml(p, titleJa) {
       <div>${escapeHtml(titleJa || "🤖 AIの予想")}: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predResultBadgeHtml(p)}</div>
       ${predBarHtml(p)}
       <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-      ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${blendLine}${predFreshnessLineHtml(p)}
+      ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${blendLine}${predPreKickLineHtml(p)}${predFreshnessLineHtml(p)}
     </div>`;
 }
 // ---- 2026年8月18日・v50「市場ブレンド」の開示 ----
@@ -8385,7 +8407,31 @@ function predictionSummaryBlockHtml(p, titleJa) {
 //   「市場の受け売りに近づく」トレードオフを隠さないための行。
 function predBlendLineHtml(p) {
   if (!p || !p.blend || !Number.isFinite(p.blend.marketPct)) return "";
-  return `<div class="value-note" style="margin-top:2px;">⚖️ この予想の判定: 市場${Number(p.blend.marketPct)}%+AI${Number(p.blend.aiPct)}%の合成(比率は実測で学習・毎日見直し)</div>`;
+  // v57: 市場確率の出典(複数社平均か1社か)も開示する
+  const srcTag = (p.oddsSource && p.oddsSource.kind === "consensus" && Number.isFinite(Number(p.oddsSource.nBooks)))
+    ? ` <span style="opacity:.85;">市場=<span>${Number(p.oddsSource.nBooks)}社平均</span></span>` : "";
+  return `<div class="value-note" style="margin-top:2px;">⚖️ この予想の判定: 市場${Number(p.blend.marketPct)}%+AI${Number(p.blend.aiPct)}%の合成(比率は実測で学習・毎日見直し)${srcTag}</div>`;
+}
+// ---- 2026年8月19日・v57「直前情報」 ----
+//   スタメン確定・直前オッズによる参考判定。公式の予想(対決・的中率の対象)は
+//   朝の予想のまま変えない(後出し防止と学習の整合性。サーバー側で保証)。
+//   翻訳しやすいよう、固定語は<span>で区切って辞書の完全一致に載せる。
+function predPreKickLineHtml(p) {
+  if (!p || !p.preKick) return "";
+  const pk = p.preKick;
+  const kind = pk.confirmed ? "スタメン確定" : "オッズ更新";
+  const src = (pk.oddsSource && pk.oddsSource.kind === "consensus" && Number.isFinite(Number(pk.oddsSource.nBooks)))
+    ? `・<span>${Number(pk.oddsSource.nBooks)}社平均</span>` : (pk.oddsSource ? `・<span>市場1社</span>` : "");
+  let verdict = "";
+  if (pk.blended && pk.blended.probsPct) {
+    const w = pk.blended.predictedWinner;
+    const nameH = escapeHtml((p.home && p.home.name) || "ホーム");
+    const nameA = escapeHtml((p.away && p.away.name) || "アウェイ");
+    const label = w === "home" ? `${nameH} 勝利` : w === "away" ? `${nameA} 勝利` : "引き分け";
+    const pct = w === "home" ? pk.blended.probsPct.homeWinPct : w === "away" ? pk.blended.probsPct.awayWinPct : pk.blended.probsPct.drawPct;
+    verdict = ` → <strong>${label} ${Number(pct)}%</strong>${pk.blended.changedFromMorning ? ` <span style="color:var(--series-2); font-weight:700;">(朝から変化)</span>` : ""}`;
+  }
+  return `<div class="value-note" style="margin-top:2px;">⚡ <span>直前情報</span>(<span>${kind}</span>${src})${verdict} <span style="opacity:.8;">(公式の予想は朝のまま)</span></div>`;
 }
 // 一覧の行に足す1行の予想ストリップ(軽さ優先: バー無し・テキストのみ)
 function predStripHtml(p) {
@@ -8649,9 +8695,14 @@ async function renderDuelLeaderboard(container) {
 // 2026年8月18日・v53「AIが見る地力ランキング」タブ
 // ================================================================
 let rankingsInited = false;
+let rankingsRenderedAt = 0; // v57: 開きっぱなしのタブ(特にスマホ)で古い表示が残る問題への対応
 function rankingsEnsureInit() {
-  if (rankingsInited) return;
+  // v57: 前回描画から10分以上たってタブを開いたら取り直す。
+  // 本番で「サーバー側はクラブ名に自己回復済みなのに、開きっぱなしの画面だけ
+  // 古いチームID表示のまま」という実例があった(再読込しない限り直らなかった)。
+  if (rankingsInited && (Date.now() - rankingsRenderedAt) < 10 * 60 * 1000) return;
   rankingsInited = true;
+  rankingsRenderedAt = Date.now();
   renderRankingsTab();
 }
 async function renderRankingsTab() {
@@ -8756,7 +8807,7 @@ async function renderTodayPredictionsHero(reuseCached) {
         ${duelMyPickLineHtml(p)}
         ${predBarHtml(p)}
         <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-        ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${predBlendLineHtml(p)}${predFreshnessLineHtml(p)}
+        ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${predBlendLineHtml(p)}${predPreKickLineHtml(p)}${predFreshnessLineHtml(p)}
         <div style="margin-top:6px;"><button class="ghost-btn pred-share-btn" type="button" data-share-idx="${todayPredShareItems.indexOf(p)}" style="padding:5px 12px; font-size:12px;">📸 画像でシェア</button></div>
       </div>`;
   };
