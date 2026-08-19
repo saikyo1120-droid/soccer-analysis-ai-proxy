@@ -6494,7 +6494,7 @@ async function handleHttpRequest(req, res) {
         } else {
           const ratings = await upstashGetJSON(RATINGS_KEY).catch(() => null);
           if (!ratings || !ratings.available || !ratings.byTeam) {
-            rkBody = { ok: true, available: false, reasonJa: "地力レーティングは、次の朝の学習(12大会×5シーズンの実試合からの初回学習)のあとに公開されます。でっち上げの暫定値は出しません。" };
+            rkBody = { ok: true, available: false, reasonJa: "地力レーティングは、次の朝の学習(9リーグ×3シーズンの実試合からの初回学習)のあとに公開されます。でっち上げの暫定値は出しません。" };
           } else {
             const prev = await upstashGetJSON("learn:ratings:ranks:prev").catch(() => null);
             const prevRanks = (prev && prev.ranks) || {};
@@ -6569,7 +6569,7 @@ async function handleHttpRequest(req, res) {
               teamsRated: ratings.teamsRated || teams.length,
               prevWeekKey: (prev && prev.weekKey) || null,
               teams: teamsRanked,
-              noteJa: `12大会×5シーズン(欧州カップ戦を含む)の実試合${ratings.matchesUsed ? `(${ratings.matchesUsed}試合)` : ""}から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。${unnamedCount > 0 ? `※一部クラブ(${unnamedCount}件)の名前を提供元から自動取得しています。数分後に再読み込みすると表示されます。` : ""}`,
+              noteJa: `9リーグ×3シーズンの実試合${ratings.matchesUsed ? `(${ratings.matchesUsed}試合)` : ""}から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。${unnamedCount > 0 ? `※一部クラブ(${unnamedCount}件)の名前を提供元から自動取得しています。数分後に再読み込みすると表示されます。` : ""}`,
             };
           }
         }
