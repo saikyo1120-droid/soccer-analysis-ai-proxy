@@ -98,6 +98,7 @@ const {
   classifySuccessReasons, summarizeSuccessReasons, classifyContextualFailureReasons,
   computeFeatureEffectiveness, buildAblationCandidates, mostLikelyScoreline,
   classifyFixtureOfficial,
+  // v62: 学習した大会かどうかの判定は下の learnedComp を使う(requireは末尾にまとめる)
 } = require("./predictionModel");
 // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ ----
 // ⑨ 予測精度の毎日測定(勝敗/BTTS/Over-Under、Brier・LogLoss・較正)
@@ -134,6 +135,8 @@ const { generateAndStoreWeeklyDigest } = require("./weeklyDigest");
 const { expGoalsFromRatings, RATINGS_KEY } = require("./teamRatings");
 // v54「対決の全国ランキング」(2026年8月18日・利用者の選択)
 const { scoreFixtureDuels } = require("./duelLeaderboard");
+// v62: 学習した大会/していない大会の判定(的中率を同じ条件どうしで比べるため)
+const learnedComp = require("./learnedCompetitions");
 // v57: 複数ブックメーカーのコンセンサスオッズ(The Odds API。キー未設定なら不活性)
 const oddsApiMod = require("./oddsApi");
 // v57: クラブElo(clubelo.com・無料の独立レーティング。取得失敗は特徴量0に倒す)
@@ -1815,6 +1818,15 @@ async function runDailyLearning(deps) {
             isHome ? opponentName : team.nameEn
           );
           return { official: cls.official, officialReasonJa: cls.reasonJa };
+        })(),
+        // ---- v62: この大会をAIが学習しているかを保存する ----
+        //   学習データは欧州12大会のみ。それ以外(ハンガリーNB I・MLS等)の予想も
+        //   出し続けるが、実力を測る的中率とは分けて集計する(親善試合と同じ考え方)。
+        ...(() => {
+          const cls = learnedComp.classifyLearnedCompetition(
+            fx.league && fx.league.id, (fx.league && fx.league.name) || null
+          );
+          return { learnedCompetition: cls.learned, learnedReasonJa: cls.reasonJa };
         })(),
         // ご指示③④の証明: この予測がどのversionの重みで行われたか。
         weightsVersion: weights.version ?? 0,
