@@ -7366,6 +7366,7 @@ function matchupCardHtml(d) {
   return `
     <div style="margin-top:8px; padding:10px 12px; border:1px solid var(--border); border-left:4px solid var(--series-2); border-radius:8px;">
       <div><strong>${homeName} vs ${awayName}</strong></div>
+      ${d.lambdaClamped ? `<div class="value-note" style="margin-top:2px;">⚠️ <span>この試合はモデルの推定が現実的な範囲を外れました(確率は割り引いて見てください)</span></div>` : ""}
       ${predBarHtml(barP)}
       <div style="margin-top:4px;">🤖 <span>AIの見立て</span>: <strong>${winnerLabel}</strong>${d.topScoreline ? `(<span>最有力スコア</span> ${escapeHtml(d.topScoreline)})` : ""}</div>
       <details style="margin-top:6px;">
