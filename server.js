@@ -109,6 +109,8 @@ const {
 } = require("./learning/predictionModel");
 // v59「どんな対戦でも1行で分析」: クラブ名の解決と分析の組み立て(外部通信なし)
 const matchupLib = require("./learning/matchupAnalysis");
+// v62: 学習した大会 / していない大会 の判定(的中率を同じ条件どうしで比べるため)
+const learnedComp = require("./learning/learnedCompetitions");
 const { TEAM_STATS_KEY, combineVolatility: _combineVolatility } = require("./learning/teamStats");
 const { buildEloByNorm: buildEloByNormMU, DAILY_KEY: CLUBELO_DAILY_KEY } = require("./learning/clubElo");
 // 選手個人の実データ統計(2026年8月・知識拡張フェーズ)。
@@ -2298,6 +2300,8 @@ function buildTodayPredictionEntry(fixture, record, calibrationMap) {
     } : null,
     // v57: 市場確率の出典(コンセンサス=複数社平均かどうか)を開示する
     oddsSource: record.oddsSource || null,
+    // v62: この大会をAIが学習しているか。していない大会は画面で1行だけ正直に断る。
+    learnedCompetition: learnedComp.isLearnedRecord(record),
     // v57「直前情報」: スタメン確定・直前オッズによる参考判定(朝の予想は不変)
     preKick: record.preKick ? {
       at: record.preKick.at || null,
@@ -7012,8 +7016,13 @@ async function handleHttpRequest(req, res) {
                 if (x && x.labelJa && reasons.length < 3) reasons.push({ labelJa: String(x.labelJa), detailJa: String(x.detail || x.detailJa || "") });
               });
               const clsOfficial = isOfficialRec(r);
+              const clsLearned = learnedComp.isLearnedRecord(r);
               return {
                 official: clsOfficial,
+                // v62: 学習していない大会の外れは、その旨を添える(実力の評価とは分ける)
+                learnedCompetition: clsLearned,
+                unlearnedJa: clsLearned ? null
+                  : (r.learnedReasonJa || learnedComp.classifyLearnedCompetition(r.leagueId, r.league).reasonJa),
                 referenceJa: clsOfficial ? null
                   : (r.officialReasonJa || classifyFixtureOfficial(r.league, r.homeTeamEn, r.awayTeamEn).reasonJa || "参考扱いの試合です"),
                 homeEn: r.homeTeamEn || null, awayEn: r.awayTeamEn || null, league: r.league || null,
@@ -7059,6 +7068,19 @@ async function handleHttpRequest(req, res) {
                 referenceN: recs.length - officialRecs.length,
                 noteJa: "公式戦のみの成績です。親善試合・2軍戦は主力を休ませるため予測が難しく、参考扱いとして分けています(予想自体は出し続けています)。",
               },
+              // ---- v62: 学習した大会 / 学習していない大会 を分けて数える ----
+              //   学習データは欧州12大会のみ。ハンガリーNB I・MLS等の予想も出し続けるが、
+              //   実力は「同じ条件で測った数字」=学習済み大会の的中率で見る。
+              //   参考側の数字も必ず一緒に出す(良く見せるための隠蔽をしない)。
+              learnedSummary: (() => {
+                const split = learnedComp.accuracySplit(recs, isOfficialRec);
+                return {
+                  learned: split.learnedOfficial,
+                  unlearned: split.unlearnedOfficial,
+                  unofficial: split.unofficial,
+                  noteJa: "AIが過去試合を学習しているのは欧州12大会(9リーグ+CL・EL・ECL)です。それ以外の大会は学習データが無いため、予想は出しますが実力を測る集計とは分けています。",
+                };
+              })(),
               items, topReasons,
               honestyJa: "理由は、答え合わせの時点で実測データから機械的に分類したものです。AIが後から言い訳の文章を作っているのではありません。",
               reasonJa: recs.length ? null : "答え合わせが済んだ自社予測がまだありません(試合が終わり次第、自動で増えます)。",

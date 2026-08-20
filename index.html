@@ -1101,6 +1101,15 @@
     "この分析は「地力レーティング(過去の実試合から学習)」と「実測の傾向」で計算しています。当日の怪我人・出場停止・移籍・市場オッズは含みません(今日の試合の予想カードにはそれらも入ります)。": ["This analysis uses power ratings (learned from past real matches) and measured tendencies. It does not include today's injuries, suspensions, transfers or market odds (today's prediction cards do include those).", "本分析基于实力评级(从过往实际比赛学习)与实测倾向计算,不包含当日伤停、转会及市场赔率(今日预测卡片则包含这些)。", "Este análisis usa ratings de fuerza (aprendidos de partidos reales pasados) y tendencias medidas. No incluye lesiones, sanciones, fichajes ni cuotas de hoy (las predicciones de hoy sí los incluyen)."],
     "「クラブA vs クラブB」の形で教えていただけると分析できます(例: レアル・マドリード vs バルセロナ)。": ["Write it as \"Club A vs Club B\" and I'll analyse it (e.g. Real Madrid vs Barcelona).", "请以「俱乐部A vs 俱乐部B」的形式输入即可分析(例如: 皇家马德里 vs 巴塞罗那)。", "Escríbelo como \"Club A vs Club B\" y lo analizo (p. ej. Real Madrid vs Barcelona)."],
   });
+  // ---- ⑬ v62「学習した大会 / 学習していない大会」の分離 ----
+  add({
+    "この大会はAIがまだ学習していません(参考予想)": ["The AI hasn't learned this competition yet (reference pick)", "AI尚未学习该项赛事(仅供参考)", "La IA aún no ha aprendido esta competición (pronóstico de referencia)"],
+    "参考(学習していない大会)": ["reference (unlearned competition)", "参考(未学习的赛事)", "referencia (competición no aprendida)"],
+    "大会別の内訳": ["Breakdown by competition", "按赛事细分", "Desglose por competición"],
+    "学習した大会(欧州12大会)": ["Learned competitions (12 European)", "已学习的赛事(欧洲12项)", "Competiciones aprendidas (12 europeas)"],
+    "学習していない大会(参考)": ["Unlearned competitions (reference)", "未学习的赛事(参考)", "Competiciones no aprendidas (referencia)"],
+    "AIが過去試合を学習しているのは欧州12大会(9リーグ+CL・EL・ECL)です。それ以外の大会は学習データが無いため、予想は出しますが実力を測る集計とは分けています。": ["The AI has learned from past matches in 12 European competitions (9 leagues + UCL/UEL/UECL). It still makes picks elsewhere, but those are counted separately from the figure that measures its skill.", "AI从欧洲12项赛事(9个联赛+欧冠/欧联/欧协联)的过往比赛中学习。其他赛事仍会给出预测,但与衡量实力的命中率分开统计。", "La IA ha aprendido de partidos de 12 competiciones europeas (9 ligas + UCL/UEL/UECL). Sigue dando pronósticos en otras, pero se contabilizan aparte de la cifra que mide su nivel."],
+  });
   // ---- ⑪ 型テンプレート(実ソースから機械抽出・⦿=変数スロット) ----
   function pat(t) {
     var esc = t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -8553,7 +8562,7 @@ function predictionSummaryBlockHtml(p, titleJa) {
       <div>${escapeHtml(titleJa || "🤖 AIの予想")}: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predResultBadgeHtml(p)}</div>
       ${predBarHtml(p)}
       <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-      ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${blendLine}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
+      ${predUnlearnedLineHtml(p)}${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${blendLine}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
     </div>`;
 }
 // ---- 2026年8月18日・v50「市場ブレンド」の開示 ----
@@ -8586,6 +8595,14 @@ function predPreKickLineHtml(p) {
     verdict = ` → <strong>${label} ${Number(pct)}%</strong>${pk.blended.changedFromMorning ? ` <span style="color:var(--series-2); font-weight:700;">(朝から変化)</span>` : ""}`;
   }
   return `<div class="value-note" style="margin-top:2px;">⚡ <span>直前情報</span>(<span>${kind}</span>${src})${verdict} <span style="opacity:.8;">(公式の予想は朝のまま)</span></div>`;
+}
+// ---- 2026年8月20日・v62「学習していない大会は、その旨を1行で断る」 ----
+//   AIが過去試合を学習しているのは欧州12大会だけ。それ以外の大会でも予想は
+//   出し続けるが、「どれくらい根拠があるのか」を利用者が分かるようにする。
+//   画面が混まないよう、出すのは学習していない大会のときの1行だけ。
+function predUnlearnedLineHtml(p) {
+  if (!p || p.learnedCompetition !== false) return "";
+  return `<div class="value-note" style="margin-top:2px;">📗 <span>この大会はAIがまだ学習していません(参考予想)</span></div>`;
 }
 // ---- 2026年8月19日・v59「スコアシナリオ上位5件と派生指標」(ご要望②③) ----
 //   すでに出している予想と**同じ確率分布**から取り出した数字。新しい推定は無い。
@@ -8980,7 +8997,7 @@ async function renderTodayPredictionsHero(reuseCached) {
         ${duelMyPickLineHtml(p)}
         ${predBarHtml(p)}
         <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-        ${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${predBlendLineHtml(p)}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
+        ${predUnlearnedLineHtml(p)}${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${predBlendLineHtml(p)}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
         <div style="margin-top:6px;"><button class="ghost-btn pred-share-btn" type="button" data-share-idx="${todayPredShareItems.indexOf(p)}" style="padding:5px 12px; font-size:12px;">📸 画像でシェア</button></div>
       </div>`;
   };
@@ -9789,6 +9806,21 @@ async function renderReflectionsCard() {
       off.referenceN ? ` <span class="value-note">・ほかに親善試合など参考扱いが${Number(off.referenceN)}件</span>` : ""}</div>`);
     parts.push(`<div class="value-note" style="margin-bottom:8px;">${esc(off.noteJa || "")}</div>`);
   }
+  // ---- v62: 学習した大会と、していない大会を分けて出す ----
+  //   AIが過去試合を学習しているのは欧州12大会だけ。ハンガリーNB I・MLS等の
+  //   予想も出し続けるが、実力は「同じ条件で測った数字」で見る。
+  //   参考側の数字も必ず並べて出す(良く見せるための隠蔽をしない)。
+  const ls = d.learnedSummary || null;
+  if (ls && ((ls.learned && ls.learned.n > 0) || (ls.unlearned && ls.unlearned.n > 0))) {
+    const row = (label, b) => (b && b.n > 0)
+      ? `<div class="value-note" style="margin-top:2px;"><span>${label}</span>: <strong>${Number(b.hitRatePct)}%</strong>(${Number(b.hits)}/${Number(b.n)})</div>`
+      : "";
+    parts.push(`<div style="margin:6px 0 8px; padding:8px 10px; background:rgba(0,0,0,.03); border-radius:6px;">
+      <div style="font-weight:700; font-size:13px;"><span>大会別の内訳</span></div>
+      ${row("学習した大会(欧州12大会)", ls.learned)}${row("学習していない大会(参考)", ls.unlearned)}
+      <div class="value-note" style="margin-top:4px; opacity:.9;">${esc(ls.noteJa || "")}</div>
+    </div>`);
+  }
   parts.push(`<div class="value-note" style="margin-bottom:8px;">検証済み ${Number(d.resolvedCount) || 0}件のうち、的中 ${Number(d.hitCount) || 0}件・外れ ${Number(d.missCount) || 0}件。外れた試合を新しい順に並べています。</div>`);
   if (!d.items || !d.items.length) {
     parts.push(`<div class="value-note">直近の記録に、外した試合がありません(外れが出たら、隠さずここに並びます)。</div>`);
@@ -9802,7 +9834,9 @@ async function renderReflectionsCard() {
       const when = it.kickoff ? new Date(it.kickoff).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" }) : "";
       const refTag = it.official === false
         ? ` <span class="smarter-tag smarter-tag-ai" title="${esc(it.referenceJa || "")}">参考(親善など)</span>`
-        : "";
+        : (it.learnedCompetition === false
+          ? ` <span class="smarter-tag smarter-tag-ai" title="${esc(it.unlearnedJa || "")}">参考(学習していない大会)</span>`
+          : "");
       return `<div style="padding:10px 0; border-bottom:1px solid var(--border);">
         <div><strong>${home} vs ${away}</strong>${refTag} <span class="value-note">${esc(it.league || "")}${when ? " ・ " + when : ""}</span></div>
         <div style="margin-top:2px;">AIの予想: <strong>${esc(reflClubJa(it.predictedJa.replace("勝利", "")) + (it.predictedJa.includes("勝利") ? "勝利" : ""))}</strong>${it.predictedScoreline ? `(予想スコア ${esc(it.predictedScoreline)})` : ""} → 実際: <strong style="color:var(--critical);">${esc(reflClubJa(it.actualJa.replace("勝利", "")) + (it.actualJa.includes("勝利") ? "勝利" : ""))}${it.actualScore ? `(${esc(it.actualScore)})` : ""}</strong> ❌</div>
