@@ -30,8 +30,64 @@
  */
 
 const RATINGS_KEY = "learn:ratings:v1";
-const MIN_MATCHES_FOR_RATING = 8;   // これ未満のチームは評価しない(でっち上げ防止)
+/**
+ * v60「地力ランキングの信頼性」(本番実測での欠陥への根治)
+ * ------------------------------------------------------------------
+ * v58で欧州カップ戦を学習対象に加えた結果、**カップ予選にしか出ないクラブ**が
+ * データセットに大量に入った(評価対象 191→364チーム)。本番実測では
+ * FCノアシェラン(デンマーク)が地力1位・強さ3.428となり、アーセナル(1.898)や
+ * バイエルンを大きく上回るという、明らかに事実に反する順位が出ていた。
+ *
+ * 原因(合成データで再現・確認済み):
+ *   ①出場8試合という下限が低すぎ、②その少数の試合の相手も同じく
+ *   「予選しか出ていないクラブ」で固まっているため、**主要リーグと繋がっていない
+ *   閉じた集団の中だけで数字が決まる**。弱い相手に大勝した記録だけが残り、
+ *   その相手の弱さを測る材料がどこにも無いため、地力が青天井に膨らむ。
+ *   (再現実験: 20試合を弱小相手に大勝したクラブが強さ3.397で1位になった。
+ *    本番のノアシェラン3.428とほぼ同じ値。)
+ *
+ * 対処(2つとも統計的に正しい方向の修正であり、恣意的な調整ではない):
+ *   ①**反復コア抽出**: 「評価対象チーム同士の試合」だけを数え直して下限を満たさない
+ *     チームを外す、を変化が無くなるまで繰り返す。閉じた弱小集団は連鎖的に外れ、
+ *     残るのは「十分な試合数で互いに繋がったクラブ」だけになる。
+ *   ②**試合数に応じた収縮**: 勾配をチームごとの重み合計で割っている現在の形では、
+ *     L2の係数も同じく割らなければ数式として整合しない(現状は実質「試合数が多い
+ *     ほど強く正則化される」という逆向きになっていた)。基準値÷そのチームの重みを
+ *     掛けることで、データが薄いチームほど平均へ強く引き戻される。
+ *
+ * 下限40試合の根拠: 1リーグ1シーズンは約38試合。つまり「この5シーズンのデータの中に
+ * 1シーズンぶん以上の実績があるクラブだけを評価する」という意味であり、
+ * 少数の試合から地力を断定しないための線引き(推測で埋めるよりも、評価しない)。
+ */
+const MIN_MATCHES_FOR_RATING = 40;  // これ未満のチームは評価しない(でっち上げ防止)
+const CORE_MAX_ITERATIONS = 50;     // 反復コア抽出の安全上限(通常2〜4回で収束)
 const RATING_SUM_CENTER = 2.6;      // ratingLambdaSum の中心値(平均的な総得点)
+
+/**
+ * 反復コア抽出(純関数)。「評価対象同士の試合」だけを数え直して下限未満を外す、を
+ * 変化が無くなるまで繰り返す。返すのは評価対象チームIDの集合。
+ */
+function extractRatedCore(rows, minMatches) {
+  let rated = new Set();
+  for (const r of rows) { rated.add(r.homeId); rated.add(r.awayId); }
+  const totalTeams = rated.size;
+  const done = (set, counts, iterations) => ({
+    rated: set, counts, iterations, droppedTotal: totalTeams - set.size,
+  });
+  for (let it = 0; it < CORE_MAX_ITERATIONS; it++) {
+    const counts = new Map();
+    for (const r of rows) {
+      if (!rated.has(r.homeId) || !rated.has(r.awayId)) continue;
+      counts.set(r.homeId, (counts.get(r.homeId) || 0) + 1);
+      counts.set(r.awayId, (counts.get(r.awayId) || 0) + 1);
+    }
+    const next = new Set([...counts.entries()].filter(([, n]) => n >= minMatches).map(([id]) => id));
+    if (next.size === rated.size) return done(next, counts, it + 1);
+    rated = next;
+    if (!rated.size) return done(rated, new Map(), it + 1);
+  }
+  return done(rated, new Map(), CORE_MAX_ITERATIONS);
+}
 
 /**
  * 過去試合からチーム別レーティングを学習する。
@@ -70,13 +126,14 @@ function fitTeamRatings(rows, opts) {
     return Math.exp(-xi * Math.max(0, (nowMs - t) / 86400000));
   };
 
-  // 出場試合数を数え、閾値未満のチームは学習対象から除外する
-  const counts = new Map();
-  for (const r of usable) {
-    counts.set(r.homeId, (counts.get(r.homeId) || 0) + 1);
-    counts.set(r.awayId, (counts.get(r.awayId) || 0) + 1);
-  }
-  const rated = new Set([...counts.entries()].filter(([, n]) => n >= MIN_MATCHES_FOR_RATING).map(([id]) => id));
+  // ---- v60: 反復コア抽出 ----
+  //   「評価対象チーム同士の試合」だけを数え直して下限未満を外す、を収束まで繰り返す。
+  //   主要リーグと繋がっていない閉じた集団(カップ予選だけの弱小クラブ群)は
+  //   連鎖的に外れ、残るのは互いに十分繋がったクラブだけになる。
+  const minMatches = Number.isFinite(o.minMatches) ? o.minMatches : MIN_MATCHES_FOR_RATING;
+  const core = extractRatedCore(usable, minMatches);
+  const rated = core.rated;
+  const counts = core.counts;
   // 両チームとも評価対象の試合だけで学習する(片側不明の試合はレーティングを歪める)
   const train = usable.filter((r) => rated.has(r.homeId) && rated.has(r.awayId));
   if (train.length < 300) {
@@ -90,6 +147,7 @@ function fitTeamRatings(rows, opts) {
   const lr = o.learningRate ?? 0.1;
   const l2 = o.l2 ?? 0.02;
   const iterations = o.iterations ?? 150;
+  let wRef = null; // v60: 収縮の基準となる標準的なチームの重み(初回反復で決める)
 
   for (let iter = 0; iter < iterations; iter++) {
     const gAtt = new Map(), gDef = new Map(), wTeam = new Map();
@@ -112,14 +170,24 @@ function fitTeamRatings(rows, opts) {
       wTeam.set(r.awayId, (wTeam.get(r.awayId) || 0) + w);
     }
     if (totalW <= 0) break;
+    // ---- v60: 収縮の基準となる「標準的なチームの重み」(中央値)を一度だけ決める ----
+    //   これを基準に、データの薄いチームほど強く平均へ引き戻す。
+    if (wRef === null) {
+      const vals = [...wTeam.values()].filter((v) => v > 0).sort((a, b) => a - b);
+      wRef = vals.length ? vals[Math.floor(vals.length / 2)] : 1;
+    }
     mu -= lr * (gMu / (2 * totalW));      // 全試合×2得点分の平均勾配
     homeAdv -= lr * (gHome / totalW);     // ホーム側のみの平均勾配
     for (const id of rated) {
       // チームごとの勾配は「そのチームが関わった試合の重み合計」で平均する
       // (試合数の多いチームと少ないチームで学習の歩幅を揃える。標準的な正規化)
       const wt = Math.max(1e-9, wTeam.get(id) || 0);
-      att.set(id, att.get(id) - lr * ((gAtt.get(id) || 0) / wt + l2 * att.get(id)));
-      def.set(id, def.get(id) - lr * ((gDef.get(id) || 0) / wt + l2 * def.get(id)));
+      // v60: 勾配をwtで割るなら、L2の係数も同じくwtで割らないと数式として整合しない。
+      //   基準(中央値)を掛けて、標準的な試合数のチームでは従来と同じ強さになるよう保つ。
+      //   → データが薄いチームだけが、より強く平均へ収縮する(統計的に正しい向き)。
+      const l2Eff = l2 * (wRef / wt);
+      att.set(id, att.get(id) - lr * ((gAtt.get(id) || 0) / wt + l2Eff * att.get(id)));
+      def.set(id, def.get(id) - lr * ((gDef.get(id) || 0) / wt + l2Eff * def.get(id)));
     }
     // 識別性: att/def を平均0へ再センタリング(ずれは mu が吸収する)
     const attMean = [...att.values()].reduce((s, v) => s + v, 0) / rated.size;
@@ -143,6 +211,8 @@ function fitTeamRatings(rows, opts) {
     xgAlpha, // v57: 学習に使ったxGブレンド率(0=実ゴールのみ)
     byTeam, mu: Math.round(mu * 1000) / 1000, homeAdv: Math.round(homeAdv * 1000) / 1000,
     matchesUsed: train.length, teamsRated: Object.keys(byTeam).length,
+    // v60: 何を根拠に「評価できる」と判断したかを開示する(説明責任)
+    minMatches, coreIterations: core.iterations, teamsDropped: Math.max(0, core.droppedTotal || 0),
     reasonJa: null,
   };
 }
@@ -161,4 +231,7 @@ function expGoalsFromRatings(ratings, homeId, awayId) {
   return { home: Math.round(lh * 100) / 100, away: Math.round(la * 100) / 100 };
 }
 
-module.exports = { RATINGS_KEY, MIN_MATCHES_FOR_RATING, RATING_SUM_CENTER, fitTeamRatings, expGoalsFromRatings };
+module.exports = {
+  RATINGS_KEY, MIN_MATCHES_FOR_RATING, CORE_MAX_ITERATIONS, RATING_SUM_CENTER,
+  extractRatedCore, fitTeamRatings, expGoalsFromRatings,
+};

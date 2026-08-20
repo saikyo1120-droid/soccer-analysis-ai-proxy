@@ -57,6 +57,27 @@ function parseCsv(text) {
 }
 
 /**
+ * v60: https と http の両方を試す(どちらで失敗したかを理由として残す)。
+ * clubelo.com は歴史的に http で案内されているが、環境によっては平文HTTPの
+ * 外向き通信が通らないことがある。推測で片方だけに賭けず、両方試して記録する。
+ */
+async function fetchWithScheme(fetchFn, path) {
+  const errs = [];
+  for (const scheme of ["https", "http"]) {
+    try {
+      const res = await fetchFn(`${scheme}://api.clubelo.com/${path}`);
+      if (res && res.ok) return res;
+      errs.push(`${scheme}:${res ? res.status : "no_response"}`);
+    } catch (e) {
+      errs.push(`${scheme}:${String((e && e.message) || e).slice(0, 24)}`);
+    }
+  }
+  const err = new Error(errs.join("/"));
+  err.allSchemesFailed = true;
+  throw err;
+}
+
+/**
  * その日の全クラブEloを返す(1日1回だけ実取得。同日ぶんは保存を再利用)。
  * @returns { date, rows, fetchedFresh, staleDays, error } rowsは[]の可能性あり
  */
@@ -68,7 +89,10 @@ async function getDailyElo(deps, runAt) {
     return { date: dateStr, rows: saved.list.map(([club, country, elo]) => ({ club, country, elo })), fetchedFresh: false, staleDays: 0, error: null };
   }
   try {
-    const res = await fetchFn(`http://api.clubelo.com/${dateStr}`);
+    // v60: 本番実測で日次Eloが取れていなかった(dailyAvailable:false)。
+    //   原因を特定できるよう、https → http の順に試し、**両方の失敗理由を残す**。
+    //   (推測で「これが原因」と決めつけず、次の実行でログから判別できるようにする)
+    const res = await fetchWithScheme(fetchFn, dateStr);
     if (!res || !res.ok) throw new Error(`http_${res ? res.status : "no_response"}`);
     const rows = parseCsv(await res.text());
     if (rows.length) {
@@ -158,8 +182,8 @@ async function backfillHistory(deps, teams, sinceMs, runAt) {
     }
     if (!clubEloName) { failures.push(`unmatched:${t.name}`); continue; }
     try {
-      const url = `http://api.clubelo.com/${encodeURIComponent(clubEloName.replace(/\s+/g, ""))}`;
-      const res = await fetchFn(url);
+      // v60: 日次取得と同じく https → http の順で試す
+      const res = await fetchWithScheme(fetchFn, encodeURIComponent(clubEloName.replace(/\s+/g, "")));
       if (!res || !res.ok) throw new Error(`http_${res ? res.status : "no_response"}`);
       const hist = parseCsv(await res.text());
       const intervals = [];

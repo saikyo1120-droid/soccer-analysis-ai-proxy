@@ -1489,11 +1489,18 @@ async function runDailyLearning(deps) {
   const eloOfName = (name) => (clubEloByNormMap && clubEloDailyRows.length)
     ? clubEloMod.eloForTeamName(clubEloByNormMap, clubEloDailyRows, name) : null;
   const oddsConsensusByLeague = new Map(); // leagueId -> events[] | null(取得失敗)
-  const oddsApiStats = { enabled: oddsApiMod.isEnabled(process.env), leaguesFetched: 0, eventsTotal: 0, used: 0, failures: [] };
+  // v60: 「キーは設定済みなのに leaguesFetched が0」のとき、原因が
+  //   「対象試合が無かった」のか「取得に失敗した」のかを外から見分けられるように、
+  //   検討した試合数と対象外だった試合数も実測して残す(推測で語らないため)。
+  const oddsApiStats = {
+    enabled: oddsApiMod.isEnabled(process.env), leaguesFetched: 0, eventsTotal: 0, used: 0, failures: [],
+    fixturesConsidered: 0, fixturesOutOfScope: 0,
+  };
   async function consensusForFixture(fx) {
     if (!oddsApiStats.enabled) return null;
+    oddsApiStats.fixturesConsidered++;
     const lgId = fx && fx.league ? Number(fx.league.id) : NaN;
-    if (!Number.isFinite(lgId) || !oddsApiMod.SPORT_KEYS[lgId]) return null;
+    if (!Number.isFinite(lgId) || !oddsApiMod.SPORT_KEYS[lgId]) { oddsApiStats.fixturesOutOfScope++; return null; }
     if (!oddsConsensusByLeague.has(lgId)) {
       const r = await oddsApiMod.fetchLeagueConsensus(
         { fetchFn: (u) => fetch(u), upstashCmd: upstashEnabled ? upstashCmd : null, env: process.env },
@@ -2402,6 +2409,8 @@ async function runDailyLearning(deps) {
       dailyDate: clubEloMeta ? clubEloMeta.date : null,
       staleDays: clubEloMeta ? clubEloMeta.staleDays : null,
       usedInPredictions: clubEloUsedToday,
+      // v60: 取れなかった日は「なぜ取れなかったか」も残す(黙って0にしない)
+      error: clubEloMeta ? (clubEloMeta.error || null) : null,
       backfill: clubEloBackfillResult,
     },
     // v57: スタメン確定ウォッチの実測(朝版vs直前版のBrier比較。低いほど良い)
@@ -2438,6 +2447,9 @@ async function runDailyLearning(deps) {
       eventsTotal: oddsApiStats.eventsTotal,
       usedInPredictions: oddsApiStats.used,
       failures: oddsApiStats.failures.slice(0, 5),
+      // v60: 「対象試合が無かった」のか「取得に失敗した」のかを見分けるための実測
+      fixturesConsidered: oddsApiStats.fixturesConsidered,
+      fixturesOutOfScope: oddsApiStats.fixturesOutOfScope,
     },
     // v50: 市場ブレンドの学習結果(採否・w・検証NLL)を実測のまま残す
     marketBlendFit: marketBlendFitToday ? {
