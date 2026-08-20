@@ -6708,7 +6708,7 @@ async function handleHttpRequest(req, res) {
               teamsRated: ratings.teamsRated || teams.length,
               prevWeekKey: (prev && prev.weekKey) || null,
               teams: teamsRanked,
-              noteJa: `12大会×5シーズン(欧州カップ戦を含む)の実試合${ratings.matchesUsed ? `(${ratings.matchesUsed}試合)` : ""}から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。${unnamedCount > 0 ? `※一部クラブ(${unnamedCount}件)の名前を提供元から自動取得しています。数分後に再読み込みすると表示されます。` : ""}`,
+              noteJa: `12大会×5シーズン(欧州カップ戦を含む)の実試合${ratings.matchesUsed ? `(${ratings.matchesUsed}試合)` : ""}から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。${Number.isFinite(ratings.minMatches) ? `対象は、このデータの中に${ratings.minMatches}試合以上の実績があり、かつ他の対象クラブと十分に対戦しているクラブだけです(数試合だけの記録から地力を断定しないため)。` : ""}${unnamedCount > 0 ? `※一部クラブ(${unnamedCount}件)の名前を提供元から自動取得しています。数分後に再読み込みすると表示されます。` : ""}`,
             };
           }
         }
