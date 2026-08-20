@@ -2264,9 +2264,27 @@ function buildTodayPredictionEntry(fixture, record, calibrationMap) {
     ? (record.predictedWinner === "home" ? probs.homeWin * 100 : record.predictedWinner === "away" ? probs.awayWin * 100 : probs.draw * 100)
     : null;
   const calibrated = (rawWinnerPct !== null) ? applyCalibration(rawWinnerPct, calibrationMap) : null;
+  // ---- v63「極端な確率の是正」 ----
+  //   本番実測で「アウェイ勝利93%」が表示されていたが、AI自身の較正
+  //   (同じ自信帯の実測)では46%だった。実測でズレが分かっているのに
+  //   生の値を主役にして出し続けるのは、利用者に対して不誠実である。
+  //   主表示は**実績で較正した確率**にし、モデル生値は必ず併記する
+  //   (数字のすり替えではなく、より正しい方を前に出す)。
+  const rawWinnerPctRounded = (rawWinnerPct !== null) ? Math.round(rawWinnerPct) : null;
+  const confidence = (rawWinnerPctRounded === null) ? null : {
+    displayPct: calibrated ? calibrated.calibratedPct : rawWinnerPctRounded,
+    rawPct: rawWinnerPctRounded,
+    calibrated: !!calibrated,
+    basisN: calibrated ? calibrated.basisN : null,
+    gapPt: calibrated ? (calibrated.calibratedPct - rawWinnerPctRounded) : null,
+    // 生値が範囲外に振り切れた予測(λが上限・下限に張り付いた)かどうか
+    outOfRange: record.lambdaClamped === true,
+  };
   return {
     // 精度証明ラウンド: 較正補正・市場比較(オッズ)・似た試合(RAG強化)
     calibrated,
+    // v63: 画面に出す「1つの数字」。較正できるときは実績側を主役にする。
+    confidence,
     market: record.odds ? {
       odds: record.odds,
       impliedPct: record.marketImplied || null,

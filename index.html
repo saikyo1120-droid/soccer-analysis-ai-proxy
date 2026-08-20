@@ -1110,6 +1110,14 @@
     "学習していない大会(参考)": ["Unlearned competitions (reference)", "未学习的赛事(参考)", "Competiciones no aprendidas (referencia)"],
     "AIが過去試合を学習しているのは欧州12大会(9リーグ+CL・EL・ECL)です。それ以外の大会は学習データが無いため、予想は出しますが実力を測る集計とは分けています。": ["The AI has learned from past matches in 12 European competitions (9 leagues + UCL/UEL/UECL). It still makes picks elsewhere, but those are counted separately from the figure that measures its skill.", "AI从欧洲12项赛事(9个联赛+欧冠/欧联/欧协联)的过往比赛中学习。其他赛事仍会给出预测,但与衡量实力的命中率分开统计。", "La IA ha aprendido de partidos de 12 competiciones europeas (9 ligas + UCL/UEL/UECL). Sigue dando pronósticos en otras, pero se contabilizan aparte de la cifra que mide su nivel."],
   });
+  // ---- ⑭ v63「極端な確率の是正」(較正後の確信度・範囲外の開示) ----
+  add({
+    "確信度(実績で補正)": ["Confidence (corrected by track record)", "置信度(按实绩校正)", "Confianza (corregida por el historial)"],
+    "モデル生値": ["raw model value", "模型原始值", "valor bruto del modelo"],
+    "同じ自信帯の実測": ["measured results in the same confidence band", "同一置信区间的实测", "resultados medidos en la misma banda"],
+    "件から補正": [" cases", "场校正", " casos"],
+    "この試合はモデルの推定が現実的な範囲を外れました(確率は割り引いて見てください)": ["The model's estimate for this match fell outside a realistic range — treat the probability with caution.", "本场比赛模型的估计超出了现实范围,请谨慎看待该概率。", "La estimación del modelo para este partido quedó fuera de un rango realista; toma la probabilidad con cautela."],
+  });
   // ---- ⑪ 型テンプレート(実ソースから機械抽出・⦿=変数スロット) ----
   function pat(t) {
     var esc = t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -8549,9 +8557,6 @@ function predFreshnessLineHtml(p) {
 function predictionSummaryBlockHtml(p, titleJa) {
   if (!p) return "";
   // 精度証明ラウンド: 実績補正後の勝率・似た試合・市場比較も(あるものだけ)表示
-  const calibLine = p.calibrated
-    ? `<div class="value-note" style="margin-top:2px;">🎚️ 実績補正後の勝率: <strong>${Number(p.calibrated.calibratedPct)}%</strong>(モデル生値${Number(p.calibrated.rawPct)}%・実測${Number(p.calibrated.basisN)}件に基づく補正)</div>`
-    : "";
   const similarLine = p.similarPastJa ? `<div class="value-note" style="margin-top:2px;">📚 ${escapeHtml(p.similarPastJa)}</div>` : "";
   const marketLine = (p.market && Number.isFinite(p.market.edgePt))
     ? `<div class="value-note" style="margin-top:2px;">🏦 市場(オッズ)比較: AIは市場より${p.market.edgePt > 0 ? "強気" : "弱気"}(${p.market.edgePt > 0 ? "+" : ""}${Number(p.market.edgePt)}pt)</div>`
@@ -8562,7 +8567,7 @@ function predictionSummaryBlockHtml(p, titleJa) {
       <div>${escapeHtml(titleJa || "🤖 AIの予想")}: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predResultBadgeHtml(p)}</div>
       ${predBarHtml(p)}
       <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-      ${predUnlearnedLineHtml(p)}${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${blendLine}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
+      ${predUnlearnedLineHtml(p)}${predConfidenceLineHtml(p)}${predFactorsLineHtml(p)}${similarLine}${marketLine}${blendLine}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
     </div>`;
 }
 // ---- 2026年8月18日・v50「市場ブレンド」の開示 ----
@@ -8595,6 +8600,36 @@ function predPreKickLineHtml(p) {
     verdict = ` → <strong>${label} ${Number(pct)}%</strong>${pk.blended.changedFromMorning ? ` <span style="color:var(--series-2); font-weight:700;">(朝から変化)</span>` : ""}`;
   }
   return `<div class="value-note" style="margin-top:2px;">⚡ <span>直前情報</span>(<span>${kind}</span>${src})${verdict} <span style="opacity:.8;">(公式の予想は朝のまま)</span></div>`;
+}
+// ---- 2026年8月20日・v63「極端な確率の是正」 ----
+//   本番で「アウェイ勝利93%」が出ていたが、AI自身の較正(同じ自信帯の実測)
+//   では46%だった。実測でズレが分かっているのに生の値を主役で出し続けるのは
+//   不誠実なので、主表示は較正後にし、モデル生値を必ず併記する。
+//   さらに、期待得点が現実的な範囲(0.2〜4.0)の外へ振り切れた予測は、
+//   「モデルが表現できる範囲の外」であることを1行で正直に断る。
+function predConfidenceLineHtml(p) {
+  // v63: 古い応答(キャッシュ・再デプロイ直後)には confidence が無い。
+  //   その場合でも calibrated から同じ行を組み立て、補正の情報が消えないようにする。
+  let c = p && p.confidence;
+  if ((!c || !Number.isFinite(c.displayPct)) && p && p.calibrated
+      && Number.isFinite(p.calibrated.calibratedPct) && Number.isFinite(p.calibrated.rawPct)) {
+    c = {
+      displayPct: p.calibrated.calibratedPct, rawPct: p.calibrated.rawPct, calibrated: true,
+      basisN: Number.isFinite(p.calibrated.basisN) ? p.calibrated.basisN : null,
+      gapPt: p.calibrated.calibratedPct - p.calibrated.rawPct,
+      outOfRange: false,
+    };
+  }
+  if (!c || !Number.isFinite(c.displayPct)) return "";
+  const lines = [];
+  if (c.calibrated) {
+    const big = Number.isFinite(c.gapPt) && Math.abs(c.gapPt) >= 15;
+    lines.push(`<div class="value-note" style="margin-top:2px;">🎚️ <span>確信度(実績で補正)</span>: <strong${big ? ' style="color:var(--series-2);"' : ""}>${Number(c.displayPct)}%</strong>(<span>モデル生値</span> ${Number(c.rawPct)}%${Number.isFinite(c.basisN) ? ` ・ <span>同じ自信帯の実測</span>${Number(c.basisN)}<span>件から補正</span>` : ""})</div>`);
+  }
+  if (c.outOfRange) {
+    lines.push(`<div class="value-note" style="margin-top:2px;">⚠️ <span>この試合はモデルの推定が現実的な範囲を外れました(確率は割り引いて見てください)</span></div>`);
+  }
+  return lines.join("");
 }
 // ---- 2026年8月20日・v62「学習していない大会は、その旨を1行で断る」 ----
 //   AIが過去試合を学習しているのは欧州12大会だけ。それ以外の大会でも予想は
@@ -8631,7 +8666,10 @@ function predStripHtml(p) {
   if (typeof duelModeOn === "function" && duelModeOn() && String(p.status || "") === "NS" && !p.resolved && !duelGetPicks()[p.fixtureId]) {
     return `🤜🤛 <span class="value-note">対決中 — 上の「今日のAI予想」で自分の予想を先に選ぶと表示されます</span>`;
   }
-  const winPct = p.probs ? (p.predictedWinner === "home" ? p.probs.homeWinPct : p.predictedWinner === "away" ? p.probs.awayWinPct : p.probs.drawPct) : null;
+  // v63: 実績で較正した確率があれば、そちらを主表示にする(生値はカード側で併記)
+  const winPct = (p.confidence && Number.isFinite(p.confidence.displayPct))
+    ? p.confidence.displayPct
+    : (p.probs ? (p.predictedWinner === "home" ? p.probs.homeWinPct : p.predictedWinner === "away" ? p.probs.awayWinPct : p.probs.drawPct) : null);
   return `🤖 AI予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${winPct !== null ? ` <span style="color:var(--series-2); font-weight:700;">${Number(winPct)}%</span>` : ""}${predResultBadgeHtml(p)}`;
 }
 // 一覧描画後(または予想データ到着後)に、予想ストリップの空きスロットを埋める。
@@ -8980,9 +9018,6 @@ async function renderTodayPredictionsHero(reuseCached) {
     const scoreStr = (p.score && p.score.home !== null && p.score.home !== undefined) ? ` <strong>${Number(p.score.home)} - ${Number(p.score.away)}</strong>` : "";
     // 精度証明ラウンド: 実績補正後の勝率(較正)・似た試合・市場(オッズ)比較。
     // それぞれ実測がある試合にだけ表示する(無いものは出さない=でっち上げない)。
-    const calibLine = p.calibrated
-      ? `<div class="value-note" style="margin-top:2px;">🎚️ 実績補正後の勝率: <strong>${Number(p.calibrated.calibratedPct)}%</strong>(モデル生値${Number(p.calibrated.rawPct)}%・同じ自信帯の実測${Number(p.calibrated.basisN)}件に基づく補正)</div>`
-      : "";
     const similarLine = p.similarPastJa
       ? `<div class="value-note" style="margin-top:2px;">📚 ${escapeHtml(p.similarPastJa)}</div>`
       : "";
@@ -8997,7 +9032,7 @@ async function renderTodayPredictionsHero(reuseCached) {
         ${duelMyPickLineHtml(p)}
         ${predBarHtml(p)}
         <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-        ${predUnlearnedLineHtml(p)}${predFactorsLineHtml(p)}${calibLine}${similarLine}${marketLine}${predBlendLineHtml(p)}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
+        ${predUnlearnedLineHtml(p)}${predConfidenceLineHtml(p)}${predFactorsLineHtml(p)}${similarLine}${marketLine}${predBlendLineHtml(p)}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
         <div style="margin-top:6px;"><button class="ghost-btn pred-share-btn" type="button" data-share-idx="${todayPredShareItems.indexOf(p)}" style="padding:5px 12px; font-size:12px;">📸 画像でシェア</button></div>
       </div>`;
   };
