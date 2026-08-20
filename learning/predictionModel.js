@@ -21,6 +21,10 @@
  * 採用するゲートを通す(dailyJob.js側で既存のグリッドサーチと同じ安全策を適用)。
  */
 
+// v63: 1チームの1試合期待得点として現実的な範囲。プロサッカーでこの外側の値が
+//   起こることは事実上なく、外れた値は「モデルが表現できる範囲の外」を意味する。
+const LAMBDA_MIN = 0.2;
+const LAMBDA_MAX = 4.0;
 const EXTENDED_DEFAULT_WEIGHTS = {
   homeBase: 1.35,
   awayBase: 1.15,
@@ -277,15 +281,34 @@ function predictOutcomeV2(features, weights) {
   for (const [fKey, wKey] of Object.entries(FEATURE_SUM_WEIGHT_MAP)) {
     openness += (f[fKey] || 0) * (w[wKey] || 0);
   }
-  // 下限は0.15へ引き下げた。旧値0.4は「1試合で0.4点未満はあり得ない」という
-  // 強い仮定で、守備的な組み合わせを表現できずクランプが頻発していた。
-  const homeLambda = Math.max(0.15, (w.homeBase ?? EXTENDED_DEFAULT_WEIGHTS.homeBase) + score + openness);
-  const awayLambda = Math.max(0.15, (w.awayBase ?? EXTENDED_DEFAULT_WEIGHTS.awayBase) - score + openness);
+  // ---- v63「極端な確率の是正」(本番実測での欠陥への根治) ----
+  //   λは特徴量の**線形和**なので、原理的に負にもなれば青天井にもなる。
+  //   本番実測では λH が下限に張り付き(0.15)、λA が3を超えた結果、
+  //   「アウェイ勝利93%」という現実には出ない確率が表示されていた。
+  //   同じ試合をAI自身の較正(実測)にかけると46%であり、モデルの生値が
+  //   壊れていることは自分の実測データからも分かっていた。
+  //
+  //   プロサッカーで1チームの1試合期待得点が0.2未満・4.0超になることは事実上ない。
+  //   この範囲を外れた値は「モデルが表現できる範囲の外」であり、数字として
+  //   意味を持たない。範囲で丸めたうえで、**丸めたという事実を必ず持ち帰る**
+  //   (黙って丸めると、壊れた推定が自信満々の確率として表示され続ける)。
+  const lo = LAMBDA_MIN, hi = LAMBDA_MAX;
+  const rawHome = (w.homeBase ?? EXTENDED_DEFAULT_WEIGHTS.homeBase) + score + openness;
+  const rawAway = (w.awayBase ?? EXTENDED_DEFAULT_WEIGHTS.awayBase) - score + openness;
+  const homeLambda = Math.max(lo, Math.min(hi, rawHome));
+  const awayLambda = Math.max(lo, Math.min(hi, rawAway));
+  const clampedHome = rawHome < lo || rawHome > hi;
+  const clampedAway = rawAway < lo || rawAway > hi;
   const lambdaDiff = homeLambda - awayLambda;
   let predictedWinner = "draw";
   if (lambdaDiff > 0.15) predictedWinner = "home";
   else if (lambdaDiff < -0.15) predictedWinner = "away";
-  return { homeLambda, awayLambda, predictedWinner, score };
+  return {
+    homeLambda, awayLambda, predictedWinner, score,
+    // v63: 推定が現実的な範囲の外へ出たか(出た試合は表示で正直に断る)
+    lambdaClamped: clampedHome || clampedAway,
+    lambdaRaw: { home: Math.round(rawHome * 1000) / 1000, away: Math.round(rawAway * 1000) / 1000 },
+  };
 }
 
 // ---- Dixon-Coles(1997)の低スコア補正 ----
@@ -1274,6 +1297,7 @@ module.exports = {
   FEATURE_SUM_WEIGHT_MAP,
   FEATURE_LABELS_JA,
   LEARNABLE_KEYS, WEIGHT_BOUNDS,
+  LAMBDA_MIN, LAMBDA_MAX,
   WEIGHT_LABELS_JA,
   FAILURE_REASON_LABELS_JA,
   computeMatchFeatures,

@@ -1794,6 +1794,9 @@ async function runDailyLearning(deps) {
         leagueId: (fx.league && Number.isFinite(Number(fx.league.id))) ? Number(fx.league.id) : null,
         homeFormScore, awayFormScore, predictedWinner, // v1互換フィールド(既存のバックテスト・テストとの互換性のため維持)
         homeLambda, awayLambda, features, weightsSnapshot: weights, factorImportance: importance,
+        // v63: 期待得点が現実的な範囲(0.2〜4.0)の外へ出たか。出た試合は
+        //   モデルが表現できる範囲の外なので、画面で正直に断る材料として残す。
+        lambdaClamped: modelOut.lambdaClamped === true,
         kickoff: fx.fixture.date, loggedAt: runAt.toISOString(),
         resolved: false, actualWinner: null, correct: null, resolvedAt: null,
         originTeamEn: team.nameEn, stateHypothesis,
