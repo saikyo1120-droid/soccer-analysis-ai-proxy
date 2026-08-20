@@ -30,6 +30,7 @@ const { normName, namesMatch } = require("./oddsApi");
 const { expGoalsFromRatings } = require("./teamRatings");
 const {
   computeMatchProbabilitiesRaw, topScorelinesFrom, mostLikelyScoreline, derivedMatchMetrics,
+  LAMBDA_MIN, LAMBDA_MAX,
 } = require("./predictionModel");
 const { combineVolatility } = require("./teamStats");
 const { CLUB_UNIVERSE } = require("./clubUniverse");
@@ -285,12 +286,20 @@ function buildMatchup(p) {
     };
   }
   const rho = (weights && Number.isFinite(weights.rho)) ? weights.rho : 0;
-  const raw = computeMatchProbabilitiesRaw(eg.home, eg.away, 8, rho);
+  // ---- v64: 期待得点に現実的な範囲を掛ける(v63と同じ考え方をこの経路にも) ----
+  //   地力レーティングからの期待得点は exp() なので負にはならないが、
+  //   レーティングが極端なクラブでは上限なく大きくなりうる。予想カード側
+  //   (predictOutcomeV2)には v63 で範囲を入れたのに、この「どんな対戦でも分析」
+  //   の経路には入っていなかった。同じ基準を適用し、外れたら正直に開示する。
+  const lamHome = Math.max(LAMBDA_MIN, Math.min(LAMBDA_MAX, eg.home));
+  const lamAway = Math.max(LAMBDA_MIN, Math.min(LAMBDA_MAX, eg.away));
+  const lambdaClamped = lamHome !== eg.home || lamAway !== eg.away;
+  const raw = computeMatchProbabilitiesRaw(lamHome, lamAway, 8, rho);
   const winner = (raw.homeWin >= raw.draw && raw.homeWin >= raw.awayWin) ? "home"
     : (raw.awayWin >= raw.draw ? "away" : "draw");
-  const scenarios = topScorelinesFrom(eg.home, eg.away, 6, rho, 5)
+  const scenarios = topScorelinesFrom(lamHome, lamAway, 6, rho, 5)
     .map((s) => ({ scoreline: s.scoreline, pct: pct1(s.p) }));
-  const derived = derivedMatchMetrics(eg.home, eg.away, 8, rho);
+  const derived = derivedMatchMetrics(lamHome, lamAway, 8, rho);
 
   // 実測の傾向(集計済みのものだけ。無いクラブは null)
   const sTeam = (id) => (teamStats && teamStats.byTeam && teamStats.byTeam[id]) || null;
@@ -324,7 +333,9 @@ function buildMatchup(p) {
       awayWinPct: Math.round(raw.awayWin * 100),
     },
     expGoals: { home: eg.home, away: eg.away },
-    topScoreline: mostLikelyScoreline(eg.home, eg.away, 6, rho, winner),
+    // v64: 期待得点が現実的な範囲を外れたか(外れた分析は割り引いて見てもらう)
+    lambdaClamped,
+    topScoreline: mostLikelyScoreline(lamHome, lamAway, 6, rho, winner),
     scenarios,
     derived: derived ? {
       bttsPct: Math.round(derived.btts * 100),
