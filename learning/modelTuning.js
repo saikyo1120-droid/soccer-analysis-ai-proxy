@@ -206,6 +206,10 @@ function fitHistoryWeights(trainRows, initialWeights, runAt) {
       if (fitRows.some((r) => r.features && r.features[fKey])) presentKeys.add(wKey);
     }
     presentKeys.add("rho"); // ρは特徴量ではなくスコア分布の補正なので常に対象
+    // v61: ホーム/アウェイの基礎得点も、特徴量ではないが常に学習対象にする。
+    //   これが固定値だったために「常にホーム」にすら負ける状態が続いていた。
+    presentKeys.add("homeBase");
+    presentKeys.add("awayBase");
     const keys = [...presentKeys];
     const refMs = runAt instanceof Date ? runAt.getTime() : Date.parse(runAt) || 0;
     const t0 = Date.now(); // v49: 実行時間を実測して記録に残す(説明責任・本番の観測用)

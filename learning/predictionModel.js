@@ -632,7 +632,38 @@ function buildAblationCandidates(effectivenessReport, currentWeights) {
 // 実装漏れの修正: 新しく追加した特徴量の重みをこの配列に入れ忘れていたため、
 // 勾配降下法の対象外となり「永遠に0のまま=その特徴量が一生使われない」状態に
 // なっていた。特徴量を追加するときは、必ずこの配列にも追加すること。
+/* ----------------------------------------------------------------------------
+ * v61「ホーム有利を学習できるようにする」(本番実測での欠陥への根治)
+ * ----------------------------------------------------------------------------
+ * ■ 見つかった欠陥
+ *   本番実測(2026年8月20日)で、自社モデルの的中率は37.2%。
+ *   「常にホームが勝つと言うだけ」の約45%を8ポイント下回っていた。
+ *   外れた理由の1位は「直近フォームを重視しすぎた」で69件と圧倒的。
+ *
+ * ■ 原因
+ *   サッカーで最も安定して効く要素である**ホーム有利(homeBase/awayBase)が
+ *   学習対象キーに入っていなかった**。ノイズの多い特徴量(フォーム・直近得点等)は
+ *   すべて学習対象なのに、一番頼りになる土台だけが固定値だったため、
+ *   モデルはノイズ側へ引っ張られる一方で、そこから戻る手段を持っていなかった。
+ *   ・実測の裏づけ: 外れた試合の多くが「アウェイ寄りに予想 → 実際はホーム勝ち」。
+ *   ・市場ブレンドが w=0.90(市場90%+AI10%)まで上がっていたのも同じ症状で、
+ *     採用時の検証NLLは 1.9188(=当てずっぽうの ln3≒1.0986 より悪い)だった。
+ *
+ * ■ 対処
+ *   homeBase / awayBase を学習対象に加える。値は過去試合15,000件から
+ *   勾配降下法が決める(人手で数字を決めるのではなく、データに決めさせる)。
+ *   併せて、キーごとに妥当な可動範囲を持たせる。従来は全キー一律 [-1, 1] に
+ *   丸めていたため、そのまま追加すると **homeBase 1.35 が黙って 1.0 に潰される**
+ *   (この落とし穴があるので、範囲の導入と同時でなければ追加してはいけない)。
+ * -------------------------------------------------------------------------- */
+/** 学習中に各キーが取りうる範囲(未指定は従来どおり [-1, 1]) */
+const WEIGHT_BOUNDS = {
+  homeBase: [0.2, 4],   // 1試合の期待得点。ポアソンの平均なので正の値のみ
+  awayBase: [0.2, 4],
+};
 const LEARNABLE_KEYS = [
+  // v61: サッカーで最も効く土台。固定値のままでは学習が是正できなかった
+  "homeBase", "awayBase",
   "sensitivity", "goalRateSensitivity", "injurySensitivity",
   "standingsSensitivity", "headToHeadSensitivity", "fatigueSensitivity",
   "venueSensitivity", "suspensionSensitivity", "xgSensitivity", "topScorerSensitivity",
@@ -684,7 +715,10 @@ function fitWeightsGradientDescent(records, initialWeights, opts) {
       // `(w[wKey] || 0)` が NaN を静かに0へ落とすため、**その特徴量が
       // 二度と使われない状態が永久に続く**(エラーも出ない)。
       // 有限な数値でなければ、その回の更新を捨てて直前の値を維持する。
-      next[k] = Number.isFinite(updated) ? Math.max(-1, Math.min(1, updated)) : weights[k];
+      // v61: キーごとの可動範囲。homeBase/awayBase は1〜1.5前後の値を取るため、
+      //   従来の一律 [-1, 1] のままでは初期値が黙って潰れてしまう。
+      const bound = WEIGHT_BOUNDS[k] || [-1, 1];
+      next[k] = Number.isFinite(updated) ? Math.max(bound[0], Math.min(bound[1], updated)) : weights[k];
     }
     weights = next;
   }
@@ -1239,7 +1273,7 @@ module.exports = {
   FEATURE_WEIGHT_MAP,
   FEATURE_SUM_WEIGHT_MAP,
   FEATURE_LABELS_JA,
-  LEARNABLE_KEYS,
+  LEARNABLE_KEYS, WEIGHT_BOUNDS,
   WEIGHT_LABELS_JA,
   FAILURE_REASON_LABELS_JA,
   computeMatchFeatures,
