@@ -1482,7 +1482,7 @@ async function runDailyLearning(deps) {
   //   取れない日は7日以内の保存で継続(staleDaysを開示)。それも無ければ特徴量0。
   let clubEloDailyRows = [], clubEloByNormMap = null, clubEloMeta = null, clubEloUsedToday = 0;
   try {
-    clubEloMeta = await clubEloMod.getDailyElo({ fetchFn: (u) => fetch(u), upstashGetJSON, upstashSetJSON }, runAt.getTime());
+    clubEloMeta = await clubEloMod.getDailyElo({ fetchFn: (u, o) => fetch(u, o), upstashGetJSON, upstashSetJSON }, runAt.getTime());
     clubEloDailyRows = clubEloMeta.rows || [];
     clubEloByNormMap = clubEloMod.buildEloByNorm(clubEloDailyRows);
     if (clubEloMeta.error && !clubEloDailyRows.length) errors.push(`clubelo_daily_failed:${clubEloMeta.error}`);
@@ -1506,7 +1506,7 @@ async function runDailyLearning(deps) {
     if (!Number.isFinite(lgId) || !oddsApiMod.SPORT_KEYS[lgId]) { oddsApiStats.fixturesOutOfScope++; return null; }
     if (!oddsConsensusByLeague.has(lgId)) {
       const r = await oddsApiMod.fetchLeagueConsensus(
-        { fetchFn: (u) => fetch(u), upstashCmd: upstashEnabled ? upstashCmd : null, env: process.env },
+        { fetchFn: (u, o) => fetch(u, o), upstashCmd: upstashEnabled ? upstashCmd : null, env: process.env },
         lgId, runAt.getTime());
       if (r && r.ok) {
         oddsApiStats.leaguesFetched++;
@@ -2261,7 +2261,7 @@ async function runDailyLearning(deps) {
           }
           if (teamsForElo.length >= 20) {
             clubEloBackfillResult = await clubEloMod.backfillHistory(
-              { fetchFn: (u) => fetch(u), upstashCmd, upstashGetJSON, upstashSetJSON },
+              { fetchFn: (u, o) => fetch(u, o), upstashCmd, upstashGetJSON, upstashSetJSON },
               teamsForElo, runAt.getTime() - Math.round(3.3 * 365 * 86400000), runAt.getTime());
             if (clubEloBackfillResult && clubEloBackfillResult.ran) {
               ceHist = await upstashGetJSON(clubEloMod.HIST_KEY).catch(() => null);

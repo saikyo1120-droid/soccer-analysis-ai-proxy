@@ -63,13 +63,33 @@ function parseCsv(text) {
  */
 async function fetchWithScheme(fetchFn, path) {
   const errs = [];
+  // v65: Node の fetch は接続レベルの失敗をすべて「fetch failed」という1つの
+  //   メッセージに包んでしまう(本番実測: "https:fetch failed/http:fetch failed")。
+  //   本当の原因は e.cause(ENOTFOUND=DNS / ECONNREFUSED=接続拒否 /
+  //   ETIMEDOUT=応答なし / 証明書エラー 等)に入っているので、そこまで掘って残す。
+  //   併せて、行儀としてUser-Agentを名乗り、15秒で必ず打ち切る
+  //   (相手が無応答の日に学習ジョブが数分止まるのを防ぐ)。
+  const causeOf = (e) => {
+    const parts = [];
+    let cur = e;
+    for (let depth = 0; cur && depth < 4; depth++) {
+      const code = cur.code || cur.errno || null;
+      const msg = String(cur.message || "").slice(0, 40);
+      if (code) parts.push(String(code));
+      else if (msg && msg !== "fetch failed") parts.push(msg);
+      cur = cur.cause;
+    }
+    return parts.length ? parts.join("<") : String((e && e.message) || e).slice(0, 24);
+  };
+  const opts = { headers: { "User-Agent": "soccer-analysis-ai/1.0 (daily learning job)" } };
+  try { if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opts.signal = AbortSignal.timeout(15000); } catch (e) { /* 古い実行環境では無しで続行 */ }
   for (const scheme of ["https", "http"]) {
     try {
-      const res = await fetchFn(`${scheme}://api.clubelo.com/${path}`);
+      const res = await fetchFn(`${scheme}://api.clubelo.com/${path}`, opts);
       if (res && res.ok) return res;
       errs.push(`${scheme}:${res ? res.status : "no_response"}`);
     } catch (e) {
-      errs.push(`${scheme}:${String((e && e.message) || e).slice(0, 24)}`);
+      errs.push(`${scheme}:${causeOf(e)}`);
     }
   }
   const err = new Error(errs.join("/"));
