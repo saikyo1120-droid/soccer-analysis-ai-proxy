@@ -293,8 +293,23 @@ function predictOutcomeV2(features, weights) {
   //   意味を持たない。範囲で丸めたうえで、**丸めたという事実を必ず持ち帰る**
   //   (黙って丸めると、壊れた推定が自信満々の確率として表示され続ける)。
   const lo = LAMBDA_MIN, hi = LAMBDA_MAX;
-  const rawHome = (w.homeBase ?? EXTENDED_DEFAULT_WEIGHTS.homeBase) + score + openness;
-  const rawAway = (w.awayBase ?? EXTENDED_DEFAULT_WEIGHTS.awayBase) - score + openness;
+  // ---- v66「乗法モデル」(モデル本体の構造改善①) ----
+  //   加法形 λ = base + score は、特徴量の効果を「得点の絶対量」で足すため、
+  //   原理的に負や青天井が起こる(v63で範囲を入れて症状は止めたが、構造は残る)。
+  //   統計の標準形はポアソン回帰の対数リンク:
+  //     λH = homeBase × exp(+score + openness)
+  //     λA = awayBase × exp(−score + openness)
+  //   ・λは常に正(構造的に壊れない)
+  //   ・効果が「割合」で効く(強豪の+10%と弱小の+10%が同じ意味になる)
+  //   ・score=0 なら λ=base で加法形と完全一致
+  //   どちらの形を使うかは weights.modelForm("mult")で決まり、**未指定は従来の
+  //   加法形のままビット同一**(劣化禁止)。乗法形は毎日の学習ゲートが
+  //   ホールドアウト検証で勝ったときにだけ採用される(人手では切り替えない)。
+  const isMult = w.modelForm === "mult";
+  const hb = (w.homeBase ?? EXTENDED_DEFAULT_WEIGHTS.homeBase);
+  const ab = (w.awayBase ?? EXTENDED_DEFAULT_WEIGHTS.awayBase);
+  const rawHome = isMult ? hb * Math.exp(score + openness) : hb + score + openness;
+  const rawAway = isMult ? ab * Math.exp(-score + openness) : ab - score + openness;
   const homeLambda = Math.max(lo, Math.min(hi, rawHome));
   const awayLambda = Math.max(lo, Math.min(hi, rawAway));
   const clampedHome = rawHome < lo || rawHome > hi;
@@ -773,6 +788,8 @@ function isSaneWeights(w) {
   }
   // v50: 市場ブレンドは0〜0.95(1.0=完全に市場の受け売り、は許可しない)
   if (w.marketBlend !== undefined && !(Number.isFinite(w.marketBlend) && w.marketBlend >= 0 && w.marketBlend <= 0.95)) return false;
+  // v66: モデルの形は "add" / "mult" / 未指定 の3通りだけ(壊れた値を保存しない)
+  if (w.modelForm !== undefined && w.modelForm !== "add" && w.modelForm !== "mult") return false;
   return true;
 }
 
@@ -847,6 +864,13 @@ function describeWeightsHistoryEntry(entry) {
   const newW = entry.newWeights || {};
   const keys = Object.keys(WEIGHT_LABELS_JA);
   const bullets = keys.map((k) => describeOneWeightChange(k, oldW[k], newW[k])).filter(Boolean);
+  // v66: モデルの形(加法/乗法)が切り替わった日は、それを最初に開示する
+  const formOf = (w) => (w && w.modelForm === "mult" ? "mult" : "add");
+  if (formOf(oldW) !== formOf(newW)) {
+    bullets.unshift(formOf(newW) === "mult"
+      ? "✓ 予測の計算の形を「掛け算(乗法)モデル」へ切り替えました(検証データで従来の足し算モデルを上回ったため。効果が割合で効く統計の標準形です)"
+      : "✓ 予測の計算の形を「足し算(加法)モデル」へ戻しました(検証データでこちらが上回ったため)");
+  }
   const accUp = typeof entry.oldAccuracy === "number" && typeof entry.newAccuracy === "number";
   const reason = accUp
     ? `直近${entry.sampleSize ?? "?"}試合の検証結果で、的中率が${entry.oldAccuracy}%→${entry.newAccuracy}%に上がったため(${methodLabelJa})。`

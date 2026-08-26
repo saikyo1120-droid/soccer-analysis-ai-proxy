@@ -365,11 +365,33 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   //   ・候補の優劣は学習用データのLogLossで決め、採否は従来どおり
   //     検証用データの関門(shouldAdoptWithConsistency)が判断する。
   const gradFit = fitHistoryWeights(train, found.weights, runAt);
+  // ---- v66「乗法モデル」: 加法形と乗法形の両方を毎日学習し、勝った方を候補にする ----
+  //   乗法形(λ = base × exp(Σ特徴×重み))はポアソン回帰の標準形で、λが構造的に
+  //   壊れない。ただし切り替えは人手では行わず、**同じ学習データで両方を学習し、
+  //   同じ検証ゲートで勝った方だけ**が候補になる(負けた日は従来のまま=劣化禁止)。
+  //   重みは形ごとに意味が違うため、乗法形は乗法形として一から勾配学習する。
+  const gradFitMult = fitHistoryWeights(train, { ...found.weights, modelForm: "mult" }, runAt);
   const trainEvalGrid = evaluate(train, found.weights);
   const trainEvalGrad = gradFit.weights ? evaluate(train, gradFit.weights) : null;
-  const gradWon = !!(trainEvalGrad && trainEvalGrad.measurable && trainEvalGrid.measurable
-    && trainEvalGrad.logLoss < trainEvalGrid.logLoss);
-  const candidateWeights = gradWon ? gradFit.weights : found.weights;
+  const trainEvalGradMult = gradFitMult.weights ? evaluate(train, gradFitMult.weights) : null;
+  const lossOf = (ev) => (ev && ev.measurable ? ev.logLoss : Infinity);
+  // 3候補(グリッド・勾配加法・勾配乗法)から学習用LogLoss最小を選ぶ
+  //(採否そのものは従来どおり、この後の検証用データの関門が判断する)
+  const candidates3 = [
+    { weights: found.weights, loss: lossOf(trainEvalGrid), viaGradient: false, form: "add" },
+    { weights: gradFit.weights, loss: lossOf(trainEvalGrad), viaGradient: true, form: "add" },
+    { weights: gradFitMult.weights, loss: lossOf(trainEvalGradMult), viaGradient: true, form: "mult" },
+  ].filter((c) => c.weights);
+  candidates3.sort((a, b) => a.loss - b.loss);
+  const best3 = candidates3[0];
+  const gradWon = !!(best3 && best3.viaGradient && Number.isFinite(best3.loss));
+  const candidateWeights = best3 ? best3.weights : found.weights;
+  const candidateFormDetail = {
+    gridLogLoss: Number.isFinite(lossOf(trainEvalGrid)) ? Math.round(lossOf(trainEvalGrid) * 10000) / 10000 : null,
+    gradAddLogLoss: Number.isFinite(lossOf(trainEvalGrad)) ? Math.round(lossOf(trainEvalGrad) * 10000) / 10000 : null,
+    gradMultLogLoss: Number.isFinite(lossOf(trainEvalGradMult)) ? Math.round(lossOf(trainEvalGradMult) * 10000) / 10000 : null,
+    chosenForm: candidateWeights && candidateWeights.modelForm === "mult" ? "mult" : "add",
+  };
 
   const oldEval = evaluate(test, base);
   const newEval = evaluate(test, candidateWeights);
@@ -419,12 +441,20 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     // 静かに捨てられてしまうため、学習対象キー全部を保存する
     // (グリッド候補が勝った場合も同じキー集合で、値が3個以外は元のまま)。
     newParams: decision.adopt
-      ? Object.fromEntries(LEARNABLE_KEYS
+      ? {
+        ...Object.fromEntries(LEARNABLE_KEYS
           .filter((k) => Number.isFinite(candidateWeights[k]))
-          .map((k) => [k, candidateWeights[k]]))
+          .map((k) => [k, candidateWeights[k]])),
+        // v66: モデルの形は数値でないため上のfilterで落ちる。**必ず明示して保存**する。
+        //   (加法候補が勝った日に、保存済みの"mult"が黙って残ると、加法用に
+        //    学習した重みを乗法で解釈してしまう=構造的な壊れ方。テストで固定)
+        modelForm: candidateWeights.modelForm === "mult" ? "mult" : "add",
+      }
       : null,
     // どちらの候補が勝ったか(実測の記録。gradFit.detailは学習の中身の説明)
     method: gradWon ? "history_gradient_descent" : "grid_search",
+    // v66: 加法/乗法の比較結果(学習用LogLoss)と選ばれた形を毎日記録する
+    modelFormDetail: candidateFormDetail,
     gradientFit: gradFit.detail,
     // v50: レーティング学習の実測記録
     teamRatings: {
@@ -521,6 +551,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     adopted: record.adopted,
     teamRatings: record.teamRatings,
     teamStats: record.teamStats, // v59: 派生指標の集計結果(実測)
+    modelFormDetail: record.modelFormDetail, // v66: 加法/乗法の比較実測と選ばれた形
     consistencyChecked: record.consistencyChecked,
     reasonJa: record.reasonJa,
     datasetSize: ds.rows.length,
