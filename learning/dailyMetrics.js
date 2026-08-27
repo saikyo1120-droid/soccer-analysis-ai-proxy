@@ -134,14 +134,20 @@ function compareSnapshots(today, yesterday) {
 
   let verdictJa;
   let improved;
-  if (points.length) {
+  // ---- v67: 「賢くなりました」の見出し条件を実力側へ寄せる(利用者の指摘) ----
+  //   これまでは知識・記憶が増えれば的中率が下がった日でも見出しは
+  //   「昨日より賢くなりました」だった(下落は「ただし…」で開示)。
+  //   知識の件数は活動の結果であって実力の証明ではない。的中率が下がった日は
+  //   見出しでは断定せず、「増えたもの」と「下がったもの」を同格で並べる。
+  //   (勝手な閾値は置かない: 下がったか上がったかの符号だけで言い分ける)
+  if (points.length && declines.length) {
+    improved = null; // 混在: 断定しない
+    verdictJa = `${points.join("、")}。一方で、${declines.join("、")}。知識は増えましたが、的中率が下がったため「賢くなった」とは言い切りません(検証データが少ないうちは的中率が上下します)。`;
+    if (activities.length) verdictJa += ` また、${activities.join("、")}。`;
+  } else if (points.length) {
     improved = true;
     verdictJa = `昨日より賢くなりました: ${points.join("、")}。`;
     if (activities.length) verdictJa += ` また、${activities.join("、")}。`;
-    if (declines.length) {
-      // 良い点だけを並べて悪化を隠さない(誠実さの方針)
-      verdictJa += ` ただし、${declines.join("、")}(検証データが少ないうちは的中率が上下します)。`;
-    }
   } else if (declines.length) {
     improved = false;
     verdictJa = `本日は${declines.join("、")}。知識・記憶の増加もありませんでした。`;

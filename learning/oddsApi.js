@@ -91,6 +91,13 @@ const NAME_ALIASES = {
   "paris sg": "paris saint germain", // ClubElo表記(v57)
   "inter": "inter milan",
   "athletic club": "athletic bilbao",
+  // v67: 綴り違いの英語名(ダイアクリティカル除去では埋まらない別綴り)。
+  //   本番実測: 「Bayern Munich」がAPI-Football正式名「Bayern München」と照合できず、
+  //   ・The Odds APIのコンセンサスがバイエルンの試合を一度も照合できていなかった
+  //   ・対戦分析で「バイエルン」が女子チーム(Bayern Munich W)に化けた
+  //   の2つの実バグの根になっていた。正規化後の完全一致だけを許す(推測はしない)。
+  "bayern munich": "bayern munchen",
+  "cologne": "koln", // The Odds API表記「FC Cologne」→ 正式名「1. FC Köln」
 };
 function normName(s) {
   let t = String(s || "").toLowerCase();

@@ -2259,7 +2259,11 @@ async function runDailyLearning(deps) {
             const tn = (await upstashGetJSON("learn:teamnames").catch(() => null)) || {};
             for (const id of Object.keys(tn)) teamsForElo.push({ id: Number(id), name: tn[id] });
           }
-          if (teamsForElo.length >= 20) {
+          if (clubEloDailyRows.length === 0) {
+            // v69: 日次一覧すら取れない日は、同じホストへの約190回の履歴取得も無駄
+            //   (本番実測: 無応答ホストへの連続タイムアウトで朝の学習が62分に膨張)。
+            clubEloBackfillResult = { ran: false, reasonJa: "日次のElo一覧が取得できない日(ホスト無応答)のため、履歴の取得は見送りました。回復した日に自動で試します。" };
+          } else if (teamsForElo.length >= 20) {
             clubEloBackfillResult = await clubEloMod.backfillHistory(
               { fetchFn: (u, o) => fetch(u, o), upstashCmd, upstashGetJSON, upstashSetJSON },
               teamsForElo, runAt.getTime() - Math.round(3.3 * 365 * 86400000), runAt.getTime());

@@ -202,6 +202,20 @@ function tokenSet(name) {
 }
 
 /**
+ * v67: 女子・ユース・2軍を示す表記(API-Footballの命名慣習)。
+ * 本番実測: 学習の採集名簿に「Bayern Munich W」(女子)が入った日から、
+ * 「バイエルン」の照合が女子チーム1件に一意ヒットしてしまい、
+ * 男子トップチームの分析ができなくなった。問い合わせがそれを求めていない限り、
+ * これらの表記を持つ候補は表記ゆらぎ照合の対象にしない
+ * (別チームに化けるくらいなら照合しない、という v59 の原則の徹底)。
+ */
+const SQUAD_VARIANT_RE = /(\s|\()W\)?$|\sW\s|U-?(17|18|19|20|21|23)|\s(II|III|B)$|women|youth|reserves?|femin|ladies/i;
+function isSquadVariantName(name) { return SQUAD_VARIANT_RE.test(String(name || "")); }
+function queryWantsVariant(q) {
+  return SQUAD_VARIANT_RE.test(String(q || "")) || /女子|レディース|ユース|リザーブ|2軍|セカンド/.test(String(q || ""));
+}
+
+/**
  * クラブ名(日本語/英語/短縮形)を1つのチームIDに解決する(純関数)。
  * @returns {{ok:true, id, name, nameJa}|{ok:false, reason, candidates?, queryRaw}}
  */
@@ -230,8 +244,12 @@ function resolveClub(raw, ctx) {
   }
 
   // ③ 表記ゆらぎ照合(候補が2件以上なら**使わない**=誤マッチ防止)
+  //   v67: 問い合わせが女子・ユース・2軍を求めていない限り、それらの表記を持つ
+  //   候補はここから除外する(「Bayern Munich W」への化けの再発防止)。
+  const allowVariant = queryWantsVariant(q) || queryWantsVariant(target);
+  const fuzzyPool = allowVariant ? index : index.filter((e) => !isSquadVariantName(e.name));
   const fuzzy = [];
-  for (const e of index) {
+  for (const e of fuzzyPool) {
     if (namesMatch(e.name, target)) fuzzy.push(e);
     if (fuzzy.length > 4) break;
   }
@@ -245,7 +263,7 @@ function resolveClub(raw, ctx) {
   const qTokens = tokenSet(target);
   if (qTokens.size) {
     const hits = [];
-    for (const e of index) {
+    for (const e of fuzzyPool) {
       const et = tokenSet(e.name);
       let common = false;
       for (const t of qTokens) if (et.has(t)) { common = true; break; }

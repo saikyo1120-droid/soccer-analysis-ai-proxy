@@ -190,6 +190,8 @@ async function backfillHistory(deps, teams, sinceMs, runAt) {
   const byTeamId = {};
   const failures = [];
   let fetched = 0;
+  let consecutiveConnFails = 0; // v69: 接続レベルの連続失敗(3でホスト障害と判断して中断)
+  let abortedForHostDown = false;
   for (const t of teams) {
     if (!t || !Number.isFinite(Number(t.id)) || !t.name) continue;
     // ClubElo側の正式名を特定(曖昧なら見送り=正直)
@@ -201,6 +203,15 @@ async function backfillHistory(deps, teams, sinceMs, runAt) {
       if (hits.length === 1) clubEloName = hits[0].club;
     }
     if (!clubEloName) { failures.push(`unmatched:${t.name}`); continue; }
+    // ---- v69: 連続失敗ブレーカー(本番実測での欠陥への修正) ----
+    //   ホストが無応答の日にクラブごとに約30秒(https10s+http15s+再試行)を
+    //   費やし、朝の学習が62分(通常12〜17分)へ膨らんだ。接続レベルの失敗が
+    //   3クラブ連続したら「ホスト自体が落ちている」と判断して中断する
+    //   (1クラブだけの個別失敗と、ホスト全体の障害を区別する)。
+    if (consecutiveConnFails >= 3) {
+      abortedForHostDown = true;
+      break;
+    }
     try {
       // v60: 日次取得と同じく https → http の順で試す
       const res = await fetchWithScheme(fetchFn, encodeURIComponent(clubEloName.replace(/\s+/g, "")));
@@ -220,18 +231,33 @@ async function backfillHistory(deps, teams, sinceMs, runAt) {
       intervals.sort((a, b) => a[0] - b[0]);
       if (intervals.length) { byTeamId[t.id] = intervals; fetched++; }
       else failures.push(`empty:${t.name}`);
+      consecutiveConnFails = 0; // 応答があった=ホストは生きている(連続失敗を数え直す)
     } catch (e) {
       failures.push(`fetch_failed:${t.name}:${String(e.message || e).slice(0, 30)}`);
+      consecutiveConnFails++;
     }
     await sleep(THROTTLE_MS); // 無料APIへの礼儀(集中アクセスしない)
   }
   const payload = { builtAt: new Date(runAt).toISOString(), byTeamId };
+  // v69: 1件も取れずホスト障害で中断した場合は、空の履歴を保存しない
+  //   (空を保存すると「取得済み」と誤判定され、回復後に永久に再試行されない)。
+  if (abortedForHostDown && fetched === 0) {
+    await upstashCmd(["DEL", HIST_LOCK_KEY]).catch(() => {}); // 回復後すぐ試せるようロックも返す
+    return {
+      ran: true, fetched: 0, matchedTeams: 0, abortedForHostDown: true,
+      failures: failures.slice(0, 8), failureCount: failures.length,
+      saved: false,
+      reasonJa: "接続レベルの失敗が3クラブ連続したため、ホスト障害と判断して中断しました(回復した日に自動で再試行します)。",
+    };
+  }
   const savedOk = await upstashSetJSON(HIST_KEY, payload).catch(() => false);
   return {
     ran: true, fetched, matchedTeams: Object.keys(byTeamId).length,
+    abortedForHostDown,
     failures: failures.slice(0, 8), failureCount: failures.length,
     saved: savedOk !== false,
-    reasonJa: savedOk === false ? "履歴の保存に失敗しました(サイズ超過の可能性)。" : null,
+    reasonJa: savedOk === false ? "履歴の保存に失敗しました(サイズ超過の可能性)。"
+      : (abortedForHostDown ? "途中から接続できなくなったため、取得できた分だけ保存して中断しました。" : null),
   };
 }
 
