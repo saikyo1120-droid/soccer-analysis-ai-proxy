@@ -1108,6 +1108,7 @@
     "参考(学習していない大会)": ["reference (unlearned competition)", "参考(未学习的赛事)", "referencia (competición no aprendida)"],
     "大会別の内訳": ["Breakdown by competition", "按赛事细分", "Desglose por competición"],
     "学習した大会(欧州12大会)": ["Learned competitions (12 European)", "已学习的赛事(欧洲12项)", "Competiciones aprendidas (12 europeas)"],
+    "全大会混合(公式戦全体)": ["All competitions mixed (all competitive)", "全部赛事混合(全部正式比赛)", "Todas las competiciones (mezcla, oficiales)"],
     "学習していない大会(参考)": ["Unlearned competitions (reference)", "未学习的赛事(参考)", "Competiciones no aprendidas (referencia)"],
     "AIが過去試合を学習しているのは欧州12大会(9リーグ+CL・EL・ECL)です。それ以外の大会は学習データが無いため、予想は出しますが実力を測る集計とは分けています。": ["The AI has learned from past matches in 12 European competitions (9 leagues + UCL/UEL/UECL). It still makes picks elsewhere, but those are counted separately from the figure that measures its skill.", "AI从欧洲12项赛事(9个联赛+欧冠/欧联/欧协联)的过往比赛中学习。其他赛事仍会给出预测,但与衡量实力的命中率分开统计。", "La IA ha aprendido de partidos de 12 competiciones europeas (9 ligas + UCL/UEL/UECL). Sigue dando pronósticos en otras, pero se contabilizan aparte de la cifra que mide su nivel."],
   });
@@ -1164,6 +1165,7 @@
     ["12大会×5シーズン(欧州カップ戦を含む)の実試合⦿から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。⦿", "Learned by the AI from real matches across 12 competitions × 5 seasons (incl. European cups)$1: each club's attack and defence strength (Dixon-Coles method, time-decayed, updated daily). Power = attack + defence. ↑↓ compares with last week. Not a subjective ranking — a purely mechanical calculation from measured data, with no manual adjustment.$2", "由AI从12项赛事×5个赛季(含欧洲杯赛)的实际比赛$1中学习得出: 各俱乐部的攻击力与防守力(Dixon-Coles法、含时间衰减、每日更新)。实力=攻击+防守。↑↓为与上周对比。这不是主观排名——全部由实测数据机械计算,无人工调整。$2", "Aprendido por la IA de partidos reales de 12 competiciones × 5 temporadas (incl. copas europeas)$1: fuerza ofensiva y defensiva de cada club (método Dixon-Coles, con decaimiento temporal, actualización diaria). Fuerza = ataque + defensa. ↑↓ compara con la semana pasada. No es un ranking subjetivo: cálculo puramente mecánico de datos medidos, sin ajustes manuales.$2"],
     ["(⦿試合)", "($1 matches)", "($1场)", "($1 partidos)"],
     ["(⦿/⦿件)", "($1/$2)", "($1/$2)", "($1/$2)"],
+    ["学習した大会の的中率(勝敗): ⦿%", "Learned-competition accuracy (result): $1%", "已学习赛事命中率(胜负): $1%", "Acierto en competiciones aprendidas (resultado): $1%"],
     ["公式戦の的中率(勝敗): ⦿%", "Competitive-match accuracy (result): $1%", "正式比赛命中率(胜负): $1%", "Acierto en partidos oficiales (resultado): $1%"],
     ["公式戦の的中率: ⦿%", "Competitive-match accuracy: $1%", "正式比赛命中率: $1%", "Acierto en partidos oficiales: $1%"],
     ["スコアまで的中(何対何): ⦿%", "Exact-score hits: $1%", "比分完全命中(几比几): $1%", "Acierto de marcador exacto: $1%"],
@@ -9653,7 +9655,10 @@ async function renderSmarterCard() {
 
   /* ---- 同じ質問への、昨日と今日の答え ---- */
   parts.push(`<h3 class="sim-subhead" style="margin-top:14px;">📋 毎日ぶつけている同じ質問への答え</h3>`);
-  parts.push(`<p class="value-note" style="margin:-4px 0 8px;">毎日まったく同じ8つの質問をAIに投げて、答えられる中身がどう変わったかを記録しています。${
+  // v71④: 質問数は8問→49問へ拡張されたため、決め打ちせずデータから数える
+  //   (古いサーバー応答=8問の日も、新しい49問の日も、実際の数を正直に表示する)。
+  const qCount = Number(diff.questionCount) || (diff.items || []).length || null;
+  parts.push(`<p class="value-note" style="margin:-4px 0 8px;">毎日まったく同じ${qCount ? `${qCount}問の` : ""}質問をAIに投げて、答えられる中身がどう変わったかを記録しています。${
     diff.countingNoteJa ? esc(diff.countingNoteJa) : ""}</p>`);
   const items = diff.items || [];
   if (!items.length) {
@@ -9854,9 +9859,21 @@ async function renderReflectionsCard() {
   // 2026年8月18日: 公式戦の成績を主表示に。親善・2軍は「参考」と明記して分ける
   // (親善試合は主力を休ませるため、プロでも当てられない。混ぜると実力より低く見える)。
   const off = d.officialSummary || null;
+  // ---- v71(2026年8月28日・利用者の承認①): 見出しの主役を「学習済み大会」の数字にする ----
+  //   全大会混合の数字は、AIが学習していない大会(参考予想)が混ざるほど実力とズレる。
+  //   学習済み大会の数字が取れるときはそれを主見出しにし、混合値は下の内訳へ移す
+  //   (隠すのではなく、置き場所を実力の順に並べ替えるだけ)。
+  //   learnedSummaryが無い旧サーバー応答では、従来どおり混合値を見出しに出す(劣化なし)。
+  const lsHead = (d.learnedSummary && d.learnedSummary.learned && Number(d.learnedSummary.learned.n) > 0)
+    ? d.learnedSummary.learned : null;
   if (off && off.n > 0) {
-    parts.push(`<div style="margin-bottom:4px;"><span style="font-size:15px; font-weight:700;">公式戦の的中率(勝敗): ${Number(off.hitRatePct)}%</span> <span class="value-note">(${Number(off.hits)}/${Number(off.n)}件)</span>${
-      off.referenceN ? ` <span class="value-note">・ほかに親善試合など参考扱いが${Number(off.referenceN)}件</span>` : ""}</div>`);
+    if (lsHead) {
+      parts.push(`<div style="margin-bottom:4px;"><span style="font-size:15px; font-weight:700;">学習した大会の的中率(勝敗): ${Number(lsHead.hitRatePct)}%</span> <span class="value-note">(${Number(lsHead.hits)}/${Number(lsHead.n)}件)</span>${
+        off.referenceN ? ` <span class="value-note">・ほかに親善試合など参考扱いが${Number(off.referenceN)}件</span>` : ""}</div>`);
+    } else {
+      parts.push(`<div style="margin-bottom:4px;"><span style="font-size:15px; font-weight:700;">公式戦の的中率(勝敗): ${Number(off.hitRatePct)}%</span> <span class="value-note">(${Number(off.hits)}/${Number(off.n)}件)</span>${
+        off.referenceN ? ` <span class="value-note">・ほかに親善試合など参考扱いが${Number(off.referenceN)}件</span>` : ""}</div>`);
+    }
     // ---- v70(2026年8月28日・利用者のご要望): 勝敗だけでなく「何対何」まで当てた率も並べて出す ----
     //   上の数字は勝敗(ホーム勝ち/引き分け/アウェイ勝ち)だけの的中率。スコア完全一致は
     //   別物なので、混ざらないよう両方を明記する。採点できる記録が無ければ正直にその旨を出す。
@@ -9878,9 +9895,14 @@ async function renderReflectionsCard() {
     const row = (label, b) => (b && b.n > 0)
       ? `<div class="value-note" style="margin-top:2px;"><span>${label}</span>: <strong>${Number(b.hitRatePct)}%</strong>(${Number(b.hits)}/${Number(b.n)})</div>`
       : "";
+    // v71: 見出しを学習済み大会に譲ったときは、従来の混合値をこの内訳に移して出し続ける
+    //   (数字を消さない。実力の数字と参考の数字の置き場所を入れ替えるだけ)。
+    const mixedRow = (lsHead && off && off.n > 0)
+      ? row("全大会混合(公式戦全体)", { n: off.n, hits: off.hits, hitRatePct: off.hitRatePct })
+      : "";
     parts.push(`<div style="margin:6px 0 8px; padding:8px 10px; background:rgba(0,0,0,.03); border-radius:6px;">
       <div style="font-weight:700; font-size:13px;"><span>大会別の内訳</span></div>
-      ${row("学習した大会(欧州12大会)", ls.learned)}${row("学習していない大会(参考)", ls.unlearned)}
+      ${row("学習した大会(欧州12大会)", ls.learned)}${row("学習していない大会(参考)", ls.unlearned)}${mixedRow}
       <div class="value-note" style="margin-top:4px; opacity:.9;">${esc(ls.noteJa || "")}</div>
     </div>`);
   }
