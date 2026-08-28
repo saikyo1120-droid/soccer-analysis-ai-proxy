@@ -38,7 +38,7 @@ const {
 } = require("./predictionModel");
 // v50「チームの地力レーティング」: 過去試合からチーム別の攻撃力・守備力を学習し、
 // 期待得点(λ̂)を特徴量として既存モデルへ渡す(重みは実測で学習・初期0)。
-const { fitTeamRatings, expGoalsFromRatings, RATINGS_KEY } = require("./teamRatings");
+const { fitTeamRatings, expGoalsFromRatings, RATINGS_KEY, XI_DEFAULT } = require("./teamRatings");
 // v59「派生指標」: 同じデータセットからBTTS率・クリーンシート率・荒れやすさを
 // 1回だけ集計して保存する(利用者の質問時は読み出すだけ。方針⑥)。
 const { buildTeamStats, TEAM_STATS_KEY } = require("./teamStats");
@@ -271,6 +271,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   }
   // αの既定は0(=実ゴールのみ)。選択は後段のグリッドで行う(早期returnでも0を開示)
   let xgAlphaChosen = 0, xgAlphaDetail = null;
+  let xiChosen = XI_DEFAULT, xiDetail = null; // v71③: 時間減衰ξ(門番付き探索)
 
   if (!ds.rows.length) {
     return {
@@ -288,6 +289,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
       datasetSize: ds.rows.length,
       clubEloRows: clubEloRowsCount, // v57: Elo付きで学習に使えた試合数(実測)
       xgAlpha: xgAlphaChosen, xgAlphaDetail, xgRows: xgRowsCount, // v57: xGブレンドの実測
+      xi: xiChosen, xiDetail, // v71③: 時間減衰ξの実測
       datasetNoteJa: ds.reasonJa,
     };
   }
@@ -346,7 +348,54 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   } else if (xgRowsCount > 0) {
     xgAlphaDetail = { chosen: 0, xgRows: xgRowsCount, reasonJa: `xG付きの過去試合が${xgRowsCount}件で、α選択に必要な300件に達していません(それまで実ゴールのみで学習)。` };
   }
-  const ratingsTrain = fitTeamRatings(train, { nowMs: nowMsForRatings, xgAlpha: xgAlphaChosen });
+  // ---- v71③(2026年8月28日・利用者の承認): 時間減衰ξのゲート付き探索 ----
+  //   「古い試合をどれだけ割り引くか」(1日あたりの減衰率ξ)はこれまで固定値だった。
+  //   xGブレンド率αと同じ門番方式: 学習用データだけで各候補のレーティングを作り、
+  //   検証用データのLogLossで比較して、勝った値だけを使う。
+  //   ・既定値XI_DEFAULTも必ず候補に入れる(改善しなければ従来と完全同一)
+  //   ・αを選んだ後にξを選ぶ(逐次探索。総当たりにしない理由: 学習時間を
+  //     増やしすぎない。62分事件の教訓で、追加は候補3件ぶんの再学習に抑える)
+  //   ・学習用データが500件未満の日は探索せず既定値(理由を記録)
+  let ratingsTrain = null;
+  if (train.length >= 500) {
+    const xiCandidates = [0.003, XI_DEFAULT, 0.012];
+    const xiScores = [];
+    for (const x of xiCandidates) {
+      const rt = fitTeamRatings(train, { nowMs: nowMsForRatings, xgAlpha: xgAlphaChosen, decayXiPerDay: x });
+      const testCopy = test.map((r) => ({ ...r }));
+      attachRatings(testCopy, rt);
+      const ev = evaluate(testCopy, base);
+      xiScores.push({ xi: x, logLoss: ev.measurable ? ev.logLoss : Infinity, rt });
+    }
+    xiScores.sort((a, b) => a.logLoss - b.logLoss);
+    // 門番の追加ルール: 既定値をノイズで手放さない。
+    //   既定値より 0.0005 以上LogLossが小さいときだけ乗り換える(同点・僅差は既定値)。
+    //   (テスト実測で3候補が小数4桁まで同点になる例があった。意味のない乗り換えは
+    //    「検証で勝った値だけ採用」の精神に反する)
+    const XI_ADOPT_MARGIN = 0.0005;
+    const defaultScore = xiScores.find((sc) => sc.xi === XI_DEFAULT);
+    const best = xiScores[0];
+    if (Number.isFinite(best.logLoss) && defaultScore) {
+      if (best.xi !== XI_DEFAULT && Number.isFinite(defaultScore.logLoss)
+        && best.logLoss <= defaultScore.logLoss - XI_ADOPT_MARGIN) {
+        xiChosen = best.xi;
+        ratingsTrain = best.rt;
+      } else {
+        xiChosen = XI_DEFAULT;
+        ratingsTrain = defaultScore.rt;
+      }
+    }
+    xiDetail = {
+      candidates: xiScores.map((sc) => ({ xi: sc.xi, logLoss: Number.isFinite(sc.logLoss) ? Math.round(sc.logLoss * 10000) / 10000 : null })),
+      chosen: xiChosen, default: XI_DEFAULT,
+      noteJa: xiChosen === XI_DEFAULT
+        ? "検証データで既定値を意味のある差(LogLoss 0.0005以上)で上回る減衰率が無かったため、従来どおりの値を使います(僅差・同点では乗り換えません)。"
+        : `検証データのLogLossが既定値より0.0005以上小さかった減衰率 ${xiChosen}/日 を採用しました(既定値: ${XI_DEFAULT}/日)。`,
+    };
+  } else {
+    xiDetail = { chosen: XI_DEFAULT, default: XI_DEFAULT, reasonJa: `学習用の過去試合が${train.length}件で、減衰率ξの探索に必要な500件に達していません(それまで既定値で学習します)。` };
+  }
+  if (!ratingsTrain) ratingsTrain = fitTeamRatings(train, { nowMs: nowMsForRatings, xgAlpha: xgAlphaChosen, decayXiPerDay: xiChosen });
   const ratingsAttachedTrain = attachRatings(train, ratingsTrain);
   const ratingsAttachedTest = attachRatings(test, ratingsTrain);
 
@@ -415,6 +464,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     datasetSize: ds.rows.length,
       clubEloRows: clubEloRowsCount, // v57: Elo付きで学習に使えた試合数(実測)
       xgAlpha: xgAlphaChosen, xgAlphaDetail, xgRows: xgRowsCount, // v57: xGブレンドの実測
+      xi: xiChosen, xiDetail, // v71③: 時間減衰ξの実測(候補ごとの検証LogLossと選ばれた値)
     trainSize: train.length,
     testSize: test.length,
     combinationsEvaluated: found.evaluated,
@@ -469,7 +519,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   //   保存に失敗したら既存のレーティングが残る(読み出し側は無ければ影響0)。
   let ratingsSaved = false;
   try {
-    const ratingsFull = fitTeamRatings(ds.rows, { nowMs: nowMsForRatings, xgAlpha: xgAlphaChosen });
+    const ratingsFull = fitTeamRatings(ds.rows, { nowMs: nowMsForRatings, xgAlpha: xgAlphaChosen, decayXiPerDay: xiChosen }); // v71③: 本番保存用も選ばれたξで学習
     if (ratingsFull.available && upstashEnabled) {
       ratingsFull.builtAt = runAt.toISOString();
       // v53: 表示用のチーム名(データセットのメタから)。
@@ -552,6 +602,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     teamRatings: record.teamRatings,
     teamStats: record.teamStats, // v59: 派生指標の集計結果(実測)
     modelFormDetail: record.modelFormDetail, // v66: 加法/乗法の比較実測と選ばれた形
+    xi: record.xi, xiDetail: record.xiDetail, // v71③: 時間減衰ξの実測
     consistencyChecked: record.consistencyChecked,
     reasonJa: record.reasonJa,
     datasetSize: ds.rows.length,

@@ -20,7 +20,7 @@
  *
  * ■ 何を確認するか(ご指示の①〜⑨に対応)
  *   ① 学習が14段階すべてを通って完走したか(learn:progress と正解表の突き合わせ)
- *   ② 定点質問8問の答えが、昨日と比べてどう変わったか
+ *   ② 定点質問(v71④で8問→49問、v72で89問)の答えが、昨日と比べてどう変わったか
  *   ③ 予測(的中率・自信度・説明可能性・較正・答え合わせ)が更新されているか
  *   ④ 成長指標(知識・記憶・予測・選手・クラブ)が実際に増えているか
  *   ⑤ 学習ダッシュボードに出す差分(このモジュールの出力がそのまま材料になる)
@@ -35,7 +35,7 @@
  *   qa:answers:<日付> … 定点質問の答え(翌日の比較材料)
  */
 
-/** 定点質問(ご指示で挙げられた8つ)。毎日まったく同じ質問を投げる。 */
+/** 定点質問。毎日まったく同じ質問を投げる(最初の8問はご指示で挙げられたもの。v71④で49問、同日v72で89問へ拡張)。 */
 const FIXED_QUESTIONS = [
   { id: "player_kubo", kind: "player", questionJa: "久保建英はどんな選手ですか？", targetJa: "久保建英", match: ["kubo", "久保"] },
   { id: "club_arsenal", kind: "club", questionJa: "アーセナルの今の状態は？", nameEn: "Arsenal", nameJa: "アーセナル" },
@@ -51,6 +51,102 @@ const FIXED_QUESTIONS = [
   { id: "young_prospects", kind: "young", questionJa: "若手有望株は？", churn: "rank" },
   { id: "injuries", kind: "injuries", questionJa: "怪我情報は？", churn: "window" },
   { id: "transfers", kind: "transfers", questionJa: "移籍情報は？", churn: "window" },
+  // ---- v71④(2026年8月28日・利用者の承認): 定点質問を8問→49問へ大幅拡張(同日v72で89問へ) ----
+  //   設計原則(バグを増やさないため):
+  //   ・新しい種類(kind)はほぼ増やさない。既存のplayer/club/picksの仕組みを再利用する
+  //     (=新しいデータ経路を作らない。picksだけ metric 指定を追加)。
+  //   ・クラブはCLUB_UNIVERSEの先頭40件(怪我・移籍の集計が毎日読むクラブ)から選ぶ。
+  //     同じ実行内のメモ化キャッシュ(getDossierCached)に必ず乗るため、
+  //     質問を増やしてもRedisの読み出し回数はほぼ増えない(62分事件の教訓)。
+  //   ・選手は索引(loadPlayerIndexで一度読む1枚の表)から探すだけ=追加読み出しゼロ。
+  //   ・索引に居ない選手・調査ファイルの無い日は「答えられません」と正直に返り、
+  //     後日答えられるようになったら newlyAnswerable として成長に数えられる。
+  //   ・質問を増やした初日を「賢くなった」に数えない(diffAnswersのcomparable判定)。
+  { id: "player_haaland", kind: "player", questionJa: "ハーランドはどんな選手ですか？", targetJa: "アーリング・ハーランド", match: ["haaland"] },
+  { id: "player_mbappe", kind: "player", questionJa: "エンバペはどんな選手ですか？", targetJa: "キリアン・エンバペ", match: ["mbapp"] },
+  { id: "player_bellingham", kind: "player", questionJa: "ベリンガムはどんな選手ですか？", targetJa: "ジュード・ベリンガム", match: ["bellingham"] },
+  { id: "player_salah", kind: "player", questionJa: "サラーはどんな選手ですか？", targetJa: "モハメド・サラー", match: ["m. salah", "salah"] },
+  { id: "player_yamal", kind: "player", questionJa: "ヤマルはどんな選手ですか？", targetJa: "ラミン・ヤマル", match: ["yamal"] },
+  { id: "player_vinicius", kind: "player", questionJa: "ヴィニシウスはどんな選手ですか？", targetJa: "ヴィニシウス・ジュニオール", match: ["vinicius junior", "vinicius"] },
+  { id: "player_kane", kind: "player", questionJa: "ハリー・ケインはどんな選手ですか？", targetJa: "ハリー・ケイン", match: ["h. kane"] },
+  { id: "player_saka", kind: "player", questionJa: "サカはどんな選手ですか？", targetJa: "ブカヨ・サカ", match: ["b. saka"] },
+  { id: "player_musiala", kind: "player", questionJa: "ムシアラはどんな選手ですか？", targetJa: "ジャマル・ムシアラ", match: ["musiala"] },
+  { id: "player_wirtz", kind: "player", questionJa: "ヴィルツはどんな選手ですか？", targetJa: "フロリアン・ヴィルツ", match: ["f. wirtz", "wirtz"] },
+  { id: "player_pedri", kind: "player", questionJa: "ペドリはどんな選手ですか？", targetJa: "ペドリ", match: ["pedri"] },
+  { id: "player_griezmann", kind: "player", questionJa: "グリーズマンはどんな選手ですか？", targetJa: "アントワーヌ・グリーズマン", match: ["griezmann"] },
+  { id: "player_kvara", kind: "player", questionJa: "クワラツヘリアはどんな選手ですか？", targetJa: "フビチャ・クワラツヘリア", match: ["kvaratskhelia"] },
+  { id: "player_valverde", kind: "player", questionJa: "バルベルデはどんな選手ですか？", targetJa: "フェデリコ・バルベルデ", match: ["f. valverde", "valverde"] },
+  { id: "player_foden", kind: "player", questionJa: "フォーデンはどんな選手ですか？", targetJa: "フィル・フォーデン", match: ["foden"] },
+  { id: "player_odegaard", kind: "player", questionJa: "ウーデゴールはどんな選手ですか？", targetJa: "マルティン・ウーデゴール", match: ["degaard"] },
+  { id: "player_mitoma", kind: "player", questionJa: "三笘薫はどんな選手ですか？", targetJa: "三笘薫", match: ["mitoma", "三笘"] },
+  { id: "player_kamada", kind: "player", questionJa: "鎌田大地はどんな選手ですか？", targetJa: "鎌田大地", match: ["kamada", "鎌田"] },
+  { id: "player_tomiyasu", kind: "player", questionJa: "冨安健洋はどんな選手ですか？", targetJa: "冨安健洋", match: ["tomiyasu", "冨安"] },
+  { id: "player_doan", kind: "player", questionJa: "堂安律はどんな選手ですか？", targetJa: "堂安律", match: ["doan", "堂安"] },
+  { id: "player_minamino", kind: "player", questionJa: "南野拓実はどんな選手ですか？", targetJa: "南野拓実", match: ["minamino", "南野"] },
+  { id: "club_realmadrid", kind: "club", questionJa: "レアル・マドリードの今の状態は？", nameEn: "Real Madrid", nameJa: "レアル・マドリード" },
+  { id: "club_bayern", kind: "club", questionJa: "バイエルンの今の状態は？", nameEn: "Bayern Munich", nameJa: "バイエルン・ミュンヘン" },
+  { id: "club_psg", kind: "club", questionJa: "パリ・サンジェルマンの今の状態は？", nameEn: "Paris Saint Germain", nameJa: "パリ・サンジェルマン" },
+  { id: "club_liverpool", kind: "club", questionJa: "リヴァプールの今の状態は？", nameEn: "Liverpool", nameJa: "リヴァプール" },
+  { id: "club_inter", kind: "club", questionJa: "インテルの今の状態は？", nameEn: "Inter", nameJa: "インテル" },
+  { id: "club_dortmund", kind: "club", questionJa: "ドルトムントの今の状態は？", nameEn: "Borussia Dortmund", nameJa: "ボルシア・ドルトムント" },
+  { id: "club_barcelona", kind: "club", questionJa: "バルセロナの今の状態は？", nameEn: "Barcelona", nameJa: "FCバルセロナ" },
+  { id: "club_leverkusen", kind: "club", questionJa: "レバークーゼンの今の状態は？", nameEn: "Bayer Leverkusen", nameJa: "バイヤー・レバークーゼン" },
+  { id: "club_atletico", kind: "club", questionJa: "アトレティコ・マドリードの今の状態は？", nameEn: "Atletico Madrid", nameJa: "アトレティコ・マドリード" },
+  { id: "club_juventus", kind: "club", questionJa: "ユヴェントスの今の状態は？", nameEn: "Juventus", nameJa: "ユヴェントス" },
+  { id: "club_acmilan", kind: "club", questionJa: "ACミランの今の状態は？", nameEn: "AC Milan", nameJa: "ACミラン" },
+  { id: "club_asroma", kind: "club", questionJa: "ASローマの今の状態は？", nameEn: "AS Roma", nameJa: "ASローマ" },
+  { id: "club_napoli", kind: "club", questionJa: "ナポリの今の状態は？", nameEn: "Napoli", nameJa: "ナポリ" },
+  { id: "club_chelsea", kind: "club", questionJa: "チェルシーの今の状態は？", nameEn: "Chelsea", nameJa: "チェルシー" },
+  { id: "club_manutd", kind: "club", questionJa: "マンチェスター・ユナイテッドの今の状態は？", nameEn: "Manchester United", nameJa: "マンチェスター・ユナイテッド" },
+  { id: "club_tottenham", kind: "club", questionJa: "トッテナムの今の状態は？", nameEn: "Tottenham", nameJa: "トッテナム" },
+  { id: "club_sevilla", kind: "club", questionJa: "セビージャの今の状態は？", nameEn: "Sevilla", nameJa: "セビージャ" },
+  { id: "club_marseille", kind: "club", questionJa: "マルセイユの今の状態は？", nameEn: "Marseille", nameJa: "マルセイユ" },
+  { id: "top_scorers", kind: "picks", metric: "goals", questionJa: "得点ランキングの上位は？", churn: "rank" },
+  { id: "top_assists", kind: "picks", metric: "assists", questionJa: "アシストランキングの上位は？", churn: "rank" },
+  // ---- v72(同日・利用者の追加承認): 49問→89問へさらに拡張 ----
+  //   クラブ+20問: 「毎日読む先頭40クラブ」の残り全部。集計が既に読むデータへの
+  //   相乗りなので、この20問の追加コストはゼロ(Redis読み出し増なし)。
+  //   選手+20問: 索引1枚から探すだけ=追加読み出しゼロ。日本代表4選手を含む。
+  { id: "club_leipzig", kind: "club", questionJa: "RBライプツィヒの今の状態は？", nameEn: "RB Leipzig", nameJa: "RBライプツィヒ" },
+  { id: "club_benfica", kind: "club", questionJa: "ベンフィカの今の状態は？", nameEn: "Benfica", nameJa: "ベンフィカ" },
+  { id: "club_atalanta", kind: "club", questionJa: "アタランタの今の状態は？", nameEn: "Atalanta", nameJa: "アタランタ" },
+  { id: "club_porto", kind: "club", questionJa: "FCポルトの今の状態は？", nameEn: "Porto", nameJa: "FCポルト" },
+  { id: "club_sporting", kind: "club", questionJa: "スポルティングCPの今の状態は？", nameEn: "Sporting CP", nameJa: "スポルティングCP" },
+  { id: "club_psv", kind: "club", questionJa: "PSVアイントホーフェンの今の状態は？", nameEn: "PSV Eindhoven", nameJa: "PSVアイントホーフェン" },
+  { id: "club_ajax", kind: "club", questionJa: "アヤックスの今の状態は？", nameEn: "Ajax", nameJa: "アヤックス" },
+  { id: "club_feyenoord", kind: "club", questionJa: "フェイエノールトの今の状態は？", nameEn: "Feyenoord", nameJa: "フェイエノールト" },
+  { id: "club_brugge", kind: "club", questionJa: "クラブ・ブルッヘの今の状態は？", nameEn: "Club Brugge", nameJa: "クラブ・ブルッヘ" },
+  { id: "club_lazio", kind: "club", questionJa: "ラツィオの今の状態は？", nameEn: "Lazio", nameJa: "ラツィオ" },
+  { id: "club_villarreal", kind: "club", questionJa: "ビジャレアルの今の状態は？", nameEn: "Villarreal", nameJa: "ビジャレアル" },
+  { id: "club_frankfurt", kind: "club", questionJa: "フランクフルトの今の状態は？", nameEn: "Eintracht Frankfurt", nameJa: "アイントラハト・フランクフルト" },
+  { id: "club_shakhtar", kind: "club", questionJa: "シャフタール・ドネツクの今の状態は？", nameEn: "Shakhtar Donetsk", nameJa: "シャフタール・ドネツク" },
+  { id: "club_braga", kind: "club", questionJa: "スポルティング・ブラガの今の状態は？", nameEn: "Sporting Braga", nameJa: "スポルティング・ブラガ" },
+  { id: "club_fiorentina", kind: "club", questionJa: "フィオレンティーナの今の状態は？", nameEn: "Fiorentina", nameJa: "フィオレンティーナ" },
+  { id: "club_rangers", kind: "club", questionJa: "レンジャーズの今の状態は？", nameEn: "Rangers", nameJa: "レンジャーズ" },
+  { id: "club_celtic", kind: "club", questionJa: "セルティックの今の状態は？", nameEn: "Celtic", nameJa: "セルティック" },
+  { id: "club_salzburg", kind: "club", questionJa: "レッドブル・ザルツブルクの今の状態は？", nameEn: "Red Bull Salzburg", nameJa: "レッドブル・ザルツブルク" },
+  { id: "club_olympiakos", kind: "club", questionJa: "オリンピアコスの今の状態は？", nameEn: "Olympiakos Piraeus", nameJa: "オリンピアコス" },
+  { id: "club_lille", kind: "club", questionJa: "リールの今の状態は？", nameEn: "Lille", nameJa: "リール" },
+  { id: "player_lewandowski", kind: "player", questionJa: "レヴァンドフスキはどんな選手ですか？", targetJa: "ロベルト・レヴァンドフスキ", match: ["lewandowski"] },
+  { id: "player_rodrygo", kind: "player", questionJa: "ロドリゴはどんな選手ですか？", targetJa: "ロドリゴ", match: ["rodrygo"] },
+  { id: "player_raphinha", kind: "player", questionJa: "ラフィーニャはどんな選手ですか？", targetJa: "ラフィーニャ", match: ["raphinha"] },
+  { id: "player_olmo", kind: "player", questionJa: "ダニ・オルモはどんな選手ですか？", targetJa: "ダニ・オルモ", match: ["d. olmo"] },
+  { id: "player_gyokeres", kind: "player", questionJa: "ヨケレスはどんな選手ですか？", targetJa: "ヴィクトル・ヨケレス", match: ["gyokeres", "gyökeres"] },
+  { id: "player_isak", kind: "player", questionJa: "イサクはどんな選手ですか？", targetJa: "アレクサンデル・イサク", match: ["a. isak"] },
+  { id: "player_rice", kind: "player", questionJa: "デクラン・ライスはどんな選手ですか？", targetJa: "デクラン・ライス", match: ["d. rice"] },
+  { id: "player_palmer", kind: "player", questionJa: "コール・パーマーはどんな選手ですか？", targetJa: "コール・パーマー", match: ["c. palmer"] },
+  { id: "player_bfernandes", kind: "player", questionJa: "ブルーノ・フェルナンデスはどんな選手ですか？", targetJa: "ブルーノ・フェルナンデス", match: ["b. fernandes"] },
+  { id: "player_odembele", kind: "player", questionJa: "デンベレはどんな選手ですか？", targetJa: "ウスマン・デンベレ", match: ["o. demb"] },
+  { id: "player_hakimi", kind: "player", questionJa: "ハキミはどんな選手ですか？", targetJa: "アシュラフ・ハキミ", match: ["hakimi"] },
+  { id: "player_donnarumma", kind: "player", questionJa: "ドンナルンマはどんな選手ですか？", targetJa: "ジャンルイジ・ドンナルンマ", match: ["donnarumma"] },
+  { id: "player_courtois", kind: "player", questionJa: "クルトワはどんな選手ですか？", targetJa: "ティボ・クルトワ", match: ["courtois"] },
+  { id: "player_alisson", kind: "player", questionJa: "アリソンはどんな選手ですか？", targetJa: "アリソン・ベッカー", match: ["alisson"] },
+  { id: "player_vandijk", kind: "player", questionJa: "ファン・ダイクはどんな選手ですか？", targetJa: "フィルジル・ファン・ダイク", match: ["van dijk"] },
+  { id: "player_modric", kind: "player", questionJa: "モドリッチはどんな選手ですか？", targetJa: "ルカ・モドリッチ", match: ["modric", "modrić"] },
+  { id: "player_endo", kind: "player", questionJa: "遠藤航はどんな選手ですか？", targetJa: "遠藤航", match: ["w. endo", "遠藤"] },
+  { id: "player_jito", kind: "player", questionJa: "伊東純也はどんな選手ですか？", targetJa: "伊東純也", match: ["j. ito", "伊東"] },
+  { id: "player_itakura", kind: "player", questionJa: "板倉滉はどんな選手ですか？", targetJa: "板倉滉", match: ["itakura", "板倉"] },
+  { id: "player_sugawara", kind: "player", questionJa: "菅原由勢はどんな選手ですか？", targetJa: "菅原由勢", match: ["sugawara", "菅原"] },
 ];
 
 const CLUBS_FOR_AGGREGATE = 40; // 怪我・移籍を集計するときに見るクラブ数の上限
@@ -156,7 +252,7 @@ function createAutoQA(deps) {
   }
 
   /* ====================================================================
-   * ② 定点質問8問の答えを作る
+   * ② 定点質問(FIXED_QUESTIONS・v71④で8問→49問、v72で89問)の答えを作る
    *    「答え」= AIがその質問に対して **事実として言えること** の一覧。
    *    LLMの文章ではないので、昨日との差分がそのまま「増えた知識」になる。
    * ==================================================================== */
@@ -311,14 +407,19 @@ function createAutoQA(deps) {
         }
 
         if (q.kind === "picks" || q.kind === "young") {
-          const withRating = rows.filter((r) => num(r[C.rating]) !== null);
+          // v71④: picksは metric 指定で「得点」「アシスト」の上位も出せる。
+          //   metric未指定(従来のpicks・young)は平均評価のままで、動作はビット単位で同一。
+          //   得点・アシストは0の選手を除く(0点の羅列は「上位」の答えにならないため)。
+          const metricCol = q.metric === "goals" ? C.goals : q.metric === "assists" ? C.assists : C.rating;
+          const metricJa = q.metric === "goals" ? "ゴール" : q.metric === "assists" ? "アシスト" : "平均評価";
+          const withRating = rows.filter((r) => num(r[metricCol]) !== null && (q.metric ? num(r[metricCol]) > 0 : true));
           let list;
           if (q.kind === "young") {
             list = withRating.filter((r) => { const a = num(r[C.age]); return a !== null && a <= YOUNG_AGE_MAX; });
           } else {
             list = withRating;
           }
-          list = list.sort((a, b) => num(b[C.rating]) - num(a[C.rating])).slice(0, 8);
+          list = list.sort((a, b) => num(b[metricCol]) - num(a[metricCol])).slice(0, 8);
           // 同姓同名がいると、比較のときに Map で片方が消えてしまう。
           // 所属クラブを付けて必ず一意にする(消えた選手が見えなくなるのを防ぐ)。
           const seenKey = new Map();
@@ -329,14 +430,16 @@ function createAutoQA(deps) {
             const club = r[C.teamJa] || r[C.teamEn] || "所属不明";
             return {
               k: n === 1 ? base : `${base}(${club})`,
-              v: `平均評価 ${r[C.rating]}・${club}${num(r[C.age]) !== null ? `・${r[C.age]}歳` : ""}`,
+              v: `${metricJa} ${r[metricCol]}・${club}${num(r[C.age]) !== null ? `・${r[C.age]}歳` : ""}`,
             };
           });
           push(q, { canAnswer: facts.length > 0, facts, aiWordsJa: null,
             reasonJa: facts.length ? null
               : (q.kind === "young"
                 ? `${YOUNG_AGE_MAX}歳以下で平均評価まで取得できている選手がまだ1人もいません。`
-                : "平均評価まで取得できている選手がまだ1人もいません。") });
+                : q.metric
+                  ? `${metricJa}が1以上の選手がまだ索引にいません(シーズン序盤や索引更新前は0件になりえます)。`
+                  : "平均評価まで取得できている選手がまだ1人もいません。") });
           continue;
         }
 
@@ -383,7 +486,7 @@ function createAutoQA(deps) {
         push(q, { canAnswer: false, facts: [], aiWordsJa: null, reasonJa: `この質問の確認中に問題が起きました。${errJa(e)}` });
       }
     }
-    return { at: new Date(nowMs()).toISOString(), dateKey: dateKeyOf(), answers };
+    return { at: new Date(nowMs()).toISOString(), dateKey: dateKeyOf(), questionCount: answers.length, answers };
   }
 
   /**
@@ -418,7 +521,11 @@ function createAutoQA(deps) {
       for (const [k, v] of yFacts) if (!tFacts.has(k)) lostFacts.push({ k, v });
 
       const newlyAnswerable = !!(t.canAnswer && y && !y.canAnswer);
-      if (countGain) {
+      // v71④: 昨日この質問を聞いていない(質問集の拡張直後など)場合は、
+      //   今日の事実が全部「新しく言えるようになった」ように見えてしまう。
+      //   聞き始めただけで賢くなってはいないので、比較できる質問だけを数える。
+      const comparable = !!y;
+      if (countGain && comparable) {
         if (newlyAnswerable) newlyAnswerableCount++;
         newFactTotal += newFacts.length;
         changedFactTotal += changedFacts.length;
@@ -464,15 +571,16 @@ function createAutoQA(deps) {
       hasYesterday,
       items,
       newFactTotal, changedFactTotal, lostFactTotal, newlyAnswerableCount,
+      questionCount: (todaySet.answers || []).length, // v71④: 定点質問の現在数(8→49→89に拡張)
       grew: hasYesterday ? grew : null,
       countingNoteJa: "「今日の試合」と「注目選手・若手有望株の上位」は、性質上ふつうに入れ替わるため、増えた数にも減った数にも入れていません(何も学んでいない日でも「賢くなった」「後退した」と出てしまうため)。「怪我」「移籍」は新しく入ったぶんだけを数え、期間から外れたぶんは減少に数えていません。",
       verdictJa: !hasYesterday
         ? "昨日の答えが保存されていないため、今日は比較できません(明日から比較できます)。"
         : grew
-          ? `同じ8つの質問に対して、昨日は言えなかったことを ${newFactTotal}件 言えるようになり、${changedFactTotal}件 の数値が新しくなりました`
+          ? `同じ${(todaySet.answers || []).length}問の定点質問に対して、昨日は言えなかったことを ${newFactTotal}件 言えるようになり、${changedFactTotal}件 の数値が新しくなりました`
             + (newlyAnswerableCount ? `。さらに ${newlyAnswerableCount}問 は昨日まったく答えられなかった質問です。` : "。")
             + lostNote
-          : `同じ8つの質問に対して、昨日から言えることが1つも増えていません(データが更新されていない可能性があります)。${lostNote}`,
+          : `同じ${(todaySet.answers || []).length}問の定点質問に対して、昨日から言えることが1つも増えていません(データが更新されていない可能性があります)。${lostNote}`,
     };
   }
 

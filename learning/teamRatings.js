@@ -95,6 +95,11 @@ function extractRatedCore(rows, minMatches) {
  * @param {object} opts - { iterations, learningRate, l2, decayXiPerDay, nowMs }
  * @returns {{ available, byTeam, mu, homeAdv, matchesUsed, teamsRated, reasonJa }}
  */
+// v71③: 時間減衰ξの既定値(1日あたり)。半減期に直すと約107日。
+//   これまで固定だったが、xGブレンド率αと同じ門番方式(検証データで勝った値だけ採用)で
+//   毎日の学習時に候補と比較されるようになった(modelTuning参照)。既定値も必ず候補に入る。
+const XI_DEFAULT = 0.0065;
+
 function fitTeamRatings(rows, opts) {
   const o = opts || {};
   const usable = (rows || []).filter((r) => r
@@ -116,8 +121,8 @@ function fitTeamRatings(rows, opts) {
     return [r.actualHomeGoals, r.actualAwayGoals];
   };
 
-  // 時間減衰の重み(古い試合ほど軽く)
-  const xi = o.decayXiPerDay ?? 0.0065;
+  // 時間減衰の重み(古い試合ほど軽く)。既定値は XI_DEFAULT(v71で門番付き探索の候補になった)
+  const xi = o.decayXiPerDay ?? XI_DEFAULT;
   const nowMs = o.nowMs ?? 0;
   const wOf = (r) => {
     if (!xi || !nowMs) return 1;
@@ -233,5 +238,5 @@ function expGoalsFromRatings(ratings, homeId, awayId) {
 
 module.exports = {
   RATINGS_KEY, MIN_MATCHES_FOR_RATING, CORE_MAX_ITERATIONS, RATING_SUM_CENTER,
-  extractRatedCore, fitTeamRatings, expGoalsFromRatings,
+  extractRatedCore, fitTeamRatings, expGoalsFromRatings, XI_DEFAULT,
 };
