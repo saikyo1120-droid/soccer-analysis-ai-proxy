@@ -7088,6 +7088,26 @@ async function handleHttpRequest(req, res) {
                 hitRatePct: officialRecs.length ? Math.round((officialHits.length / officialRecs.length) * 1000) / 10 : null,
                 referenceN: recs.length - officialRecs.length,
                 noteJa: "公式戦のみの成績です。親善試合・2軍戦は主力を休ませるため予測が難しく、参考扱いとして分けています(予想自体は出し続けています)。",
+                // ---- v70(2026年8月28日・利用者のご要望): 「何対何」まで当てたかを別枠で数える ----
+                //   上のhitRatePctは勝敗(ホーム勝ち/引き分け/アウェイ勝ち)だけの的中率。
+                //   こちらは予想時に保存した「最も可能性の高いスコア」が実スコアと
+                //   完全一致した割合。分母は、勝敗予想と整合するスコア予想と実スコアの
+                //   両方が残っている公式戦だけ(無い記録を外れ扱いにしない)。
+                //   後からスコアを選び直すことはできない(保存済みの予想のみを採点)。
+                scoreline: (() => {
+                  const gradable = officialRecs.filter((r) => r.predictedScoreline
+                    && scorelineOutcome(r.predictedScoreline) === r.predictedWinner
+                    && r.actualScore && Number.isFinite(Number(r.actualScore.home)) && Number.isFinite(Number(r.actualScore.away)));
+                  const slHits = gradable.filter((r) => r.predictedScoreline === `${r.actualScore.home}-${r.actualScore.away}`);
+                  return {
+                    n: gradable.length,
+                    hits: slHits.length,
+                    hitRatePct: gradable.length ? Math.round((slHits.length / gradable.length) * 1000) / 10 : null,
+                    noteJa: gradable.length
+                      ? "予想時に保存した「最も可能性の高いスコア」が実スコアと完全一致した割合です。勝敗より桁違いに難しく、世界の強い予測モデルでも10%前後が普通です。"
+                      : "スコアまで採点できる記録がまだありません(スコア予想と実スコアの両方が保存された試合から自動で数え始めます)。",
+                  };
+                })(),
               },
               // ---- v62: 学習した大会 / 学習していない大会 を分けて数える ----
               //   学習データは欧州12大会のみ。ハンガリーNB I・MLS等の予想も出し続けるが、

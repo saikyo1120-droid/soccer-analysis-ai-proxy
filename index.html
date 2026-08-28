@@ -1018,6 +1018,7 @@
     "まだ結果が確定した予測はありません。": ["No predictions have been settled yet.", "还没有已出结果的预测。", "Aún no hay predicciones con resultado confirmado."],
     "AI予測の正答率:": ["AI accuracy:", "AI预测正确率:", "Precisión de la IA:"],
     "公式戦の的中率:": ["Competitive-match accuracy:", "正式比赛命中率:", "Acierto en partidos oficiales:"],
+    "スコアまで的中(何対何): まだ採点できる記録がありません。": ["Exact-score hits: no gradable records yet.", "比分完全命中(几比几): 暂无可评分的记录。", "Acierto de marcador exacto: aún no hay registros evaluables."],
     "直近の記録に、外した試合がありません(外れが出たら、隠さずここに並びます)。": ["No misses in the recent record (when they happen, they'll be listed here, never hidden).", "近期记录中没有失误(一旦出现,会毫不隐瞒地列在这里)。", "Sin fallos en el registro reciente (cuando ocurran, se listarán aquí, sin ocultarlos)."],
     "参考(親善など)": ["Reference (friendlies etc.)", "参考(友谊赛等)", "Referencia (amistosos, etc.)"],
     "外した理由(実測データからの機械的な分類):": ["Why it missed (mechanically classified from real data):", "失误原因(由实测数据机械分类):", "Por qué falló (clasificado mecánicamente con datos reales):"],
@@ -1163,7 +1164,9 @@
     ["12大会×5シーズン(欧州カップ戦を含む)の実試合⦿から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。⦿", "Learned by the AI from real matches across 12 competitions × 5 seasons (incl. European cups)$1: each club's attack and defence strength (Dixon-Coles method, time-decayed, updated daily). Power = attack + defence. ↑↓ compares with last week. Not a subjective ranking — a purely mechanical calculation from measured data, with no manual adjustment.$2", "由AI从12项赛事×5个赛季(含欧洲杯赛)的实际比赛$1中学习得出: 各俱乐部的攻击力与防守力(Dixon-Coles法、含时间衰减、每日更新)。实力=攻击+防守。↑↓为与上周对比。这不是主观排名——全部由实测数据机械计算,无人工调整。$2", "Aprendido por la IA de partidos reales de 12 competiciones × 5 temporadas (incl. copas europeas)$1: fuerza ofensiva y defensiva de cada club (método Dixon-Coles, con decaimiento temporal, actualización diaria). Fuerza = ataque + defensa. ↑↓ compara con la semana pasada. No es un ranking subjetivo: cálculo puramente mecánico de datos medidos, sin ajustes manuales.$2"],
     ["(⦿試合)", "($1 matches)", "($1场)", "($1 partidos)"],
     ["(⦿/⦿件)", "($1/$2)", "($1/$2)", "($1/$2)"],
+    ["公式戦の的中率(勝敗): ⦿%", "Competitive-match accuracy (result): $1%", "正式比赛命中率(胜负): $1%", "Acierto en partidos oficiales (resultado): $1%"],
     ["公式戦の的中率: ⦿%", "Competitive-match accuracy: $1%", "正式比赛命中率: $1%", "Acierto en partidos oficiales: $1%"],
+    ["スコアまで的中(何対何): ⦿%", "Exact-score hits: $1%", "比分完全命中(几比几): $1%", "Acierto de marcador exacto: $1%"],
     ["根拠(最重要要素): ⦿ ・ 学習v⦿の重みで予測", "Basis (top factor): $1 ・ predicted with learning-v$2 weights", "依据(最重要因素): $1 ・ 使用学习v$2的权重预测", "Base (factor principal): $1 ・ predicho con pesos del aprendizaje v$2"],
     ["根拠(最重要要素): ⦿ ・", "Basis (top factor): $1 ・", "依据(最重要因素): $1 ・", "Base (factor principal): $1 ・"],
     ["根拠(最重要要素): ⦿", "Basis (top factor): $1", "依据(最重要因素): $1", "Base (factor principal): $1"],
@@ -9178,18 +9181,32 @@ async function renderDailyReportWidget() {
   const trendLine = (acc7 && acc7.measurable) || (acc30 && acc30.measurable)
     ? `<div class="value-note">推移: ${acc7 && acc7.measurable ? `直近7日 的中率${acc7.hitRatePct}%(${acc7.n}件)` : "直近7日 測定なし"} ・ ${acc30 && acc30.measurable ? `直近30日 ${acc30.hitRatePct}%(${acc30.n}件)` : "直近30日 測定なし"}</div>`
     : "";
+  // ---- v70(2026年8月28日・利用者のご要望): 勝敗と別に「何対何」まで一致した率も出す ----
+  //   データは同じ /api/learning/metrics のaccuracy(採点済みの保存値)にある
+  //   scoreline(スコア完全一致)を読むだけ。無い期間は行ごと出さない(推測で埋めない)。
+  const slToday = acc.today && acc.today.scoreline;
+  const sl7 = acc.last7Days && acc.last7Days.scoreline;
+  const sl30 = acc.last30Days && acc.last30Days.scoreline;
+  const slTrendLine = ((sl7 && sl7.n > 0) || (sl30 && sl30.n > 0))
+    ? `<div class="value-note">スコア一致の推移: ${sl7 && sl7.n > 0 ? `直近7日 ${sl7.hitRatePct}%(${sl7.n}件)` : "直近7日 測定なし"} ・ ${sl30 && sl30.n > 0 ? `直近30日 ${sl30.hitRatePct}%(${sl30.n}件)` : "直近30日 測定なし"}</div>`
+    : "";
   if (accToday && accToday.measurable) {
     const dRow = Number.isFinite(vsY.hitRateDeltaPct)
       ? `<div class="value-note">前日比: 的中率${sign(vsY.hitRateDeltaPct)}pt ・ Brier ${sign(vsY.brierDelta)} ・ LogLoss ${sign(vsY.logLossDelta)}(Brier/LogLossは減少=改善)</div>`
       : `<div class="value-note" style="opacity:.85;">${escapeHtml(vsY.noteJa || "")}</div>`;
+    const slRow = (slToday && slToday.n > 0)
+      ? `<div class="value-note">スコアまで一致(何対何): ${slToday.hitRatePct}%(${slToday.n}件)</div>`
+      : "";
     accuracyHtml = `
       <div style="margin-top:6px;"><strong>🎯 本日の予測精度(答え合わせ${accToday.n}件)</strong>
         <div class="value-note">勝敗: 的中率${accToday.hitRatePct}% ・ Brier ${accToday.avgBrier} ・ LogLoss ${accToday.avgLogLoss}</div>
+        ${slRow}
         ${dRow}
         ${trendLine}
+        ${slTrendLine}
       </div>`;
   } else {
-    accuracyHtml = `<div class="value-note" style="margin-top:6px;">🎯 本日の予測精度: ${escapeHtml((acc.today && acc.today.reasonJa) || "本日答え合わせできた予測がまだありません(試合が終わり次第、自動で測定されます)。")}${trendLine}</div>`;
+    accuracyHtml = `<div class="value-note" style="margin-top:6px;">🎯 本日の予測精度: ${escapeHtml((acc.today && acc.today.reasonJa) || "本日答え合わせできた予測がまだありません(試合が終わり次第、自動で測定されます)。")}${trendLine}${slTrendLine}</div>`;
   }
 
   // ---- 学習で予測がどう変わったか(①) ----
@@ -9838,8 +9855,18 @@ async function renderReflectionsCard() {
   // (親善試合は主力を休ませるため、プロでも当てられない。混ぜると実力より低く見える)。
   const off = d.officialSummary || null;
   if (off && off.n > 0) {
-    parts.push(`<div style="margin-bottom:4px;"><span style="font-size:15px; font-weight:700;">公式戦の的中率: ${Number(off.hitRatePct)}%</span> <span class="value-note">(${Number(off.hits)}/${Number(off.n)}件)</span>${
+    parts.push(`<div style="margin-bottom:4px;"><span style="font-size:15px; font-weight:700;">公式戦の的中率(勝敗): ${Number(off.hitRatePct)}%</span> <span class="value-note">(${Number(off.hits)}/${Number(off.n)}件)</span>${
       off.referenceN ? ` <span class="value-note">・ほかに親善試合など参考扱いが${Number(off.referenceN)}件</span>` : ""}</div>`);
+    // ---- v70(2026年8月28日・利用者のご要望): 勝敗だけでなく「何対何」まで当てた率も並べて出す ----
+    //   上の数字は勝敗(ホーム勝ち/引き分け/アウェイ勝ち)だけの的中率。スコア完全一致は
+    //   別物なので、混ざらないよう両方を明記する。採点できる記録が無ければ正直にその旨を出す。
+    const offSl = off.scoreline || null;
+    if (offSl && Number(offSl.n) > 0 && offSl.hitRatePct !== null && offSl.hitRatePct !== undefined) {
+      parts.push(`<div style="margin-bottom:4px;"><span style="font-weight:700;">スコアまで的中(何対何): ${Number(offSl.hitRatePct)}%</span> <span class="value-note">(${Number(offSl.hits)}/${Number(offSl.n)}件)</span></div>`);
+      parts.push(`<div class="value-note" style="margin-bottom:6px;">${esc(offSl.noteJa || "")}</div>`);
+    } else if (offSl) {
+      parts.push(`<div class="value-note" style="margin-bottom:6px;">スコアまで的中(何対何): まだ採点できる記録がありません。</div>`);
+    }
     parts.push(`<div class="value-note" style="margin-bottom:8px;">${esc(off.noteJa || "")}</div>`);
   }
   // ---- v62: 学習した大会と、していない大会を分けて出す ----
