@@ -53,7 +53,10 @@ const { createRelationshipIndex } = require("./knowledge/relationshipIndex");
 const { createMemoryStore } = require("./memory/memoryStore");
 const { createAutoQA } = require("./learning/autoQA");
 const { createClubProfileEngine } = require("./knowledge/clubProfileEngine");
-const { buildEvidencePool } = require("./reasoning/evidencePool");
+const { buildEvidencePool, buildPlayerEvidencePool } = require("./reasoning/evidencePool");
+// v78(案2): 選手の質問にも6段階の熟考を拡張(選手用の観点・データ種別)
+const { PLAYER_HYPOTHESIS_FACTORS } = require("./reasoning/hypothesisGenerator");
+const { PLAYER_DATA_SPECS } = require("./reasoning/deliberation");
 const { assembleReasoning, formatReasoningForPrompt } = require("./reasoning/reasoningEngine");
 // 2026年8月・優先順位④: 6段階の熟考(必要データ取得→仮説生成→仮説比較→反対意見→根拠評価→最終結論)。
 const { deliberate } = require("./reasoning/deliberation");
@@ -2334,6 +2337,11 @@ function buildTodayPredictionEntry(fixture, record, calibrationMap) {
       marketPct: record.blendUsed.marketPct, aiPct: record.blendUsed.aiPct,
       noteJa: record.blendUsed.noteJa || null,
     } : null,
+    // v79(案6): 「2つ目の意見」(API-Football予想)を混合した予想は、その旨を必ず開示する
+    apifbBlend: record.apifbBlendUsed ? {
+      pct: record.apifbBlendUsed.pct ?? null,
+      noteJa: record.apifbBlendUsed.noteJa || null,
+    } : null,
     // v57: 市場確率の出典(コンセンサス=複数社平均かどうか)を開示する
     oddsSource: record.oddsSource || null,
     // v62: この大会をAIが学習しているか。していない大会は画面で1行だけ正直に断る。
@@ -3893,6 +3901,8 @@ const clubDossier = createClubDossier({
 // 以後はメモリ上で検索する。最終方針⑥「利用者が質問した瞬間に重い処理を
 // 行う設計は禁止」に従い、検索1回あたりの Redis / API アクセスは 0 回。
 const playerSearch = require("./knowledge/playerSearch");
+// v77(2026年9月1日・集客①): 試合個別ページ+サイトマップ(保存済みレコードの読み出しのみ)
+const seoPages = require("./knowledge/seoPages");
 const { CLUB_UNIVERSE } = require("./learning/clubUniverse");
 const { collectClubPlayersBatch } = require("./learning/universeCollector");
 const playerSearchDeps = {
@@ -5770,6 +5780,21 @@ function parseDiscussLlmOutput(rawText) {
   return { generalView, aiOpinion, counterArgument, finalConclusion, futureOutlook, mostImportantOpinion, followUpQuestions, parsedOk: true };
 }
 
+// ---- v79(2026年9月1日・利用者の承認 案5): 会話の文脈記憶 ----
+//   画面側が送ってくる「直近の会話」(最大3往復)を検証・切り詰めする。
+//   利用者入力なので上限を厳格に(1往復あたり質問500字・回答要旨800字)。
+//   形式が不正な要素は黙って捨てる(エラーにしない=従来の1問完結の動作に戻るだけ)。
+function sanitizeDiscussHistory(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.slice(-3).map((t) => {
+    if (!t || typeof t !== "object") return null;
+    const q = String(t.q || "").trim().slice(0, 500);
+    const a = String(t.a || "").trim().slice(0, 800);
+    if (!q || !a) return null;
+    return { q, a };
+  }).filter(Boolean);
+}
+
 async function handleDiscuss(body, clientIp) {
   if (!body || typeof body !== "object") return { status: 400, body: { ok: false, error: "invalid JSON body" } };
   const question = String(body.question || "").trim();
@@ -6127,6 +6152,10 @@ async function handleDiscuss(body, clientIp) {
     const { body: statsBody } = await handlePlayerSeasonStats(q);
     if (statsBody.found) {
       playerStatsFoundForTier = true;
+      // v78(案2): 選手用の根拠プール組み立てのため、この分岐内で実際に取得できた
+      // ものだけを控えておく(取得できなかった項目は控えない=でっち上げ防止)
+      let playerReasonProfileStatement = null;
+      const playerReasonClubItems = [];
       const s = statsBody.stats || {};
       const playerName = (statsBody.player && statsBody.player.name) || hint.name || "対象選手";
       facts.push(`${playerName}の${statsBody.season}シーズン実成績: 出場${s.appearances ?? "不明"}試合・${s.goals ?? "不明"}得点・${s.assists ?? "不明"}アシスト・平均レーティング${s.avgRating ?? "不明"}`);
@@ -6155,6 +6184,7 @@ async function handleDiscuss(body, clientIp) {
           );
           if (playerProfileResult && playerProfileResult.profile && playerProfileResult.profile.statement) {
             facts.push(playerProfileResult.profile.statement);
+            playerReasonProfileStatement = playerProfileResult.profile.statement; // v78(案2)
           }
         } catch (e) { /* ベストエフォート: プロフィール生成に失敗しても選手の実成績自体は回答に使う */ }
 
@@ -6179,9 +6209,87 @@ async function handleDiscuss(body, clientIp) {
           const clubK = await knowledgeStore.getActiveKnowledge(hint.teamEn);
           const clubItems = clubK ? [].concat(clubK.facts || [], clubK.analyses || []) : [];
           clubItems.slice(0, 2).forEach((k) => {
-            if (k && k.statement) facts.push(`[所属クラブの状況] ${k.statement}`);
+            if (k && k.statement) {
+              facts.push(`[所属クラブの状況] ${k.statement}`);
+              playerReasonClubItems.push(k.statement); // v78(案2): 根拠プールにも同じ実データを使う
+            }
           });
         } catch (e) { /* 無ければ無いで続行 */ }
+      }
+
+      // ---- v78(2026年9月1日・利用者の承認 案2): 選手にも6段階の熟考を拡張 ----
+      //   これまで仮説生成→根拠ランキング→反論検討→結論(Stage E)と6段階の
+      //   熟考はクラブの質問だけに配線されていた(READMEに正直に開示済みの制限)。
+      //   選手でも、この分岐で実際に取得できた実データだけから根拠プールを組み、
+      //   選手用の観点(PLAYER_HYPOTHESIS_FACTORS)・選手用のデータ種別
+      //   (PLAYER_DATA_SPECS)で同じ工程を回す。新しい外部API呼び出しは無し
+      //   (追加はKnowledge Engineの読み出し1回だけ)。失敗しても回答は返す。
+      if (statsBody.player && statsBody.player.id) {
+        try {
+          const pKey = `player:${statsBody.player.id}`;
+          const pName = (statsBody.player && statsBody.player.name) || hint.name || "対象選手";
+          let playerStoredKnowledge = null;
+          try { playerStoredKnowledge = await knowledgeStore.getActiveKnowledge(pKey); } catch (e) { /* 蓄積が無くても続行 */ }
+          const playerPool = buildPlayerEvidencePool({
+            playerKey: pKey, season: statsBody.season || null,
+            stats: statsBody.stats || {},
+            clubItems: playerReasonClubItems,
+            profileStatement: playerReasonProfileStatement,
+            playerKnowledge: playerStoredKnowledge,
+          });
+          reasoningBundle = assembleReasoning(playerPool, { teamJa: pName, teamEn: pKey }, { factors: PLAYER_HYPOTHESIS_FACTORS });
+          knowledgeMeta.reasoning = {
+            hypothesesConsidered: reasoningBundle.hypotheses.map((h) => ({ label: h.label, score: h.score, evidenceCount: h.evidence.length })),
+            selectedLabel: reasoningBundle.selected ? reasoningBundle.selected.label : null,
+            selfCheck: reasoningBundle.selfCheck,
+            evidencePoolSize: reasoningBundle.evidencePoolSize,
+            orphanCategories: reasoningBundle.orphanCategories || [],
+          };
+          memorySubjectKey = `${pKey}:leadingFactor`;
+          try {
+            previousConclusion = await memoryStore.getLastConclusion(memorySubjectKey);
+          } catch (e) { /* Memory Engine未設定・エラー時は「前回の結論なし」 */ }
+          if (previousConclusion) knowledgeMeta.reasoning.previousConclusion = previousConclusion.statement;
+          const ps = statsBody.stats || {};
+          const hasV = (v) => v !== null && v !== undefined;
+          deliberationResult = deliberate({
+            ranked: reasoningBundle.hypotheses,
+            dataAvailability: {
+              playerScoring: hasV(ps.goals) || hasV(ps.assists),
+              playerOpportunity: hasV(ps.appearances),
+              playerRating: hasV(ps.avgRating),
+              playerCreation: hasV(ps.keyPasses) || hasV(ps.passAccuracyPct) || hasV(ps.dribbleSuccessRatePct),
+              playerDefense: hasV(ps.defensiveActions) || hasV(ps.duelWinRatePct),
+              playerClubContext: playerReasonClubItems.length > 0,
+            },
+            // 選手の質問で本当に必要なのはこの4種類。創造性・守備指標はポジションに
+            // よって提供元にデータが無いことがあるため、必須には数えない(正直な減点を
+            // 「仕様上取れない項目」にまで広げない)。
+            requiredKeys: ["playerScoring", "playerOpportunity", "playerRating", "playerClubContext"],
+            dataSpecs: PLAYER_DATA_SPECS,
+            previousConclusion,
+          });
+          knowledgeMeta.deliberation = {
+            stages: deliberationResult.stages,
+            finalConclusionJa: deliberationResult.finalConclusionJa,
+            counterArgumentJa: deliberationResult.counterArgumentJa,
+            confidence: deliberationResult.confidence,
+            factorBreakdown: deliberationResult.factorBreakdown,
+            changedFromPrevious: deliberationResult.changedFromPrevious,
+          };
+          // クラブと同じ方針: 星は厳しい方(小さい方)を採り、理由は両方を残す
+          if (deliberationResult && deliberationResult.confidence
+              && Number.isFinite(deliberationResult.confidence.stars)
+              && confidence && Number.isFinite(confidence.stars)) {
+            confidence = {
+              stars: Math.min(deliberationResult.confidence.stars, confidence.stars),
+              reasonJa: [deliberationResult.confidence.reasonJa || "", confidence.reasonJa].filter(Boolean).join(" "),
+            };
+          }
+        } catch (e) {
+          // 熟考の組み立てに失敗しても、従来どおりの選手回答(実成績ベース)は返す
+          knowledgeMeta.playerReasoningErrorJa = `選手の熟考工程でエラーが発生したため、従来形式で回答しました(${e.message})`;
+        }
       }
     } else {
       facts.push(`${hint.name || "対象選手"}の実成績データは見つかりませんでした(${statsBody.reason || "不明"})。`);
@@ -6262,7 +6370,18 @@ async function handleDiscuss(body, clientIp) {
       (appLang !== "ja" ? "(この趣旨を、利用者が選択した回答言語で自然に述べてください)" : "") +
       `根拠が不足している場合は、無理に断定せず不足していることを正直に述べてください。`;
   }
+  // ---- v79(案5): 直前の会話を文脈としてLLMへ渡す ----
+  //   これまでAI会話は1問ごとに記憶を失っていた(「じゃあ彼の弱点は?」の
+  //   「彼」が誰か分からなかった)。画面が送る直近の往復(最大3)を参考情報
+  //   として添える。LLM呼び出し回数は従来どおり1回のまま。
+  const discussHistory = sanitizeDiscussHistory(body.history);
+  knowledgeMeta.historyTurns = discussHistory.length;
   const userPrompt = [
+    ...(discussHistory.length ? [
+      "直前の会話(参考情報。「彼」「その選手」などの指す相手はこの文脈で解釈してください。ただし事実の根拠としては、この下の「取得できた事実」を優先すること):",
+      ...discussHistory.map((t, i) => `- 質問${i + 1}: ${t.q}\n  回答${i + 1}(要旨): ${t.a}`),
+      "",
+    ] : []),
     `利用者の質問: 「${question}」`,
     "",
     // 第7次監査で発見した誤りの修正:
@@ -6331,6 +6450,20 @@ async function handleDiscuss(body, clientIp) {
     try {
       const nowIso = new Date().toISOString();
       const selected = reasoningBundle.selected;
+      // ---- v78(案2): このStage Eはクラブ専用だったため、主体キーがクラブ名
+      // (subject.labelEn)に直書きされていた。選手にも熟考を拡張したので、
+      // 記録先の主体を memorySubjectKey から機械的に導く(クラブは従来と
+      // 1文字も変わらないキー・保存先になることをテストで固定)。
+      const stageEIsPlayer = memorySubjectKey.startsWith("player:");
+      const stageEEntityEn = stageEIsPlayer
+        ? memorySubjectKey.replace(/:leadingFactor$/, "")
+        : subject.labelEn;
+      const stageEEntityJa = stageEIsPlayer
+        ? ((body.playerHint && body.playerHint.name) || stageEEntityEn)
+        : (subject.labelJa || subject.labelEn);
+      const stageETimelineKey = stageEIsPlayer
+        ? `${stageEEntityEn}:beliefs`
+        : `team:${subject.labelEn}:beliefs`;
       const changeReason = selected.evidence.length
         ? `新しい根拠(${selected.evidence.slice(0, 3).map((e) => e.statement).join(" / ")})に基づき判断が更新されました。`
         : "根拠が変化したため判断が更新されました。";
@@ -6363,13 +6496,13 @@ async function handleDiscuss(body, clientIp) {
           .filter((e) => e && (e.type === "fact" || e.type === "analysis") && !e.isAiGenerated)
           .map((e) => e.statement).slice(0, 3);
         if (factualEvidence.length) {
-          await thoughtTimeline.append(`team:${subject.labelEn}:beliefs`, {
+          await thoughtTimeline.append(stageETimelineKey, {
             kind: "trigger",
-            statementJa: `${subject.labelJa || subject.labelEn}について新しい実データが入りました`,
+            statementJa: `${stageEEntityJa}について新しい実データが入りました`,
             evidence: factualEvidence, at: nowIso,
           }).catch(() => {});
         }
-        await thoughtTimeline.append(`team:${subject.labelEn}:beliefs`, {
+        await thoughtTimeline.append(stageETimelineKey, {
           kind: "belief", statementJa: selected.statement,
           causeJa: factualEvidence.length ? null : "変化のきっかけとなる実データは特定できていません。",
           evidence: factualEvidence, at: nowIso,
@@ -6378,7 +6511,7 @@ async function handleDiscuss(body, clientIp) {
 
       if (selected.score > 0) {
         await knowledgeStore.saveKnowledgeItem({
-          teamEn: subject.labelEn, category: "aiLeadingFactor", type: "analysis",
+          teamEn: stageEEntityEn, category: "aiLeadingFactor", type: "analysis",
           statement: `【AIの結論】${selected.statement}`,
           isAiGenerated: true,
           computedAt: nowIso,
@@ -6421,7 +6554,9 @@ async function handleDiscuss(body, clientIp) {
       // Memory Engineが結線されているのはクラブの質問だけ(上のStage E参照)。
       // 「対象外の質問でメモリが使われなかった」ことを利用率の低下に数えないよう、
       // 対象の質問かどうかを分けて記録する。
-      memoryEligible: subject.type === "club" && !!subject.labelEn,
+      // v78(案2): 選手にもMemory Engineを結線したため、選手の質問(実成績あり)も
+      // 「メモリ対象」に数える(利用率の分母の定義変更。計測の正直さを保つため注記)
+      memoryEligible: (subject.type === "club" && !!subject.labelEn) || (subject.type === "player" && !!memorySubjectKey),
       memoryAttached: !!previousConclusion,
       stars: confidence && Number.isFinite(confidence.stars) ? confidence.stars : null,
     });
@@ -6480,6 +6615,8 @@ const MIME = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".svg": "image/svg+xml",
+  // v77(集客④・PWA): マニフェストの正しいMIME(拡張子自体は以前から公開許可済み)
+  ".webmanifest": "application/manifest+json; charset=utf-8",
 };
 // ---- 2026年8月・全機能監査で実際に再現したソース流出の修正 ----
 //   従来のガードは `filePath.startsWith(STATIC_ROOT)` だけだった。ところが
@@ -8477,6 +8614,72 @@ async function handleHttpRequest(req, res) {
     return;
   }
 
+  // ---- v77(2026年9月1日・集客①④): 検索エンジンとPWAの受け皿ルート ----
+  //   ・/match/<試合ID> … 保存済み予想レコードを軽量HTMLにして返す(方針⑥:
+  //     新しい計算・外部API・LLMは一切なし。10分キャッシュでUpstash読み出しも最小)
+  //   ・/sitemap.xml, /robots.txt … 検索エンジン向け(60分キャッシュ)
+  //   ・/sw.js … PWA用サービスワーカー。静的配信は安全のため .js を公開しない
+  //     方針(ソース流出対策)を維持したまま、この1ファイルだけ明示的に許可する。
+  //     更新が確実に行き渡るよう no-cache で返す(ブラウザは毎回鮮度確認する)。
+  if (req.method === "GET" && (seoPages.MATCH_PATH_RE.test(pathname)
+    || pathname === "/sitemap.xml" || pathname === "/robots.txt" || pathname === "/sw.js")) {
+    // /api/ と同じ1分あたりのレート制限を共有する(IDを走査してUpstash読み出しを
+    // 浪費させる攻撃をキャッシュ+制限の二段で抑える)
+    const seoIp = clientKeyFromRequest(req);
+    if (rateLimited(seoIp)) {
+      res.writeHead(429, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Too many requests");
+      return;
+    }
+    const fwdProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+    const seoOrigin = `${fwdProto || "http"}://${req.headers.host || "localhost"}`;
+    try {
+      if (pathname === "/sw.js") {
+        const swPath = path.join(STATIC_ROOT, "sw.js");
+        if (!fs.existsSync(swPath)) { res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" }); res.end("Not found"); return; }
+        res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-cache" });
+        res.end(fs.readFileSync(swPath, "utf8"));
+        return;
+      }
+      if (pathname === "/robots.txt") {
+        res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=3600" });
+        res.end(seoPages.robotsTxt(seoOrigin));
+        return;
+      }
+      if (pathname === "/sitemap.xml") {
+        const smKey = cacheKeyOf("seo-sitemap", [seoOrigin]);
+        let xml = cacheGet(smKey);
+        if (xml === undefined) {
+          xml = UPSTASH_ENABLED ? await seoPages.buildSitemapXml({ upstashCmd }, seoOrigin)
+            : await seoPages.buildSitemapXml({ upstashCmd: async () => [] }, seoOrigin);
+          cacheSet(smKey, xml, 60 * 60 * 1000);
+        }
+        res.writeHead(200, { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "public, max-age=3600" });
+        res.end(xml);
+        return;
+      }
+      const seoMatch = seoPages.MATCH_PATH_RE.exec(pathname);
+      const fixtureIdStr = seoMatch[1];
+      // originもキーに含める(将来の独自ドメイン併用時に、別ホストのcanonicalを混ぜない)
+      const pageKey = cacheKeyOf("seo-page", [fixtureIdStr, seoOrigin]);
+      let page = cacheGet(pageKey);
+      if (page === undefined) {
+        page = UPSTASH_ENABLED
+          ? await seoPages.renderMatchPage({ upstashGetJSON }, fixtureIdStr, seoOrigin)
+          : { status: 404, html: seoPages.renderNotFoundHtml(fixtureIdStr, seoOrigin) };
+        cacheSet(pageKey, page, 10 * 60 * 1000);
+      }
+      res.writeHead(page.status, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=600" });
+      res.end(page.html);
+      return;
+    } catch (e) {
+      // ページ生成の失敗でサーバー全体を巻き込まない(正直に503で返す)
+      res.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("temporarily unavailable");
+      return;
+    }
+  }
+
   serveStatic(req, res, pathname);
 }
 
@@ -8537,6 +8740,7 @@ module.exports = {
   handlePredictMatch,
   perfSnapshot, // 最終方針: 性能の常時計測(テスト・負荷試験から参照)
   handleDiscuss,
+  sanitizeDiscussHistory, // v79(案5): 会話の文脈記憶の検証関数(テスト対象)
   maybeWatchLineups, // v57: スタメン確定ウォッチ(テストから直接駆動する)
   handleMatchup, buildScenarioFields, // v59: 任意対戦の分析・スコアシナリオ(テスト対象)
   getOrLogPrediction,

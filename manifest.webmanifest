@@ -1,0 +1,15 @@
+{
+  "name": "サッカー分析AI",
+  "short_name": "サッカーAI",
+  "description": "AIが毎日の試合を予想し、外れも隠さず答え合わせするサッカー分析アプリ",
+  "lang": "ja",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f9f9f7",
+  "theme_color": "#2a78d6",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

@@ -11,6 +11,11 @@
 <meta property="og:description" content="AIが毎朝、今日の試合の勝敗と勝率を予想。試合後に必ず答え合わせをして、的中率・学習の成長を毎日公開しています。">
 <meta property="og:site_name" content="サッカー分析AI">
 <meta name="twitter:card" content="summary">
+<!-- v77(2026年9月1日・集客④): PWA対応。スマホの「ホーム画面に追加」でアプリとして開ける -->
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#2a78d6">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
 <style>
   :root {
     color-scheme: light;
@@ -1018,6 +1023,12 @@
     "まだ結果が確定した予測はありません。": ["No predictions have been settled yet.", "还没有已出结果的预测。", "Aún no hay predicciones con resultado confirmado."],
     "AI予測の正答率:": ["AI accuracy:", "AI预测正确率:", "Precisión de la IA:"],
     "公式戦の的中率:": ["Competitive-match accuracy:", "正式比赛命中率:", "Acierto en partidos oficiales:"],
+    "🙈 これまでの的中実績(外れも含む全試合の採点記録)を見る": ["🙈 See the AI's track record (full graded record, misses included)", "🙈 查看AI的过往战绩(包含失误在内的全部判分记录)", "🙈 Ver el historial de aciertos (registro completo calificado, fallos incluidos)"],
+    "🔗 この試合のページ": ["🔗 Match page", "🔗 本场比赛页面", "🔗 Página del partido"],
+    "📊 リーグ別の実測": ["📊 Measured results by league", "📊 分联赛实测", "📊 Datos medidos por liga"],
+    "引分実際": ["Actual draws", "实际平局", "Empates reales"],
+    "引分予想": ["Predicted draws", "预测平局", "Empates previstos"],
+    "引分的中": ["Draw hits", "平局命中", "Empates acertados"],
     "スコアまで的中(何対何): まだ採点できる記録がありません。": ["Exact-score hits: no gradable records yet.", "比分完全命中(几比几): 暂无可评分的记录。", "Acierto de marcador exacto: aún no hay registros evaluables."],
     "直近の記録に、外した試合がありません(外れが出たら、隠さずここに並びます)。": ["No misses in the recent record (when they happen, they'll be listed here, never hidden).", "近期记录中没有失误(一旦出现,会毫不隐瞒地列在这里)。", "Sin fallos en el registro reciente (cuando ocurran, se listarán aquí, sin ocultarlos)."],
     "参考(親善など)": ["Reference (friendlies etc.)", "参考(友谊赛等)", "Referencia (amistosos, etc.)"],
@@ -1185,6 +1196,13 @@
     ["⦿社平均", "$1-bookmaker average", "$1家平均", "media de $1 casas"],
     ["⦿ 勝利 ⦿%", "$1 to win $2%", "$1获胜 $2%", "Gana $1: $2%"],
     ["引き分け ⦿%", "Draw $1%", "平局 $1%", "Empate: $1%"],
+    // ---- v76(利用者意見調査の還元): 実績導線+生成情報の開示 ----
+    // 注意: 「生成モデル: ⦿」の短い型は長い型にもマッチするため、必ず長い型を先に置く
+    ["🙈 実測の的中率 ⦿%(⦿/⦿件)— 外れも含む全試合の採点記録を見る", "🙈 Measured accuracy $1% ($2/$3) — see the full graded record, misses included", "🙈 实测命中率 $1%($2/$3场)— 查看包含失误在内的全部判分记录", "🙈 Acierto medido $1 % ($2/$3) — ver el registro completo calificado, fallos incluidos"],
+    ["🏷️ 生成モデル: ⦿ ・ 根拠にした実データ ⦿件(上の「📊 根拠にした事実」に全て記載)", "🏷️ Model: $1 ・ $2 real-data facts used (all listed under \"📊 View the facts used\")", "🏷️ 生成模型: $1 ・ 依据实测数据$2条(全部列于上方「📊 查看依据的事实」)", "🏷️ Modelo: $1 ・ $2 datos reales de base (todos listados en «📊 Ver los hechos utilizados»)"],
+    ["🏷️ 生成モデル: ⦿", "🏷️ Model: $1", "🏷️ 生成模型: $1", "🏷️ Modelo: $1"],
+    // v79(案6): 第二意見ブレンドの開示行
+    ["🤝 第二意見を⦿%混合(API-Football予想・比率は実測で学習)", "🤝 Second opinion blended at $1% (API-Football forecast; ratio learned from real results)", "🤝 混合第二意见$1%(API-Football预测·比例由实测学习)", "🤝 Segunda opinión mezclada al $1 % (pronóstico de API-Football; proporción aprendida de resultados reales)"],
   ];
   for (var rp = 0; rp < RAWP.length; rp++) P.push([pat(RAWP[rp][0]), RAWP[rp][1], RAWP[rp][2], RAWP[rp][3]]);
   /* ==== 辞書ここまで ==== */
@@ -5303,7 +5321,7 @@ async function sendChatMessage(player, presetText) {
   if (isDiscussionTrigger(text)) {
     if (input) input.value = "";
     renderChatUI(player);
-    await runDiscussFlow(text, dLevel, player, (msg) => chatHistories[key].push(msg), () => renderChatUI(player));
+    await runDiscussFlow(text, dLevel, player, (msg) => chatHistories[key].push(msg), () => renderChatUI(player), undefined, `card:${key}`);
     return;
   }
 
@@ -5315,7 +5333,7 @@ async function sendChatMessage(player, presetText) {
   if (ruleAnswer === NO_RULE_MATCH) {
     if (input) input.value = "";
     renderChatUI(player);
-    await runDiscussFlow(text, dLevel, player, (msg) => chatHistories[key].push(msg), () => renderChatUI(player));
+    await runDiscussFlow(text, dLevel, player, (msg) => chatHistories[key].push(msg), () => renderChatUI(player), undefined, `card:${key}`);
     return;
   }
   const answer = beginnerize(ruleAnswer);
@@ -7134,7 +7152,7 @@ function buildDiscussSubject(q, contextPlayer, forcedPlayerName) {
 // (サーバー側のLLM呼び出しだけで最大30秒×複数段)。75秒まで待つ。
 const DISCUSS_TIMEOUT_MS = 75000;
 
-async function fetchDiscussApi(question, subject, playerHint) {
+async function fetchDiscussApi(question, subject, playerHint, history) {
   try {
     const url = `${API_PROXY_BASE}/discuss`;
     // v56: 利用者の言語設定を渡す(AIの回答はサーバー側で選択言語のまま生成される)
@@ -7142,12 +7160,27 @@ async function fetchDiscussApi(question, subject, playerHint) {
     return await fetchJsonWithTimeout(url, DISCUSS_TIMEOUT_MS, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, subject, playerHint, lang }),
+      // v79(案5): 直近の会話(最大3往復・要旨のみ)を文脈として渡す
+      body: JSON.stringify({ question, subject, playerHint, lang, history: Array.isArray(history) ? history.slice(-3) : [] }),
     });
   } catch (e) {
     return null;
   }
 }
+
+// ---- v79(2026年9月1日・利用者の承認 案5): 会話の文脈記憶(端末内のみ) ----
+//   これまでAI会話は1問ごとに記憶を失っていた。画面ごと(ヒーローチャット/
+//   選手カードごと)に直近3往復の「質問と回答の要旨」を覚えておき、
+//   ①サーバーへ文脈として渡す ②「彼」「その選手」のような続きの質問で
+//   対象が特定できないとき、直前の対象を引き継ぐ。保存は画面のメモリ内だけ
+//   (再読み込みで消える。サーバーや端末ストレージには保存しない)。
+const discussMemories = new Map();
+function discussMemoryOf(key) {
+  if (!discussMemories.has(key)) discussMemories.set(key, { turns: [], lastSubject: null, lastPlayerHint: null });
+  return discussMemories.get(key);
+}
+// 続きの質問と判定する言い方(対象の取り違えを避けるため意図的に狭くする)
+const DISCUSS_FOLLOWUP_RE = /彼|その選手|この選手|あの選手|さっきの|同じ選手|そのクラブ|このクラブ|あのクラブ|こいつ|あいつ|\b(he|him|his|that player|this player|the same player)\b/i;
 
 // 2026年8月・「議論できるAI」強化フェーズ(ご要望⑤): 単なる事実の要約ではなく、
 // 「一般論→AI独自の意見→反対意見→最終結論→今後どうなるか」という議論の型を
@@ -7243,27 +7276,63 @@ function renderDiscussReplyHtml(resp) {
   // 吹き出しが「🧠 AIが考えています…」のまま固まっていた。
   const confidenceReasonJa = (resp.confidence && resp.confidence.reasonJa) || "確信度の内訳はこの回答には付いていません。";
   const confidenceHtml = `<div class="discuss-confidence">${stars} <span class="value-note">${escapeHtml(confidenceReasonJa)}</span></div>`;
+  // ---- v76(2026年9月1日・利用者意見調査の還元C): 生成情報の開示 ----
+  //   調査で分かったこと: 「AI搭載」を名乗るだけでモデル名を明かさないサービスは
+  //   信頼されない(比較サイトの主要評価軸が「モデル名の開示」だった)。また
+  //   スポーツ×AIチャット最大の敵は「もっともらしい嘘」(大手チャットAIが架空の
+  //   試合スタッツを自信満々に答えた報道)。サーバーは使用モデル名を毎回
+  //   meta.llmModel で返しているのに画面に出していなかったので、回答の末尾に
+  //   1行だけ開示する(新しい通信・計算は一切なし。metaが無い旧応答では何も出ない)。
+  const genModelName = resp.meta && resp.meta.llmModel ? String(resp.meta.llmModel) : null;
+  const genFactCount = Number((resp.facts && resp.facts.length) || 0);
+  const genInfoHtml = genModelName
+    ? `<div class="value-note" style="margin-top:4px; opacity:.75;">${genFactCount > 0
+      ? `🏷️ 生成モデル: ${escapeHtml(genModelName)} ・ 根拠にした実データ ${genFactCount}件(上の「📊 根拠にした事実」に全て記載)`
+      : `🏷️ 生成モデル: ${escapeHtml(genModelName)}`}</div>`
+    : "";
   const followupsHtml = resp.followUpQuestions && resp.followUpQuestions.length
     ? `<div class="followup-chip-row">${resp.followUpQuestions.map(q => `<button class="chat-followup-btn" data-q="${escapeHtml(q)}">・${escapeHtml(q)}</button>`).join("")}</div>`
     : "";
-  return { text: body + thoughtChangeHtml, extras: `${confidenceHtml}${multiStepHtml}${ragHtml}${deliberationHtml}${graphHtml}${timelineHtml}${factsHtml}${followupsHtml}` };
+  return { text: body + thoughtChangeHtml, extras: `${confidenceHtml}${multiStepHtml}${ragHtml}${deliberationHtml}${graphHtml}${timelineHtml}${factsHtml}${genInfoHtml}${followupsHtml}` };
 }
 
 // hero chat・選手個別チャット共通の議論モードフロー。
 // pushFn: 新しいメッセージオブジェクトを履歴配列に積む関数
 // renderFn: 履歴を再描画する関数
-async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn, forcedPlayerName) {
-  const { subject, playerHint, resolvedPlayer } = buildDiscussSubject(q, contextPlayer, forcedPlayerName);
+async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn, forcedPlayerName, surfaceKey) {
+  let { subject, playerHint, resolvedPlayer } = buildDiscussSubject(q, contextPlayer, forcedPlayerName);
+  // ---- v79(案5): 文脈記憶の読み出し ----
+  //   記憶は「画面」単位(ヒーローチャット=hero / 選手カードごと=card:◯◯)。
+  //   ヒーローチャットで選手名に言及した質問と、その続きの代名詞質問が
+  //   別々の記憶に分かれてしまわないよう、呼び出し側が画面キーを明示する。
+  const memKey = surfaceKey
+    || ((contextPlayer && contextPlayer.name) ? `card:${contextPlayer.name}` : "hero");
+  const mem = discussMemoryOf(memKey);
+  // 「彼の弱点は?」のような続きの質問で対象を特定できなかったら、直前の対象を引き継ぐ
+  // (引き継ぐのは代名詞などの明示的な「続きの言い方」があるときだけ=取り違え防止)
+  if ((!subject || !subject.type) && mem.lastSubject && DISCUSS_FOLLOWUP_RE.test(q)) {
+    subject = mem.lastSubject;
+    if (!playerHint && mem.lastPlayerHint) playerHint = mem.lastPlayerHint;
+  }
   const pendingMsg = { role: "ai", text: `<p class="value-note">🧠 AIが考えています…(実データを確認し、考察を組み立てています。最大1分ほどかかることがあります)</p>`, extras: "" };
   pushFn(pendingMsg);
   renderFn();
 
-  const resp = await fetchDiscussApi(q, subject, playerHint);
+  const resp = await fetchDiscussApi(q, subject, playerHint, mem.turns);
 
   if (resp && resp.ok) {
     const rendered = renderDiscussReplyHtml(resp);
     pendingMsg.text = rendered.text;
     pendingMsg.extras = rendered.extras;
+    // ---- v79(案5): 文脈記憶への書き込み(要旨のみ・最大3往復) ----
+    try {
+      const summary = String(resp.finalConclusion || resp.mostImportantOpinion || resp.aiOpinion || "").slice(0, 600);
+      if (summary) {
+        mem.turns.push({ q: String(q).slice(0, 500), a: summary });
+        while (mem.turns.length > 3) mem.turns.shift();
+      }
+      if (subject && subject.type) { mem.lastSubject = subject; mem.lastPlayerHint = playerHint || null; }
+    } catch (e) { /* 記憶は付加機能。失敗しても回答表示に影響させない */ }
   } else {
     // 議論エンジンに接続できなかった/失敗した場合: 「考えたふり」はせず正直に状況を
     // 伝えた上で、参考情報として従来のデータ要約(キーワードベース)を添える。
@@ -7412,7 +7481,7 @@ async function heroAskAI(question) {
   // キーワード回答ではなくRAG+LLMの議論エンジンへ切り替える。それ以外は
   // 以下の既存ロジックを完全に維持する。
   if (isDiscussionTrigger(q)) {
-    await runDiscussFlow(q, dLevel, null, (msg) => heroChatHistory.push(msg), renderHeroChatUI);
+    await runDiscussFlow(q, dLevel, null, (msg) => heroChatHistory.push(msg), renderHeroChatUI, undefined, "hero");
     return;
   }
 
@@ -7453,7 +7522,7 @@ async function heroAskAI(question) {
     psOpenByName(mentioned[0].nameJa);
     const ruleAnswer = answerPlayerQuestion(mentioned[0], q, state.level);
     if (ruleAnswer === NO_RULE_MATCH) {
-      await runDiscussFlow(q, dLevel, mentioned[0], (msg) => heroChatHistory.push(msg), renderHeroChatUI);
+      await runDiscussFlow(q, dLevel, mentioned[0], (msg) => heroChatHistory.push(msg), renderHeroChatUI, undefined, "hero");
       return;
     }
     reply = `${mentioned[0].nameJa}について、下にAI分析カードを表示しました。${ruleAnswer}`;
@@ -7463,7 +7532,7 @@ async function heroAskAI(question) {
     if (clubName) {
       const ruleAnswer = answerClubQuestion(clubName, q, state.level);
       if (ruleAnswer === NO_RULE_MATCH) {
-        await runDiscussFlow(q, dLevel, null, (msg) => heroChatHistory.push(msg), renderHeroChatUI);
+        await runDiscussFlow(q, dLevel, null, (msg) => heroChatHistory.push(msg), renderHeroChatUI, undefined, "hero");
         return;
       }
       reply = ruleAnswer;
@@ -7482,13 +7551,28 @@ async function heroAskAI(question) {
       // 「主題なし」の一般知識考察としてAIの議論エンジンへ渡す(常に何らかの
       // 実質的な回答を試みる)。
       const guessedName = guessUnregisteredPlayerName(q);
-      await runDiscussFlow(q, dLevel, null, (msg) => heroChatHistory.push(msg), renderHeroChatUI, guessedName || undefined);
+      await runDiscussFlow(q, dLevel, null, (msg) => heroChatHistory.push(msg), renderHeroChatUI, guessedName || undefined, "hero");
       return;
     }
   }
   const extras = buildDialogueExtras(topicType, topicCtx, dLevel);
   heroChatHistory.push({ role: "ai", text: escapeHtml(reply), extras });
   renderHeroChatUI();
+  // ---- v79(案5): ルールベースで即答した場合も、会話の文脈記憶へ残す ----
+  //   これが無いと「◯◯はどんな選手?」(即答)→「彼の弱点は?」(AI考察)の流れで
+  //   2問目のAIが対象を思い出せない(検査pw_v79_checkで実際に再現した欠陥)。
+  try {
+    const mem = discussMemoryOf("hero");
+    mem.turns.push({ q: String(q).slice(0, 500), a: String(reply).slice(0, 600) });
+    while (mem.turns.length > 3) mem.turns.shift();
+    if (topicType === "player" && topicCtx) {
+      const built = buildDiscussSubject(q, topicCtx);
+      if (built && built.subject && built.subject.type) { mem.lastSubject = built.subject; mem.lastPlayerHint = built.playerHint || null; }
+    } else if (topicType === "club" && topicCtx) {
+      const builtC = buildDiscussSubject(q, null);
+      if (builtC && builtC.subject && builtC.subject.type === "club") { mem.lastSubject = builtC.subject; mem.lastPlayerHint = null; }
+    }
+  } catch (e) { /* 記憶は付加機能。即答の表示に影響させない */ }
 }
 // Categorized suggested-question chips (home-screen polish): 今話題 / 今日人気 are
 // curated pools; AIおすすめ is generated from the SAME daily picks the dashboard
@@ -8571,11 +8655,18 @@ function predictionSummaryBlockHtml(p, titleJa) {
 //   ブレンドで判定した予想は、内訳(市場◯%+AI◯%)を必ず表示する。
 //   「市場の受け売りに近づく」トレードオフを隠さないための行。
 function predBlendLineHtml(p) {
-  if (!p || !p.blend || !Number.isFinite(p.blend.marketPct)) return "";
-  // v57: 市場確率の出典(複数社平均か1社か)も開示する
-  const srcTag = (p.oddsSource && p.oddsSource.kind === "consensus" && Number.isFinite(Number(p.oddsSource.nBooks)))
-    ? ` <span style="opacity:.85;">市場=<span>${Number(p.oddsSource.nBooks)}社平均</span></span>` : "";
-  return `<div class="value-note" style="margin-top:2px;">⚖️ この予想の判定: 市場${Number(p.blend.marketPct)}%+AI${Number(p.blend.aiPct)}%の合成(比率は実測で学習・毎日見直し)${srcTag}</div>`;
+  let html = "";
+  if (p && p.blend && Number.isFinite(p.blend.marketPct)) {
+    // v57: 市場確率の出典(複数社平均か1社か)も開示する
+    const srcTag = (p.oddsSource && p.oddsSource.kind === "consensus" && Number.isFinite(Number(p.oddsSource.nBooks)))
+      ? ` <span style="opacity:.85;">市場=<span>${Number(p.oddsSource.nBooks)}社平均</span></span>` : "";
+    html += `<div class="value-note" style="margin-top:2px;">⚖️ この予想の判定: 市場${Number(p.blend.marketPct)}%+AI${Number(p.blend.aiPct)}%の合成(比率は実測で学習・毎日見直し)${srcTag}</div>`;
+  }
+  // v79(案6): 「2つ目の意見」(API-Football予想)を混合した予想は必ず開示する
+  if (p && p.apifbBlend && Number.isFinite(Number(p.apifbBlend.pct))) {
+    html += `<div class="value-note" style="margin-top:2px;">🤝 第二意見を${Number(p.apifbBlend.pct)}%混合(API-Football予想・比率は実測で学習)</div>`;
+  }
+  return html;
 }
 // ---- 2026年8月19日・v57「直前情報」 ----
 //   スタメン確定・直前オッズによる参考判定。公式の予想(対決・的中率の対象)は
@@ -9030,7 +9121,9 @@ async function renderTodayPredictionsHero(reuseCached) {
         ${predBarHtml(p)}
         <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
         ${predUnlearnedLineHtml(p)}${predConfidenceLineHtml(p)}${predFactorsLineHtml(p)}${similarLine}${marketLine}${predBlendLineHtml(p)}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
-        <div style="margin-top:6px;"><button class="ghost-btn pred-share-btn" type="button" data-share-idx="${todayPredShareItems.indexOf(p)}" style="padding:5px 12px; font-size:12px;">📸 画像でシェア</button></div>
+        <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;"><button class="ghost-btn pred-share-btn" type="button" data-share-idx="${todayPredShareItems.indexOf(p)}" style="padding:5px 12px; font-size:12px;">📸 画像でシェア</button>${
+          /* v77(集客①): 検索エンジンにも載る試合個別ページへの導線(共有用URLにもなる) */
+          Number.isFinite(Number(p.fixtureId)) ? `<a class="ghost-btn" href="/match/${Number(p.fixtureId)}" style="padding:5px 12px; font-size:12px; text-decoration:none; display:inline-block;">🔗 この試合のページ</a>` : ""}</div>
       </div>`;
   };
   // 共有画像はこの一覧のデータから描くため、描画前に持っておく
@@ -9058,7 +9151,8 @@ async function renderTodayPredictionsHero(reuseCached) {
         : `<span class="value-note">📡 本日の実際の試合一覧は、データ連携サーバーに接続できたときに表示されます。</span>`}
       <button class="more-details-btn" type="button" id="sharePredictionsBtn" style="display:inline-block; width:auto; padding:5px 12px;">🔗 この予想をシェア</button>
     </div>
-    <p class="value-note" style="margin-top:6px; opacity:.8;">${escapeHtml(data.noteJa || "")}</p>`;
+    <p class="value-note" style="margin-top:6px; opacity:.8;">${escapeHtml(data.noteJa || "")}</p>
+    <p class="value-note" style="margin-top:4px;"><a href="#" id="predsToReflectionsLink" style="color:inherit;">🙈 これまでの的中実績(外れも含む全試合の採点記録)を見る</a></p>`;
 
   // 監査の指摘への対応: インラインonclickをやめ、対象カードが表示されている
   // ときだけボタンを描画するようにしたので、ここで通常どおり配線する。
@@ -9067,6 +9161,21 @@ async function renderTodayPredictionsHero(reuseCached) {
     jumpBtn.addEventListener("click", () => {
       const c = document.getElementById("realFixturesCard");
       if (c && c.style.display !== "none") c.scrollIntoView({ behavior: "smooth" });
+    });
+  }
+  // ---- v76(2026年9月1日・利用者意見調査の還元B): 実績への導線 ----
+  //   ネット上の調査で、AI予想サービスへの最大の要望は「自称の的中率ではなく、
+  //   負けも含む採点済みの全記録」だと分かった(ScoreGPT比較・Trustpilot実レビュー等)。
+  //   うちは反省タブに全記録が既にあるので、いちばん見られる予想カードから
+  //   1タップで届く導線を張る。数字はページ読込時に反省タブ用へ取得済みの
+  //   データを再利用するだけで、このリンクのための新しい通信は発生させない(方針⑥)。
+  const reflLink = document.getElementById("predsToReflectionsLink");
+  if (reflLink) {
+    applyReflHeadlineToHeroLink(); // 反省タブの読み込みが先に済んでいれば、実測値つきの文言に差し替わる
+    reflLink.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      const b = document.querySelector('#modeSwitch button[data-mode="reflections"]');
+      if (b) { b.click(); window.scrollTo({ top: 0, behavior: "smooth" }); }
     });
   }
   // 精度証明ラウンド③: シェアボタン(端末の共有機能があればそれを、無ければURLコピー)
@@ -9353,10 +9462,24 @@ async function renderDailyReportWidget() {
       ? `<div class="value-note" style="margin-top:4px;">📜 この${siHistory.periodDays}日間の自己改善: 記録${siHistory.totalEvents}件(変更${(siHistory.counts && siHistory.counts.change) || 0}・効果測定${(siHistory.counts && siHistory.counts.evaluation) || 0}・差し戻し${(siHistory.counts && siHistory.counts.revert) || 0})</div>
          ${(siHistory.latest && siHistory.latest.length) ? `<ul style="margin:4px 0 0 1em; padding:0;">${siHistory.latest.slice(0, 5).map((e) => `<li class="value-note" style="opacity:.9;">${e.at ? new Date(e.at).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" }) : ""} [${escapeHtml(e.type || "")}] ${escapeHtml(e.summaryJa || "")}</li>`).join("")}</ul>` : ""}`
       : "";
+    // ---- v78(2026年9月1日・利用者の承認 案4): リーグ別の常設実測表 ----
+    //   夜間の学習が集計済みの数値を表示するだけ(このカードは新しい計算をしない)。
+    //   引き分け列は「引き分け帯の学習」(案1)の効果と弱点をリーグ単位で追うため。
+    const ltRows = (si && si.diagnosis && si.diagnosis.leagueTable) || [];
+    const leagueTableHtml = ltRows.length
+      ? `<div style="margin-top:6px;"><strong style="font-size:13px;">📊 リーグ別の実測</strong>
+          <div style="overflow-x:auto; margin-top:4px;"><table style="border-collapse:collapse; font-size:12px; min-width:420px;">
+            <tr style="border-bottom:1px solid var(--border);"><th style="text-align:left; padding:3px 8px 3px 0;">リーグ</th><th style="text-align:right; padding:3px 8px;">件数</th><th style="text-align:right; padding:3px 8px;">的中率</th><th style="text-align:right; padding:3px 8px;">引分実際</th><th style="text-align:right; padding:3px 8px;">引分予想</th><th style="text-align:right; padding:3px 8px;">引分的中</th></tr>
+            ${ltRows.map((r) => `<tr style="border-bottom:1px solid var(--border);"><td style="padding:3px 8px 3px 0;">${escapeHtml(r.league)}</td><td style="text-align:right; padding:3px 8px;">${Number(r.n)}</td><td style="text-align:right; padding:3px 8px;"><strong>${Number(r.hitRatePct)}%</strong></td><td style="text-align:right; padding:3px 8px;">${Number(r.drawActualPct)}%</td><td style="text-align:right; padding:3px 8px;">${Number(r.drawPredictedPct)}%</td><td style="text-align:right; padding:3px 8px;">${Number(r.drawHitN)}件</td></tr>`).join("")}
+          </table></div>
+          ${si.diagnosis.leagueTableNoteJa ? `<div class="value-note" style="margin-top:3px; opacity:.85;">${escapeHtml(si.diagnosis.leagueTableNoteJa)}</div>` : ""}
+        </div>`
+      : "";
     selfImproveHtml = `
       <div style="margin-top:8px; padding:8px 10px; border-left:3px solid #5b2d86; background:rgba(91,45,134,.05); border-radius:4px;">
         <strong>🔁 自己改善ループ(AIが自分で診断→提案→実行→効果測定)</strong>
         ${diagParts.length ? `<div class="value-note" style="margin-top:4px;">🩺 診断: ${diagParts.join(" / ")}</div>` : ""}
+        ${leagueTableHtml}
         ${proposalsHtml}
         ${evalHtml}
         ${si && si.currentConfig ? `<div class="value-note" style="margin-top:4px; opacity:.85;">現在の自己調整値: xG収集周期${si.currentConfig.xgRotationDays}日 ・ 選手詳細上限${si.currentConfig.playerDetailCap}人 ・ 優先クラブ枠${si.currentConfig.priorityClubsMax}</div>` : ""}
@@ -9817,6 +9940,20 @@ function reflClubJa(en) {
   for (const [ja, e] of Object.entries(UNIVERSE_CLUB_JA_TO_EN)) { if (e === en) return ja; }
   return en;
 }
+// ---- v76(利用者意見調査の還元B): 予想カードの実績リンクに実測値を差し込む ----
+//   renderReflectionsCard がページ読込時に取得する的中率(学習済み大会が主役、
+//   無ければ公式戦全体)をここに控え、ホームの「今日のAI予想」カードのリンク文言を
+//   「実測の的中率◯%(m/n件)」つきに更新する。読込順はどちらが先でも成立する:
+//   ・反省タブが先 → 予想カード描画後の配線がこの関数を呼んで反映
+//   ・予想カードが先 → 反省タブ読込後にこの関数が直接リンクを書き換える
+//   追加の通信は無し(既存の /api/reflections 読み出しの結果を使い回すだけ)。
+let reflHeadlineForHero = null;
+function applyReflHeadlineToHeroLink() {
+  const link = document.getElementById("predsToReflectionsLink");
+  const hb = reflHeadlineForHero;
+  if (!link || !hb || !Number.isFinite(Number(hb.hitRatePct))) return;
+  link.textContent = `🙈 実測の的中率 ${Number(hb.hitRatePct)}%(${Number(hb.hits)}/${Number(hb.n)}件)— 外れも含む全試合の採点記録を見る`;
+}
 async function renderReflectionsCard() {
   const el = document.getElementById("reflectionsBody");
   if (!el) return;
@@ -9857,6 +9994,11 @@ async function renderReflectionsCard() {
   //   learnedSummaryが無い旧サーバー応答では、従来どおり混合値を見出しに出す(劣化なし)。
   const lsHead = (d.learnedSummary && d.learnedSummary.learned && Number(d.learnedSummary.learned.n) > 0)
     ? d.learnedSummary.learned : null;
+  // v76(還元B): 見出しに使うのと同じ数字を、ホームの予想カードのリンクにも反映する
+  reflHeadlineForHero = lsHead
+    ? { hitRatePct: lsHead.hitRatePct, hits: lsHead.hits, n: lsHead.n }
+    : ((off && off.n > 0) ? { hitRatePct: off.hitRatePct, hits: off.hits, n: off.n } : null);
+  applyReflHeadlineToHeroLink();
   if (off && off.n > 0) {
     if (lsHead) {
       parts.push(`<div style="margin-bottom:4px;"><span style="font-size:15px; font-weight:700;">学習した大会の的中率(勝敗): ${Number(lsHead.hitRatePct)}%</span> <span class="value-note">(${Number(lsHead.hits)}/${Number(lsHead.n)}件)</span>${
@@ -11232,6 +11374,19 @@ if (document.getElementById("playerSection") &&
     document.getElementById("playerSection").style.display !== "none") {
   psEnsureInit();
 }
+
+// ---- v77(2026年9月1日・集客④): PWAサービスワーカーの登録 ----
+//   ネットワーク優先(常に最新を配る)のSWなので、画面が古いまま残る事故はない。
+//   navigator.webdriver(自動テスト)中は登録しない: テストはネットワーク層の
+//   モックを使うため、SWが挟まると検査自体が成立しなくなる。
+try {
+  if ("serviceWorker" in navigator && !navigator.webdriver
+      && (location.protocol === "https:" || location.hostname === "localhost")) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("/sw.js").catch(() => { /* 未対応・失敗でも本体は動く */ });
+    });
+  }
+} catch (e) { /* SWが無い環境でも本体の動作に影響させない */ }
 </script>
 </body>
 </html>
