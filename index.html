@@ -4895,7 +4895,12 @@ async function renderRealPerformancePanel(player) {
     el.innerHTML = `<p class="value-note">🔄 実データ連携サーバーを確認中…(サーバーが休止していた場合、初回は最大1分ほどかかることがあります)</p>`;
   }
   const data = await fetchRealPlayerSeasonStats(player);
-  if (!data) { el.innerHTML = ""; return; } // no proxy / no key / not found → leave the simulated section as the only content, unchanged
+  if (!data) {
+    // v74: シミュレーション区画を廃止したため、取得できない場合もその旨を正直に表示する
+    // (空白のまま放置しない。理由の候補も添える)
+    el.innerHTML = `<p class="value-note">この選手の今シーズン実データは取得できませんでした(選手を特定できない・出場記録がまだ無い・API予算の節約中、のいずれかです。翌日以降に自動で再挑戦します)。</p>`;
+    return;
+  }
   const s = data.stats || {}; // 監査の指摘: statsが無い応答でパネルが永久に固まっていた
   const offSeasonNote = (data.requestedSeason && data.season && data.requestedSeason !== data.season)
     ? `新シーズンはまだ試合数が少ないため、直近の完了シーズン(${data.season})の実績を表示しています。`
@@ -4908,7 +4913,7 @@ async function renderRealPerformancePanel(player) {
   const liveNum = (v) => (v === null || v === undefined || v === "" || !Number.isFinite(Number(v)) ? "-" : String(Number(v)));
   el.innerHTML = `
     <div class="live-data-banner">
-      <span class="live-data-badge">🟢 実データ</span>API-Football(有料API)から取得した${escapeHtml(String(data.season ?? ""))}シーズンの成績です(${data.fetchedAt ? escapeHtml(String(data.fetchedAt).slice(0,10)) + "時点・" : ""}キャッシュ済みの場合あり)。${teamNote}下のシミュレーション区画とは別ソースです。${offSeasonNote}
+      <span class="live-data-badge">🟢 実データ</span>API-Football(有料API)から取得した${escapeHtml(String(data.season ?? ""))}シーズンの成績です(${data.fetchedAt ? escapeHtml(String(data.fetchedAt).slice(0,10)) + "時点・" : ""}キャッシュ済みの場合あり)。${teamNote}${offSeasonNote}
       <div class="live-stat-grid">
         ${/* 2026年8月7日のセキュリティ監査の指摘: 外部API由来の数値を素通しで
              innerHTML に入れていた。数値として扱えないものは "-" にする。 */""}
@@ -5089,7 +5094,7 @@ function renderPlayerCard(player, level) {
     <div class="fit-row"><div class="fit-name">${l.name}</div><span class="stars">${starStr(l.score/20)}</span></div>`).join("");
 
   wrap.innerHTML = `
-    ${player.isFallback ? `<div class="card" style="border-color:var(--warning);"><p style="margin:0; font-size:13px;">⚠️ 「${escapeHtml(player.name)}」はサンプルデータベースに未登録のため、AIが入力名から仮生成した<b>参考用のダミーデータ</b>です。実在の選手情報とは一致しません。</p></div>` : ""}
+    ${player.isFallback ? `<div class="card" style="border-color:var(--warning);"><p style="margin:0; font-size:13px;">⚠️ 「${escapeHtml(player.name)}」は詳細プロフィール未登録の選手です。根拠のない推定(能力値・プレースタイル診断など)は表示せず、外部ソースと実データの確認結果だけを表示します。</p></div>` : ""}
 
     <div class="card">
       <div class="player-head">
@@ -5098,10 +5103,10 @@ function renderPlayerCard(player, level) {
           <div class="name-line">${player.emoji === "❔" ? "" : ""}${player.name}</div>
           <div style="font-size:13px; color:var(--text-secondary);">${player.nameJa}</div>
         </div>
-        <div style="margin-left:auto; text-align:right;">
+        ${player.isFallback ? "" : `<div style="margin-left:auto; text-align:right;">
           <div class="overall">AI総合評価<br><b>${fmt(player.overall,1)}</b> / 100</div>
           <div class="stars">${stars}</div>
-        </div>
+        </div>`}
       </div>
       <div class="meta-row">
         <span>${player.flag} ${player.country}</span>
@@ -5111,7 +5116,7 @@ function renderPlayerCard(player, level) {
         <span>🦶 ${player.foot}</span>
         <span>📏 ${player.height}${player.height !== "-" ? "cm" : ""}</span>
       </div>
-      <div class="verdict-block">
+      ${player.isFallback ? `<p class="value-note" style="margin:10px 0 4px;">未登録選手のため、能力値・プレースタイル・総評などの推定表示は行いません(v74・利用者の方針: 情報が無いものを無理に書かない)。「もっと見る」で外部ソース・今シーズン実データの確認結果を表示します。</p>` : `<div class="verdict-block">
         <div class="verdict-stars">${stars}</div>
         <div class="verdict-label">${verdictLine}</div>
       </div>
@@ -5120,7 +5125,7 @@ function renderPlayerCard(player, level) {
       <h3 style="font-size:14px; margin:16px 0 8px;">📊 能力値</h3>
       ${attrsHtml}
       <h3 style="font-size:14px; margin:16px 0 8px;">🧩 プレースタイル</h3>
-      <div class="tag-row">${tagsHtml}</div>
+      <div class="tag-row">${tagsHtml}</div>`}
       <button class="more-details-btn" id="moreDetailsToggleBtn" type="button">▼ もっと見る(詳細分析)</button>
     </div>
 
@@ -5130,7 +5135,7 @@ function renderPlayerCard(player, level) {
 
     ${isBayernPlayer(player) ? `<div class="card" id="liveBayernPanel"><p class="value-note">ライブデータを取得中…</p></div>` : ""}
 
-    <div class="grid-2">
+    ${player.isFallback ? "" : `<div class="grid-2">
       <div class="card">
         <h2>✅ 長所 / ⚠️ 改善点</h2>
         <div class="two-col">
@@ -5162,9 +5167,9 @@ function renderPlayerCard(player, level) {
         <h3 style="font-size:13px; margin:16px 0 4px;">💰 現在の契約</h3>
         ${contractHtml}
       </div>
-    </div>
+    </div>`}
 
-    <div class="card">
+    ${player.isFallback ? "" : `<div class="card">
       <h2>🤖 AIスカウティングレポート</h2>
       <div class="two-col">
         <div><h3>強み</h3><ul>${player.scouting.strengths.map(s => `<li>${beginnerize(s)}</li>`).join("")}</ul></div>
@@ -5172,37 +5177,19 @@ function renderPlayerCard(player, level) {
       </div>
       <h3 style="font-size:13.5px; margin:16px 0 8px;">おすすめ戦術(能力値からAIが算出)</h3>
       ${Object.keys(tactics).map(k => `<div class="tactic-row"><span>${TACTIC_LABELS[k]}</span><span class="stars">${starStr(tactics[k])}</span></div>`).join("")}
-    </div>
+    </div>`}
 
     <div class="card">
-      <h2>📈 コンディション・パフォーマンス推移</h2>
-      <div id="livePerfPanel"></div>
-      <div class="sim-banner">⚠️ ここから下は実際の試合結果や医療情報ではありません。個人の直近5試合評価・ゴール・アシストなどを無料で取得できる信頼できるAPIが現時点で見つからなかったため、能力値と年齢からAIがシミュレーションした参考情報を表示しています(有料APIプロキシ(server/)を起動しキーを設定すると、取得できた選手は上に実データが自動表示されます)。</div>
-      <div class="sim-grid">
-        <div>
-          <h3 class="sim-subhead">直近5試合の調子(シミュレーション)</h3>
-          <div class="form-row">${formHtml}</div>
-          <p class="form-legend">W=勝 / D=分 / L=敗 ・ 平均評価 ${fmt(sim.avgRating,2)}</p>
-        </div>
-        <div>
-          <h3 class="sim-subhead">現在のコンディション(シミュレーション)</h3>
-          <div style="display:flex; justify-content:space-between; font-size:13px; color:var(--text-secondary);"><span>${sim.condStatus}</span><span>${sim.condPct}%</span></div>
-          ${condTrackHtml}
-        </div>
-      </div>
-      <div class="sim-grid" style="margin-top:16px;">
-        <div>
-          <h3 class="sim-subhead">能力推移(直近シーズン〜現在, シミュレーション)</h3>
-          ${abilityTrendHtml}
-        </div>
-        <div>
-          <h3 class="sim-subhead">${sim.isGK ? "セーブの傾向(推定)" : "得点パターン(推定)"}</h3>
-          ${patternBarHtml}
-        </div>
-      </div>
+      <h2>📈 今シーズンの実データ</h2>
+      <!-- v74(2026年9月1日・利用者の指示): 旧「コンディション・パフォーマンス推移」の
+           シミュレーション表示(直近5試合の調子・コンディション・能力推移・得点パターン)を削除した。
+           これらは能力値と年齢からの永続的なシミュレーションで、時間が経っても実データには
+           ならない設計だったため(実データ化には試合ごとの個人評価の常時取得が必要)。
+           実データ(API-Footballの今シーズン実績)が取得できた選手はこのパネルに表示される。 -->
+      <div id="livePerfPanel"><p class="value-note">実データを確認中…(取得できない選手は取得できない旨を表示します)</p></div>
     </div>
 
-    <div class="card">
+    ${player.isFallback ? "" : `<div class="card">
       <h2>🧭 適性(シミュレーション)</h2>
       <div class="sim-banner">⚠️ 能力値から算出した相性の推定であり、実際の監督評価やスカウティングレポートではありません。</div>
       <div class="sim-grid">
@@ -5215,9 +5202,9 @@ function renderPlayerCard(player, level) {
           ${leagueFitHtml}
         </div>
       </div>
-    </div>
+    </div>`}
 
-    <div class="card">
+    ${player.isFallback ? "" : `<div class="card">
       <h2>🏷️ AIプレースタイル診断 & スカウト評価</h2>
       <div class="playstyle-banner">
         <div class="playstyle-emoji">${playstyleTag.emoji}</div>
@@ -5231,23 +5218,23 @@ function renderPlayerCard(player, level) {
       <div class="scout-star-row"><span>🌱 育成向き</span><span class="stars">${starStr(scoutStars.potential)}</span></div>
       <button class="share-btn" id="shareCardBtn">📋 この診断結果をコピーしてシェア</button>
       <p class="value-note" style="margin-top:8px;">能力値から自動計算したAIの独自評価です。実際のクラブのスカウティング判断とは異なります。</p>
-    </div>
+    </div>`}
 
-    <div class="card">
+    ${player.isFallback ? "" : `<div class="card">
       <h2>🧠 AI豆知識</h2>
       <div class="trivia-box"><span class="emoji">💡</span><span id="triviaText">${trivia}</span></div>
       <button class="share-btn" id="triviaRefreshBtn" style="margin-top:8px;">🔄 別の豆知識を見る</button>
-    </div>
+    </div>`}
 
-    <div class="card">
+    ${player.isFallback ? "" : `<div class="card">
       <h2>⚖️ 他の選手と比較する</h2>
       <div class="compare-select-row">
         <select id="compareSelect" style="flex:1; min-width:220px; padding:9px 12px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary); font-size:13.5px;"></select>
       </div>
       <div id="compareResultWrap"></div>
-    </div>
+    </div>`}
 
-    <div class="card">
+    ${player.isFallback ? "" : `<div class="card">
       <h2>💬 この選手についてAIに質問する</h2>
       <p class="value-note" style="margin-bottom:10px;">登録されている選手データ(能力値・プレースタイル・契約情報など)をもとに、AIが質問の意図を読み取って回答する簡易チャットです(外部のLLM APIには接続しておらず、この端末内の処理だけで完結しています)。</p>
       <div class="chat-suggest-row">
@@ -5263,7 +5250,7 @@ function renderPlayerCard(player, level) {
         <input type="text" id="chatInput" placeholder="例: 久保建英との違いは？">
         <button class="apply-btn" id="chatSendBtn" style="margin-top:0; width:auto; padding:9px 18px;">送信</button>
       </div>
-    </div>
+    </div>`}
 
     </div>
   `;
@@ -7141,7 +7128,11 @@ function buildDiscussSubject(q, contextPlayer, forcedPlayerName) {
 
 // LLM推論はルールベースの即答と異なり、RAGでの複数回のデータ取得+実際のLLM呼び出しで
 // 数秒かかることがあるため、Stage Bの予測API(1.5秒)より大幅に長いタイムアウトを取る。
-const DISCUSS_TIMEOUT_MS = 15000;
+// v74(2026年9月1日・利用者の指摘「AIがまともに会話できていない」への修正):
+// AI考察はPlanner→実データ取得→推論→LLMと多段で動くため、15秒では
+// 正常な処理中でも打ち切られ、毎回「接続できませんでした」に見えていた
+// (サーバー側のLLM呼び出しだけで最大30秒×複数段)。75秒まで待つ。
+const DISCUSS_TIMEOUT_MS = 75000;
 
 async function fetchDiscussApi(question, subject, playerHint) {
   try {
@@ -7263,7 +7254,7 @@ function renderDiscussReplyHtml(resp) {
 // renderFn: 履歴を再描画する関数
 async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn, forcedPlayerName) {
   const { subject, playerHint, resolvedPlayer } = buildDiscussSubject(q, contextPlayer, forcedPlayerName);
-  const pendingMsg = { role: "ai", text: `<p class="value-note">🧠 AIが考えています…(実データを確認し、考察を組み立てています)</p>`, extras: "" };
+  const pendingMsg = { role: "ai", text: `<p class="value-note">🧠 AIが考えています…(実データを確認し、考察を組み立てています。最大1分ほどかかることがあります)</p>`, extras: "" };
   pushFn(pendingMsg);
   renderFn();
 

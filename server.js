@@ -113,6 +113,7 @@ const matchupLib = require("./learning/matchupAnalysis");
 const learnedComp = require("./learning/learnedCompetitions");
 const { TEAM_STATS_KEY, combineVolatility: _combineVolatility } = require("./learning/teamStats");
 const { buildEloByNorm: buildEloByNormMU, DAILY_KEY: CLUBELO_DAILY_KEY } = require("./learning/clubElo");
+const clubEloDiag = require("./learning/clubElo"); // v73: 診断エンドポイント用(probeDaily)
 // 選手個人の実データ統計(2026年8月・知識拡張フェーズ)。
 const { computePlayerRealStats } = require("./learning/playerFeatures");
 const { createPlayerProfileEngine } = require("./knowledge/playerProfileEngine");
@@ -1280,7 +1281,24 @@ async function resolveTeamId(teamNameEnglish, opts) {
     return null;
   }
   const exact = list.find((r) => (r.team && r.team.name || "").toLowerCase() === name.toLowerCase());
-  const id = (exact || list[0]).team.id;
+  // ---- v74(2026年9月1日・利用者の指摘): 女子・ユース・2軍チームへの化けを防ぐ ----
+  //   /teams検索は男子トップチームと一緒に女子(〜W)・U19・IIなども返す。
+  //   完全一致が無いときに従来は先頭(list[0])を採用しており、これが
+  //   「選手検索に女子選手が混ざる」混入経路だった(化けたチームIDで名簿を
+  //   取得すると、そのクラブの索引が丸ごと女子選手になる)。
+  //   検索した名前自体が女子等を指定していない限り、変種チームは候補から外す。
+  let pick = exact || null;
+  if (!pick) {
+    const wantsVariant = matchupLib.SQUAD_VARIANT_RE.test(name);
+    const pool = wantsVariant ? list : list.filter((r) => !matchupLib.SQUAD_VARIANT_RE.test((r.team && r.team.name) || ""));
+    pick = pool[0] || null;
+    if (!pick) {
+      // 男子トップチームが1件も無い場合は正直に「見つからない」扱い(でっち上げ照合をしない)
+      cacheSet(cacheKey, null, TEAM_NOT_FOUND_CACHE_MS);
+      return null;
+    }
+  }
+  const id = pick.team.id;
   cacheSet(cacheKey, id, 30 * 24 * 60 * 60 * 1000);
   return id;
 }
@@ -3258,6 +3276,14 @@ const AUTO_SWEEP_STALE_MS = Number(process.env.AUTO_SWEEP_STALE_MS) || 60 * 60 *
 //   Redisコマンド節約: キックオフ表は30分ごとに1回だけ作り直し、
 //   窓内の試合が無い時間帯は1コマンドも使わない。
 // ================================================================
+// ---- v75(2026年9月1日・利用者の指示「直前オッズ効果の計測が0件のまま」への修正) ----
+//   根本原因: この観測は「利用者のアクセス」だけがきっかけだった(下のフックは
+//   リクエスト時のみ)。キックオフ前にサイトを誰も開かない日は、サーバーが
+//   起きていても観測が一度も走らず、2週間 n=0 のままだった。
+//   対策②: 起きている間はサーバー自身が3分ごとに観測を試みる(リクエスト不要)。
+//   対策①(matchday-ping.yml)が試合時間帯にサーバーを起こし続けるので、
+//   この自走タイマーが窓内の試合を確実に拾う。unref()でテスト・終了処理を妨げない。
+//   (maybeWatchLineups自体に3分スロットルがあるため、リクエスト起動と重複しても安全)
 let lineupWatchLastTickMs = 0;
 const lineupKickoffCache = { at: 0, byId: new Map() };
 async function maybeWatchLineups() {
@@ -3331,6 +3357,11 @@ async function maybeWatchLineups() {
     // 直前情報がついたら「今日のAI予想」のキャッシュを破棄(次のアクセスで表示される)
     if (updatedAny) cacheSet(`predictions-today:${appDateKey()}`, undefined, 1);
   } catch (e) { /* 監視は付加機能。本体のリクエスト処理に影響させない */ }
+}
+const LINEUP_WATCH_SELF_TICK_MS = Number(process.env.LINEUP_WATCH_SELF_TICK_MS) || 3 * 60 * 1000;
+if (process.env.LINEUP_WATCH !== "0") {
+  const lineupSelfTimer = setInterval(() => { runInBackgroundCtx(() => maybeWatchLineups()); }, LINEUP_WATCH_SELF_TICK_MS);
+  if (lineupSelfTimer && typeof lineupSelfTimer.unref === "function") lineupSelfTimer.unref(); // プロセス終了を妨げない
 }
 
 async function maybeSelfHealAutoCollect() {
@@ -3991,7 +4022,14 @@ async function loadPlayerIndex(force) {
         playerIndexState.lastError = r.reasonJa || "索引の読み出しに失敗しました。";
         playerIndexState.reasonJa = `索引の再読み込みに失敗したため、前回読み込んだ${playerIndexState.rows.length}人ぶんの内容を表示しています(${r.reasonJa || "原因不明"})。`;
       } else {
-        playerIndexState.rows = r.rows || [];
+        // ---- v74(2026年9月1日・利用者の指摘): 読み込み時にも女子・ユース等を弾く ----
+        //   索引の作り直しは夜間なので、保存済みの索引に混入が残っている間も
+        //   画面には出さない(即日で直る防波堤)。外した件数は隠さず記録する。
+        const allRows = r.rows || [];
+        const VAR_RE = matchupLib.SQUAD_VARIANT_RE;
+        const CI = playerSearch.COL;
+        playerIndexState.rows = allRows.filter((row) => !VAR_RE.test(String(row[CI.teamEn] || "")) && !VAR_RE.test(String(row[CI.teamJa] || "")));
+        playerIndexState.droppedVariantRows = allRows.length - playerIndexState.rows.length;
         playerIndexState.meta = r.meta || null;
         // 「目次があるのか無いのか」は原因の切り分けに直結するので必ず持ち回す
         playerIndexState.metaFound = r.metaFound !== undefined ? r.metaFound : !!r.meta;
@@ -6611,6 +6649,74 @@ async function handleHttpRequest(req, res) {
         res.end(JSON.stringify({ ok: true, hasKey: !!API_KEY, viaRapidApi: VIA_RAPIDAPI }));
         return;
       }
+      if (pathname === "/api/diag/clubelo") {
+        // ---- v73(2026年8月29日): クラブElo接続の診断エンドポイント ----
+        //   Renderのシェルには入れないため、「本番サーバー自身がclubeloへ接続した
+        //   実測結果(試行ごとの生エラーコード・所要ms)」をこのGETで見られるようにする。
+        //   ・10分キャッシュ: 外から連打されても実際の接続試行は10分に1回だけ
+        //     (能動的に外部へ接続する endpoint なので、悪用時の影響を抑える)
+        //   ・保存は一切しない(読み取り専用の診断)
+        const diagCached = cacheGet("diag:clubelo");
+        if (diagCached) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ...diagCached, cached: true }));
+          return;
+        }
+        let savedDaily = null;
+        try {
+          const sd = UPSTASH_ENABLED ? await upstashGetJSON(CLUBELO_DAILY_KEY).catch(() => null) : null;
+          if (sd && sd.date) savedDaily = { date: sd.date, rowCount: Array.isArray(sd.list) ? sd.list.length : null };
+        } catch (e) { /* 保存の有無は付加情報 */ }
+        const probe = await clubEloDiag.probeDaily({ timeoutMs: 8000 });
+        const body = {
+          ok: true,
+          generatedAt: new Date().toISOString(),
+          probe,
+          savedDaily,
+          noteJa: "probe.attempts が「本番サーバーからclubeloへ実際に接続した結果」です(方式・エラーコード・所要ms)。10分キャッシュされます。",
+        };
+        cacheSet("diag:clubelo", body, 10 * 60 * 1000);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(body));
+        return;
+      }
+      if (pathname === "/api/diag/llm") {
+        // ---- v74(2026年9月1日): AI考察(LLM)接続の診断エンドポイント ----
+        //   「AIの考察機能に接続できませんでした」の原因を外から特定できるように、
+        //   ごく小さい実呼び出しを1回だけ行い、成功/失敗と実際のエラー文(鍵は含まれない)
+        //   ・所要msを返す。10分キャッシュ(連打されても実呼び出しは10分に1回。
+        //   1回あたりのコストは入力十数トークン+出力数トークンでごくわずか)。
+        const llmDiagCached = cacheGet("diag:llm");
+        if (llmDiagCached) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ...llmDiagCached, cached: true }));
+          return;
+        }
+        const t0 = Date.now();
+        const out = {
+          ok: false, provider: currentProviderName(), configured: !!process.env.ANTHROPIC_API_KEY,
+          generatedAt: new Date().toISOString(),
+        };
+        try {
+          const r = await generateLLM({
+            systemPrompt: "テスト呼び出しです。「OK」とだけ返してください。",
+            userPrompt: "接続確認",
+            maxTokens: 8,
+          });
+          out.ok = true;
+          out.model = r && r.model ? r.model : null;
+          out.ms = Date.now() - t0;
+          out.noteJa = "LLMへの実呼び出しに成功しました(この結果は10分キャッシュされます)。";
+        } catch (e) {
+          out.ms = Date.now() - t0;
+          out.errorJa = "LLMへの実呼び出しに失敗しました。";
+          out.errorDetail = String((e && e.message) || e).slice(0, 300);
+        }
+        cacheSet("diag:llm", out, 10 * 60 * 1000);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(out));
+        return;
+      }
       if (pathname === "/api/player-season-stats") {
         const { status, body } = await handlePlayerSeasonStats(parsed.searchParams);
         res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -8426,7 +8532,7 @@ module.exports = {
   handleCoachSearch,
   handleAccuracyStats,
   handleAutoCollectPredictions,
-  handleDailyDiff, rebuildPlayerIndexNow,
+  handleDailyDiff, rebuildPlayerIndexNow, resolveTeamId, // v74: resolveTeamIdはテスト用に公開
   __clearCache: () => cache.clear(),   // テストで時間依存のキャッシュを跨ぐため
   handlePredictMatch,
   perfSnapshot, // 最終方針: 性能の常時計測(テスト・負荷試験から参照)
