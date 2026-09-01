@@ -24,6 +24,8 @@
  */
 
 const { normName, namesMatch } = require("./oddsApi");
+const http = require("http");
+const https = require("https");
 
 const DAILY_KEY = "learn:clubelo:daily";   // { date, list: [[club, country, elo], ...] }
 const HIST_KEY = "learn:clubelo:hist";     // { builtAt, byTeamId: { id: [[fromMs, elo], ...] } }
@@ -57,43 +59,131 @@ function parseCsv(text) {
 }
 
 /**
- * v60: https と http の両方を試す(どちらで失敗したかを理由として残す)。
- * clubelo.com は歴史的に http で案内されているが、環境によっては平文HTTPの
- * 外向き通信が通らないことがある。推測で片方だけに賭けず、両方試して記録する。
+ * v73(2026年8月29日・利用者の承認): 依存ゼロのまま接続を強化する自前トランスポート。
+ *
+ * 背景(利用者経由で受けた指摘は正しかった):
+ *   Node組み込みfetch(undici)の接続確立タイムアウト(既定約10秒)は
+ *   AbortSignalでは延長できない。ただし解決に npm パッケージ(undici)は不要で、
+ *   Node標準の https.request なら接続〜応答全体を1つのタイマーで制御でき、
+ *   ECONNREFUSED / ETIMEDOUT / ENOTFOUND 等の生のエラーコードが直接取れる
+ *   (これまで謎だった「http:23」のような包まれたコードも、次の失敗から正体が残る)。
+ *   このプロジェクトの土台「依存パッケージゼロ(GitHub画面のドラッグだけで更新可能)」を
+ *   壊さないため、undici導入案は採らずこの実装にした。
  */
-async function fetchWithScheme(fetchFn, path) {
-  const errs = [];
-  // v65: Node の fetch は接続レベルの失敗をすべて「fetch failed」という1つの
-  //   メッセージに包んでしまう(本番実測: "https:fetch failed/http:fetch failed")。
-  //   本当の原因は e.cause(ENOTFOUND=DNS / ECONNREFUSED=接続拒否 /
-  //   ETIMEDOUT=応答なし / 証明書エラー 等)に入っているので、そこまで掘って残す。
-  //   併せて、行儀としてUser-Agentを名乗り、15秒で必ず打ち切る
-  //   (相手が無応答の日に学習ジョブが数分止まるのを防ぐ)。
-  const causeOf = (e) => {
-    const parts = [];
-    let cur = e;
-    for (let depth = 0; cur && depth < 4; depth++) {
-      const code = cur.code || cur.errno || null;
-      const msg = String(cur.message || "").slice(0, 40);
-      if (code) parts.push(String(code));
-      else if (msg && msg !== "fetch failed") parts.push(msg);
-      cur = cur.cause;
-    }
-    return parts.length ? parts.join("<") : String((e && e.message) || e).slice(0, 24);
-  };
-  const opts = { headers: { "User-Agent": "soccer-analysis-ai/1.0 (daily learning job)" } };
-  try { if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opts.signal = AbortSignal.timeout(15000); } catch (e) { /* 古い実行環境では無しで続行 */ }
-  for (const scheme of ["https", "http"]) {
-    try {
-      const res = await fetchFn(`${scheme}://api.clubelo.com/${path}`, opts);
-      if (res && res.ok) return res;
-      errs.push(`${scheme}:${res ? res.status : "no_response"}`);
-    } catch (e) {
-      errs.push(`${scheme}:${causeOf(e)}`);
+const DEFAULT_TIMEOUT_MS = 15000;
+const USER_AGENT = "soccer-analysis-ai/1.0 (daily learning job)";
+
+function httpGetRaw(url, opts) {
+  const o = opts || {};
+  const timeoutMs = Number.isFinite(o.timeoutMs) ? o.timeoutMs : DEFAULT_TIMEOUT_MS;
+  const startedAt = Date.now();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (code, msg) => {
+      if (settled) return; settled = true;
+      const e = new Error(msg || String(code));
+      e.code = String(code);
+      e.elapsedMs = Date.now() - startedAt;
+      reject(e);
+    };
+    const go = (u, redirectsLeft) => {
+      let parsed;
+      try { parsed = new URL(u); } catch (e) { return fail("BAD_URL", String(u).slice(0, 60)); }
+      const mod = parsed.protocol === "http:" ? http : https;
+      let req;
+      try {
+        req = mod.request(parsed, { method: "GET", headers: { "User-Agent": o.userAgent || USER_AGENT, Accept: "text/csv,text/plain,*/*" } }, (res) => {
+          const status = res.statusCode || 0;
+          if (status >= 300 && status < 400 && res.headers.location && redirectsLeft > 0) {
+            res.resume(); // 本文は読み捨てて転送先へ(clubeloはhttp→httpsの転送があり得る)
+            return go(new URL(res.headers.location, parsed).toString(), redirectsLeft - 1);
+          }
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            if (settled) return; settled = true;
+            const body = Buffer.concat(chunks).toString("utf8");
+            resolve({ ok: status >= 200 && status < 300, status, elapsedMs: Date.now() - startedAt, text: async () => body });
+          });
+          res.on("error", (e) => fail(e.code || "RES_ERROR", e.message));
+        });
+      } catch (e) { return fail(e.code || "REQ_BUILD_ERROR", e.message); }
+      // 接続確立を含む全体のタイムアウト(undiciと違い自由に延長できる)
+      req.setTimeout(timeoutMs, () => {
+        req.destroy(Object.assign(new Error(`timeout after ${timeoutMs}ms`), { code: `TIMEOUT_${timeoutMs}MS` }));
+      });
+      req.on("error", (e) => fail(e.code || e.errno || "REQ_ERROR", e.message));
+      req.end();
+    };
+    go(url, 3);
+  });
+}
+
+/** 注入が無いときに使う既定の取得関数(fetch互換の最小形: ok/status/text) */
+function defaultFetchFn(url, opts) {
+  return httpGetRaw(url, { timeoutMs: (opts && opts.__timeoutMs) || DEFAULT_TIMEOUT_MS });
+}
+
+/** e.cause を掘って一番具体的なコードを返す(undici形・生エラー形の両対応) */
+function causeOf(e) {
+  const parts = [];
+  let cur = e;
+  for (let depth = 0; cur && depth < 4; depth++) {
+    const code = cur.code || cur.errno || null;
+    const msg = String(cur.message || "").slice(0, 40);
+    if (code) parts.push(String(code));
+    else if (msg && msg !== "fetch failed") parts.push(msg);
+    cur = cur.cause;
+  }
+  return parts.length ? parts.join("<") : String((e && e.message) || e).slice(0, 24);
+}
+
+/** 試行ログを人が読める1行へ(例: r1 https:TIMEOUT_12000MS@12005ms/r1 http:ECONNREFUSED@230ms) */
+function summarizeAttempts(attempts) {
+  return (attempts || []).map((a) => `r${a.round} ${a.scheme}:${a.code}@${a.ms}ms`).join("/");
+}
+
+/**
+ * v60: https と http の両方を試す(どちらで失敗したかを理由として残す)。
+ * v73: ラウンド制のリトライ(既定1ラウンド=従来どおり)と試行ごとの
+ *      {ラウンド, 方式, コード, 所要ms} の記録を追加。
+ *      リトライを使うのは日次一覧(1日1リクエスト)だけ。クラブ別の履歴取得は
+ *      従来どおり1ラウンド+v69遮断器(62分事件を再発させない)。
+ */
+async function fetchWithScheme(fetchFn, path, retryOpts) {
+  const o = retryOpts || {};
+  const rounds = Math.max(1, Number(o.rounds) || 1);
+  const timeouts = Array.isArray(o.timeoutsMs) && o.timeoutsMs.length ? o.timeoutsMs : [DEFAULT_TIMEOUT_MS];
+  const backoffs = Array.isArray(o.backoffMs) ? o.backoffMs : [2000, 8000];
+  const doFetch = fetchFn || defaultFetchFn;
+  const attempts = [];
+  for (let r = 1; r <= rounds; r++) {
+    if (r > 1) await sleep(backoffs[Math.min(r - 2, backoffs.length - 1)] || 0);
+    const t = timeouts[Math.min(r - 1, timeouts.length - 1)];
+    const opts = { headers: { "User-Agent": USER_AGENT }, __timeoutMs: t };
+    try { if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opts.signal = AbortSignal.timeout(t); } catch (e) { /* 古い実行環境では無しで続行 */ }
+    for (const scheme of ["https", "http"]) {
+      const t0 = Date.now();
+      try {
+        const res = await doFetch(`${scheme}://api.clubelo.com/${path}`, opts);
+        const ms = res && Number.isFinite(res.elapsedMs) ? res.elapsedMs : Date.now() - t0;
+        if (res && res.ok) {
+          attempts.push({ round: r, scheme, code: "OK", status: res.status || 200, ms });
+          res.__attempts = attempts;
+          return res;
+        }
+        attempts.push({ round: r, scheme, code: `HTTP_${res ? res.status : "no_response"}`, ms });
+      } catch (e) {
+        const ms = Number.isFinite(e && e.elapsedMs) ? e.elapsedMs : Date.now() - t0;
+        attempts.push({ round: r, scheme, code: causeOf(e), ms });
+      }
     }
   }
-  const err = new Error(errs.join("/"));
+  // 旧形式(https:コード/http:コード)も先頭に残す(既存の監視・表示との互換のため)
+  const legacy = attempts.slice(0, 2).map((a) => `${a.scheme}:${a.code}`).join("/");
+  const err = new Error(rounds > 1 ? `${legacy} | ${summarizeAttempts(attempts)}` : legacy);
   err.allSchemesFailed = true;
+  err.attempts = attempts;
   throw err;
 }
 
@@ -108,27 +198,30 @@ async function getDailyElo(deps, runAt) {
   if (saved && saved.date === dateStr && Array.isArray(saved.list)) {
     return { date: dateStr, rows: saved.list.map(([club, country, elo]) => ({ club, country, elo })), fetchedFresh: false, staleDays: 0, error: null };
   }
+  // v73: 日次一覧は1日1リクエストだけの大事な取得なので、ここだけ多段リトライで粘る。
+  //   本番実測(8/27にデータ取得成功→以後失敗)から「先方が時々しか応答しない」状態が
+  //   濃厚で、リトライが効く見込みが高い。最悪でも合計約2.5分で諦める(62分事件とは
+  //   桁が違う)。クラブ別の履歴取得はこのリトライを使わない(v69遮断器を維持)。
+  const retryPlan = deps.dailyRetryPlan || { rounds: 3, timeoutsMs: [12000, 30000, 30000], backoffMs: [2000, 8000] };
   try {
-    // v60: 本番実測で日次Eloが取れていなかった(dailyAvailable:false)。
-    //   原因を特定できるよう、https → http の順に試し、**両方の失敗理由を残す**。
-    //   (推測で「これが原因」と決めつけず、次の実行でログから判別できるようにする)
-    const res = await fetchWithScheme(fetchFn, dateStr);
+    const res = await fetchWithScheme(fetchFn, dateStr, retryPlan);
     if (!res || !res.ok) throw new Error(`http_${res ? res.status : "no_response"}`);
     const rows = parseCsv(await res.text());
     if (rows.length) {
       if (upstashSetJSON) await upstashSetJSON(DAILY_KEY, { date: dateStr, list: rows.map((r) => [r.club, r.country, r.elo]) }).catch(() => {});
-      return { date: dateStr, rows, fetchedFresh: true, staleDays: 0, error: null };
+      return { date: dateStr, rows, fetchedFresh: true, staleDays: 0, error: null, attempts: res.__attempts || null };
     }
     throw new Error("empty_csv");
   } catch (e) {
+    const attempts = (e && e.attempts) || null;
     // 今日ぶんが取れない日は、7日以内の保存があればそれを使う(正直にstaleDaysを返す)
     if (saved && Array.isArray(saved.list) && saved.date) {
       const staleDays = Math.round((Date.parse(dateStr) - Date.parse(saved.date)) / 86400000);
       if (staleDays >= 0 && staleDays <= 7) {
-        return { date: saved.date, rows: saved.list.map(([club, country, elo]) => ({ club, country, elo })), fetchedFresh: false, staleDays, error: String(e.message || e).slice(0, 50) };
+        return { date: saved.date, rows: saved.list.map(([club, country, elo]) => ({ club, country, elo })), fetchedFresh: false, staleDays, error: String(e.message || e).slice(0, 300), attempts };
       }
     }
-    return { date: dateStr, rows: [], fetchedFresh: false, staleDays: null, error: String(e.message || e).slice(0, 50) };
+    return { date: dateStr, rows: [], fetchedFresh: false, staleDays: null, error: String(e.message || e).slice(0, 300), attempts };
   }
 }
 
@@ -278,8 +371,35 @@ function makeHistoryLookup(hist) {
   return (teamId, dateMs) => eloAt(byTeamId[teamId], dateMs);
 }
 
+/**
+ * v73: 診断用の単発プローブ(/api/diag/clubelo から呼ばれる)。
+ * その場で https/http を1回ずつ短いタイムアウトで叩き、試行ごとの
+ * {方式, コード, 所要ms} を返す。保存は一切しない(診断は読み取り専用)。
+ * 呼び出し側(server.js)が10分キャッシュするため、外から連打されても
+ * 実際の接続試行は10分に1回に抑えられる。
+ */
+async function probeDaily(deps) {
+  const d = deps || {};
+  const dateStr = new Date(d.nowMs || Date.now()).toISOString().slice(0, 10);
+  const out = { at: new Date(d.nowMs || Date.now()).toISOString(), target: `api.clubelo.com/${dateStr}`, ok: false, rowCount: null, attempts: [] };
+  try {
+    const res = await fetchWithScheme(d.fetchFn, dateStr, { rounds: 1, timeoutsMs: [Number.isFinite(d.timeoutMs) ? d.timeoutMs : 6000] });
+    out.attempts = res.__attempts || [];
+    const rows = parseCsv(await res.text());
+    out.ok = rows.length > 0;
+    out.rowCount = rows.length;
+    out.sample = rows.slice(0, 3).map((r) => r.club);
+    if (!rows.length) out.noteJa = "接続はできましたが、CSVとして解釈できる行がありませんでした。";
+  } catch (e) {
+    out.attempts = (e && e.attempts) || [];
+    out.errorJa = "接続できませんでした(試行ごとのコードと所要msを参照)。";
+  }
+  return out;
+}
+
 module.exports = {
   DAILY_KEY, HIST_KEY, HIST_LOCK_KEY,
   parseCsv, getDailyElo, buildEloByNorm, eloForTeamName,
   backfillHistory, eloAt, makeHistoryLookup,
+  httpGetRaw, defaultFetchFn, fetchWithScheme, summarizeAttempts, probeDaily,
 };

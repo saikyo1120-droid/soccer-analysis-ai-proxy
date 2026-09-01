@@ -1482,7 +1482,9 @@ async function runDailyLearning(deps) {
   //   取れない日は7日以内の保存で継続(staleDaysを開示)。それも無ければ特徴量0。
   let clubEloDailyRows = [], clubEloByNormMap = null, clubEloMeta = null, clubEloUsedToday = 0;
   try {
-    clubEloMeta = await clubEloMod.getDailyElo({ fetchFn: (u, o) => fetch(u, o), upstashGetJSON, upstashSetJSON }, runAt.getTime());
+    // v73: fetchFnの注入を外し、clubElo内蔵のNode標準トランスポート(https.request)を使う。
+    //   接続タイムアウトを自由に制御でき、失敗時に生のエラーコード+所要msが試行ごとに残る。
+    clubEloMeta = await clubEloMod.getDailyElo({ upstashGetJSON, upstashSetJSON }, runAt.getTime());
     clubEloDailyRows = clubEloMeta.rows || [];
     clubEloByNormMap = clubEloMod.buildEloByNorm(clubEloDailyRows);
     if (clubEloMeta.error && !clubEloDailyRows.length) errors.push(`clubelo_daily_failed:${clubEloMeta.error}`);
@@ -2265,7 +2267,8 @@ async function runDailyLearning(deps) {
             clubEloBackfillResult = { ran: false, reasonJa: "日次のElo一覧が取得できない日(ホスト無応答)のため、履歴の取得は見送りました。回復した日に自動で試します。" };
           } else if (teamsForElo.length >= 20) {
             clubEloBackfillResult = await clubEloMod.backfillHistory(
-              { fetchFn: (u, o) => fetch(u, o), upstashCmd, upstashGetJSON, upstashSetJSON },
+              { upstashCmd, upstashGetJSON, upstashSetJSON }, // v73: 内蔵トランスポート使用
+
               teamsForElo, runAt.getTime() - Math.round(3.3 * 365 * 86400000), runAt.getTime());
             if (clubEloBackfillResult && clubEloBackfillResult.ran) {
               ceHist = await upstashGetJSON(clubEloMod.HIST_KEY).catch(() => null);

@@ -209,7 +209,7 @@ function tokenSet(name) {
  * これらの表記を持つ候補は表記ゆらぎ照合の対象にしない
  * (別チームに化けるくらいなら照合しない、という v59 の原則の徹底)。
  */
-const SQUAD_VARIANT_RE = /(\s|\()W\)?$|\sW\s|U-?(17|18|19|20|21|23)|\s(II|III|B)$|women|youth|reserves?|femin|ladies/i;
+const SQUAD_VARIANT_RE = /(\s|\()W\)?$|\sW\s|U-?(17|18|19|20|21|23)|\s(II|III|B)$|women|youth|reserves?|femin|frauen|femminile|dames|ladies|女子|レディース/i; // v74: frauen・femminile・dames・日本語表記も追加(女子混入対策)
 function isSquadVariantName(name) { return SQUAD_VARIANT_RE.test(String(name || "")); }
 function queryWantsVariant(q) {
   return SQUAD_VARIANT_RE.test(String(q || "")) || /女子|レディース|ユース|リザーブ|2軍|セカンド/.test(String(q || ""));
@@ -382,6 +382,7 @@ function buildMatchup(p) {
 }
 
 module.exports = {
+  SQUAD_VARIANT_RE, isSquadVariantName,
   MAX_SIDE_LEN, JA_ALIASES,
   cleanSide, parseMatchupText, jaKey, buildJaMap, buildNameIndex, resolveClub, buildMatchup,
 };
