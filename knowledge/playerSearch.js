@@ -1499,6 +1499,7 @@ async function rebuildIndexFromStore(deps, opts) {
     ok: false, source: "store", apiCalls: 0,
     fromSquads: 0, fromRecords: 0, carriedOver: 0,
     clubsWithSquad: 0, recordsRead: 0, redisReads: 0,
+    droppedVariant: 0, // v74: 女子・ユース等として索引から外した件数(隠さず数える)
     reasonJa: null,
   };
   if (!deps || !deps.upstashEnabled) {
@@ -1531,7 +1532,18 @@ async function rebuildIndexFromStore(deps, opts) {
     }
     return out;
   };
-  const put = (id, rec) => { merged.set(Number(id), mergeInto(merged.get(Number(id)), rec)); };
+  // ---- v74(2026年9月1日・利用者の指摘): 女子・ユース・2軍チームの選手を索引に入れない ----
+  //   このサイトは男子サッカー専用(利用者の方針)。過去にチームID照合の化けで
+  //   女子チームの名簿・記録が保存された可能性があるため、索引を作る段階でも弾く。
+  //   (照合側の根本修正は server.js resolveTeamId 参照。ここは防波堤の二重化)
+  const VARIANT_RE = /(\s|\()W\)?$|\sW\s|U-?(17|18|19|20|21|23)|\s(II|III|B)$|women|youth|reserves?|femin|frauen|femminile|dames|ladies|女子|レディース/i;
+  const isVariantRec = (rec) => VARIANT_RE.test(String((rec && rec.teamEn) || "")) || VARIANT_RE.test(String((rec && rec.teamJa) || "")) || VARIANT_RE.test(String((rec && rec.leagueName) || ""));
+  let droppedVariant = 0;
+  const put = (id, rec) => {
+    if (isVariantRec(rec)) { droppedVariant++; return false; }
+    merged.set(Number(id), mergeInto(merged.get(Number(id)), rec));
+    return true;
+  };
 
   for (const club of clubs) {
     const d = await clubDossier.getDossier(club.nameEn).catch(() => null);
@@ -1541,11 +1553,10 @@ async function rebuildIndexFromStore(deps, opts) {
     stats.clubsWithSquad++;
     for (const p of squad) {
       if (!p || !p.id) continue;
-      put(p.id, {
+      if (put(p.id, {
         id: Number(p.id), name: p.name, teamEn: club.nameEn, teamJa: club.nameJa,
         leagueId: club.leagueId || null, position: p.position, age: p.age, number: p.number,
-      });
-      stats.fromSquads++;
+      })) stats.fromSquads++;
     }
   }
 
@@ -1561,8 +1572,7 @@ async function rebuildIndexFromStore(deps, opts) {
     stats.redisReads++;
     stats.recordsRead++;
     if (!rec || !rec.id) continue;
-    put(rec.id, rec);
-    stats.fromRecords++;
+    if (put(rec.id, rec)) stats.fromRecords++;
   }
 
   // ---- ④ スタメン配置(細かいポジションの推定に使う。保存済み) ----
@@ -1578,10 +1588,13 @@ async function rebuildIndexFromStore(deps, opts) {
   // 前回の索引にしかいない選手も残す(名簿の輪番で今日たまたま読めなかった人を消さない)
   for (const [id, prevRow] of prevMap) {
     if (merged.has(id)) continue;
+    // v74: 前回の索引から引き継ぐ行にも同じ防波堤を通す(過去に混入した女子選手を掃除する)
+    if (VARIANT_RE.test(String(prevRow[COL.teamEn] || "")) || VARIANT_RE.test(String(prevRow[COL.teamJa] || ""))) { droppedVariant++; continue; }
     rows.push(prevRow);
     stats.carriedOver++;
   }
 
+  stats.droppedVariant = droppedVariant;
   if (!rows.length) {
     stats.reasonJa = "保存済みのデータから作れる選手が1人もいませんでした(名簿も選手記録もまだ空です)。";
     return stats;
