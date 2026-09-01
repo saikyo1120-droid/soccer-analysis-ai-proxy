@@ -41,6 +41,19 @@ const REQUIRED_DATA_SPECS = [
   { key: "venue", labelJa: "ホーム/アウェイ別の成績" },
 ];
 
+// ---- v78(2026年9月1日・利用者の承認 案2): 選手の質問用のデータ種別 ----
+//   6段階の熟考はこれまでクラブ専用だった。選手の質問では「必要なデータ」の
+//   種類そのものが違うため、クラブ用と混ぜず別の一覧を持つ
+//   (クラブの質問の表示・充足率計算には1文字も影響させない=劣化禁止)。
+const PLAYER_DATA_SPECS = [
+  { key: "playerScoring", labelJa: "得点関与(ゴール・アシスト)の実績" },
+  { key: "playerOpportunity", labelJa: "出場機会(出場試合数)" },
+  { key: "playerRating", labelJa: "試合評価(平均レーティング)" },
+  { key: "playerCreation", labelJa: "チャンスメイク指標(キーパス・パス成功率など)" },
+  { key: "playerDefense", labelJa: "守備・対人指標(タックル・デュエルなど)" },
+  { key: "playerClubContext", labelJa: "所属クラブの状況" },
+];
+
 // 根拠の種類ごとの信頼度。事実は最も信頼でき、意見は参考程度。
 // aiEstimate は第5次監査で追加。AIが実データ無しに一般論から推定した内容なので、
 // 信頼度は最も低く扱う(0にはしない。まったく無価値ではないが、実データとは
@@ -63,12 +76,15 @@ const EVIDENCE_TYPE_TRUST = { fact: 1.0, analysis: 0.7, profile: 0.5, opinion: 0
  * @param {object} availability - {form:true, goals:false, ...}
  * @param {string[]} [requiredKeys] - 今回の質問で本当に必要な項目のkey一覧
  */
-function assessDataAvailability(availability, requiredKeys) {
+function assessDataAvailability(availability, requiredKeys, dataSpecs) {
   const a = availability || {};
+  // v78(案2): dataSpecs で対象領域(クラブ用/選手用)を切り替えられるようにする。
+  // 未指定なら従来どおりクラブ用(既存の呼び出しは全て挙動不変)。
+  const DOMAIN_SPECS = (Array.isArray(dataSpecs) && dataSpecs.length) ? dataSpecs : REQUIRED_DATA_SPECS;
   const specs = Array.isArray(requiredKeys) && requiredKeys.length
-    ? REQUIRED_DATA_SPECS.filter((s) => requiredKeys.includes(s.key))
-    : REQUIRED_DATA_SPECS;
-  const specList = specs.length ? specs : REQUIRED_DATA_SPECS;
+    ? DOMAIN_SPECS.filter((s) => requiredKeys.includes(s.key))
+    : DOMAIN_SPECS;
+  const specList = specs.length ? specs : DOMAIN_SPECS;
   const available = [];
   const missing = [];
   for (const spec of specList) {
@@ -76,7 +92,7 @@ function assessDataAvailability(availability, requiredKeys) {
     else missing.push(spec.labelJa);
   }
   // 今回は必要としなかったが、あれば分析の幅が広がる項目(正直に別枠で示す)
-  const notRequired = REQUIRED_DATA_SPECS
+  const notRequired = DOMAIN_SPECS
     .filter((s) => !specList.includes(s) && !a[s.key])
     .map((s) => s.labelJa);
   const coveragePct = Math.round((available.length / specList.length) * 100);
@@ -292,7 +308,8 @@ function deliberate(input) {
   const ranked = Array.isArray(i.ranked) ? i.ranked : [];
 
   // requiredKeys: 今回の質問で本当に必要なデータの種類(未指定なら従来どおり8種類すべて)
-  const dataGathering = assessDataAvailability(i.dataAvailability, i.requiredKeys);
+  // dataSpecs(v78・案2): 選手の質問では PLAYER_DATA_SPECS を渡す(未指定=クラブ用)
+  const dataGathering = assessDataAvailability(i.dataAvailability, i.requiredKeys, i.dataSpecs);
   const comparison = compareHypotheses(ranked);
   const counterArgument = buildCounterArgument(comparison);
   const evaluation = evaluateEvidence(comparison, dataGathering, ranked);
@@ -332,5 +349,5 @@ function deliberate(input) {
 
 module.exports = {
   deliberate, assessDataAvailability, compareHypotheses, buildCounterArgument,
-  evaluateEvidence, buildFinalConclusion, REQUIRED_DATA_SPECS, EVIDENCE_TYPE_TRUST,
+  evaluateEvidence, buildFinalConclusion, REQUIRED_DATA_SPECS, PLAYER_DATA_SPECS, EVIDENCE_TYPE_TRUST,
 };

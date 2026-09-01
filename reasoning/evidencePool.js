@@ -127,4 +127,68 @@ function buildEvidencePool(knowledge, teamEn) {
   return pool;
 }
 
-module.exports = { buildEvidencePool };
+// ---- v78(2026年9月1日・利用者の承認 案2): 選手の質問用の根拠プール ----
+//   handleDiscussの選手分岐で実際に取得できたデータ(今季の実成績・追加指標・
+//   プロフィール・所属クラブの知識・蓄積済みの選手知識)を、クラブと同じ
+//   evidence item の形へ正規化する。取得できなかった指標のitemは作らない
+//   (=無いことを正直に表す)。カテゴリ名は hypothesisGenerator.js の
+//   PLAYER_HYPOTHESIS_FACTORS と厳密に対応(テストで固定)。
+function buildPlayerEvidencePool(input) {
+  const pool = [];
+  const i = input || {};
+  const s = i.stats || {};
+  const key = i.playerKey || null;
+  const season = i.season ? `${i.season}シーズン` : "今シーズン";
+  const has = (v) => v !== null && v !== undefined;
+
+  if (has(s.appearances)) {
+    pool.push({ category: "playerOpportunity", type: "fact", teamEn: key, statement: `${season}の出場は${s.appearances}試合。` });
+  }
+  if (has(s.goals) || has(s.assists)) {
+    pool.push({
+      category: "playerScoring", type: "fact", teamEn: key,
+      statement: `${season}は${has(s.goals) ? `${s.goals}得点` : "得点数不明"}・${has(s.assists) ? `${s.assists}アシスト` : "アシスト数不明"}。`,
+    });
+  }
+  if (has(s.avgRating)) {
+    pool.push({ category: "playerRating", type: "fact", teamEn: key, statement: `${season}の平均レーティングは${s.avgRating}。` });
+  }
+  {
+    const creation = [];
+    if (has(s.keyPasses)) creation.push(`キーパス${s.keyPasses}本`);
+    if (has(s.passAccuracyPct)) creation.push(`パス成功率${s.passAccuracyPct}%`);
+    if (has(s.dribbleSuccessRatePct)) creation.push(`ドリブル成功率${s.dribbleSuccessRatePct}%`);
+    if (creation.length) pool.push({ category: "playerCreation", type: "fact", teamEn: key, statement: `${season}の攻撃指標: ${creation.join("・")}。` });
+  }
+  {
+    const defense = [];
+    if (has(s.defensiveActions)) defense.push(`守備アクション(タックル+インターセプト)${s.defensiveActions}回`);
+    if (has(s.duelWinRatePct)) defense.push(`デュエル勝率${s.duelWinRatePct}%`);
+    if (defense.length) pool.push({ category: "playerDefense", type: "fact", teamEn: key, statement: `${season}の守備・対人指標: ${defense.join("・")}。` });
+  }
+  // 所属クラブの蓄積知識(handleDiscussが読み出した最大2件をそのまま使う)
+  (i.clubItems || []).forEach((st) => {
+    if (st) pool.push({ category: "clubContext", type: "fact", teamEn: key, statement: String(st) });
+  });
+  // このターンで生成・取得した選手プロフィール(AI生成のためaiEstimate扱い)。
+  // 蓄積知識側(下のke.profiles)に同文が既にある場合は重複させない。
+  if (i.profileStatement && !(i.playerKnowledge && (i.playerKnowledge.profiles || []).some((p) => p && p.statement === i.profileStatement))) {
+    pool.push({ category: "playerProfile", type: "aiEstimate", teamEn: key, statement: i.profileStatement, isAiGenerated: true });
+  }
+  // 蓄積済みの選手知識(Knowledge Engine)。AI生成の推定はクラブと同じく
+  // aiEstimate として実データより明確に低い重みで扱う(でっち上げ防止の既存原則)。
+  const ke = i.playerKnowledge;
+  if (ke) {
+    const typeFor = (item, fallback) => (item && item.isAiGenerated ? "aiEstimate" : fallback);
+    const push = (item, category, type) => pool.push({
+      category: item.category || category, type, teamEn: key, statement: item.statement,
+      isAiGenerated: !!item.isAiGenerated,
+    });
+    (ke.facts || []).forEach((item) => push(item, "playerSeasonStats", typeFor(item, "fact")));
+    (ke.analyses || []).forEach((item) => push(item, "playerSeasonStats", typeFor(item, "analysis")));
+    (ke.profiles || []).forEach((item) => push(item, "playerProfile", typeFor(item, "analysis")));
+  }
+  return pool;
+}
+
+module.exports = { buildEvidencePool, buildPlayerEvidencePool };

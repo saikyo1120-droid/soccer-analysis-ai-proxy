@@ -127,15 +127,81 @@ const HYPOTHESIS_FACTORS = [
   },
 ];
 
+// ---- v78(2026年9月1日・利用者の承認 案2): 選手の質問用の観点 ----
+//   6段階の熟考をクラブ専用から選手にも拡張する。クラブ用と同じ設計思想:
+//   観点は固定テンプレート、各観点にどれだけ「実際に取得できた根拠」が
+//   集まるかは毎回の実データ次第(存在しない根拠はでっち上げない)。
+//   カテゴリ名は buildPlayerEvidencePool(evidencePool.js)の出力と厳密に対応
+//   させる(過去の監査で繰り返し起きた「カテゴリ名の不一致で根拠が全部
+//   捨てられる」事故を防ぐため、v78のテストで対応関係を固定する)。
+const PLAYER_HYPOTHESIS_FACTORS = [
+  {
+    id: "player_scoring",
+    label: "得点関与(ゴール・アシスト)が評価の中心という見立て",
+    relevantCategories: ["playerScoring", "playerSeasonStats"],
+    buildStatement: (nameJa, matched) =>
+      matched.length
+        ? `${nameJa}の現在の評価は、今シーズンの得点・アシストという直接の数字に支えられている可能性が高い。`
+        : `${nameJa}の得点関与を示す実データは見当たらなかった。`,
+  },
+  {
+    id: "player_creation",
+    label: "チャンスメイク・ボール技術が持ち味という見立て",
+    relevantCategories: ["playerCreation"],
+    buildStatement: (nameJa, matched) =>
+      matched.length
+        ? `${nameJa}はキーパス・パス精度・仕掛けなど、得点の一つ手前の貢献が持ち味である可能性がある。`
+        : `${nameJa}のチャンスメイクに関する実データは見当たらなかった。`,
+  },
+  {
+    id: "player_defense",
+    label: "守備貢献・対人の強さが持ち味という見立て",
+    relevantCategories: ["playerDefense"],
+    buildStatement: (nameJa, matched) =>
+      matched.length
+        ? `${nameJa}はタックル・インターセプト・デュエルなど、守備側の実測が評価を支えている可能性がある。`
+        : `${nameJa}の守備・対人に関する実データは見当たらなかった。`,
+  },
+  {
+    id: "player_consistency",
+    label: "試合ごとの安定感(平均評価)が評価を支えているという見立て",
+    relevantCategories: ["playerRating"],
+    buildStatement: (nameJa, matched) =>
+      matched.length
+        ? `${nameJa}は試合ごとの平均レーティングという「安定して計算できる働き」が評価につながっている可能性がある。`
+        : `${nameJa}の試合評価(平均レーティング)は取得できなかった。`,
+  },
+  {
+    id: "player_opportunity",
+    label: "出場機会・起用のされ方が現状を左右しているという見立て",
+    relevantCategories: ["playerOpportunity", "playerProfile"],
+    buildStatement: (nameJa, matched) =>
+      matched.length
+        ? `${nameJa}の現状は、出場機会(起用のされ方)そのものに左右されている可能性がある。`
+        : `${nameJa}の出場機会に関する実データは見当たらなかった。`,
+  },
+  {
+    id: "player_club_situation",
+    label: "所属クラブの状況が影響しているという見立て",
+    relevantCategories: ["clubContext"],
+    buildStatement: (nameJa, matched) =>
+      matched.length
+        ? `${nameJa}個人の数字だけでなく、所属クラブの現在の状況(調子・順位など)が影響している可能性がある。`
+        : `${nameJa}の所属クラブの状況を示すデータは見当たらなかった。`,
+  },
+];
+
 /**
  * @param {Array} evidencePool - buildEvidencePool()の出力
  * @param {{teamJa?: string, teamEn?: string}} teamInfo
+ * @param {Array} factors - 観点の一覧(省略時は従来どおりクラブ用。v78で選手用を追加)
  * @returns {Array<{id, label, statement, evidence: Array}>}
  */
-function generateHypotheses(evidencePool, teamInfo) {
+function generateHypotheses(evidencePool, teamInfo, factors) {
   const pool = evidencePool || [];
   const teamJa = (teamInfo && teamInfo.teamJa) || (teamInfo && teamInfo.teamEn) || "対象クラブ";
-  return HYPOTHESIS_FACTORS.map((factor) => {
+  const factorList = (Array.isArray(factors) && factors.length) ? factors : HYPOTHESIS_FACTORS;
+  return factorList.map((factor) => {
     const matched = pool.filter((e) => factor.relevantCategories.includes(e.category));
     return {
       id: factor.id,
@@ -146,4 +212,4 @@ function generateHypotheses(evidencePool, teamInfo) {
   });
 }
 
-module.exports = { generateHypotheses, HYPOTHESIS_FACTORS };
+module.exports = { generateHypotheses, HYPOTHESIS_FACTORS, PLAYER_HYPOTHESIS_FACTORS };

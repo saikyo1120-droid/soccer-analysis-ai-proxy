@@ -41,10 +41,11 @@ function runSelfCheck(rankedHypotheses) {
 /**
  * @param {Array} evidencePool - buildEvidencePool()の出力
  * @param {{teamJa?: string, teamEn?: string}} teamInfo
+ * @param {{factors?: Array}} opts - v78(案2): 選手用など観点一覧の差し替え(省略時=クラブ用で従来どおり)
  * @returns {{hypotheses, selected, selfCheck, evidencePoolSize}}
  */
-function assembleReasoning(evidencePool, teamInfo) {
-  const hypotheses = generateHypotheses(evidencePool, teamInfo);
+function assembleReasoning(evidencePool, teamInfo, opts) {
+  const hypotheses = generateHypotheses(evidencePool, teamInfo, opts && opts.factors);
   const ranked = rankHypotheses(hypotheses);
   const selfCheck = runSelfCheck(ranked);
 
