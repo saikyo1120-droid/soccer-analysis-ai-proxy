@@ -38,7 +38,12 @@
 const { REGISTERED_PLAYERS } = require("./registeredPlayers");
 const { computePlayerRealStats } = require("./playerFeatures");
 
-const PLAYER_UPDATE_CAP_DEFAULT = 3;
+// v78(2026年9月1日・利用者の指示 案3): 「商品として出すまでは、APIの余りは
+// 全て学習に回してよい」との明示指示を受け、既定値を3→20名/日へ引き上げ
+// (登録選手の一巡が約36日→約5日に)。1日約40〜60リクエスト増で、Proプラン
+// (7,500/日)の実測消費(約1,000/日)に対して十分な余裕がある。
+// 環境変数 PLAYER_UPDATE_CAP でいつでも上下できる設計は従来どおり。
+const PLAYER_UPDATE_CAP_DEFAULT = 20;
 const RATING_HISTORY_MAX = 60; // 直近60回ぶんの記録を保持
 
 // ご要望の16項目。source は「どこから取るか」、permanentlyUnavailable は

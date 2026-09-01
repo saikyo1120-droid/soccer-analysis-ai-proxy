@@ -29,13 +29,19 @@ const OUTCOMES = ["home", "draw", "away"];
 /** 1試合ぶんの予測を、評価に必要な形でまとめて返す */
 function predictRow(row, weights) {
   const f = computeMatchFeatures(row.homeCtx, row.awayCtx, null);
-  const { homeLambda, awayLambda } = predictOutcomeV2(f, weights);
+  const { homeLambda, awayLambda, predictedWinner } = predictOutcomeV2(f, weights);
   const rho = weights && weights.rho ? weights.rho : 0;
   const p = computeMatchProbabilitiesRaw(homeLambda, awayLambda, 8, rho);
   const probs = { home: p.homeWin, draw: p.draw, away: p.awayWin };
   return {
     probs,
-    predicted: OUTCOMES.reduce((best, o) => (probs[o] > probs[best] ? o : best), "home"),
+    // ---- v78(案1)で発見・修正した不整合 ----
+    //   従来ここは確率のargmax(最大値の結果)で勝敗を決めていたが、本番の
+    //   予測(predictOutcomeV2)は「λ差の引き分け帯」で決めている。つまり
+    //   バックテスト・採用ゲートは本番と違うルールの成績を測っていた。
+    //   本番と同じ判定(predictOutcomeV2のpredictedWinner=引き分け帯ルール、
+    //   帯はweights.drawBand)に統一する。確率・LogLoss・Brierは従来と不変。
+    predicted: predictedWinner,
     scoreline: mostLikelyScoreline(homeLambda, awayLambda, 6, rho),
     top3: topScorelinesFrom(homeLambda, awayLambda, 6, rho, 3).map((x) => x.scoreline),
     market: marketProbabilities(homeLambda, awayLambda, 8, rho),

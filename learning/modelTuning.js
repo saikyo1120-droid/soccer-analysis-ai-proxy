@@ -55,8 +55,11 @@ const LEAGUE_NAMES_JA = {
   2: "チャンピオンズリーグ", 3: "ヨーロッパリーグ", 848: "カンファレンスリーグ",
 };
 const TUNING_LOG_KEEP = 60;
-// データセットを作り直す間隔。毎日15リクエスト使う必要はない(過去試合は増えない)。
-const REFRESH_DAYS = 7;
+// データセットを作り直す間隔。
+// v78(案3・利用者の指示「商品化まで予算の余りは全て学習へ」): 週1回→3日ごとへ短縮。
+// シーズン進行中は新しい試合が毎週増えるため、学習データの鮮度が上がる
+// (1回あたり約62リクエスト。Proプランの余裕内)。
+const REFRESH_DAYS = 3;
 
 /** 探索するパラメータの候補。粗→細の2段階。 */
 const COARSE_GRID = {
@@ -290,6 +293,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
       clubEloRows: clubEloRowsCount, // v57: Elo付きで学習に使えた試合数(実測)
       xgAlpha: xgAlphaChosen, xgAlphaDetail, xgRows: xgRowsCount, // v57: xGブレンドの実測
       xi: xiChosen, xiDetail, // v71③: 時間減衰ξの実測
+      drawBand: 0.15, drawBandDetail: null, // v78(案1): 検証不足時は既定帯のまま
       datasetNoteJa: ds.reasonJa,
     };
   }
@@ -434,13 +438,63 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   candidates3.sort((a, b) => a.loss - b.loss);
   const best3 = candidates3[0];
   const gradWon = !!(best3 && best3.viaGradient && Number.isFinite(best3.loss));
-  const candidateWeights = best3 ? best3.weights : found.weights;
+  let candidateWeights = best3 ? best3.weights : found.weights;
   const candidateFormDetail = {
     gridLogLoss: Number.isFinite(lossOf(trainEvalGrid)) ? Math.round(lossOf(trainEvalGrid) * 10000) / 10000 : null,
     gradAddLogLoss: Number.isFinite(lossOf(trainEvalGrad)) ? Math.round(lossOf(trainEvalGrad) * 10000) / 10000 : null,
     gradMultLogLoss: Number.isFinite(lossOf(trainEvalGradMult)) ? Math.round(lossOf(trainEvalGradMult) * 10000) / 10000 : null,
     chosenForm: candidateWeights && candidateWeights.modelForm === "mult" ? "mult" : "add",
   };
+
+  // ---- v78(2026年9月1日・利用者の承認 案1): 引き分け帯の学習(門番付き) ----
+  //   帯は勝敗ラベルの決め方だけを変える(λ・確率・LogLossは不変)ため、
+  //   評価は検証データの「的中率」で行う(xi=v71③と同じ、候補比較→門番の流儀)。
+  //   門番の条件(すべて満たしたときだけ既定値0.15から動く):
+  //     ①検証が300件以上 ②的中率が既定帯より+0.4pt以上良い
+  //     ③その帯でも引き分け予想が0件にならない(「絶対引き分けと言わないAI」への
+  //       退化は、当たり数が増えても採用しない。evaluateの注記どおりAccuracyだけ
+  //       だと引き分けを捨てる方が有利に見えることがあるため)
+  const DRAW_BAND_DEFAULT = 0.15;
+  const DRAW_BAND_ADOPT_MARGIN_PT = 0.4;
+  let drawBandChosen = DRAW_BAND_DEFAULT;
+  let drawBandDetail = null;
+  if (test.length >= 300) {
+    const bandCandidates = [0.06, 0.10, DRAW_BAND_DEFAULT, 0.20, 0.25];
+    const scoredBands = bandCandidates.map((b) => {
+      const ev = evaluate(test, { ...candidateWeights, drawBand: b });
+      return {
+        band: b,
+        accuracyPct: ev && ev.measurable ? ev.accuracyPct : null,
+        drawPredictedCount: ev && ev.measurable ? ev.drawPredictedCount : null,
+        drawRecallPct: ev && ev.measurable ? ev.drawRecallPct : null,
+      };
+    });
+    const defBand = scoredBands.find((s) => s.band === DRAW_BAND_DEFAULT);
+    const eligible = scoredBands.filter((s) => s.accuracyPct !== null && (s.drawPredictedCount || 0) > 0);
+    eligible.sort((a, b) => b.accuracyPct - a.accuracyPct);
+    const bestBand = eligible[0] || null;
+    if (bestBand && defBand && defBand.accuracyPct !== null
+      && bestBand.band !== DRAW_BAND_DEFAULT
+      && bestBand.accuracyPct >= defBand.accuracyPct + DRAW_BAND_ADOPT_MARGIN_PT) {
+      drawBandChosen = bestBand.band;
+    }
+    drawBandDetail = {
+      candidates: scoredBands,
+      chosen: drawBandChosen, default: DRAW_BAND_DEFAULT,
+      noteJa: drawBandChosen === DRAW_BAND_DEFAULT
+        ? `検証${test.length}件の的中率で既定帯±${DRAW_BAND_DEFAULT}を+${DRAW_BAND_ADOPT_MARGIN_PT}pt以上上回る帯が無かったため、既定値を維持しました。`
+        : `検証${test.length}件の的中率が既定帯より+${DRAW_BAND_ADOPT_MARGIN_PT}pt以上高かった帯±${drawBandChosen}を採用しました(既定: ±${DRAW_BAND_DEFAULT})。`,
+    };
+  } else {
+    drawBandDetail = {
+      chosen: DRAW_BAND_DEFAULT, default: DRAW_BAND_DEFAULT,
+      reasonJa: `検証用の過去試合が${test.length}件で、引き分け帯の探索に必要な300件に達していません(それまで既定値±${DRAW_BAND_DEFAULT}で判定します)。`,
+    };
+  }
+  // 選ばれた帯を候補weightsに載せる(門番を通らなければ既定値0.15が明示的に載る
+  // だけで、従来の挙動と完全に同一)。この後の新旧比較・一貫性検証・採否も、
+  // この帯込みの候補で判定される(採用されなければ帯も従来のまま)。
+  candidateWeights = { ...candidateWeights, drawBand: drawBandChosen };
 
   const oldEval = evaluate(test, base);
   const newEval = evaluate(test, candidateWeights);
@@ -465,6 +519,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
       clubEloRows: clubEloRowsCount, // v57: Elo付きで学習に使えた試合数(実測)
       xgAlpha: xgAlphaChosen, xgAlphaDetail, xgRows: xgRowsCount, // v57: xGブレンドの実測
       xi: xiChosen, xiDetail, // v71③: 時間減衰ξの実測(候補ごとの検証LogLossと選ばれた値)
+      drawBand: drawBandChosen, drawBandDetail, // v78(案1): 引き分け帯の実測(候補ごとの検証的中率と選ばれた帯)
     trainSize: train.length,
     testSize: test.length,
     combinationsEvaluated: found.evaluated,
@@ -499,6 +554,10 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
         //   (加法候補が勝った日に、保存済みの"mult"が黙って残ると、加法用に
         //    学習した重みを乗法で解釈してしまう=構造的な壊れ方。テストで固定)
         modelForm: candidateWeights.modelForm === "mult" ? "mult" : "add",
+        // v78(案1): 引き分け帯もLEARNABLE_KEYS(勾配学習の対象)には入らないため
+        // 明示して保存する。門番を通らなかった日は既定値0.15が明示的に載るだけで
+        // 挙動は従来と同一。
+        drawBand: Number.isFinite(candidateWeights.drawBand) ? candidateWeights.drawBand : 0.15,
       }
       : null,
     // どちらの候補が勝ったか(実測の記録。gradFit.detailは学習の中身の説明)
@@ -603,6 +662,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     teamStats: record.teamStats, // v59: 派生指標の集計結果(実測)
     modelFormDetail: record.modelFormDetail, // v66: 加法/乗法の比較実測と選ばれた形
     xi: record.xi, xiDetail: record.xiDetail, // v71③: 時間減衰ξの実測
+    drawBand: record.drawBand, drawBandDetail: record.drawBandDetail, // v78(案1): 引き分け帯の実測
     consistencyChecked: record.consistencyChecked,
     reasonJa: record.reasonJa,
     datasetSize: ds.rows.length,

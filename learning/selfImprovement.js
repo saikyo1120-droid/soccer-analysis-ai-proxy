@@ -100,9 +100,16 @@ function buildSelfDiagnosis(input) {
   const byLeague = new Map();
   for (const r of resolved) {
     if (!r.league) continue;
-    const cur = byLeague.get(r.league) || { n: 0, hits: 0 };
+    const cur = byLeague.get(r.league) || { n: 0, hits: 0, drawActual: 0, drawPredicted: 0, drawHit: 0 };
     cur.n++;
     if (r.correct) cur.hits++;
+    // v78(案4): 引き分けの実際の頻度・予想頻度・的中数もリーグ別に実測する
+    // (引き分け帯の学習=案1の効果と弱点をリーグ単位で追えるようにするため)
+    if (r.actualWinner === "draw") cur.drawActual++;
+    if (r.predictedWinner === "draw") {
+      cur.drawPredicted++;
+      if (r.actualWinner === "draw") cur.drawHit++;
+    }
     byLeague.set(r.league, cur);
   }
   const overallN = resolved.length;
@@ -111,6 +118,18 @@ function buildSelfDiagnosis(input) {
     .filter(([, v]) => v.n >= 3)
     .map(([league, v]) => ({ league, n: v.n, hitRatePct: round1((v.hits / v.n) * 100) }))
     .sort((a, b) => a.hitRatePct - b.hitRatePct);
+  // v78(案4): リーグ別の常設実測表(件数の多い順・n≥3のみ。少数サンプルの%は
+  // 実力を表さないため載せない=的中率カードと同じ方針)
+  const leagueTable = Array.from(byLeague.entries())
+    .filter(([, v]) => v.n >= 3)
+    .map(([league, v]) => ({
+      league, n: v.n,
+      hitRatePct: round1((v.hits / v.n) * 100),
+      drawActualPct: round1((v.drawActual / v.n) * 100),
+      drawPredictedPct: round1((v.drawPredicted / v.n) * 100),
+      drawHitN: v.drawHit,
+    }))
+    .sort((a, b) => b.n - a.n);
 
   // (b) データ欠損率(予測時に両側の実値が揃っていた特徴の記録割合から)
   const withTrust = resolved.filter((r) => r.featureTrust && Array.isArray(r.featureTrust.parts));
@@ -151,6 +170,9 @@ function buildSelfDiagnosis(input) {
     leagueAccuracy,
     leagueAccuracyNoteJa: leagueAccuracy.length ? null
       : (overallN ? "リーグ情報つきの答え合わせ済み予測がまだ3件未満のため、リーグ別の精度は判定不能です(新しい予測記録から自動で貯まります)。" : "答え合わせ済みの予測がまだ無いため、リーグ別の精度は判定不能です。"),
+    // v78(案4): リーグ別の常設実測表(的中率+引き分けの実際/予想/的中)
+    leagueTable,
+    leagueTableNoteJa: `直近の答え合わせ済み${overallN}件からの実測(3件以上のリーグのみ・件数の多い順)。「引分実際」はそのリーグで実際に引き分けだった割合、「引分予想」はAIが引き分けと予想した割合です。`,
     dataGaps,
     dataGapsNoteJa: dataGaps.length ? null : "信頼度つきの予測記録がまだ3件未満のため、データ欠損率は判定不能です。",
     ineffectiveFeatures,

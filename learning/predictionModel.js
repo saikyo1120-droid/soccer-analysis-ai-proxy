@@ -315,9 +315,15 @@ function predictOutcomeV2(features, weights) {
   const clampedHome = rawHome < lo || rawHome > hi;
   const clampedAway = rawAway < lo || rawAway > hi;
   const lambdaDiff = homeLambda - awayLambda;
+  // ---- v78(2026年9月1日・利用者の承認 案1): 引き分け帯を学習パラメータへ ----
+  //   従来の±0.15はハードコードで一度も学習されていなかった(サッカーは約1/4が
+  //   引き分けなのに、ここだけ勘のままだった)。weights.drawBand が学習で採用
+  //   されたときだけ変わり、未指定なら従来の0.15(過去の保存済み
+  //   weightsSnapshotとの完全な後方互換=劣化禁止)。
+  const drawBand = Number.isFinite(w.drawBand) ? w.drawBand : 0.15;
   let predictedWinner = "draw";
-  if (lambdaDiff > 0.15) predictedWinner = "home";
-  else if (lambdaDiff < -0.15) predictedWinner = "away";
+  if (lambdaDiff > drawBand) predictedWinner = "home";
+  else if (lambdaDiff < -drawBand) predictedWinner = "away";
   return {
     homeLambda, awayLambda, predictedWinner, score,
     // v63: 推定が現実的な範囲の外へ出たか(出た試合は表示で正直に断る)
@@ -788,6 +794,8 @@ function isSaneWeights(w) {
   }
   // v50: 市場ブレンドは0〜0.95(1.0=完全に市場の受け売り、は許可しない)
   if (w.marketBlend !== undefined && !(Number.isFinite(w.marketBlend) && w.marketBlend >= 0 && w.marketBlend <= 0.95)) return false;
+  // v79(案6): 2つ目の意見(API-Football予想)の混合比も同じ範囲制限
+  if (w.apifbBlend !== undefined && !(Number.isFinite(w.apifbBlend) && w.apifbBlend >= 0 && w.apifbBlend <= 0.95)) return false;
   // v66: モデルの形は "add" / "mult" / 未指定 の3通りだけ(壊れた値を保存しない)
   if (w.modelForm !== undefined && w.modelForm !== "add" && w.modelForm !== "mult") return false;
   return true;
@@ -1287,6 +1295,112 @@ function fitMarketBlend(records, opts) {
   };
 }
 
+// ============================================================================
+// v79(2026年9月1日・利用者の承認 案6): 「2つ目の意見」= API-Football予想の学習ブレンド
+// ----------------------------------------------------------------------------
+// サイトは以前からAPI-Football側の試合予想(percent)を取得・採点してきたが、
+// 表示専用で自前予想には使われていなかった。市場ブレンド(v50)と同じ
+// 「ホールドアウト検証の門番を通ったときだけ混ぜる」方式で、この2つ目の
+// 意見を学習ブレンドする。w(weights.apifbBlend)が0の間は1ビットも影響しない。
+// 混合の土台(baseline)は「その予測が実際に使った確率」= 自前モデル
+// +(市場ブレンドが効いていた場合は)市場ブレンド後の確率。学習も適用も
+// 同じ土台を使う(学習と本番で条件が食い違う事故を作らない)。
+// ============================================================================
+
+/** ブレンドの土台となる確率(自前モデル+適用済み市場ブレンド)を再現する */
+function baselineProbsOf(homeLambda, awayLambda, rho, marketImplied, marketW) {
+  const p = computeMatchProbabilitiesRaw(homeLambda, awayLambda, undefined, rho || 0);
+  const model = { home: p.homeWin, draw: p.draw, away: p.awayWin };
+  const usableMarket = Number.isFinite(marketW) && marketW > 0 && marketImplied
+    && Number.isFinite(marketImplied.homePct) && Number.isFinite(marketImplied.drawPct) && Number.isFinite(marketImplied.awayPct);
+  if (!usableMarket) return model;
+  return blendProbs(model, { home: marketImplied.homePct / 100, draw: marketImplied.drawPct / 100, away: marketImplied.awayPct / 100 }, marketW);
+}
+
+function secondOpinionSampleOf(r) {
+  if (!r || !r.resolved || !r.actualWinner || !r.apifbImplied) return null;
+  if (!Number.isFinite(r.homeLambda) || !Number.isFinite(r.awayLambda)) return null;
+  const a = r.apifbImplied;
+  if (!Number.isFinite(a.homePct) || !Number.isFinite(a.drawPct) || !Number.isFinite(a.awayPct)) return null;
+  const rho = Number.isFinite(r.weightsSnapshot && r.weightsSnapshot.rho) ? r.weightsSnapshot.rho : 0;
+  // その予測が実際に使った市場ブレンド比(record.blendUsed.w)をそのまま再現する
+  const marketW = (r.blendUsed && Number.isFinite(r.blendUsed.w)) ? r.blendUsed.w : 0;
+  return {
+    model: baselineProbsOf(r.homeLambda, r.awayLambda, rho, r.marketImplied || null, marketW),
+    market: { home: a.homePct / 100, draw: a.drawPct / 100, away: a.awayPct / 100 },
+    actual: r.actualWinner,
+  };
+}
+
+/**
+ * API-Football予想の混合比 w を学習する(fitMarketBlendと同じ門番方式)。
+ * 検証NLLが w=0(混ぜない)を上回らなければ採用しない=劣化ゼロ設計。
+ */
+function fitSecondOpinionBlend(records, opts) {
+  const MIN_SAMPLES = (opts && opts.minSamples) || 40;
+  const samples = (records || []).map(secondOpinionSampleOf).filter(Boolean);
+  if (samples.length < MIN_SAMPLES) {
+    return { adopted: false, w: 0, samples: samples.length, reasonJa: `API-Football予想つきで答え合わせ済みの記録が${samples.length}件で、学習に必要な${MIN_SAMPLES}件に達していません(v79導入後の予測から自動で貯まります)。` };
+  }
+  const split = Math.floor(samples.length * 0.7);
+  const train = samples.slice(0, split);
+  const valid = samples.slice(split);
+  if (valid.length < 10) {
+    return { adopted: false, w: 0, samples: samples.length, reasonJa: `検証用が${valid.length}件で不足しています。` };
+  }
+  const EPS = 1e-9;
+  const nllOf = (set, w) => set.reduce((s, x) =>
+    s - Math.log(Math.max(EPS, blendProbs(x.model, x.market, w)[x.actual])), 0) / set.length;
+  let bestW = 0, bestTrainNll = nllOf(train, 0);
+  for (let w = 0.05; w <= 0.901; w += 0.05) {
+    const nll = nllOf(train, w);
+    if (nll < bestTrainNll) { bestTrainNll = nll; bestW = Math.round(w * 100) / 100; }
+  }
+  const validBase = nllOf(valid, 0);
+  const validBest = nllOf(valid, bestW);
+  if (bestW === 0 || validBest >= validBase) {
+    return {
+      adopted: false, w: 0, samples: samples.length, bestTrainW: bestW,
+      validNllBase: Math.round(validBase * 10000) / 10000, validNllBest: Math.round(validBest * 10000) / 10000,
+      reasonJa: bestW === 0
+        ? "学習データ上も「混ぜない」が最良だったため、API-Football予想は判定に使いません。"
+        : `検証データで混合(w=${bestW})が「混ぜない」を上回らなかったため、採用を見送りました(迷ったら現状維持)。`,
+    };
+  }
+  return {
+    adopted: true, w: bestW, samples: samples.length,
+    validNllBase: Math.round(validBase * 10000) / 10000,
+    validNllBest: Math.round(validBest * 10000) / 10000,
+    reasonJa: `検証${valid.length}件で「2つ目の意見」の混合(API-Football${Math.round(bestW * 100)}%)がNLL ${Math.round(validBase * 10000) / 10000}→${Math.round(validBest * 10000) / 10000}へ改善したため採用しました。`,
+  };
+}
+
+/**
+ * 予測時に「2つ目の意見」を混合する。w=0またはデータ無しなら何も変えない。
+ * @returns {{ probs, predictedWinner, apifbBlendUsed }} apifbBlendUsed=null なら不変。
+ */
+function applySecondOpinionBlend(input) {
+  const i = input || {};
+  const base = baselineProbsOf(i.homeLambda, i.awayLambda, i.rho || 0, i.marketImplied || null,
+    Number.isFinite(i.marketW) ? i.marketW : 0);
+  const a = i.apifbImplied;
+  const usable = Number.isFinite(i.w) && i.w > 0 && a
+    && Number.isFinite(a.homePct) && Number.isFinite(a.drawPct) && Number.isFinite(a.awayPct);
+  if (!usable) {
+    const pick = base.home >= base.draw && base.home >= base.away ? "home" : base.away >= base.draw ? "away" : "draw";
+    return { probs: base, predictedWinner: pick, apifbBlendUsed: null };
+  }
+  const probs = blendProbs(base, { home: a.homePct / 100, draw: a.drawPct / 100, away: a.awayPct / 100 }, i.w);
+  const pick = probs.home >= probs.draw && probs.home >= probs.away ? "home" : probs.away >= probs.draw ? "away" : "draw";
+  return {
+    probs, predictedWinner: pick,
+    apifbBlendUsed: {
+      w: i.w, pct: Math.round(i.w * 100),
+      noteJa: `この予想は「2つ目の意見」(API-Football予想)を${Math.round(i.w * 100)}%混合して判定しています(比率は実測で学習・毎晩見直し)。`,
+    },
+  };
+}
+
 /**
  * 予測時にブレンドを適用する(オッズが無ければ自前モデルのまま)。
  * @returns {{ probs, predictedWinner, blendUsed }} blendUsed=null なら純自前。
@@ -1341,6 +1455,7 @@ module.exports = {
   buildAblationCandidates,
   fitWeightsGradientDescent,
   fitMarketBlend, applyMarketBlend, blendProbs,
+  fitSecondOpinionBlend, applySecondOpinionBlend, secondOpinionSampleOf, baselineProbsOf, // v79(案6)
   describeWeightsHistoryEntry,
   buildLearningSummary,
   classifyFailureReasons,

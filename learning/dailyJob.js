@@ -70,6 +70,8 @@ const LEARNING_STAGES = [
   "⑥ 知能メトリクスの計測",
 ];
 const { createKnowledgeStore } = require("../knowledge/knowledgeStore");
+// v77(集客①): サイトマップ用の軽量索引(予測保存時に1行RPUSHするだけ)
+const seoPages = require("../knowledge/seoPages");
 const { createMemoryStore } = require("../memory/memoryStore");
 const { createRelationshipIndex } = require("../knowledge/relationshipIndex");
 const { createClubProfileEngine } = require("../knowledge/clubProfileEngine");
@@ -93,6 +95,7 @@ const {
 const {
   EXTENDED_DEFAULT_WEIGHTS, computeMatchFeatures, predictOutcomeV2, isSaneWeights,
   applyMarketBlend, fitMarketBlend,
+  fitSecondOpinionBlend, applySecondOpinionBlend, // v79(案6): 2つ目の意見の学習ブレンド
   computeFactorImportance, backtestAccuracyV2, fitWeightsGradientDescent,
   buildLearningSummary, classifyFailureReasons, summarizeFailureReasons,
   classifySuccessReasons, summarizeSuccessReasons, classifyContextualFailureReasons,
@@ -236,9 +239,11 @@ function predictOutcome(homeFormScore, awayFormScore, weights) {
   const homeLambda = Math.max(0.4, w.homeBase + diff * w.sensitivity);
   const awayLambda = Math.max(0.4, w.awayBase - diff * w.sensitivity);
   const lambdaDiff = homeLambda - awayLambda;
+  // v78(案1): 引き分け帯はweights.drawBand(未指定は従来の0.15=完全後方互換)
+  const drawBand = Number.isFinite(w.drawBand) ? w.drawBand : 0.15;
   let predictedWinner = "draw";
-  if (lambdaDiff > 0.15) predictedWinner = "home";
-  else if (lambdaDiff < -0.15) predictedWinner = "away";
+  if (lambdaDiff > drawBand) predictedWinner = "home";
+  else if (lambdaDiff < -drawBand) predictedWinner = "away";
   return { homeLambda, awayLambda, predictedWinner };
 }
 
@@ -1751,6 +1756,38 @@ async function runDailyLearning(deps) {
           blendUsed = blended.blendUsed;
         }
       }
+
+      // ---- v79(2026年9月1日・利用者の承認 案6): 「2つ目の意見」= API-Football予想 ----
+      //   同じ試合へのAPI-Football側の予想確率を取得して記録する(1試合+1リクエスト・
+      //   1日の予測数ぶんだけ。Proプラン予算内)。取得できない日は正直に「無し」。
+      //   学習した混合比 w(weights.apifbBlend)が0の間は、記録されるだけで判定には
+      //   1ビットも影響しない(市場ブレンドと同じ門番方式。v79導入後に記録が貯まり、
+      //   検証で改善が実測できたときだけ毎晩の学習が w を採用する)。
+      let apifbImplied = null;
+      try {
+        const pd = await callApiFootball("/predictions", { fixture: fixtureId }, { jobCall: true });
+        const pct = pd && Array.isArray(pd.response) && pd.response[0]
+          && pd.response[0].predictions && pd.response[0].predictions.percent;
+        if (pct) {
+          const h = parseInt(pct.home, 10), d = parseInt(pct.draw, 10), a2 = parseInt(pct.away, 10);
+          if (Number.isFinite(h) && Number.isFinite(d) && Number.isFinite(a2)) {
+            apifbImplied = { homePct: h, drawPct: d, awayPct: a2 };
+          }
+        }
+      } catch (e) { /* 取得失敗は「無し」として続行(架空の値を作らない) */ }
+      let apifbBlendUsed = null;
+      const apifbW = Number.isFinite(weights.apifbBlend) ? weights.apifbBlend : 0;
+      if (apifbW > 0 && apifbImplied) {
+        const b2 = applySecondOpinionBlend({
+          homeLambda, awayLambda, rho: Number.isFinite(weights.rho) ? weights.rho : 0,
+          marketImplied, marketW: blendUsed ? blendW : 0,
+          apifbImplied, w: apifbW,
+        });
+        if (b2.apifbBlendUsed) {
+          predictedWinner = b2.predictedWinner;
+          apifbBlendUsed = b2.apifbBlendUsed;
+        }
+      }
       const importance = computeFactorImportance(features, weights);
       const topFactor = importance.find((i) => i.stars > 0);
 
@@ -1804,6 +1841,8 @@ async function runDailyLearning(deps) {
         originTeamEn: team.nameEn, stateHypothesis,
         // 精度証明ラウンド: オッズ(市場比較・ROI用)と「似た試合」(RAG強化)
         odds: matchOdds, marketImplied, marketEdgePt,
+        // v79(案6): 2つ目の意見(API-Football予想)の実測値と、混合したかの開示
+        apifbImplied, apifbBlendUsed,
         oddsSource, // v57: 市場確率の出典(consensus=複数社平均 / single=API-Football 1社)
         blendUsed, // v50: 市場ブレンドで判定した場合の内訳(nullなら純自前モデル)
         similarPast: similarPast.length ? similarPast : null,
@@ -1866,6 +1905,8 @@ async function runDailyLearning(deps) {
       await upstashSetJSON(`learn:ownpred:${fixtureId}`, record);
       await upstashCmd(["RPUSH", "learn:ownpred:pending", String(fixtureId)]).catch(() => {});
       await upstashCmd(["INCR", "learn:ownpred:total"]).catch(() => {});
+      // v77(集客①): 検索エンジン用サイトマップの軽量索引に1行追記(失敗しても予測処理は続行)
+      await seoPages.recordMatchIndexEntry({ upstashCmd }, record).catch(() => {});
       newPredictionsLogged++;
       predictionClubsSeen.push(team.nameEn);
       // 「どのクラブがいつ予測されたか」を残し、TOP100のカバー率を後から実測できるようにする
@@ -2331,6 +2372,41 @@ async function runDailyLearning(deps) {
     errors.push(`market_blend_fit_failed:${e && (e.code || e.message)}`);
   }
 
+  // ---- v79(2026年9月1日・利用者の承認 案6): 「2つ目の意見」ブレンドの学習 ----
+  //   API-Football予想つきで答え合わせ済みの記録から、混合比 w(weights.apifbBlend)を
+  //   ホールドアウト検証で学習する。市場ブレンド(上)と完全に同じ門番方式:
+  //   検証で改善しなければ w は変えない(以前採用した w が不利になれば0へ戻す)。
+  let apifbBlendFitToday = null;
+  try {
+    const recentForApifb = await loadRecentRecordsOnce();
+    const fitA = fitSecondOpinionBlend(recentForApifb);
+    apifbBlendFitToday = fitA;
+    const MIN_SAMPLES_FOR_APIFB_CHANGE = 40;
+    if (upstashEnabled && fitA && fitA.samples >= MIN_SAMPLES_FOR_APIFB_CHANGE) {
+      const storedNow = (await upstashGetJSON("learn:weights").catch(() => null)) || {};
+      const currentW = Number.isFinite(storedNow.apifbBlend) ? storedNow.apifbBlend : 0;
+      const newW = fitA.adopted ? fitA.w : 0;
+      if (Math.abs(newW - currentW) >= 0.005) {
+        const merged = { ...EXTENDED_DEFAULT_WEIGHTS, ...storedNow, apifbBlend: newW, version: (storedNow.version || 0) + 1, updatedAt: runAt.toISOString() };
+        if (isSaneWeights(merged)) {
+          const okSave = await upstashSetJSON("learn:weights", merged);
+          if (okSave !== false) {
+            await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
+              date: dateKey, adopted: true, method: "apifb_blend",
+              oldWeights: { apifbBlend: currentW }, newWeights: { apifbBlend: newW },
+              sampleSize: fitA.samples, note: fitA.reasonJa,
+            })]).catch(() => {});
+            apifbBlendFitToday = { ...fitA, saved: true, fromW: currentW, toW: newW };
+          } else {
+            apifbBlendFitToday = { ...fitA, saved: false, reasonJa: `${fitA.reasonJa || ""}(ただし保存に失敗したため反映されていません)` };
+          }
+        }
+      }
+    }
+  } catch (e) {
+    errors.push(`apifb_blend_fit_failed:${e && (e.code || e.message)}`);
+  }
+
   await stage("⑤ 知識ベース更新と成長ログ");
   // ---- ⑤ 今日の知識ベース更新と成長ログ ----
   // Stage E以降: 「事実」の保存先はKnowledge Engine(knowledgeStore.js)に一本化。
@@ -2481,6 +2557,15 @@ async function runDailyLearning(deps) {
       validNllBase: marketBlendFitToday.validNllBase ?? null,
       validNllBest: marketBlendFitToday.validNllBest ?? null,
       reasonJa: marketBlendFitToday.reasonJa || null,
+    } : null,
+    // v79(案6): 「2つ目の意見」(API-Football予想)ブレンドの学習結果(実測のまま)
+    apifbBlendFit: apifbBlendFitToday ? {
+      adopted: !!apifbBlendFitToday.adopted, w: apifbBlendFitToday.w ?? 0,
+      samples: apifbBlendFitToday.samples ?? 0,
+      saved: apifbBlendFitToday.saved === true,
+      validNllBase: apifbBlendFitToday.validNllBase ?? null,
+      validNllBest: apifbBlendFitToday.validNllBest ?? null,
+      reasonJa: apifbBlendFitToday.reasonJa || null,
     } : null,
     // v48: 週間ダイジェストの生成結果(生成した週・見送り理由)を実測のまま残す
     weeklyDigest: weeklyDigestResult ? {
@@ -2834,6 +2919,9 @@ async function runDailyLearning(deps) {
           worstLeague: diagnosis.leagueAccuracy[0] || null,
           leagueAccuracy: diagnosis.leagueAccuracy.slice(0, 5),
           leagueAccuracyNoteJa: diagnosis.leagueAccuracyNoteJa,
+          // v78(案4): リーグ別の常設実測表(裏側タブに表として表示する)
+          leagueTable: diagnosis.leagueTable || [],
+          leagueTableNoteJa: diagnosis.leagueTableNoteJa || null,
           dataGaps: diagnosis.dataGaps,
           dataGapsNoteJa: diagnosis.dataGapsNoteJa,
           ineffectiveFeatures: diagnosis.ineffectiveFeatures,
