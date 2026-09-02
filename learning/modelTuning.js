@@ -337,18 +337,33 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   //   各αで学習用データだけからレーティングを学習し、検証用データのLogLossで
   //   比較する(リークなし)。改善しなければα=0のまま(=従来と完全同一)。
   if (xgRowsCount >= 300) {
-    const candidates = [0, 0.3, 0.5, 0.7];
-    const scores = [];
-    for (const a of candidates) {
+    const scoreAlpha = (a) => {
       const rt = fitTeamRatings(train, { nowMs: nowMsForRatings, xgAlpha: a });
       const testCopy = test.map((r) => ({ ...r }));
       attachRatings(testCopy, rt);
       const ev = evaluate(testCopy, base);
-      scores.push({ alpha: a, logLoss: ev.measurable ? ev.logLoss : Infinity });
-    }
+      return { alpha: a, logLoss: ev.measurable ? ev.logLoss : Infinity };
+    };
+    const candidates = [0, 0.3, 0.5, 0.7];
+    const scores = candidates.map(scoreAlpha);
     scores.sort((x, y) => x.logLoss - y.logLoss);
-    if (Number.isFinite(scores[0].logLoss) && scores[0].alpha !== 0) xgAlphaChosen = scores[0].alpha;
-    xgAlphaDetail = { candidates: scores, chosen: xgAlphaChosen, xgRows: xgRowsCount };
+    // ---- v80(2026年9月1日・利用者の承認 案10): 粗→細の2段階探索 ----
+    //   粗い勝者の近傍(±0.1を0.05刻み)をCPUだけで再探索する(APIコスト0)。
+    //   「α=0(混ぜない)が最良なら従来どおり0のまま」という規則は変えない。
+    const fineScores = [];
+    if (Number.isFinite(scores[0].logLoss) && scores[0].alpha !== 0) {
+      const center = scores[0].alpha;
+      const tried = new Set(candidates);
+      for (const a of [center - 0.1, center - 0.05, center + 0.05, center + 0.1]) {
+        const rounded = Math.round(a * 100) / 100;
+        if (rounded <= 0 || rounded > 0.9 || tried.has(rounded)) continue;
+        tried.add(rounded);
+        fineScores.push(scoreAlpha(rounded));
+      }
+      const all = scores.concat(fineScores).sort((x, y) => x.logLoss - y.logLoss);
+      if (Number.isFinite(all[0].logLoss) && all[0].alpha !== 0) xgAlphaChosen = all[0].alpha;
+    }
+    xgAlphaDetail = { candidates: scores, fineCandidates: fineScores, chosen: xgAlphaChosen, xgRows: xgRowsCount };
   } else if (xgRowsCount > 0) {
     xgAlphaDetail = { chosen: 0, xgRows: xgRowsCount, reasonJa: `xG付きの過去試合が${xgRowsCount}件で、α選択に必要な300件に達していません(それまで実ゴールのみで学習)。` };
   }
@@ -459,8 +474,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   let drawBandChosen = DRAW_BAND_DEFAULT;
   let drawBandDetail = null;
   if (test.length >= 300) {
-    const bandCandidates = [0.06, 0.10, DRAW_BAND_DEFAULT, 0.20, 0.25];
-    const scoredBands = bandCandidates.map((b) => {
+    const scoreBand = (b) => {
       const ev = evaluate(test, { ...candidateWeights, drawBand: b });
       return {
         band: b,
@@ -468,9 +482,29 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
         drawPredictedCount: ev && ev.measurable ? ev.drawPredictedCount : null,
         drawRecallPct: ev && ev.measurable ? ev.drawRecallPct : null,
       };
-    });
-    const defBand = scoredBands.find((s) => s.band === DRAW_BAND_DEFAULT);
-    const eligible = scoredBands.filter((s) => s.accuracyPct !== null && (s.drawPredictedCount || 0) > 0);
+    };
+    const bandCandidates = [0.06, 0.10, DRAW_BAND_DEFAULT, 0.20, 0.25];
+    const scoredBands = bandCandidates.map(scoreBand);
+    // ---- v80(2026年9月1日・利用者の承認 案10): 粗→細の2段階探索 ----
+    //   粗い候補の最良帯の近傍(±0.03を0.015刻み)をCPUだけで再探索する
+    //   (APIコスト0)。門番の条件(既定帯より+0.4pt・引き分け0件へ退化しない)は
+    //   細かい候補にもそのまま適用する。
+    const coarseEligible = scoredBands.filter((s) => s.accuracyPct !== null && (s.drawPredictedCount || 0) > 0)
+      .sort((a, b) => b.accuracyPct - a.accuracyPct);
+    const fineScoredBands = [];
+    if (coarseEligible[0]) {
+      const center = coarseEligible[0].band;
+      const tried = new Set(bandCandidates);
+      for (const delta of [-0.03, -0.015, 0.015, 0.03]) {
+        const b = Math.round((center + delta) * 1000) / 1000;
+        if (b < 0.03 || b > 0.30 || tried.has(b)) continue;
+        tried.add(b);
+        fineScoredBands.push(scoreBand(b));
+      }
+    }
+    const allBands = scoredBands.concat(fineScoredBands);
+    const defBand = allBands.find((s) => s.band === DRAW_BAND_DEFAULT);
+    const eligible = allBands.filter((s) => s.accuracyPct !== null && (s.drawPredictedCount || 0) > 0);
     eligible.sort((a, b) => b.accuracyPct - a.accuracyPct);
     const bestBand = eligible[0] || null;
     if (bestBand && defBand && defBand.accuracyPct !== null
@@ -480,10 +514,11 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     }
     drawBandDetail = {
       candidates: scoredBands,
+      fineCandidates: fineScoredBands, // v80(案10): 細かい刻みの再探索の実測
       chosen: drawBandChosen, default: DRAW_BAND_DEFAULT,
       noteJa: drawBandChosen === DRAW_BAND_DEFAULT
-        ? `検証${test.length}件の的中率で既定帯±${DRAW_BAND_DEFAULT}を+${DRAW_BAND_ADOPT_MARGIN_PT}pt以上上回る帯が無かったため、既定値を維持しました。`
-        : `検証${test.length}件の的中率が既定帯より+${DRAW_BAND_ADOPT_MARGIN_PT}pt以上高かった帯±${drawBandChosen}を採用しました(既定: ±${DRAW_BAND_DEFAULT})。`,
+        ? `検証${test.length}件の的中率で既定帯±${DRAW_BAND_DEFAULT}を+${DRAW_BAND_ADOPT_MARGIN_PT}pt以上上回る帯が無かったため、既定値を維持しました(粗${scoredBands.length}+細${fineScoredBands.length}候補を探索)。`
+        : `検証${test.length}件の的中率が既定帯より+${DRAW_BAND_ADOPT_MARGIN_PT}pt以上高かった帯±${drawBandChosen}を採用しました(既定: ±${DRAW_BAND_DEFAULT}・粗${scoredBands.length}+細${fineScoredBands.length}候補を探索)。`,
     };
   } else {
     drawBandDetail = {

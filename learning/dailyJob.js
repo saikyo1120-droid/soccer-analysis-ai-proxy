@@ -165,7 +165,19 @@ const { sampleWeightOf, buildFeatureTrust } = require("./trustEngine");
 // 20件でも最大400件程度。最終方針③「精度>コスト。無駄だけ削る」に沿って
 // **学習データの供給量を増やす**方向へ引き上げる。
 // 予算が逼迫している日は下のループ内で apiBudget を見て自動的に止まる。
-const OWN_PREDICT_LOG_CAP = Number(process.env.OWN_PREDICT_LOG_CAP) || 20; // 1回の実行で新しく記録する自社予測の件数上限
+// ---- v80(2026年9月1日・利用者の指示): 公開前フルスロットルモード ----
+//   「世間に公開するまではAPIを限界まで学習に充ててよい。公開時に調整できる形に」
+//   との明示指示を受けた設定。既定はON。**公開するときはRenderの環境変数で
+//   PRELAUNCH_LEARNING=0 を設定するだけ**で、予測対象・件数上限が従来の
+//   控えめな値に戻る(利用者向けの余力を最優先する通常モード)。
+//   フルスロットル中も、予算の安全弁(apiBudget)と40分アラームは従来どおり働く。
+const PRELAUNCH_LEARNING = String(process.env.PRELAUNCH_LEARNING ?? "1") !== "0";
+const OWN_PREDICT_LOG_CAP = Number(process.env.OWN_PREDICT_LOG_CAP)
+  || (PRELAUNCH_LEARNING ? 90 : 20); // 1回の実行で新しく記録する自社予測の件数上限(公開前は90)
+// v80(案8): 学習済み12大会の「全試合」を予測対象に加える際の1回あたり上限。
+// 通常モードでは0(=従来どおり登録クラブの試合だけ)。
+const EXTRA_FIXTURES_CAP = Number(process.env.EXTRA_FIXTURES_CAP)
+  || (PRELAUNCH_LEARNING ? 70 : 0);
 // 予測を1件立てるのに必要な最低リクエスト数の目安。これを下回ったら打ち切る。
 const OWN_PREDICT_MIN_BUDGET = 25;
 // ---- 2026年8月・上の引き上げと必ずセットで直す必要がある値 ----
@@ -560,6 +572,47 @@ function capList(list, cap = GROWTH_LOG_LIST_CAP) {
   });
   if (unique.length <= cap) return unique;
   return [...unique.slice(0, cap), `…ほか${unique.length - cap}種類を省略しました(表示件数の上限${cap}件)`];
+}
+
+// ---- v80(2026年9月1日・利用者の承認 案8): 学習済み大会の「全試合」を予測対象へ ----
+//   これまで予測対象は登録クラブ(UEFA上位100+利用者登録)の次の試合だけだった。
+//   学習の燃料は「答え合わせ済みの件数」なので、学習済み12大会の今日・明日の
+//   全試合を対象に加えてサンプル供給量を数倍にする(公開前フルスロットルの中核)。
+//   コスト設計: /fixtures?date=1回で全世界のその日の試合が取れるため、
+//   一覧の取得は日付あたり1リクエストだけ。各試合の予測コストは従来と同じ
+//   仕組み(チームごとのフォーム取得はteamFormCacheで実行内共有)。
+//   でっち上げ禁止: 対象は実際にAPIが返した未開始(NS/TBD)の試合のみ。
+async function buildExtraFixtureTeams(deps, opts) {
+  const o = opts || {};
+  const cap = Number.isFinite(o.cap) ? o.cap : 0;
+  if (cap <= 0) return { teams: [], scanned: 0, totalEligible: 0, reasonJa: "通常モード(拡張なし)" };
+  const learnedIds = o.learnedIds instanceof Set ? o.learnedIds : new Set(o.learnedIds || []);
+  const out = [];
+  const seen = new Set(o.excludeFixtureIds || []);
+  let scanned = 0;
+  for (const d of o.dates || []) {
+    const res = await deps.callApiFootball("/fixtures", { date: d });
+    for (const fx of (res && res.response) || []) {
+      scanned++;
+      const lid = fx && fx.league && Number(fx.league.id);
+      const st = fx && fx.fixture && fx.fixture.status && fx.fixture.status.short;
+      const fid = fx && fx.fixture && fx.fixture.id;
+      if (!fid || seen.has(fid) || !learnedIds.has(lid)) continue;
+      if (st !== "NS" && st !== "TBD") continue; // 開始済み・延期などは対象外
+      if (!fx.teams || !fx.teams.home || !fx.teams.home.id || !fx.teams.away || !fx.teams.away.id) continue;
+      seen.add(fid);
+      // 予測ループの既存の本体をそのまま使えるよう「主体チーム」の形にして返す。
+      // presetFixture: この試合を直接使う(次戦の再検索をしない=リクエスト節約)
+      // apiTeamId: 名前からのID解決(resolveTeamId)を飛ばす(誤解決も防ぐ)
+      out.push({
+        nameEn: fx.teams.home.name, nameJa: fx.teams.home.name,
+        apiTeamId: fx.teams.home.id, presetFixture: fx, synthetic: true,
+      });
+    }
+  }
+  // キックオフの近い順に採用(答え合わせが早く返る試合ほど学習が速く回るため)
+  out.sort((a, b) => new Date(a.presetFixture.fixture.date) - new Date(b.presetFixture.fixture.date));
+  return { teams: out.slice(0, cap), scanned, totalEligible: out.length };
 }
 
 async function runDailyLearning(deps) {
@@ -1539,7 +1592,28 @@ async function runDailyLearning(deps) {
   // いたため、知識収集は毎日100クラブ回っているのに **予測はTOP100のうち9クラブ
   // にしか立たない**(残り91クラブは構造上、永久に予測対象外)状態だった。
   // TOP100 + 利用者が登録した TOP100外クラブ を、日付で安定的に回転させる。
-  const predictionPool = clubsForPrediction(dateKey, REGISTERED_TEAMS, OWN_PREDICT_LOG_CAP);
+  // ---- v80(案8): 学習済み12大会の今日・明日の全試合を予測対象に追加 ----
+  let extraFixturesMeta = null;
+  let extraFixtureTeams = [];
+  if (EXTRA_FIXTURES_CAP > 0) {
+    try {
+      const d0 = runAt.toISOString().slice(0, 10);
+      const d1 = new Date(runAt.getTime() + 86400000).toISOString().slice(0, 10);
+      const builtExtra = await buildExtraFixtureTeams({ callApiFootball }, {
+        cap: EXTRA_FIXTURES_CAP, dates: [d0, d1],
+        learnedIds: learnedComp.LEARNED_LEAGUE_IDS,
+      });
+      extraFixtureTeams = builtExtra.teams;
+      extraFixturesMeta = {
+        prelaunch: PRELAUNCH_LEARNING, capApplied: EXTRA_FIXTURES_CAP,
+        scanned: builtExtra.scanned, eligible: builtExtra.totalEligible, queued: builtExtra.teams.length,
+        noteJa: `学習済み大会の全試合拡張: 2日分${builtExtra.scanned}試合を走査し、対象${builtExtra.totalEligible}件のうち${builtExtra.teams.length}件をキックオフの近い順に予測キューへ追加しました(公開前フルスロットル)。`,
+      };
+    } catch (e) {
+      errors.push(`allfixtures_failed:${String((e && e.message) || e).slice(0, 40)}`);
+    }
+  }
+  const predictionPool = [...clubsForPrediction(dateKey, REGISTERED_TEAMS, OWN_PREDICT_LOG_CAP), ...extraFixtureTeams];
   const predictionClubsSeen = [];
   let predictionPoolScanned = 0;
   let predictionStoppedReason = null;
@@ -1550,9 +1624,15 @@ async function runDailyLearning(deps) {
     predictionPoolScanned++;
     try {
       const cached = teamFormCache.get(team.nameEn);
-      const teamId = cached ? cached.teamId : await resolveTeamId(team.nameEn);
+      // v80(案8): 全試合拡張の項目はAPIのチームIDと試合を持って来るため、
+      // 名前からのID解決も「次の試合」の再検索もしない(リクエスト節約+誤解決防止)。
+      // IDを持っている場合はキャッシュより優先する: 表示名が同じ別クラブの
+      // キャッシュを取り違えると、主体と相手が入れ替わる事故になるため。
+      const teamId = team.apiTeamId || (cached ? cached.teamId : await resolveTeamId(team.nameEn));
       if (!teamId) continue;
-      const upcoming = await callApiFootball("/fixtures", { team: teamId, next: 1 });
+      const upcoming = team.presetFixture
+        ? { response: [team.presetFixture] }
+        : await callApiFootball("/fixtures", { team: teamId, next: 1 });
       const fx = upcoming && upcoming.response && upcoming.response[0];
       if (!fx || !fx.fixture) continue;
       const fixtureId = fx.fixture.id;
@@ -1585,7 +1665,9 @@ async function runDailyLearning(deps) {
         teamFormCache.set(name, built); // 同じ実行内で同じクラブを二度取りに行かない
         return built;
       };
-      const subjectForm = cached || await formOf(team.nameEn, teamId);
+      // v80(案8): キャッシュはIDまで一致した時だけ使う(formOf内の同名別クラブ
+      // ガードと同じ規律を、この直接参照にも適用する)
+      const subjectForm = (cached && cached.teamId === teamId) ? cached : await formOf(team.nameEn, teamId);
       const opponentForm = await formOf(opponentName, opponentId);
       if (!subjectForm || !opponentForm) {
         errors.push(`predict_skipped_no_form:${team.nameEn}`);
@@ -1911,7 +1993,8 @@ async function runDailyLearning(deps) {
       predictionClubsSeen.push(team.nameEn);
       // 「どのクラブがいつ予測されたか」を残し、TOP100のカバー率を後から実測できるようにする
       // (説明責任: 「漏れていないか」を推測ではなく数字で答えられるようにするため)
-      await upstashCmd(["HSET", "learn:ownpred:clubcoverage", team.nameEn, dateKey]).catch(() => {});
+      // v80(案8): 全試合拡張の任意クラブはTOP100台帳を汚さない(カバー率の意味を守る)
+      if (!team.synthetic) await upstashCmd(["HSET", "learn:ownpred:clubcoverage", team.nameEn, dateKey]).catch(() => {});
     } catch (e) {
       errors.push(`predict_failed:${team.nameEn}:${e.message}`);
     }
@@ -1941,7 +2024,9 @@ async function runDailyLearning(deps) {
       top100CoveredPct: CLUB_UNIVERSE.length ? Math.round((top100Covered.length / CLUB_UNIVERSE.length) * 1000) / 10 : null,
       neverPredictedSample: never.slice(0, 10),
       neverPredictedCount: never.length,
-      noteJa: `予測の対象は全${predictionPool.length}クラブ(UEFA上位100 + 登録クラブ)。本日は${predictionPoolScanned}クラブを確認し${newPredictionsLogged}件を新規記録。上位100のうち${top100Covered.length}クラブは過去に1回以上予測済み(${never.length}クラブは未実施)。`,
+      // v80(案8): 全試合拡張の実測(公開前フルスロットルの見える化)
+      extraFixtures: extraFixturesMeta,
+      noteJa: `予測の対象は全${predictionPool.length}件(UEFA上位100+登録クラブ${extraFixturesMeta ? `+学習済み大会の全試合${extraFixturesMeta.queued}件` : ""})。本日は${predictionPoolScanned}件を確認し${newPredictionsLogged}件を新規記録。上位100のうち${top100Covered.length}クラブは過去に1回以上予測済み(${never.length}クラブは未実施)。`,
     };
   } catch (e) {
     predictionCoverage = { error: e.message, noteJa: "予測カバー率を取得できませんでした(Upstashの読み出しに失敗)" };
@@ -3065,5 +3150,7 @@ module.exports = {
   DEFAULT_WEIGHTS, REGISTERED_TEAMS, LEARNING_STAGES,
   buildReflectionText, mergeGrowthLogs,
   MIN_RESOLVED_FOR_RECALIBRATION, OWN_PRED_RECENT_KEEP, OWN_PREDICT_LOG_CAP,
+  // v80(案8): 全試合拡張(テスト対象)+公開前フルスロットルの状態
+  buildExtraFixtureTeams, EXTRA_FIXTURES_CAP, PRELAUNCH_LEARNING,
   getTuningHistory,
 };
