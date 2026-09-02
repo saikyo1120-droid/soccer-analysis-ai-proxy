@@ -112,8 +112,11 @@ test("★欠陥2b: 怪我人・得点力・疲労・フォームも片側欠損�
 });
 
 test("両方そろっている場合は、これまで通り正しく差が計算される(既存機能を壊していない)", () => {
-  const home = { formScore: 2, avgGoalsFor: 2, avgGoalsAgainst: 0.5, pointsPerGame: 2.2, matchesLast7Days: 1, injuryCount: 1, suspensionCount: 0, homeVenueWinRate: 0.8, xgNet: 0.9, topScorerGoals: 15 };
-  const away = { formScore: -1, avgGoalsFor: 1, avgGoalsAgainst: 1.5, pointsPerGame: 1.0, matchesLast7Days: 3, injuryCount: 4, suspensionCount: 2, awayVenueWinRate: 0.2, xgNet: -0.4, topScorerGoals: 5 };
+  // 2026-09-02監査での更新: audit5以後にv47(市場エッジ)・v50(レーティング)・
+  // v57(クラブElo)が正当追加された。全特徴の「供給できた」申告を検証するため、
+  // 追加分の入力も与える(与えなければfalse=正直な申告、はそれ自体正しい挙動)。
+  const home = { formScore: 2, avgGoalsFor: 2, avgGoalsAgainst: 0.5, pointsPerGame: 2.2, matchesLast7Days: 1, injuryCount: 1, suspensionCount: 0, homeVenueWinRate: 0.8, xgNet: 0.9, topScorerGoals: 15, ratingExpGoals: 1.8, clubElo: 1900 };
+  const away = { formScore: -1, avgGoalsFor: 1, avgGoalsAgainst: 1.5, pointsPerGame: 1.0, matchesLast7Days: 3, injuryCount: 4, suspensionCount: 2, awayVenueWinRate: 0.2, xgNet: -0.4, topScorerGoals: 5, ratingExpGoals: 1.2, clubElo: 1700 };
   const f = computeMatchFeatures(home, away, { homeSideWins: 3, awaySideWins: 1 });
   assert.strictEqual(f.formDiff, 3);
   assert.strictEqual(Math.round(f.goalRateDiff * 100) / 100, 2);
@@ -125,7 +128,7 @@ test("両方そろっている場合は、これまで通り正しく差が計�
   assert.strictEqual(f.suspensionDiff, 2);
   assert.strictEqual(Math.round(f.xgDiff * 100) / 100, 1.3);
   assert.strictEqual(f.topScorerDiff, 10);
-  const avail = computeFeatureAvailability(home, away, { homeSideWins: 3, awaySideWins: 1 });
+  const avail = computeFeatureAvailability(home, away, { homeSideWins: 3, awaySideWins: 1 }, { homePct: 55, drawPct: 25, awayPct: 20 });
   for (const k of Object.keys(avail)) assert.strictEqual(avail[k], true, `${k} は供給できたと申告されるべき`);
 });
 

@@ -280,7 +280,14 @@ async function main() {
     assert.ok(/handleFixturesToday\(new URLSearchParams\(\), \{ jobCall: true \}\)/.test(src), "auto-collectのフェーズ2がjobCall計上");
     assert.ok(src.includes("llm:budget:"), "LLM全体上限がUpstashへ永続化(スリープでリセットされない)");
     assert.ok(src.includes("learn:forceruns:"), "force実行回数がUpstashへ永続化");
-    assert.ok(/DAILY_RUN_LOCK_SECONDS\) \|\| 1800/.test(src), "実行ロックの既定が30分に延長");
+    // 2026-09-02監査での更新: 8/7に実行ロックは90分へ正当延長された(README第21節:
+  // 30分では学習の所要時間約40分より短かった)。audit8本来の意図「30分未満へ
+  // 縮めない」を保ちつつ、現行の定数を読んで検証する。
+  {
+    const lockM = src.match(/DAILY_RUN_LOCK_SECONDS\)\s*\|\|\s*(\d+)/);
+    assert.ok(lockM && Number(lockM[1]) >= 1800,
+      `実行ロックの既定は30分以上のはず(現行: ${lockM && lockM[1]}秒)`);
+  }
     assert.ok(src.includes('e.code === "API_ERROR" || e.code === "NO_KEY"'), "クォータ超過・キー未設定を「選手が存在しない」と誤キャッシュしない");
   });
 

@@ -70,7 +70,11 @@ test("★① 各モジュールは自前で fetch を呼ばず、必ず注入さ
   ];
   for (const rel of modules) {
     const src = fs.readFileSync(path.join(ROOT, "server", rel), "utf8");
-    const directFetch = src.match(/(^|[^.\w])fetch\s*\(/g) || [];
+    // 2026-09-02監査での更新: v57のThe Odds APIはfetchFn注入(oddsApi.js内に専用の
+    // 月次予算ガードあり)で通信する。これはAPI-Football予算の迂回ではないため
+    // 検査対象から除外する(それ以外のbare fetchは従来どおり0件を要求)。
+    const scanSrc = src.replace(/fetchFn:\s*\([^)]*\)\s*=>\s*fetch\s*\(/g, "fetchFn:INJECTED(");
+    const directFetch = scanSrc.match(/(^|[^.\w])fetch\s*\(/g) || [];
     assert.strictEqual(directFetch.length, 0,
       `${rel} が直接 fetch を呼んでいる(予算ガードを迂回してしまう): ${directFetch.length}箇所`);
   }

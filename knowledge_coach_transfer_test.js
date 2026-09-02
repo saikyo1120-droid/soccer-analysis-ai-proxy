@@ -79,7 +79,8 @@ function makeFlatFixtureList(teamId, n, dateBase) {
     let foundCoachChange = false;
     let foundTransfer = false;
     for (const team of REGISTERED_TEAMS) {
-      const active = await ks.getActiveKnowledge(team.nameEn);
+      // 2026-09-02監査での更新: 学習の固定時刻で保存した知識を実時刻で読むと、失効(fact14日/opinion7日/analysis30日)により日付経過でテストが壊れる時限爆弾だった。読み出しにも同じ基準時刻を渡す。
+      const active = await ks.getActiveKnowledge(team.nameEn, new Date("2026-08-01T04:00:00Z").getTime());
       if (active.facts.some((f) => f.category === "coachChange" && f.statement.includes("Old Coach") && f.statement.includes("New Coach"))) foundCoachChange = true;
       if (active.facts.some((f) => f.category === "transferImpact" && f.statement.includes("New Signing"))) foundTransfer = true;
     }

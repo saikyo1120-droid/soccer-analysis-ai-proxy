@@ -15,8 +15,19 @@
  *   ⑤ /api/diag/clubelo が10分キャッシュ付きで動く
  */
 const path = require("path");
+const fs = require("fs");
+// 配置の自動判別(2026-09-02監査): 開発配置(scripts/../server/)でも、リポジトリの
+// フラット配置(テストと同じ階層または親にserver.jsとlearning/)でも実行できるようにする。
+// リポジトリに保管したテストが、保管先(フラット配置)ではそのまま実行できなかった問題の修正。
+const ROOT = (() => {
+  if (fs.existsSync(path.join(__dirname, "..", "server", "server.js"))) return path.resolve(__dirname, "..");
+  if (fs.existsSync(path.join(__dirname, "server.js")) && fs.existsSync(path.join(__dirname, "learning"))) return __dirname;
+  if (fs.existsSync(path.join(__dirname, "..", "server.js")) && fs.existsSync(path.join(__dirname, "..", "learning"))) return path.resolve(__dirname, "..");
+  return path.resolve(__dirname, "..", "..");
+})();
+const SERVER_DIR = fs.existsSync(path.join(ROOT, "server", "server.js")) ? path.join(ROOT, "server") : ROOT;
 const http = require("http");
-const clubElo = require(path.join(__dirname, "..", "server", "learning", "clubElo"));
+const clubElo = require(path.join(SERVER_DIR, "learning", "clubElo"));
 
 let passed = 0, failed = 0;
 const ck = (n, ok, d) => { if (ok) { console.log("  ✅ " + n); passed++; } else { console.log("  ❌ " + n + (d ? "\n     " + d : "")); failed++; } };
@@ -192,7 +203,7 @@ const ck = (n, ok, d) => { if (ok) { console.log("  ✅ " + n); passed++; } else
       }
       const e = new Error("blocked in test"); e.name = "AbortError"; throw e;
     };
-    const { server } = require(path.join(__dirname, "..", "server", "server.js"));
+    const { server } = require(path.join(SERVER_DIR, "server.js"));
     await new Promise((r) => server.on("listening", r));
     const port = server.address().port;
     const get = (p) => new Promise((resolve) => {

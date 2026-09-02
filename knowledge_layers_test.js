@@ -149,7 +149,8 @@ function makeGenerateLLMMock() {
 
     const knowledgeStore = createKnowledgeStore({ upstashEnabled: true, ...mock });
     const teamEn = REGISTERED_TEAMS[0].nameEn;
-    const active = await knowledgeStore.getActiveKnowledge(teamEn);
+    // 2026-09-02監査での更新: 学習の固定時刻で保存した知識を実時刻で読むと、失効(fact14日/opinion7日/analysis30日/reflection90日)により日付経過でテストが壊れる時限爆弾だった。読み出しにも同じ基準時刻を渡す。
+    const active = await knowledgeStore.getActiveKnowledge(teamEn, new Date("2026-08-01T04:00:00Z").getTime());
     assert.ok(active.profiles.length >= 1, "Knowledge EngineにLayer2(profile)が保存されているはず");
     assert.ok(active.opinions.some((o) => o.category === "dailyAiView"), "Knowledge EngineにLayer3(AIの見解)がミラーされているはず");
   });
@@ -206,7 +207,8 @@ function makeGenerateLLMMock() {
     assert.ok(result.reflectionsSaved >= 1, "不的中の予測でもreflectionsSavedが増えるはず");
 
     const knowledgeStore = createKnowledgeStore({ upstashEnabled: true, ...mock });
-    const active = await knowledgeStore.getActiveKnowledge(teamEn);
+    // 2026-09-02監査での更新: 学習の固定時刻で保存した知識を実時刻で読むと、失効(fact14日/opinion7日/analysis30日/reflection90日)により日付経過でテストが壊れる時限爆弾だった。読み出しにも同じ基準時刻を渡す。
+    const active = await knowledgeStore.getActiveKnowledge(teamEn, new Date("2026-08-01T04:00:00Z").getTime());
     const reflection = active.reflections.find((r) => r.detail && r.detail.correct === false);
     assert.ok(reflection, "不的中だった予測についても、Knowledge EngineにLayer4(reflection)が保存されているはず(以前は保存していなかった実際のギャップ)");
     assert.ok(reflection.statement.includes("不的中"), "振り返り文言に不的中であることが明示されているはず");

@@ -11,14 +11,23 @@
 const path = require("path");
 const fs = require("fs");
 
-const ROOT = path.resolve(__dirname, fs.existsSync(path.join(__dirname, "..", "server", "server.js")) ? ".." : "../..");
+// 配置の自動判別(2026-09-02監査): 開発配置(scripts/../server/)でも、リポジトリの
+// フラット配置(テストと同じ階層または親にserver.jsとlearning/)でも実行できるようにする。
+// リポジトリに保管したテストが、保管先(フラット配置)ではそのまま実行できなかった問題の修正。
+const ROOT = (() => {
+  if (fs.existsSync(path.join(__dirname, "..", "server", "server.js"))) return path.resolve(__dirname, "..");
+  if (fs.existsSync(path.join(__dirname, "server.js")) && fs.existsSync(path.join(__dirname, "learning"))) return __dirname;
+  if (fs.existsSync(path.join(__dirname, "..", "server.js")) && fs.existsSync(path.join(__dirname, "..", "learning"))) return path.resolve(__dirname, "..");
+  return path.resolve(__dirname, "..", "..");
+})();
+const SERVER_DIR = fs.existsSync(path.join(ROOT, "server", "server.js")) ? path.join(ROOT, "server") : ROOT;
 const results = [];
 const ck = (label, ok, detail) => { results.push([label, ok]); console.log(`  [${ok ? "OK" : "FAIL"}] ${label}${ok ? "" : detail ? " — " + String(detail).slice(0, 300) : ""}`); };
 
 // ============ 案1: 引き分け帯 ============
-const pm = require(path.join(ROOT, "server", "learning", "predictionModel.js"));
-const dj = require(path.join(ROOT, "server", "learning", "dailyJob.js"));
-const mb = require(path.join(ROOT, "server", "learning", "modelBacktest.js"));
+const pm = require(path.join(SERVER_DIR, "learning", "predictionModel.js"));
+const dj = require(path.join(SERVER_DIR, "learning", "dailyJob.js"));
+const mb = require(path.join(SERVER_DIR, "learning", "modelBacktest.js"));
 
 {
   // predictOutcomeV2: 帯なしweights=従来0.15と同一(後方互換)
@@ -64,7 +73,7 @@ const mb = require(path.join(ROOT, "server", "learning", "modelBacktest.js"));
 }
 {
   // modelTuningの結線(静的確認): 門番つき探索・引き分け0件ガード・採用時の保存
-  const src = fs.readFileSync(path.join(ROOT, "server", "learning", "modelTuning.js"), "utf8");
+  const src = fs.readFileSync(path.join(SERVER_DIR, "learning", "modelTuning.js"), "utf8");
   ck("案1: modelTuningに門番つき帯探索がある", src.includes("DRAW_BAND_ADOPT_MARGIN_PT") && src.includes("drawBandDetail"), "");
   ck("案1: 「引き分け0件へ退化する帯は採用しない」ガードがある", src.includes("drawPredictedCount || 0) > 0"), "");
   ck("案1: 採用時にdrawBandがnewParams(保存対象)へ入る", /newParams[\s\S]{0,700}drawBand: Number\.isFinite/.test(src), "");
@@ -72,10 +81,10 @@ const mb = require(path.join(ROOT, "server", "learning", "modelBacktest.js"));
 }
 
 // ============ 案2: 選手の熟考 ============
-const { buildPlayerEvidencePool } = require(path.join(ROOT, "server", "reasoning", "evidencePool.js"));
-const { PLAYER_HYPOTHESIS_FACTORS, HYPOTHESIS_FACTORS, generateHypotheses } = require(path.join(ROOT, "server", "reasoning", "hypothesisGenerator.js"));
-const { assembleReasoning } = require(path.join(ROOT, "server", "reasoning", "reasoningEngine.js"));
-const { deliberate, PLAYER_DATA_SPECS, assessDataAvailability } = require(path.join(ROOT, "server", "reasoning", "deliberation.js"));
+const { buildPlayerEvidencePool } = require(path.join(SERVER_DIR, "reasoning", "evidencePool.js"));
+const { PLAYER_HYPOTHESIS_FACTORS, HYPOTHESIS_FACTORS, generateHypotheses } = require(path.join(SERVER_DIR, "reasoning", "hypothesisGenerator.js"));
+const { assembleReasoning } = require(path.join(SERVER_DIR, "reasoning", "reasoningEngine.js"));
+const { deliberate, PLAYER_DATA_SPECS, assessDataAvailability } = require(path.join(SERVER_DIR, "reasoning", "deliberation.js"));
 
 const FULL_STATS = { appearances: 20, goals: 8, assists: 5, avgRating: 7.4, keyPasses: 30, passAccuracyPct: 85, dribbleSuccessRatePct: 60, defensiveActions: 25, duelWinRatePct: 55 };
 {
@@ -128,7 +137,7 @@ const FULL_STATS = { appearances: 20, goals: 8, assists: 5, avgRating: 7.4, keyP
 }
 {
   // server.jsの結線(静的確認)
-  const src = fs.readFileSync(path.join(ROOT, "server", "server.js"), "utf8");
+  const src = fs.readFileSync(path.join(SERVER_DIR, "server.js"), "utf8");
   ck("案2: handleDiscussの選手分岐に熟考の結線がある",
     src.includes("buildPlayerEvidencePool({") && src.includes("factors: PLAYER_HYPOTHESIS_FACTORS") && src.includes("dataSpecs: PLAYER_DATA_SPECS"), "");
   ck("案2: Stage Eの保存先が選手/クラブで正しく分かれる(stageE変数)",
@@ -136,7 +145,7 @@ const FULL_STATS = { appearances: 20, goals: 8, assists: 5, avgRating: 7.4, keyP
 }
 
 // ============ 案4: リーグ別の実測表 ============
-const si = require(path.join(ROOT, "server", "learning", "selfImprovement.js"));
+const si = require(path.join(SERVER_DIR, "learning", "selfImprovement.js"));
 {
   const mk = (league, predicted, actual) => ({ resolved: true, league, predictedWinner: predicted, actualWinner: actual, correct: predicted === actual, featureTrust: null });
   const records = [
@@ -158,13 +167,13 @@ const si = require(path.join(ROOT, "server", "learning", "selfImprovement.js"));
 {
   const html = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");
   ck("案4: 裏側タブにリーグ別実測表の描画がある", html.includes("リーグ別の実測") && html.includes("leagueTable") && html.includes("引分実際"), "");
-  const djSrc = fs.readFileSync(path.join(ROOT, "server", "learning", "dailyJob.js"), "utf8");
+  const djSrc = fs.readFileSync(path.join(SERVER_DIR, "learning", "dailyJob.js"), "utf8");
   ck("案4: 夜間レポートにleagueTableが載る結線がある", djSrc.includes("leagueTable: diagnosis.leagueTable"), "");
 }
 
 // ============ 案3: 予算→学習 ============
 {
-  const pdu = require(path.join(ROOT, "server", "learning", "playerDailyUpdate.js"));
+  const pdu = require(path.join(SERVER_DIR, "learning", "playerDailyUpdate.js"));
   ck("案3: 選手評価更新の既定が20名/日(一巡約5日)", pdu.PLAYER_UPDATE_CAP_DEFAULT === 20, String(pdu.PLAYER_UPDATE_CAP_DEFAULT));
 }
 

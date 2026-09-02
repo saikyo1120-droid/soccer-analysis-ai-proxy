@@ -157,7 +157,9 @@ function makeFlatFixtureList(teamId, n, dateBase) {
 
     // ②Knowledge Engineに「predictionFailureReason」としてanalysis保存されている(→評議論モードの根拠プールにも乗る)
     const ks = createKnowledgeStore({ upstashEnabled: true, ...mock });
-    const active = await ks.getActiveKnowledge(originTeamEn);
+    // 2026-09-02監査での更新: 学習は固定時刻(2026-08-01)で保存するため、読み出しも
+    // 同じ基準時刻で行う(実時刻だとanalysisの30日失効で消え、日付経過で壊れる時限爆弾だった)
+    const active = await ks.getActiveKnowledge(originTeamEn, new Date("2026-08-01T03:00:00Z").getTime());
     const failureItem = active.analyses.find((a) => a.category === "predictionFailureReason");
     assert.ok(failureItem, "predictionFailureReasonがKnowledge Engineのanalysisとして保存されているはず");
     assert.ok(failureItem.statement.includes("過去対戦"), `外れた理由の内容が含まれるはず, got: ${failureItem.statement}`);
@@ -204,7 +206,7 @@ function makeFlatFixtureList(teamId, n, dateBase) {
     assert.deepStrictEqual(saved.failureReasons, [], "的中した予測はfailureReasonsが空配列のはず");
 
     const ks = createKnowledgeStore({ upstashEnabled: true, ...mock });
-    const active = await ks.getActiveKnowledge(originTeamEn);
+    const active = await ks.getActiveKnowledge(originTeamEn, new Date("2026-08-01T03:00:00Z").getTime());
     const failureItem = active.analyses.find((a) => a.category === "predictionFailureReason");
     assert.ok(!failureItem, "的中した予測についてはpredictionFailureReasonを保存しないはず(でっち上げ防止)");
   });

@@ -10,13 +10,22 @@ const path = require("path");
 const fs = require("fs");
 const http = require("http");
 
-const ROOT = path.resolve(__dirname, fs.existsSync(path.join(__dirname, "..", "server", "server.js")) ? ".." : "../..");
+// 配置の自動判別(2026-09-02監査): 開発配置(scripts/../server/)でも、リポジトリの
+// フラット配置(テストと同じ階層または親にserver.jsとlearning/)でも実行できるようにする。
+// リポジトリに保管したテストが、保管先(フラット配置)ではそのまま実行できなかった問題の修正。
+const ROOT = (() => {
+  if (fs.existsSync(path.join(__dirname, "..", "server", "server.js"))) return path.resolve(__dirname, "..");
+  if (fs.existsSync(path.join(__dirname, "server.js")) && fs.existsSync(path.join(__dirname, "learning"))) return __dirname;
+  if (fs.existsSync(path.join(__dirname, "..", "server.js")) && fs.existsSync(path.join(__dirname, "..", "learning"))) return path.resolve(__dirname, "..");
+  return path.resolve(__dirname, "..", "..");
+})();
+const SERVER_DIR = fs.existsSync(path.join(ROOT, "server", "server.js")) ? path.join(ROOT, "server") : ROOT;
 const results = [];
 const ck = (label, ok, detail) => { results.push([label, ok]); console.log(`  [${ok ? "OK" : "FAIL"}] ${label}${ok ? "" : detail ? " — " + String(detail).slice(0, 300) : ""}`); };
 
 // ============ Part 1: seoPages 単体 ============
-const seoPages = require(path.join(ROOT, "server", "knowledge", "seoPages.js"));
-const { CLUB_UNIVERSE } = require(path.join(ROOT, "server", "learning", "clubUniverse.js"));
+const seoPages = require(path.join(SERVER_DIR, "knowledge", "seoPages.js"));
+const { CLUB_UNIVERSE } = require(path.join(SERVER_DIR, "learning", "clubUniverse.js"));
 const uni = CLUB_UNIVERSE.find((c) => c && c.nameEn && c.nameJa);
 
 const baseRecord = {
@@ -110,7 +119,7 @@ global.fetch = async (u, o) => {
   const e = new Error("blocked"); e.name = "AbortError"; throw e;
 };
 
-const srv = require(path.join(ROOT, "server", "server.js"));
+const srv = require(path.join(SERVER_DIR, "server.js"));
 (async () => {
   await new Promise((r) => srv.server.on("listening", r));
   const port = srv.server.address().port;
@@ -156,7 +165,7 @@ const srv = require(path.join(ROOT, "server", "server.js"));
   ck("①index: 予想カードに試合ページへのリンク雛形がある", indexHtml.includes("/match/${Number(p.fixtureId)}"), "");
   const yml = fs.readFileSync(path.join(ROOT, ".github", "workflows", "matchday-ping.yml"), "utf8");
   ck("②YAML: ほぼ終日のcron(0-19,22-23)+土日補完(20-21)がある", yml.includes("0-19,22-23 * * *") && yml.includes("20-21 * * 0,6"), "");
-  const dj = fs.readFileSync(path.join(ROOT, "server", "learning", "dailyJob.js"), "utf8");
+  const dj = fs.readFileSync(path.join(SERVER_DIR, "learning", "dailyJob.js"), "utf8");
   ck("①dailyJob: 予測保存時にサイトマップ索引へ追記する結線がある", dj.includes("recordMatchIndexEntry"), "");
   const icons = ["icon-192.png", "icon-512.png", "apple-touch-icon.png"].every((f) => fs.existsSync(path.join(ROOT, f)));
   ck("④アイコン3種がリポジトリ直下にある", icons, "");

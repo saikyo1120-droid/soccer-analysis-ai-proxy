@@ -16,9 +16,18 @@
 const fs = require('fs');
 const assert = require('assert');
 const src = fs.readFileSync('/tmp/soccer-analysis-ai/index.html', 'utf8');
-const scriptStart = src.indexOf('<script>') + 8;
-const scriptEnd = src.lastIndexOf('</script>');
-let code = src.slice(scriptStart, scriptEnd);
+// index.htmlには現在インライン<script>が2本ある(先頭: v56多言語辞書ブロック、後方: 本体)。
+// 旧来の「最初の<script>〜最後の</script>」切り出しは間のHTMLまで巻き込んで
+// SyntaxErrorになるため、src属性なしの<script>ブロックを個別に抽出し、
+// 従来どおり本体スクリプト(最大=後方のブロック)だけを評価する。
+const inlineScripts = [];
+{
+  const re = /<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(src)) !== null) inlineScripts.push(m[1]);
+}
+if (!inlineScripts.length) throw new Error('no inline <script> blocks found in index.html');
+let code = inlineScripts.reduce((a, b) => (b.length >= a.length ? b : a), '');
 code += `\nreturn { PLAYERS, classifyFixtureStatus, fixtureStatusLabel, fixtureRowHtml, build90MinStoryHtml, pickPlayerByAttr, buildUpcomingPreviewHtml, buildLiveAnalysisHtml, buildFinishedAnalysisHtml, teamAvg, mapEnglishClubToRegistered, registeredPlayersForClubJa, fixturesByLeagueHtml, FIXTURE_LIVE_STATUSES, FIXTURE_FINISHED_STATUSES, FIXTURE_NOTSTARTED_STATUSES };`;
 
 function makeEl(id) {

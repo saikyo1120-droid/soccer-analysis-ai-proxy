@@ -10,12 +10,21 @@ const path = require("path");
 const fs = require("fs");
 const { execFileSync } = require("child_process");
 
-const ROOT = path.resolve(__dirname, fs.existsSync(path.join(__dirname, "..", "server", "server.js")) ? ".." : "../..");
+// 配置の自動判別(2026-09-02監査): 開発配置(scripts/../server/)でも、リポジトリの
+// フラット配置(テストと同じ階層または親にserver.jsとlearning/)でも実行できるようにする。
+// リポジトリに保管したテストが、保管先(フラット配置)ではそのまま実行できなかった問題の修正。
+const ROOT = (() => {
+  if (fs.existsSync(path.join(__dirname, "..", "server", "server.js"))) return path.resolve(__dirname, "..");
+  if (fs.existsSync(path.join(__dirname, "server.js")) && fs.existsSync(path.join(__dirname, "learning"))) return __dirname;
+  if (fs.existsSync(path.join(__dirname, "..", "server.js")) && fs.existsSync(path.join(__dirname, "..", "learning"))) return path.resolve(__dirname, "..");
+  return path.resolve(__dirname, "..", "..");
+})();
+const SERVER_DIR = fs.existsSync(path.join(ROOT, "server", "server.js")) ? path.join(ROOT, "server") : ROOT;
 const results = [];
 const ck = (label, ok, detail) => { results.push([label, ok]); console.log(`  [${ok ? "OK" : "FAIL"}] ${label}${ok ? "" : detail ? " — " + String(detail).slice(0, 300) : ""}`); };
 
-const dj = require(path.join(ROOT, "server", "learning", "dailyJob.js"));
-const { LEARNED_LEAGUE_IDS } = require(path.join(ROOT, "server", "learning", "learnedCompetitions.js"));
+const dj = require(path.join(SERVER_DIR, "learning", "dailyJob.js"));
+const { LEARNED_LEAGUE_IDS } = require(path.join(SERVER_DIR, "learning", "learnedCompetitions.js"));
 
 // ============ 案8: 全試合拡張(単体) ============
 const mkFx = (id, leagueId, status, kickoffIso, homeId, awayId) => ({
@@ -69,7 +78,7 @@ const mkFx = (id, leagueId, status, kickoffIso, homeId, awayId) => ({
     JSON.stringify({ log: dj.OWN_PREDICT_LOG_CAP, extra: dj.EXTRA_FIXTURES_CAP }));
   // 環境変数1つで通常モードへ戻る(別プロセスで検証)
   const out = execFileSync(process.execPath, ["-e",
-    `const dj=require(${JSON.stringify(path.join(ROOT, "server", "learning", "dailyJob.js"))});` +
+    `const dj=require(${JSON.stringify(path.join(SERVER_DIR, "learning", "dailyJob.js"))});` +
     `console.log(JSON.stringify({p:dj.PRELAUNCH_LEARNING,log:dj.OWN_PREDICT_LOG_CAP,extra:dj.EXTRA_FIXTURES_CAP}));`],
     { env: { ...process.env, PRELAUNCH_LEARNING: "0" }, encoding: "utf8" });
   const off = JSON.parse(out.trim().split("\n").pop());
@@ -78,7 +87,7 @@ const mkFx = (id, leagueId, status, kickoffIso, homeId, awayId) => ({
 }
 {
   // ループ本体への結線(静的確認)
-  const src = fs.readFileSync(path.join(ROOT, "server", "learning", "dailyJob.js"), "utf8");
+  const src = fs.readFileSync(path.join(SERVER_DIR, "learning", "dailyJob.js"), "utf8");
   ck("案8: 携行IDを最優先(同名別クラブのキャッシュ取り違え防止)",
     src.includes("const teamId = team.apiTeamId || (cached ? cached.teamId : await resolveTeamId(team.nameEn));"), "");
   ck("案8: 携行した試合を直接使い「次の試合」を再検索しない",
@@ -93,7 +102,7 @@ const mkFx = (id, leagueId, status, kickoffIso, homeId, awayId) => ({
 
 // ============ 案10: 粗→細の2段階探索(静的確認) ============
 {
-  const mt = fs.readFileSync(path.join(ROOT, "server", "learning", "modelTuning.js"), "utf8");
+  const mt = fs.readFileSync(path.join(SERVER_DIR, "learning", "modelTuning.js"), "utf8");
   ck("案10: xGブレンド率αに細かい刻みの再探索がある(fineCandidates)",
     mt.includes("fineCandidates: fineScores") && mt.includes("center - 0.05"), "");
   ck("案10: α=0(混ぜない)が最良なら従来どおり0のままの規則を維持",

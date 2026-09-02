@@ -5,7 +5,7 @@
  * モックレスポンスを返す(このサンドボックスは実サービスに到達できないため)。
  */
 const assert = require("assert");
-const { runDailyLearning, getGrowthLog, REGISTERED_TEAMS } = require("../server/learning/dailyJob");
+const { runDailyLearning, getGrowthLog, REGISTERED_TEAMS, OWN_PREDICT_LOG_CAP } = require("../server/learning/dailyJob");
 
 let failures = 0;
 async function test(name, fn) {
@@ -125,7 +125,9 @@ async function callApiFootball(endpoint, params) {
     assert.strictEqual(result.ok, true);
     assert.strictEqual(result.teamsAnalyzed, REGISTERED_TEAMS.length);
     assert.ok(result.newPredictionsLogged > 0, "新しい予測が記録されているはず、実際: " + result.newPredictionsLogged);
-    assert.ok(result.newPredictionsLogged <= 5, "1回の実行での新規予測は上限5件のはず");
+    // 2026-09-02監査での更新: 上限は5→20(8/6)→公開前90(v80)と正当に進化した。
+    // 固定値でなく現行のexport値を参照する(仕様が変わればテストも自動で追随)。
+    assert.ok(result.newPredictionsLogged <= OWN_PREDICT_LOG_CAP, `1回の実行での新規予測は上限${OWN_PREDICT_LOG_CAP}件のはず`);
     const total = await mock.upstashGetJSON.call ? null : null;
   });
 

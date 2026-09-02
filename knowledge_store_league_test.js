@@ -80,7 +80,8 @@ function createMockRedis() {
     await s.saveKnowledgeItem({ leagueEn: "Serie A (イタリア)", category: "leagueStandings", type: "fact", statement: "1位Napoli(50pt)", computedAt: "2026-08-01T00:00:00Z" });
     const r2 = await s.saveKnowledgeItem({ leagueEn: "Serie A (イタリア)", category: "leagueStandings", type: "fact", statement: "1位Inter(53pt)", computedAt: "2026-08-02T00:00:00Z" });
     assert.strictEqual(r2.saved, true, "順位表の内容が変わったので新しい事実として保存されるはず");
-    const active = await s.getActiveKnowledgeForLeague("Serie A (イタリア)");
+    // 2026-09-02監査での更新: 学習の固定時刻で保存した知識を実時刻で読むと、失効(fact14日/opinion7日/analysis30日/reflection90日)により日付経過でテストが壊れる時限爆弾だった。読み出しにも同じ基準時刻を渡す。
+    const active = await s.getActiveKnowledgeForLeague("Serie A (イタリア)", new Date("2026-08-02T01:00:00Z").getTime());
     assert.strictEqual(active.totalActive, 2);
   });
 

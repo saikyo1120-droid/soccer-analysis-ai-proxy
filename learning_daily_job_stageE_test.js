@@ -32,7 +32,11 @@ function createMockRedis() {
   return { upstashCmd, upstashGetJSON, upstashSetJSON, store };
 }
 
-async function resolveTeamId(nameEn) { return 1000 + nameEn.length; }
+// 2026-09-02監査での更新: 文字数ベースのIDは衝突する(Bayern MunichとReal Sociedad等)。
+// 衝突すると実行内メモ化(8/6導入)がモック応答を取り違える。連番で一意にする。
+const __idMap = new Map(); let __idSeq = 1000;
+async function resolveTeamId(nameEn) { if (!__idMap.has(nameEn)) __idMap.set(nameEn, __idSeq++); return __idMap.get(nameEn); }
+const SPECIAL_TEAM_ID = 1000; // 最初に解決されるクラブ(REGISTERED_TEAMS[0])のID
 function makeFixtureList(teamId, n, dateBase, gf, ga) {
   const list = [];
   for (let i = 0; i < n; i++) {
@@ -54,7 +58,9 @@ async function callApiFootball(endpoint, params) {
     const customApiFootball = async (endpoint, params) => {
       if (endpoint === "/fixtures" && params.team && params.last) {
         call++;
-        if (call === 1 || call === REGISTERED_TEAMS.length + 1) {
+        // 2026-09-02監査での更新: 「何回目の呼び出しか」はメモ化・巡回順に依存して
+        // 壊れる。対象クラブのIDで判定する(1回目も2回目も同じ内容=重複検証の意図どおり)。
+        if (params.team === SPECIAL_TEAM_ID) {
           const list = [];
           const now = Date.now();
           for (let i = 0; i < 5; i++) list.push({ fixture: { id: 1 + i, date: new Date(now - i * 86400e3).toISOString() }, teams: { home: { id: params.team }, away: { id: 2 } }, goals: { home: 4, away: 0 } });
@@ -74,7 +80,7 @@ async function callApiFootball(endpoint, params) {
 
     // Knowledge Engine側から見ても、重複した内容が1件としてしか蓄積されていないことを確認
     const ks = createKnowledgeStore({ upstashEnabled: true, ...mock });
-    const active = await ks.getActiveKnowledge(REGISTERED_TEAMS[0].nameEn);
+    const active = await ks.getActiveKnowledge(REGISTERED_TEAMS[0].nameEn, new Date("2026-08-02T04:00:00Z").getTime());
     const matching = active.facts.filter((f) => f.category === "recentFormTrend");
     assert.strictEqual(matching.length, 1, "同じ内容の事実がKnowledge Engine上で重複して蓄積されていないはず");
   });
@@ -97,7 +103,9 @@ async function callApiFootball(endpoint, params) {
       }
       return callApiFootball(endpoint, params);
     };
-    await runDailyLearning({ callApiFootball: customApiFootball, resolveTeamId, upstashEnabled: true, ...mock, now: () => new Date("2026-08-01T03:00:00Z") });
+    // 2026-09-02監査での更新: getRecentFactsForTeamは実時刻で失効判定するため、
+    // このテストだけは相対時刻で実行する(固定日付だと14日後に必ず壊れる)。
+    await runDailyLearning({ callApiFootball: customApiFootball, resolveTeamId, upstashEnabled: true, ...mock, now: () => new Date() });
     const facts = await getRecentFactsForTeam({ upstashEnabled: true, ...mock }, REGISTERED_TEAMS[0].nameEn);
     assert.ok(facts.length >= 1, "RAGが使うgetRecentFactsForTeamがKnowledge Engine経由で事実を返すはず");
     assert.ok(facts[0].statement.includes(REGISTERED_TEAMS[0].nameJa), "取得した事実に対象クラブ名が含まれるはず");
@@ -131,7 +139,7 @@ async function callApiFootball(endpoint, params) {
     assert.strictEqual(result.hypothesesDiscarded, 0);
 
     const ks = createKnowledgeStore({ upstashEnabled: true, ...mock });
-    const active = await ks.getActiveKnowledge(originTeamEn);
+    const active = await ks.getActiveKnowledge(originTeamEn, new Date("2026-08-01T04:00:00Z").getTime());
     const promoted = active.analyses.find((a) => a.category === "predictionHypothesis");
     assert.ok(promoted, "検証済みの仮説がanalysisとしてKnowledge Engineに保存されているはず");
     assert.ok(promoted.statement.includes("優位という仮説(テスト用)"), "元の仮説の内容が引き継がれているはず");
@@ -163,7 +171,7 @@ async function callApiFootball(endpoint, params) {
     assert.strictEqual(result.hypothesesDiscarded, 1, "仮説が外れたので1件破棄されたはず");
 
     const ks = createKnowledgeStore({ upstashEnabled: true, ...mock });
-    const active = await ks.getActiveKnowledge(originTeamEn);
+    const active = await ks.getActiveKnowledge(originTeamEn, new Date("2026-08-01T04:00:00Z").getTime());
     const promoted = active.analyses.find((a) => a.statement.includes("外れる予定"));
     assert.ok(!promoted, "外れた仮説は知識として保存されていないはず");
   });

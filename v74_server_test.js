@@ -5,6 +5,17 @@
  *   ③ /api/diag/llm がLLM実呼び出しの成否・所要ms・実際のエラー文を返し、10分キャッシュされる
  */
 const path = require("path");
+const fs = require("fs");
+// 配置の自動判別(2026-09-02監査): 開発配置(scripts/../server/)でも、リポジトリの
+// フラット配置(テストと同じ階層または親にserver.jsとlearning/)でも実行できるようにする。
+// リポジトリに保管したテストが、保管先(フラット配置)ではそのまま実行できなかった問題の修正。
+const ROOT = (() => {
+  if (fs.existsSync(path.join(__dirname, "..", "server", "server.js"))) return path.resolve(__dirname, "..");
+  if (fs.existsSync(path.join(__dirname, "server.js")) && fs.existsSync(path.join(__dirname, "learning"))) return __dirname;
+  if (fs.existsSync(path.join(__dirname, "..", "server.js")) && fs.existsSync(path.join(__dirname, "..", "learning"))) return path.resolve(__dirname, "..");
+  return path.resolve(__dirname, "..", "..");
+})();
+const SERVER_DIR = fs.existsSync(path.join(ROOT, "server", "server.js")) ? path.join(ROOT, "server") : ROOT;
 const http = require("http");
 
 let passed = 0, failed = 0;
@@ -48,9 +59,9 @@ global.fetch = async (u, o) => {
   const e = new Error("blocked in test: " + url.hostname); e.name = "AbortError"; throw e;
 };
 
-const srvMod = require(path.join(__dirname, "..", "server", "server.js"));
-const playerSearch = require(path.join(__dirname, "..", "server", "knowledge", "playerSearch"));
-const { SQUAD_VARIANT_RE } = require(path.join(__dirname, "..", "server", "learning", "matchupAnalysis"));
+const srvMod = require(path.join(SERVER_DIR, "server.js"));
+const playerSearch = require(path.join(SERVER_DIR, "knowledge", "playerSearch"));
+const { SQUAD_VARIANT_RE } = require(path.join(SERVER_DIR, "learning", "matchupAnalysis"));
 
 (async () => {
   console.log("\n=== v74 サーバー側(女子除外・LLM診断) ===\n");

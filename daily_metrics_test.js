@@ -114,8 +114,10 @@ const SAMPLE_LOG = {
     const today = buildDailySnapshot({ ...SAMPLE_LOG, ownAccuracyAfter: 45 }, {});
     const yesterday = { ...today, knowledgeTotal: 300, predictionAccuracy: 55 };
     const c = compareSnapshots(today, yesterday);
-    assert.strictEqual(c.improved, true);
-    assert.ok(c.verdictJa.includes("ただし"), "悪化も併記するはず: " + c.verdictJa);
+    // 2026-09-02監査での更新: v67(ラウンド47)で混在日は「賢くなったと言い切らない」
+    // 基準へ強化された(improved=null+悪化を明記)。悪化隠しの退行ではなく逆の強化。
+    assert.strictEqual(c.improved, null, "混在日は改善と断定しない(v67の基準)");
+    assert.ok(c.verdictJa.includes("一方で"), "悪化も併記するはず: " + c.verdictJa);
     assert.ok(c.verdictJa.includes("下がりました"), c.verdictJa);
   });
 

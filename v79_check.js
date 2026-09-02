@@ -6,11 +6,20 @@
 const path = require("path");
 const fs = require("fs");
 
-const ROOT = path.resolve(__dirname, fs.existsSync(path.join(__dirname, "..", "server", "server.js")) ? ".." : "../..");
+// 配置の自動判別(2026-09-02監査): 開発配置(scripts/../server/)でも、リポジトリの
+// フラット配置(テストと同じ階層または親にserver.jsとlearning/)でも実行できるようにする。
+// リポジトリに保管したテストが、保管先(フラット配置)ではそのまま実行できなかった問題の修正。
+const ROOT = (() => {
+  if (fs.existsSync(path.join(__dirname, "..", "server", "server.js"))) return path.resolve(__dirname, "..");
+  if (fs.existsSync(path.join(__dirname, "server.js")) && fs.existsSync(path.join(__dirname, "learning"))) return __dirname;
+  if (fs.existsSync(path.join(__dirname, "..", "server.js")) && fs.existsSync(path.join(__dirname, "..", "learning"))) return path.resolve(__dirname, "..");
+  return path.resolve(__dirname, "..", "..");
+})();
+const SERVER_DIR = fs.existsSync(path.join(ROOT, "server", "server.js")) ? path.join(ROOT, "server") : ROOT;
 const results = [];
 const ck = (label, ok, detail) => { results.push([label, ok]); console.log(`  [${ok ? "OK" : "FAIL"}] ${label}${ok ? "" : detail ? " — " + String(detail).slice(0, 300) : ""}`); };
 
-const pm = require(path.join(ROOT, "server", "learning", "predictionModel.js"));
+const pm = require(path.join(SERVER_DIR, "learning", "predictionModel.js"));
 
 // ============ 案6: 第二意見ブレンド(単体) ============
 {
@@ -63,12 +72,12 @@ function mkRec(actual, apifbGood, apifbBad) {
     && pm.isSaneWeights({ homeBase: 1.3, awayBase: 1.1, apifbBlend: 1.5 }) === false, "");
 }
 {
-  const dj = fs.readFileSync(path.join(ROOT, "server", "learning", "dailyJob.js"), "utf8");
+  const dj = fs.readFileSync(path.join(SERVER_DIR, "learning", "dailyJob.js"), "utf8");
   ck("案6: 予測時にAPI-Football予想を取得・記録する結線がある",
     dj.includes("apifbImplied = { homePct: h, drawPct: d, awayPct: a2 }") && dj.includes("apifbImplied, apifbBlendUsed,"), "");
   ck("案6: 毎晩の学習に門番つきの混合比フィットがある",
     dj.includes("fitSecondOpinionBlend(recentForApifb)") && dj.includes("apifbBlendFit:"), "");
-  const sv = fs.readFileSync(path.join(ROOT, "server", "server.js"), "utf8");
+  const sv = fs.readFileSync(path.join(SERVER_DIR, "server.js"), "utf8");
   ck("案6: 予想の開示(apifbBlend)がAPI応答に載る", sv.includes("apifbBlend: record.apifbBlendUsed"), "");
   const html = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");
   ck("案6: 画面の開示行(🤝 第二意見)と4言語辞書がある",
@@ -96,7 +105,7 @@ global.fetch = async (u, o) => {
   }
   const e = new Error("blocked"); e.name = "AbortError"; throw e;
 };
-const srv = require(path.join(ROOT, "server", "server.js"));
+const srv = require(path.join(SERVER_DIR, "server.js"));
 (async () => {
   await new Promise((r) => srv.server.on("listening", r));
   {
@@ -111,7 +120,7 @@ const srv = require(path.join(ROOT, "server", "server.js"));
     ck("案5: 直近3往復だけを使う", many.length === 3 && many[0].q === "Q3" && many[2].q === "Q5", JSON.stringify(many));
   }
   {
-    const sv = fs.readFileSync(path.join(ROOT, "server", "server.js"), "utf8");
+    const sv = fs.readFileSync(path.join(SERVER_DIR, "server.js"), "utf8");
     ck("案5: 直前の会話がLLMプロンプトへ渡る結線がある(文脈と事実の優先順も明記)",
       sv.includes("直前の会話(参考情報") && sv.includes("historyTurns"), "");
     const html = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");

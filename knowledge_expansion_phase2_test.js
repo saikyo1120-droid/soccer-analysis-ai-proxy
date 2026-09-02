@@ -117,7 +117,10 @@ function createMockRedis() {
     assert.strictEqual(stats.keyPasses, null);
     assert.strictEqual(stats.dribbleSuccessRatePct, null);
     assert.strictEqual(stats.duelWinRatePct, null);
-    assert.strictEqual(stats.defensiveActions, 0);
+    // 2026-09-02監査での更新: タックル・インターセプトが丸ごと欠落した入力に0を
+    // 期待するのは「0回という実測」の捏造(テスト名の趣旨とも矛盾)。監査で null
+    //(=測れていない)へ直された現行仕様が正しい。
+    assert.strictEqual(stats.defensiveActions, null);
   });
 
   await test("computePlayerRealStats: 空/nullなら正直にnullを返す", () => {
