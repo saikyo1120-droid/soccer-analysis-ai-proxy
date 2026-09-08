@@ -37,7 +37,9 @@ const ANTHROPIC_MODEL_HEAVY = process.env.ANTHROPIC_MODEL_HEAVY || "claude-opus-
 const ANTHROPIC_FALLBACK_MODEL = process.env.ANTHROPIC_FALLBACK_MODEL || "claude-haiku-4-5";
 // 尻切れ書き直し時の上限の天井(コスト暴走防止。環境変数で変更可能)
 const TRUNCATE_RETRY_CAP = parseInt(process.env.ANTHROPIC_TRUNCATE_RETRY_CAP, 10) || 2400;
-const ANTHROPIC_API_BASE = "https://api.anthropic.com/v1/messages";
+// v85: テスト時だけモックサーバーへ向けられるよう環境変数で上書き可能にする
+// (本番・通常起動では未設定=従来どおり公式エンドポイント。挙動の変化なし)
+const ANTHROPIC_API_BASE = process.env.ANTHROPIC_API_BASE || "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION = "2023-06-01";
 
 /** tier("light"/"heavy")に応じて実際に使うモデルIDを返す(llm/index.jsが開示にも使う) */
@@ -68,7 +70,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = ANTHROPIC_TIMEOUT
   }
 }
 
-async function callOnce(model, { systemPrompt, userPrompt, maxTokens }) {
+async function callOnce(model, { systemPrompt, userPrompt, maxTokens, timeoutMs }) {
   const res = await fetchWithTimeout(ANTHROPIC_API_BASE, {
     method: "POST",
     headers: {
@@ -82,7 +84,7 @@ async function callOnce(model, { systemPrompt, userPrompt, maxTokens }) {
       system: systemPrompt || "",
       messages: [{ role: "user", content: userPrompt || "" }],
     }),
-  });
+  }, timeoutMs || ANTHROPIC_TIMEOUT_MS);
   if (!res.ok) {
     const bodyText = await res.text().catch(() => "");
     const err = new Error(`Anthropic API HTTP ${res.status}: ${bodyText.slice(0, 300)}`);
@@ -112,38 +114,59 @@ function isModelNotFoundError(e) {
   return /model/i.test(String(e.bodyText || ""));
 }
 
-async function generate({ systemPrompt, userPrompt, maxTokens, tier }) {
+// ---- v85(2026年9月8日・本番実測での特定「チャットの深い考察だけ毎回失敗」への対応) ----
+//   原因: 8/18にモデルを格上げ(heavy=claude-opus-5・回答1400トークン)した際、
+//   タイムアウト(30秒)を据え置いた。高性能モデルの長い回答は生成に40〜70秒
+//   かかるため、完成する前に打ち切られ、重い考察がほぼ毎回TIMEOUTになっていた
+//   (軽量モデル・短い回答のマッチ分析は同時刻の本番で成功=キー・残高は正常と実測)。
+//   対応: ①呼び出しごとにtimeoutMsを指定可能に ②それでも時間切れの場合、
+//   呼び出し元が指定した高速モデルへ1回だけ自動で切り替えて必ず答えを返す
+//   (使ったモデルはfallbackFromで正直に開示) ③対話用途では尻切れ書き直しを
+//   無効化できる(truncateRetry:false。書き直しで待ち時間が2倍になるのを防ぐ。
+//   切れた場合はtruncated:trueで正直に注記される)。
+//   既定値はすべて従来どおり(timeoutMs=30秒・truncateRetry=有効・fallback無し)
+//   なので、毎日の学習など既存の呼び出しの挙動は1ビットも変わらない。
+async function generate({ systemPrompt, userPrompt, maxTokens, tier, timeoutMs, truncateRetry, timeoutFallbackModel, timeoutFallbackTimeoutMs, timeoutFallbackMaxTokens }) {
   if (!ANTHROPIC_API_KEY) {
     const err = new Error("ANTHROPIC_API_KEY が設定されていません(.envを確認してください)");
     err.code = "NO_KEY";
     throw err;
   }
   const requested = resolveModel(tier);
-  const runWithModel = async (model, fallbackFrom) => {
-    let r = await callOnce(model, { systemPrompt, userPrompt, maxTokens });
+  const runWithModel = async (model, fallbackFrom, callTimeoutMs, callMaxTokens) => {
+    const useMax = callMaxTokens || maxTokens;
+    let r = await callOnce(model, { systemPrompt, userPrompt, maxTokens: useMax, timeoutMs: callTimeoutMs });
     // ---- v51: 尻切れ対策 ----
     // 上限に当たって文章が切れた場合、1回だけ上限を2倍(既定の天井2400)にして
     // 書き直す。それでも切れたら truncated:true を正直に返す(呼び出し元が
     // 利用者に「末尾が省略された」と注記する)。
-    if (r.truncated) {
-      const retryMax = Math.min(TRUNCATE_RETRY_CAP, Math.max(1200, (maxTokens || 700) * 2));
-      console.error(`[anthropic] 応答がトークン上限(${maxTokens || 700})で途切れたため、上限${retryMax}で1回だけ書き直します(model=${model})`);
+    // v85: truncateRetry:false のときは書き直さない(対話は待ち時間を優先し、
+    // 切れたことを正直に注記する方を選ぶ)。
+    if (r.truncated && truncateRetry !== false) {
+      const retryMax = Math.min(TRUNCATE_RETRY_CAP, Math.max(1200, (useMax || 700) * 2));
+      console.error(`[anthropic] 応答がトークン上限(${useMax || 700})で途切れたため、上限${retryMax}で1回だけ書き直します(model=${model})`);
       try {
-        const retry = await callOnce(model, { systemPrompt, userPrompt, maxTokens: retryMax });
+        const retry = await callOnce(model, { systemPrompt, userPrompt, maxTokens: retryMax, timeoutMs: callTimeoutMs });
         r = retry;
       } catch (e) { /* 書き直しに失敗したら、切れた初回の本文をそのまま使う(無いより正直に多い方) */ }
     }
     return { text: r.text, model, fallbackFrom: fallbackFrom || undefined, truncated: !!r.truncated };
   };
   try {
-    return await runWithModel(requested);
+    return await runWithModel(requested, undefined, timeoutMs);
   } catch (e) {
     // モデルが見つからない場合だけ、予備モデルで1回だけ再試行する。
-    // それ以外(レート制限・キー不正・タイムアウト等)は従来どおり失敗を返す
-    // (予備モデルでも同じ理由で失敗するだけなので、費用を二重に使わない)。
+    // (レート制限・キー不正等は予備モデルでも同じ理由で失敗するだけなので再試行しない)
     if (isModelNotFoundError(e) && ANTHROPIC_FALLBACK_MODEL && ANTHROPIC_FALLBACK_MODEL !== requested) {
       console.error(`[anthropic] モデル「${requested}」が見つからないため、予備モデル「${ANTHROPIC_FALLBACK_MODEL}」で再試行します:`, e.message);
-      return await runWithModel(ANTHROPIC_FALLBACK_MODEL, requested);
+      return await runWithModel(ANTHROPIC_FALLBACK_MODEL, requested, timeoutMs);
+    }
+    // v85: 時間切れのときだけ、呼び出し元が指定した高速モデルへ1回だけ切り替える。
+    // 「賢い回答が時間内に完成しない」よりも「少し軽いモデルでも必ず答えが返る」
+    // 方が対話としては誠実(どのモデルで答えたかは画面に開示される)。
+    if (e && e.code === "TIMEOUT" && timeoutFallbackModel && timeoutFallbackModel !== requested) {
+      console.error(`[anthropic] モデル「${requested}」が時間切れ(${timeoutMs || ANTHROPIC_TIMEOUT_MS}ms)のため、高速モデル「${timeoutFallbackModel}」で再試行します`);
+      return await runWithModel(timeoutFallbackModel, requested, timeoutFallbackTimeoutMs || 25000, timeoutFallbackMaxTokens);
     }
     throw e;
   }
