@@ -4598,6 +4598,10 @@ async function handleMatchup(query) {
 async function handleMatchAnalysis(query, clientIp) {
   const homeRaw = (query.get("home") || "").trim();
   const awayRaw = (query.get("away") || "").trim();
+  // v82(2026年9月5日・多言語): LLMが書く4欄(narrative等)だけ利用者の言語で
+  // 生成する。定型文はこれまでどおり日本語で返し、画面側の辞書が翻訳する
+  // (事実の文言はサーバー保存の原文のまま=翻訳で事実が変質しない設計)。
+  const maLang = normalizeAppLang(query.get("lang"));
   if (!homeRaw || !awayRaw) return { status: 400, body: { ok: false, error: "home and away (club name) are required" } };
   if (homeRaw.toLowerCase() === awayRaw.toLowerCase()) return { status: 400, body: { ok: false, error: "home and away must be different clubs" } };
   // 第7次監査で発見した欠陥への対応:
@@ -4610,7 +4614,9 @@ async function handleMatchAnalysis(query, clientIp) {
   }
   // 分析の中身は1日のうちに大きくは変わらない(直近10試合・順位・怪我人)。
   // 同じ対戦の連打で毎回23件のAPIを使わないよう、30分キャッシュする。
-  const maCacheKey = cacheKeyOf("match-analysis", [homeRaw.toLowerCase(), awayRaw.toLowerCase(), appDateKey()]);
+  // v82: 言語もキーに含める(言語別にLLM文が異なるため。日本語利用者のキーは
+  // "ja"が付くだけで、ヒット率・費用のふるまいは従来と同じ)
+  const maCacheKey = cacheKeyOf("match-analysis", [homeRaw.toLowerCase(), awayRaw.toLowerCase(), maLang, appDateKey()]);
   const maCached = cacheGet(maCacheKey);
   if (maCached) return { status: 200, body: maCached };
 
@@ -4930,16 +4936,27 @@ async function handleMatchAnalysis(query, clientIp) {
         "あなたはサッカーの試合展開を予想するアナリストAIです。",
         "与えられた実データ・計算済みの数値だけを根拠にしてください。数字を新しく作らないでください。",
         "出力は次のJSON形式のみ: {\"narrative\": \"...\", \"reverseScenario\": \"...\", \"tacticalCompatibility\": \"...\", \"biggestHighlight\": \"...\"}",
-        "narrativeは試合展開の予想を100〜160文字程度の日本語で。reverseScenarioは予想が外れる場合の代替シナリオを80〜140文字程度の日本語で。",
+        // v82(多言語): 利用者が日本語以外を選んでいる場合は、4欄の本文を
+        // その言語で書かせる(JSONのキー名・データの扱いは一切変えない)。
+        ...(maLang !== "ja" ? [
+          `【言語】4つの欄の本文は必ず${APP_LANG_NAMES_JA[maLang]}で書いてください(利用者がその言語を選択しています)。クラブ名・選手名はその言語で一般的な表記を使ってください。`,
+        ] : []),
+        maLang === "ja"
+          ? "narrativeは試合展開の予想を100〜160文字程度の日本語で。reverseScenarioは予想が外れる場合の代替シナリオを80〜140文字程度の日本語で。"
+          : "narrativeは試合展開の予想を2〜3文で。reverseScenarioは予想が外れる場合の代替シナリオを2〜3文で。",
         // 第7次監査で発見した欠陥の修正:
         //   両チームのフォーメーションが「不明」と渡されているのに、
         //   「戦術相性の見立てを80〜140文字で」と無条件に要求していた。
         //   知らないと伝えた事柄について確信的な文章を書かせるのは、
         //   本プロジェクトの「でっち上げない」原則に反する。
         //   データが無い場合は空文字を返させ、決定論的な「省略します」を残す。
-        "tacticalCompatibilityは両者のフォーメーション・戦術面の相性についての見立てを80〜140文字程度の日本語で(あなたの見解であることが伝わる書き方をしてください)。",
+        maLang === "ja"
+          ? "tacticalCompatibilityは両者のフォーメーション・戦術面の相性についての見立てを80〜140文字程度の日本語で(あなたの見解であることが伝わる書き方をしてください)。"
+          : "tacticalCompatibilityは両者のフォーメーション・戦術面の相性についての見立てを2〜3文で(あなたの見解であることが伝わる書き方をしてください)。",
         "ただし、与えられた情報の中でフォーメーションが「不明」となっている場合は、tacticalCompatibilityを必ず空文字(\"\")にしてください。推測で戦術相性を書いてはいけません。",
-        "biggestHighlightはこの試合で最も注目すべき1点を60〜100文字程度の日本語で挙げてください(与えられた情報から言えることに限り、根拠が乏しい場合は空文字にしてください)。",
+        maLang === "ja"
+          ? "biggestHighlightはこの試合で最も注目すべき1点を60〜100文字程度の日本語で挙げてください(与えられた情報から言えることに限り、根拠が乏しい場合は空文字にしてください)。"
+          : "biggestHighlightはこの試合で最も注目すべき1点を1〜2文で挙げてください(与えられた情報から言えることに限り、根拠が乏しい場合は空文字にしてください)。",
         "取得できなかった項目については、決して推測で埋めないでください。",
       ].join("\n");
       const userPrompt = [
@@ -8621,8 +8638,13 @@ async function handleHttpRequest(req, res) {
   //   ・/sw.js … PWA用サービスワーカー。静的配信は安全のため .js を公開しない
   //     方針(ソース流出対策)を維持したまま、この1ファイルだけ明示的に許可する。
   //     更新が確実に行き渡るよう no-cache で返す(ブラウザは毎回鮮度確認する)。
+  //   ・/i18n.<言語>.json … v82(2026年9月5日・多言語)。選手解説などの長文の
+  //     言語パック。.json全体を公開するのではなく、この3ファイル名だけを
+  //     明示的に許可する(既存の「拡張子での一括公開はしない」方針を維持)。
+  //     中身はビルド時固定なので1時間キャッシュ+クライアント側の?v=で更新。
   if (req.method === "GET" && (seoPages.MATCH_PATH_RE.test(pathname)
-    || pathname === "/sitemap.xml" || pathname === "/robots.txt" || pathname === "/sw.js")) {
+    || pathname === "/sitemap.xml" || pathname === "/robots.txt" || pathname === "/sw.js"
+    || /^\/i18n\.(en|zh|es)\.json$/.test(pathname))) {
     // /api/ と同じ1分あたりのレート制限を共有する(IDを走査してUpstash読み出しを
     // 浪費させる攻撃をキャッシュ+制限の二段で抑える)
     const seoIp = clientKeyFromRequest(req);
@@ -8640,6 +8662,16 @@ async function handleHttpRequest(req, res) {
         res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-cache" });
         res.end(fs.readFileSync(swPath, "utf8"));
         return;
+      }
+      {
+        const i18nMatch = /^\/i18n\.(en|zh|es)\.json$/.exec(pathname);
+        if (i18nMatch) {
+          const packPath = path.join(STATIC_ROOT, `i18n.${i18nMatch[1]}.json`);
+          if (!fs.existsSync(packPath)) { res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" }); res.end("{}"); return; }
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=3600" });
+          res.end(fs.readFileSync(packPath, "utf8"));
+          return;
+        }
       }
       if (pathname === "/robots.txt") {
         res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=3600" });
