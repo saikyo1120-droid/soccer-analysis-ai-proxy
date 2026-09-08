@@ -42,7 +42,7 @@ function resolveTier(tier) {
  * @param {"light"|"heavy"} [opts.tier] - モデルの重さ(未指定=light。従来呼び出しと完全互換)
  * @returns {Promise<{text: string, provider: string, tier: string, model: string|null}>}
  */
-async function generateLLM({ systemPrompt, userPrompt, maxTokens, tier }) {
+async function generateLLM({ systemPrompt, userPrompt, maxTokens, tier, timeoutMs, truncateRetry, timeoutFallbackToLight, timeoutFallbackTimeoutMs, timeoutFallbackMaxTokens }) {
   const name = currentProviderName();
   const loader = PROVIDERS[name];
   if (!loader) {
@@ -52,7 +52,22 @@ async function generateLLM({ systemPrompt, userPrompt, maxTokens, tier }) {
   }
   const provider = loader();
   const usedTier = resolveTier(tier);
-  const out = await provider.generate({ systemPrompt: systemPrompt || "", userPrompt: userPrompt || "", maxTokens: maxTokens || 700, tier: usedTier });
+  // v85: 対話のように「賢い(=重い)モデルだが時間内に完成しないと困る」用途向けに、
+  // 呼び出しごとのタイムアウト・尻切れ書き直しの無効化・時間切れ時の軽量モデル
+  // 自動切替を、プロバイダーへ透過的に渡す。未指定なら従来と完全に同じ挙動。
+  //   timeoutFallbackToLight=true のときだけ、そのプロバイダーの軽量モデルIDを
+  //   解決して time-out 時の予備として渡す(モデルIDはプロバイダーが握っており、
+  //   server.js からは知らなくてよい設計を維持する)。
+  let timeoutFallbackModel = null;
+  if (timeoutFallbackToLight && usedTier === "heavy" && typeof provider.resolveModel === "function") {
+    const lightModel = provider.resolveModel("light");
+    const heavyModel = provider.resolveModel("heavy");
+    if (lightModel && lightModel !== heavyModel) timeoutFallbackModel = lightModel;
+  }
+  const out = await provider.generate({
+    systemPrompt: systemPrompt || "", userPrompt: userPrompt || "", maxTokens: maxTokens || 700, tier: usedTier,
+    timeoutMs, truncateRetry, timeoutFallbackModel, timeoutFallbackTimeoutMs, timeoutFallbackMaxTokens,
+  });
   // v51: プロバイダーは従来どおり文字列を返してもよいし、{text, model, fallbackFrom}を
   // 返してもよい(予備モデルで答えた場合、実際に使ったモデルを正直に開示するため)。
   const isObj = out && typeof out === "object";
