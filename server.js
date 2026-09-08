@@ -4927,10 +4927,14 @@ async function handleMatchAnalysis(query, clientIp) {
   let tacticalCompatibility = { text: buildDeterministicTacticalCompatibility(), source: "deterministic" };
   let biggestHighlight = { text: buildDeterministicBiggestHighlight(), source: "deterministic" };
 
-  // 第7次監査での修正: 以前は per-IP を先に消費していたため、サイト全体の
-  // 上限に達している日は、利用者の「1日10回」の枠がLLMを呼ばないまま減っていた。
-  // 全体の枠を先に確認する。
-  if (typeof generateLLM === "function" && (await tryConsumeLlmBudget()) && tryConsumeLlmBudgetForIp(clientIp)) {
+  // v85.1(2026年9月8日・監査で発見した予算の取りこぼし): 以前の版は「全体枠を先に
+  // 消費 → per-IP を後で確認」という順序だった。この順序だと per-IP の上限に達した
+  // 利用者のリクエストで、全体枠を1つ消費したのに per-IP で弾かれ、LLMを呼ばないまま
+  // 全体枠が減り続ける(返金も無い)。/api/discuss と同じ正しい順序に統一する:
+  //   ①per-IP を先に消費(弾かれたら全体枠は一切減らさない)
+  //   ②全体枠を消費(弾かれたら、直前に消費した per-IP の1枠を返金する)
+  if (typeof generateLLM === "function" && tryConsumeLlmBudgetForIp(clientIp)) {
+   if (await tryConsumeLlmBudget()) {
     try {
       const systemPrompt = [
         "あなたはサッカーの試合展開を予想するアナリストAIです。",
@@ -4988,6 +4992,21 @@ async function handleMatchAnalysis(query, clientIp) {
       console.error("[match-analysis] generateLLM failed, falling back to deterministic narrative:", e.code || "(no code)", "-", e.message);
       // フォールバック(上で既に決定論的な文章をセット済み)のまま続行する。
     }
+   } else {
+     // 全体枠が尽きていた: LLMを呼べないので、直前に消費した per-IP の1枠を返金する
+     // (呼べなかったのに利用者の残り回数だけ減るのは不公平。discussと同じ扱い)。
+     refundLlmBudgetForIp(clientIp);
+   }
+  }
+  // v85.1(多言語): 非日本語表示で、LLMが埋めなかった定性文の欄は「決定論的な日本語」の
+  // ままになる(LLM未使用の日・空文字を返した欄)。日本語をそのまま出すと非日本語利用者に
+  // 日本語が漏れるため、埋まらなかった(source==="deterministic")欄は空にする。
+  // 事実の数値・ラベルは別途多言語で表示しているので、この定性的な作文だけを空にする。
+  if (maLang !== "ja") {
+    if (narrative.source === "deterministic") narrative = { text: "", source: "omitted_non_ja" };
+    if (reverseScenario.source === "deterministic") reverseScenario = { text: "", source: "omitted_non_ja" };
+    if (tacticalCompatibility.source === "deterministic") tacticalCompatibility = { text: "", source: "omitted_non_ja" };
+    if (biggestHighlight.source === "deterministic") biggestHighlight = { text: "", source: "omitted_non_ja" };
   }
 
   // 2026年8月・本番監査で発見・修正: 以前は「予想勝者」(勝率の内訳から判定)と
@@ -6433,13 +6452,29 @@ async function handleDiscuss(body, clientIp) {
     // 「…むしろ得点・アシストという直結指」の尻切れを確認)。上限を引き上げ、
     // それでも切れた場合はプロバイダー側が1回だけ書き直し、なお切れたら
     // truncatedフラグで受け取って利用者に正直に注記する。
-    const { text, tier: usedTier, model: usedModel, truncated: llmTruncated } = await generateLLM({
+    // ---- v85(2026年9月8日・本番実測での特定): 重い考察が「時間切れ」で毎回失敗 ----
+    //   heavy(claude-opus-5・1400トークン)は生成に40〜70秒かかるのに、内部の
+    //   タイムアウトが30秒のままで、完成前に打ち切られていた(同時刻の本番で
+    //   軽量モデルのマッチ分析は成功=キー・残高は正常と実測)。
+    //   ①待ち時間を延ばす(heavyは60秒) ②尻切れ書き直しはしない(対話は待ち時間
+    //   優先。切れたら正直に注記) ③それでも時間切れなら軽量モデルへ自動切替して
+    //   必ず答えを返す(使ったモデルはmeta.llmModelで開示)。
+    const isHeavy = llmTier === "heavy";
+    const { text, tier: usedTier, model: usedModel, truncated: llmTruncated, modelFallbackFrom } = await generateLLM({
       systemPrompt: buildDiscussSystemPrompt(appLang), userPrompt,
-      maxTokens: llmTier === "heavy" ? 1400 : 1100, tier: llmTier,
+      maxTokens: isHeavy ? 1400 : 1100, tier: llmTier,
+      timeoutMs: isHeavy ? 60000 : 30000,
+      truncateRetry: false,
+      timeoutFallbackToLight: isHeavy,       // heavyが時間切れなら軽量モデルへ1回だけ切替
+      timeoutFallbackTimeoutMs: 25000,
+      timeoutFallbackMaxTokens: 1000,        // 切替後は少し短めにして確実に完成させる
     });
     llmTierUsed = usedTier || null;
     llmModelUsed = usedModel || null;
     llmWasTruncated = !!llmTruncated;
+    if (modelFallbackFrom) {
+      console.error(`[discuss] heavyモデル(${modelFallbackFrom})が時間切れのため、${usedModel}で回答しました`);
+    }
     llmOut = parseDiscussLlmOutput(text);
   } catch (e) {
     // これまでここでエラーの中身(実際のAnthropic APIのHTTPステータス・応答本文)を
@@ -6447,15 +6482,26 @@ async function handleDiscuss(body, clientIp) {
     // 続いても原因(APIキー不正・クレジット不足・レート制限・モデル名不正 等)を
     // 特定する手段がなかった。Renderの「Logs」タブで実際の原因が読めるようにする。
     console.error("[discuss] generateLLM failed:", e.code || "(no code)", "-", e.message);
+    // v85: 原因ごとに正直な日本語メッセージを出し分ける(画面を見るだけで原因が
+    // 分かるように)。Renderの「Logs」タブにも従来どおり原因を残す。
+    const httpStatus = e && e.httpStatus;
+    let message;
+    if (e && e.code === "NO_KEY") {
+      message = "AIのAPIキーが設定されていないため、考察機能はまだ利用できません(サーバーの環境変数をご確認ください)。";
+    } else if (e && e.code === "TIMEOUT") {
+      message = "AIの考察に時間がかかりすぎたため、いったん中断しました。もう一度お試しいただくと、多くの場合そのまま考察できます。";
+    } else if (httpStatus === 429) {
+      message = "いまAIへのアクセスが混み合っています(レート制限)。少し時間をおいてからもう一度お試しください。";
+    } else if (httpStatus === 401 || httpStatus === 403) {
+      message = "AIのAPIキーが正しくないか、権限が不足しているようです(サーバーの設定をご確認ください)。";
+    } else if (httpStatus === 402 || (e && /credit|balance|quota/i.test(String(e.message)))) {
+      message = "AI提供元の利用残高が不足しているようです(課金状況をご確認ください)。";
+    } else {
+      message = "AIの考察生成に一時的に失敗しました。少し時間をおいてからもう一度お試しください。";
+    }
     return {
       status: 200,
-      body: {
-        ok: false,
-        reason: e.code || "llm_error",
-        message: e.code === "NO_KEY"
-          ? "LLMのAPIキーが設定されていないため、考察機能はまだ利用できません(.envを確認してください)。"
-          : "AIの考察生成に失敗しました。しばらくしてから再度お試しください。",
-      },
+      body: { ok: false, reason: e.code || (httpStatus ? `http_${httpStatus}` : "llm_error"), message },
     };
   }
 
@@ -7390,7 +7436,11 @@ async function handleHttpRequest(req, res) {
             body = { ok: false, available: false, reasonJa: "答え合わせの記録を読み出せませんでした(0件だったのではなく、測れていません)。" };
           }
         }
-        cacheSet("reflections:public", body, 10 * 60 * 1000);
+        // v85.1(監査): 一時的なUpstash読み出し失敗を10分もキャッシュすると、
+        // サーバーが回復した後も全員に「読み出せませんでした」を出し続ける。
+        // 失敗応答は60秒だけキャッシュし、正常応答は従来どおり10分にする
+        // (/api/club/summary・/api/qa/latest が失敗を短命にしているのと同じ方針)。
+        cacheSet("reflections:public", body, body.ok === false ? 60 * 1000 : 10 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
         res.end(JSON.stringify(body));
         return;

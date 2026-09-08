@@ -284,11 +284,22 @@ test("★欠陥76: 1件の失敗で予測自動収集を「失敗」と報告し
     "処理そのものの失敗だけを見る形になっていない");
 });
 
-test("★欠陥77: AI考察の全体上限に達した日に、利用者個人の枠を無駄に消費しない", () => {
-  // 第8次監査でtryConsumeLlmBudgetはUpstash永続化のためasync化(await)された。
-  // 「全体の枠→個人の枠」の確認順序は同一。
-  assert.ok(/\(await tryConsumeLlmBudget\(\)\) && tryConsumeLlmBudgetForIp\(clientIp\)/.test(SERVER),
-    "全体の枠を先に確認していない");
+test("★欠陥77: AI考察の全体/個人どちらの上限でも、もう片方の枠を無駄に消費しない", () => {
+  // v85.1(監査): 旧版は「全体枠を先に消費→個人枠を後で確認」だった。これは
+  //   「全体が尽きた日に個人枠を無駄にしない」利点はあったが、逆に「個人枠が
+  //   尽きた利用者のリクエストで全体枠を1つ無駄に消費し、返金もしない」欠陥が
+  //   あった(サイト全体の枠がLLMを呼ばないまま減り続ける)。/api/discuss と
+  //   同じ「個人枠を先に消費し、全体枠が尽きていたら個人枠を返金する」順序に統一。
+  //   これで全体・個人どちらの上限でも、もう片方の枠を無駄に消費しない。
+  const maStart = SERVER.indexOf("async function handleMatchAnalysis");
+  const maBlock = SERVER.slice(maStart, maStart + 24000);
+  const ipIdx = maBlock.indexOf("if (typeof generateLLM === \"function\" && tryConsumeLlmBudgetForIp(clientIp))");
+  const globalIdx = maBlock.indexOf("if (await tryConsumeLlmBudget())");
+  assert.ok(ipIdx !== -1 && globalIdx !== -1 && ipIdx < globalIdx,
+    "個人枠→全体枠 の順序で消費していない");
+  const refundIdx = maBlock.indexOf("refundLlmBudgetForIp(clientIp)");
+  assert.ok(refundIdx !== -1 && refundIdx > globalIdx,
+    "全体枠が尽きたとき(else)に個人枠を返金していない");
 });
 
 test("★欠陥78: 保存先の読み取り失敗を、黙って「変化なし」にしない", () => {

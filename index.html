@@ -3329,6 +3329,41 @@
     "予想スコア": ["predicted score", "预想比分", "marcador previsto"],
     "うち公式戦": ["of which competitive", "其中正式比赛", "de ellos oficiales"],
   });
+  /* ==== v85(2026年9月8日): AIチャットのエラー・状態メッセージ(原因別)の翻訳 ==== */
+  add({
+    "AIサーバーを起動しています…(しばらく使われていなかったため、目を覚ますのに最大1分ほどかかります。そのままお待ちください)":
+      ["Waking up the AI server… (it went to sleep after a period of inactivity and can take up to a minute to wake — please hold on)",
+       "正在唤醒AI服务器…(闲置一段时间后已休眠,唤醒最多需要约1分钟,请稍候)",
+       "Activando el servidor de IA… (se durmió tras un periodo de inactividad y puede tardar hasta un minuto en despertar; espera un momento)"],
+    "AIサーバーの起動に時間がかかっているようです(しばらく使われていなかったサーバーが目を覚ますまで最大1分ほどかかります)。もう一度送信すると、多くの場合そのまま話せます。":
+      ["The AI server seems slow to wake up (a server that has been idle can take up to a minute to wake). Sending once more usually gets it talking.",
+       "AI服务器唤醒似乎较慢(闲置的服务器唤醒最多需约1分钟)。再发送一次,通常就能正常对话。",
+       "El servidor de IA tarda en despertar (un servidor inactivo puede tardar hasta un minuto). Envíalo una vez más y normalmente ya responderá."],
+    "AIの考察に時間がかかりすぎたため、いったん中断しました。もう一度お試しいただくと、多くの場合そのまま考察できます。":
+      ["The AI analysis took too long and was interrupted. Trying once more usually lets it finish.",
+       "AI考察耗时过长,已暂时中断。再试一次,通常就能顺利完成。",
+       "El análisis de la IA tardó demasiado y se interrumpió. Inténtalo otra vez y normalmente podrá completarlo."],
+    "いまAIへのアクセスが混み合っています(レート制限)。少し時間をおいてからもう一度お試しください。":
+      ["AI access is busy right now (rate limit). Please wait a moment and try again.",
+       "当前AI访问较为拥挤(速率限制)。请稍后再试。",
+       "El acceso a la IA está saturado ahora (límite de velocidad). Espera un momento e inténtalo de nuevo."],
+    "AIのAPIキーが設定されていないため、考察機能はまだ利用できません(サーバーの環境変数をご確認ください)。":
+      ["The analysis feature isn't available yet because the AI API key isn't set (please check the server's environment variables).",
+       "由于未设置AI的API密钥,考察功能尚不可用(请检查服务器的环境变量)。",
+       "La función de análisis aún no está disponible porque no se ha configurado la clave de API de la IA (revisa las variables de entorno del servidor)."],
+    "AIのAPIキーが正しくないか、権限が不足しているようです(サーバーの設定をご確認ください)。":
+      ["The AI API key appears to be invalid or lacks permission (please check the server settings).",
+       "AI的API密钥似乎不正确或权限不足(请检查服务器设置)。",
+       "La clave de API de la IA parece no ser válida o no tener permisos (revisa la configuración del servidor)."],
+    "AI提供元の利用残高が不足しているようです(課金状況をご確認ください)。":
+      ["The AI provider's balance appears to be insufficient (please check billing).",
+       "AI提供方的余额似乎不足(请检查账单)。",
+       "El saldo del proveedor de IA parece insuficiente (revisa la facturación)."],
+    "AIの考察生成に一時的に失敗しました。少し時間をおいてからもう一度お試しください。":
+      ["The AI analysis temporarily failed to generate. Please wait a moment and try again.",
+       "AI考察生成暂时失败。请稍后再试。",
+       "La generación del análisis de la IA falló temporalmente. Espera un momento e inténtalo de nuevo."],
+  });
   var RAWP3 = [
     ["⦿勝利(⦿)", "$1 win ($2)", "$1胜($2)", "victoria de $1 ($2)"],
     ["引き分け(⦿)", "Draw ($1)", "平局($1)", "Empate ($1)"],
@@ -6767,6 +6802,11 @@ async function fetchBayernLiveData() {
     }
     throw lastErr || new Error("no data available");
   })();
+  // v85.1(監査): 失敗(拒否)した約束をキャッシュに残すと、最初の1回失敗しただけで
+  // バイエルンのライブ欄がセッション中ずっとエラーのまま(再試行しない)になる。
+  // 拒否時はキャッシュを消し、次に開いたときに取り直せるようにする(呼び出し側は
+  // 元の約束の拒否をそのまま受け取る=挙動は不変、次回だけ再取得可能になる)。
+  bayernLiveCachePromise.catch(() => { bayernLiveCachePromise = null; });
   return bayernLiveCachePromise;
 }
 
@@ -7030,12 +7070,14 @@ function renderMatchAnalysisResult(data, homeJa, awayJa) {
     </div>
     <h3 class="sim-subhead">📋 AIが重視した要素(重要度順)</h3>
     ${factorsHtml}
+    ${data.narrative && data.narrative.text ? `
     <div class="compare-comment" style="margin-top:10px;">
       <strong>🗣️ 試合展開予想${aiTag(data.narrative)}:</strong> ${escapeHtml(data.narrative.text)}
-    </div>
+    </div>` : ""}
+    ${data.reverseScenario && data.reverseScenario.text ? `
     <div class="compare-comment" style="margin-top:8px;">
       <strong>🔄 もし予想と違ったら${aiTag(data.reverseScenario)}:</strong> ${escapeHtml(data.reverseScenario.text)}
-    </div>
+    </div>` : ""}
     ${injuriesHtml}
     ${formationHtml}
     ${data.tacticalCompatibility && data.tacticalCompatibility.text ? `
@@ -9301,7 +9343,9 @@ function buildDiscussSubject(q, contextPlayer, forcedPlayerName) {
 // AI考察はPlanner→実データ取得→推論→LLMと多段で動くため、15秒では
 // 正常な処理中でも打ち切られ、毎回「接続できませんでした」に見えていた
 // (サーバー側のLLM呼び出しだけで最大30秒×複数段)。75秒まで待つ。
-const DISCUSS_TIMEOUT_MS = 75000;
+// v85: サーバー側の最悪待ち時間(heavy 60秒が時間切れ→軽量モデルへ切替25秒=最大85秒)
+// を画面が先に打ち切らないよう、95秒に延長する。通常はheavyが30〜45秒で完成する。
+const DISCUSS_TIMEOUT_MS = 95000;
 
 // ---- v84(2026年9月8日・利用者の指摘「チャットが接続できませんと言って会話にならない」) ----
 //   本番調査の結論: LLMのAPIキーは設定済み・予算も潤沢で、機能自体は動く。あの
@@ -9533,7 +9577,8 @@ async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn, forced
 
   // v84: 起床待ちのあいだは「起動中」と正直に出す(黙って固まったように見せない)。
   const onColdStart = () => {
-    pendingMsg.text = `<p class="value-note">⏳ AIサーバーを起動しています…(しばらく使われていなかったため、目を覚ますのに最大1分ほどかかります。そのままお待ちください)</p>`;
+    var startMsg = "AIサーバーを起動しています…(しばらく使われていなかったため、目を覚ますのに最大1分ほどかかります。そのままお待ちください)";
+    pendingMsg.text = `<p class="value-note">⏳ ${escapeHtml((typeof window !== "undefined" && window.t) ? window.t(startMsg) : startMsg)}</p>`;
     try { renderFn(); } catch (e) {}
   };
   const resp = await fetchDiscussApi(q, subject, playerHint, mem.turns, onColdStart);
@@ -9554,7 +9599,10 @@ async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn, forced
   } else {
     // 議論エンジンに接続できなかった/失敗した場合: 「考えたふり」はせず正直に状況を
     // 伝えた上で、参考情報として従来のデータ要約(キーワードベース)を添える。
-    const reason = (resp && resp.message) ? resp.message : "AIサーバーの起動に時間がかかっているようです(しばらく使われていなかったサーバーが目を覚ますまで最大1分ほどかかります)。もう一度送信すると、多くの場合そのまま話せます。";
+    // v85: サーバーが返す原因別メッセージ(時間切れ・混雑・キー・残高等)は日本語で
+    // 返るため、非日本語表示では window.t で訳す(辞書に無ければ原文のまま=でっち上げない)。
+    const reasonRaw = (resp && resp.message) ? resp.message : "AIサーバーの起動に時間がかかっているようです(しばらく使われていなかったサーバーが目を覚ますまで最大1分ほどかかります)。もう一度送信すると、多くの場合そのまま話せます。";
+    const reason = (typeof window !== "undefined" && window.t) ? window.t(reasonRaw) : reasonRaw;
     let fallback = "";
     if (subject.type === "club" && subject.labelJa) fallback = buildClubAnswer(subject.labelJa, dLevel);
     else if (subject.type === "player" && resolvedPlayer) {
@@ -10712,7 +10760,14 @@ function fetchTodayPredictionsShared() {
           data.predictions.forEach((p) => predsByFixtureId.set(String(p.fixtureId), p));
         }
         return data;
-      } catch (e) { return null; }
+      } catch (e) {
+        // v85.1(監査): 失敗した約束をキャッシュに残すと、起動直後の1回の失敗で
+        // 「今日のAI予想」カードが再読込まで永久に「取得できません」に固定される。
+        // 失敗時はキャッシュを消して、次回の呼び出しで取り直せるようにする
+        // (成功した約束だけを共有キャッシュとして残す)。
+        __todayPredictionsPromise = null;
+        return null;
+      }
     })();
   }
   return __todayPredictionsPromise;
@@ -11248,7 +11303,14 @@ async function renderRankingsTab() {
   try {
     d = await fetchJsonWithTimeout(`${API_PROXY_BASE}/ratings/rankings`, backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
   } catch (e) { d = null; }
-  if (!d) { el.innerHTML = `<p class="value-note">ランキングを取得できませんでした(サーバー起動待ちの可能性があります)。</p>`; return; }
+  if (!d) {
+    // v85.1(監査): rankingsEnsureInit は描画成功の前に「初期化済み」と記録するため、
+    // 起動直後の失敗を1回引くと、10分間はタブを開き直しても再取得されずエラーの
+    // まま固定されていた。取得失敗時は初期化フラグを戻し、次にタブを開いたら
+    // 取り直せるようにする(サーバーが温まれば次の1タップで表示される)。
+    rankingsInited = false; rankingsRenderedAt = 0;
+    el.innerHTML = `<p class="value-note">ランキングを取得できませんでした(サーバー起動待ちの可能性があります)。</p>`; return;
+  }
   if (!d.available) {
     el.innerHTML = `<p class="value-note">${escapeHtml(d.reasonJa || "レーティングはまだありません。")}</p>`;
     return;
