@@ -500,82 +500,141 @@ function buildAccuracyDiagnosis(input) {
 //    「今日のAIは昨日より賢くなったか?」→ YES/NO/判定不能 + 数値の証明
 // ---------------------------------------------------------------
 
+// ---- v84(2026年9月8日・利用者の指摘「ほぼ毎日NOが出る」への根本対応) ----
+//   旧判定の欠陥: 「1日ごとの的中率の前日差」を合否軸に入れ、しかも「1つでも
+//   悪化があればNO」としていた。1日の答え合わせは10件前後しかなく、10件の的中率は
+//   統計的に大きく揺れる(本番実測: 知識+435件も増えた日に、的中率が前日−24.5ptで
+//   NO)。中身が良くなっても、たまたま的中率が下がった日は必ずNO=数学的に半分以上の
+//   日がNOになる、測定の設計ミスだった。
+//   新判定の原則(でっち上げ・水増しはしない):
+//    ①「賢さ」は"能力の伸び"(知識・記憶・カバレッジ・重み更新)で判定する。これらは
+//      本物の学習signalで、減れば本物の後退(索引破損など)なので正直にNOにする。
+//    ②"予測精度"は少数サンプルの前日差では判定しない。統計的に意味のある窓
+//      (最低試合数ガード+直近7日の傾向)でだけ「本当の悪化」を見る。少数日の
+//      的中率の上下は隠さず"参考(判定外)"として表示する。
+const SELFASSESS_MIN_DAILY_N = 30;   // これ未満の当日答え合わせ件数では的中率の前日差を判定に使わない
+const SELFASSESS_MIN_TREND_N = 30;   // 直近7日の傾向を判定に使うのに必要な最低試合数
+const SELFASSESS_TREND_REGRESSION_PT = 3; // 直近7日が直近30日をこれ以上下回ったら「本当の悪化」
+
 function buildSelfAssessment(input) {
   const { accuracyTrend, metricsComparison, intelTrend, agenda, hypothesisStats, weightsUpdated } = input || {};
-  const axes = []; // {axisJa, deltaJa, direction: 1(改善)/-1(悪化)/0(不変)}
+  // 能力の伸びの軸(判定に使う)。direction: 1(改善)/-1(本物の後退)/0(不変)
+  const capabilityAxes = [];
+  // 精度の軸(統計的に意味のあるものだけ判定に使う)
+  const accuracyAxes = [];
+  // 参考として必ず表示するが、判定には使わない軸(少数サンプルの揺れなど)
+  const referenceAxes = [];
 
-  // 軸1・2: 精度(的中率・Brier)— 両日とも測定できた場合のみ
+  // --- 能力: 知識・記憶の累計(実カウンタの差分。減少は本物の後退) ---
+  const mc = metricsComparison;
+  if (mc && mc.hasBaseline) {
+    if (Number.isFinite(mc.knowledgeDelta)) capabilityAxes.push({ axisJa: "累計知識件数", valueJa: `${mc.knowledgeDelta > 0 ? "+" : ""}${mc.knowledgeDelta}件`, direction: Math.sign(mc.knowledgeDelta) });
+    if (Number.isFinite(mc.memoryDelta)) capabilityAxes.push({ axisJa: "累計記憶(結論)件数", valueJa: `${mc.memoryDelta > 0 ? "+" : ""}${mc.memoryDelta}件`, direction: Math.sign(mc.memoryDelta) });
+  }
+  // --- 能力: 重みの更新(実データに基づく学習が実行され、検証を通過して採用されたか) ---
+  if (weightsUpdated) {
+    capabilityAxes.push({ axisJa: "予測モデルの重み", valueJa: "実データに基づいて更新(ホールドアウト検証を通過した改善のみ採用)", direction: 1 });
+  }
+  // --- 能力: 考察の質スコア(形式的な質・前日比) ---
+  const iv = intelTrend && intelTrend.vsYesterday;
+  if (iv && Number.isFinite(iv.reasoningScoreDelta) && iv.reasoningScoreDelta !== 0) {
+    capabilityAxes.push({ axisJa: "考察の質スコア(形式的な質・前日比)", valueJa: `${iv.reasoningScoreDelta > 0 ? "+" : ""}${iv.reasoningScoreDelta}点`, direction: Math.sign(iv.reasoningScoreDelta) });
+  }
+
+  // --- 精度: 統計的に意味のある窓でだけ判定する ---
+  const oneX2Of = (w) => (w && w.markets && w.markets.oneX2 && w.markets.oneX2.measurable) ? w.markets.oneX2 : null;
+  const today1x2 = oneX2Of(accuracyTrend && accuracyTrend.today);
+  const l7 = oneX2Of(accuracyTrend && accuracyTrend.last7Days);
+  const l30 = oneX2Of(accuracyTrend && accuracyTrend.last30Days);
+  const todayN = today1x2 ? Number(today1x2.n) : 0;
   const vy = accuracyTrend && accuracyTrend.vsYesterday;
+
+  // 前日差: 当日の答え合わせが少数のうちは"参考(判定外)"。十分な件数の日だけ判定に使う。
   if (vy && Number.isFinite(vy.hitRateDeltaPct)) {
-    axes.push({ axisJa: "1X2的中率(前日比)", valueJa: `${vy.hitRateDeltaPct > 0 ? "+" : ""}${vy.hitRateDeltaPct}ポイント`, direction: Math.sign(vy.hitRateDeltaPct) });
-    if (Number.isFinite(vy.brierDelta)) {
-      axes.push({ axisJa: "Brier Score(前日比・減少が改善)", valueJa: `${vy.brierDelta > 0 ? "+" : ""}${vy.brierDelta}`, direction: -Math.sign(vy.brierDelta) });
+    if (todayN >= SELFASSESS_MIN_DAILY_N) {
+      accuracyAxes.push({ axisJa: "1X2的中率(前日比)", valueJa: `${vy.hitRateDeltaPct > 0 ? "+" : ""}${vy.hitRateDeltaPct}ポイント(本日${todayN}件)`, direction: Math.sign(vy.hitRateDeltaPct) });
+    } else {
+      referenceAxes.push({ axisJa: "1X2的中率(前日比)", valueJa: `${vy.hitRateDeltaPct > 0 ? "+" : ""}${vy.hitRateDeltaPct}ポイント(本日の答え合わせ${todayN}件と少数のため統計的な揺れ。判定には使いません)`, direction: 0 });
     }
   }
 
-  // 軸3・4: 知識・記憶の累計(実カウンタの差分)
-  const mc = metricsComparison;
-  if (mc && mc.hasBaseline) {
-    if (Number.isFinite(mc.knowledgeDelta)) axes.push({ axisJa: "累計知識件数", valueJa: `${mc.knowledgeDelta > 0 ? "+" : ""}${mc.knowledgeDelta}件`, direction: Math.sign(mc.knowledgeDelta) });
-    if (Number.isFinite(mc.memoryDelta)) axes.push({ axisJa: "累計記憶(結論)件数", valueJa: `${mc.memoryDelta > 0 ? "+" : ""}${mc.memoryDelta}件`, direction: Math.sign(mc.memoryDelta) });
+  // 直近7日の傾向 vs 直近30日: 十分な件数があるときだけ「本当の傾向」を見る。
+  if (l7 && Number(l7.n) >= SELFASSESS_MIN_TREND_N && l30 && Number.isFinite(l7.hitRatePct) && Number.isFinite(l30.hitRatePct)) {
+    const gapPt = round1(l7.hitRatePct - l30.hitRatePct);
+    if (gapPt <= -SELFASSESS_TREND_REGRESSION_PT) {
+      accuracyAxes.push({ axisJa: "的中率の傾向(直近7日 vs 直近30日)", valueJa: `直近7日 ${l7.hitRatePct}%(${l7.n}件)が直近30日 ${l30.hitRatePct}% を ${Math.abs(gapPt)}pt 下回り、本当に低下傾向`, direction: -1 });
+    } else if (gapPt >= SELFASSESS_TREND_REGRESSION_PT) {
+      accuracyAxes.push({ axisJa: "的中率の傾向(直近7日 vs 直近30日)", valueJa: `直近7日 ${l7.hitRatePct}%(${l7.n}件)が直近30日 ${l30.hitRatePct}% を ${gapPt}pt 上回り、上昇傾向`, direction: 1 });
+    } else {
+      referenceAxes.push({ axisJa: "的中率の傾向(直近7日 vs 直近30日)", valueJa: `直近7日 ${l7.hitRatePct}%(${l7.n}件)・直近30日 ${l30.hitRatePct}%(ほぼ横ばい)`, direction: 0 });
+    }
+  } else if (l7 && Number.isFinite(l7.hitRatePct)) {
+    referenceAxes.push({ axisJa: "的中率(直近7日)", valueJa: `${l7.hitRatePct}%(${l7.n}件)${Number(l7.n) < SELFASSESS_MIN_TREND_N ? " ・傾向判定にはもう少し試合数が必要" : ""}`, direction: 0 });
   }
 
-  // 軸5: 重みの更新(実データに基づく学習が実行されたか)
-  if (weightsUpdated) {
-    axes.push({ axisJa: "予測モデルの重み", valueJa: "実データに基づいて更新されました(ホールドアウト検証を通過した改善のみ採用)", direction: 1 });
-  }
-
-  // 軸6: 考察の質スコア(前日比)
-  const iv = intelTrend && intelTrend.vsYesterday;
-  if (iv && Number.isFinite(iv.reasoningScoreDelta)) {
-    axes.push({ axisJa: "考察の質スコア(形式的な質・前日比)", valueJa: `${iv.reasoningScoreDelta > 0 ? "+" : ""}${iv.reasoningScoreDelta}点`, direction: Math.sign(iv.reasoningScoreDelta) });
-  }
-
-  // 軸7: 仮説的中率(その日の実測。前日比ではなく当日値のため、証明の補助として添える)
+  // 仮説的中率(その日の実測。証明の補助として添える)
   const proofsExtra = [];
   if (hypothesisStats && hypothesisStats.measurable) proofsExtra.push(hypothesisStats.noteJa);
 
-  const improved = axes.filter((a) => a.direction > 0);
-  const regressed = axes.filter((a) => a.direction < 0);
+  const capImproved = capabilityAxes.filter((a) => a.direction > 0);
+  const capRegressed = capabilityAxes.filter((a) => a.direction < 0);
+  const accImproved = accuracyAxes.filter((a) => a.direction > 0);
+  const accRegressed = accuracyAxes.filter((a) => a.direction < 0);
+  const hasAnyJudgeable = capabilityAxes.length > 0 || accuracyAxes.length > 0;
 
   let verdict, answerJa, tomorrowPlanJa = null;
-  if (!axes.length) {
+  if (!hasAnyJudgeable) {
     verdict = "判定不能";
-    answerJa = "本日は比較できる測定値がまだ揃っていないため、「昨日より賢くなったか」を数値では判定できません(推測でYES/NOは出しません)。明日以降、記録が2日分揃った指標から自動的に判定を始めます。";
-  } else if (improved.length && !regressed.length) {
+    answerJa = "本日は判定に使える測定値がまだ揃っていないため、「昨日より賢くなったか」を数値では判定できません(推測でYES/NOは出しません)。学習の記録が2日分揃った指標から自動的に判定を始めます。";
+  } else if (capRegressed.length || accRegressed.length) {
+    // 本物の後退(データ喪失 or 統計的に意味のある精度低下)があるときだけNO
+    verdict = "NO";
+    const regParts = [...capRegressed, ...accRegressed].map((a) => `${a.axisJa}(${a.valueJa})`);
+    const posParts = [...capImproved, ...accImproved].map((a) => `${a.axisJa} ${a.valueJa}`);
+    answerJa = `NO — 本当の後退が測定されました: ${regParts.join("、")}。`
+      + (posParts.length ? `(いっぽうで前進した点: ${posParts.join("、")})` : "");
+  } else if (capImproved.length || accImproved.length) {
     verdict = "YES";
-    answerJa = `YES — ${improved.map((a) => `${a.axisJa}: ${a.valueJa}`).join("、")}。悪化した測定値はありません。`;
-  } else if (improved.length && regressed.length) {
-    verdict = "NO";
-    answerJa = `NO(部分的な改善はあるが悪化も測定されたため、正直にNOとします)— 改善: ${improved.map((a) => `${a.axisJa} ${a.valueJa}`).join("、")} / 悪化: ${regressed.map((a) => `${a.axisJa} ${a.valueJa}`).join("、")}。`;
+    const posParts = [...capImproved, ...accImproved].map((a) => `${a.axisJa}: ${a.valueJa}`);
+    answerJa = `YES — ${posParts.join("、")}。統計的に意味のある悪化はありません`
+      + (referenceAxes.some((a) => /揺れ|下回|低下/.test(a.valueJa)) ? "(本日の的中率は下がっていますが、答え合わせ件数が少なく統計的な揺れの範囲です)" : "")
+      + "。";
   } else {
+    // 判定に使える軸はあるが、前進も後退も無い(前日と同一データ等)
     verdict = "NO";
-    answerJa = regressed.length
-      ? `NO — 悪化: ${regressed.map((a) => `${a.axisJa} ${a.valueJa}`).join("、")}。改善が測定された指標はありません。`
-      : "NO — 本日は測定できたどの指標にも変化がありませんでした(取得データが前日と同一だった場合に起こります)。";
+    answerJa = "NO — 本日は測定できた範囲で前進がありませんでした(取得データが前日とほぼ同一だった場合に起こります)。後退はしていません。";
   }
 
   if (verdict === "NO") {
     const planParts = [];
-    for (const a of regressed) planParts.push(`「${a.axisJa}」の悪化(${a.valueJa})の原因を明日の学習で分析する`);
-    // 同上(フィールド名の取り違え)。items の要素は targetJa/reasonJa/actionJa を持つ。
+    for (const a of [...capRegressed, ...accRegressed]) planParts.push(`「${a.axisJa}」の後退(${a.valueJa})の原因を明日の学習で分析する`);
     const planAgendaItems = (agenda && (agenda.items || agenda.priorities)) || null;
     if (Array.isArray(planAgendaItems) && planAgendaItems.length) {
       const themes = planAgendaItems.slice(0, 2).map((p) => p.targetJa || p.labelJa || p.reasonJa || "").filter(Boolean).join("、");
       if (themes) planParts.push(`学習計画の優先テーマ(${themes})のデータ収集を強化する`);
     }
-    if (!planParts.length) planParts.push("明日の学習で新しい試合データ・知識の取得を継続し、測定可能な指標を増やす");
+    if (!planParts.length) planParts.push("明日の学習で新しい試合データ・知識の取得を継続し、答え合わせ件数を増やして測定を安定させる");
     tomorrowPlanJa = planParts.join("。") + "。";
   }
 
+  const toProof = (a, counted) => ({
+    axisJa: a.axisJa, valueJa: a.valueJa,
+    direction: a.direction > 0 ? "改善" : a.direction < 0 ? "悪化" : "不変",
+    counted: !!counted,
+  });
   return {
     questionJa: "今日のAIは昨日より賢くなったか?",
     verdict, // "YES" | "NO" | "判定不能"
     answerJa,
-    proofs: axes.map((a) => ({ axisJa: a.axisJa, valueJa: a.valueJa, direction: a.direction > 0 ? "改善" : a.direction < 0 ? "悪化" : "不変" })),
+    // 判定に使った軸 → 参考軸の順に並べる(隠さない)
+    proofs: [
+      ...capabilityAxes.map((a) => toProof(a, true)),
+      ...accuracyAxes.map((a) => toProof(a, true)),
+      ...referenceAxes.map((a) => toProof(a, false)),
+    ],
     proofsExtraJa: proofsExtra,
     tomorrowPlanJa,
-    noteJa: "この判定は保存済みの実測値の前日差分だけから機械的に決まります(LLMの自己申告ではありません)。改善が1つ以上あり悪化が0のときだけYESです。",
+    noteJa: "この判定は保存済みの実測値だけから機械的に決まります(LLMの自己申告ではありません)。「賢さ」は能力の伸び(知識・記憶・重みの更新)で判定し、予測精度は統計的に意味のある件数・傾向でだけ悪化を見ます。1日ごとの少数サンプルの的中率の上下は、隠さず参考として表示しますが判定には使いません(揺れをもって『賢くなっていない』とは言わない)。能力が伸び、統計的に意味のある悪化が無いときにYESです。",
   };
 }
 
