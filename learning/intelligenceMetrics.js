@@ -535,41 +535,59 @@ function buildSelfAssessment(input) {
   if (weightsUpdated) {
     capabilityAxes.push({ axisJa: "予測モデルの重み", valueJa: "実データに基づいて更新(ホールドアウト検証を通過した改善のみ採用)", direction: 1 });
   }
-  // --- 能力: 考察の質スコア(形式的な質・前日比) ---
+  // --- 考察の質スコア(形式的な質・前日比)は"参考"に留める ----
+  //   v84.1(2026年9月8日・監査で発見): これを判定軸(direction=±1)にしていたため、
+  //   1日あたり1〜3件しかない考察の平均点が−0.1点揺れただけで「本当の後退→NO」に
+  //   なっていた。少数サンプルの形式スコアの上下は"賢さの後退"ではないので、
+  //   的中率の少数サンプルと同じく参考表示に留める(判定には使わない)。
   const iv = intelTrend && intelTrend.vsYesterday;
   if (iv && Number.isFinite(iv.reasoningScoreDelta) && iv.reasoningScoreDelta !== 0) {
-    capabilityAxes.push({ axisJa: "考察の質スコア(形式的な質・前日比)", valueJa: `${iv.reasoningScoreDelta > 0 ? "+" : ""}${iv.reasoningScoreDelta}点`, direction: Math.sign(iv.reasoningScoreDelta) });
+    referenceAxes.push({ axisJa: "考察の質スコア(形式的な質・前日比)", valueJa: `${iv.reasoningScoreDelta > 0 ? "+" : ""}${iv.reasoningScoreDelta}点(1日あたりの考察が少数のため参考。判定には使いません)`, direction: 0 });
   }
 
   // --- 精度: 統計的に意味のある窓でだけ判定する ---
+  //   v84.1: 親善試合・2軍戦は主力を休ませるためプロでも当てにくく、混ぜると実力を
+  //   低く見せる。的中率は「公式戦のみ(official)」を優先し、公式戦の件数が足りない
+  //   ときだけ全体値へフォールバックする(でっち上げ防止=無い数字は作らない)。
   const oneX2Of = (w) => (w && w.markets && w.markets.oneX2 && w.markets.oneX2.measurable) ? w.markets.oneX2 : null;
+  // 公式戦優先の的中率と件数(公式戦がMIN件以上あれば公式戦、無ければ全体)
+  const prefRate = (o) => (o && o.official && Number(o.official.n) >= SELFASSESS_MIN_DAILY_N && Number.isFinite(o.official.hitRatePct)) ? o.official.hitRatePct : (o ? o.hitRatePct : null);
+  const prefN = (o) => (o && o.official && Number(o.official.n) >= SELFASSESS_MIN_DAILY_N) ? Number(o.official.n) : (o ? Number(o.n) : 0);
+  const prefTag = (o) => (o && o.official && Number(o.official.n) >= SELFASSESS_MIN_DAILY_N) ? "公式戦" : "全試合";
   const today1x2 = oneX2Of(accuracyTrend && accuracyTrend.today);
+  const yday1x2 = oneX2Of(accuracyTrend && accuracyTrend.yesterday);
   const l7 = oneX2Of(accuracyTrend && accuracyTrend.last7Days);
   const l30 = oneX2Of(accuracyTrend && accuracyTrend.last30Days);
-  const todayN = today1x2 ? Number(today1x2.n) : 0;
-  const vy = accuracyTrend && accuracyTrend.vsYesterday;
+  const todayN = prefN(today1x2);
+  const ydayN = prefN(yday1x2);
 
-  // 前日差: 当日の答え合わせが少数のうちは"参考(判定外)"。十分な件数の日だけ判定に使う。
-  if (vy && Number.isFinite(vy.hitRateDeltaPct)) {
-    if (todayN >= SELFASSESS_MIN_DAILY_N) {
-      accuracyAxes.push({ axisJa: "1X2的中率(前日比)", valueJa: `${vy.hitRateDeltaPct > 0 ? "+" : ""}${vy.hitRateDeltaPct}ポイント(本日${todayN}件)`, direction: Math.sign(vy.hitRateDeltaPct) });
+  // 前日差: ①当日と前日の両方が十分な件数 ②差が誤差幅(3pt)を超える —— の両方を満たす
+  //   ときだけ判定に使う。少数の日や、前日が数試合しかない日の的中率の上下は"参考"。
+  //   v84.1で追加した2つのガード: 前日Nの下限 と 効果量(3pt)のしきい値。
+  if (today1x2 && Number.isFinite(prefRate(today1x2)) && yday1x2 && Number.isFinite(prefRate(yday1x2))) {
+    const dayGap = round1(prefRate(today1x2) - prefRate(yday1x2));
+    const enoughN = todayN >= SELFASSESS_MIN_DAILY_N && ydayN >= SELFASSESS_MIN_DAILY_N;
+    if (enoughN && Math.abs(dayGap) >= SELFASSESS_TREND_REGRESSION_PT) {
+      accuracyAxes.push({ axisJa: `1X2的中率(前日比・${prefTag(today1x2)})`, valueJa: `${dayGap > 0 ? "+" : ""}${dayGap}ポイント(本日${todayN}件 vs 前日${ydayN}件)`, direction: Math.sign(dayGap) });
     } else {
-      referenceAxes.push({ axisJa: "1X2的中率(前日比)", valueJa: `${vy.hitRateDeltaPct > 0 ? "+" : ""}${vy.hitRateDeltaPct}ポイント(本日の答え合わせ${todayN}件と少数のため統計的な揺れ。判定には使いません)`, direction: 0 });
+      const why = !enoughN ? `本日${todayN}件・前日${ydayN}件と少数のため統計的な揺れ` : `差が${Math.abs(dayGap)}ptと誤差幅の範囲`;
+      referenceAxes.push({ axisJa: "1X2的中率(前日比)", valueJa: `${dayGap > 0 ? "+" : ""}${dayGap}ポイント(${why}。判定には使いません)`, direction: 0 });
     }
   }
 
   // 直近7日の傾向 vs 直近30日: 十分な件数があるときだけ「本当の傾向」を見る。
-  if (l7 && Number(l7.n) >= SELFASSESS_MIN_TREND_N && l30 && Number.isFinite(l7.hitRatePct) && Number.isFinite(l30.hitRatePct)) {
-    const gapPt = round1(l7.hitRatePct - l30.hitRatePct);
+  const l7rate = prefRate(l7), l30rate = prefRate(l30), l7n = prefN(l7);
+  if (l7 && l7n >= SELFASSESS_MIN_TREND_N && l30 && Number.isFinite(l7rate) && Number.isFinite(l30rate)) {
+    const gapPt = round1(l7rate - l30rate);
     if (gapPt <= -SELFASSESS_TREND_REGRESSION_PT) {
-      accuracyAxes.push({ axisJa: "的中率の傾向(直近7日 vs 直近30日)", valueJa: `直近7日 ${l7.hitRatePct}%(${l7.n}件)が直近30日 ${l30.hitRatePct}% を ${Math.abs(gapPt)}pt 下回り、本当に低下傾向`, direction: -1 });
+      accuracyAxes.push({ axisJa: `的中率の傾向(直近7日 vs 直近30日・${prefTag(l7)})`, valueJa: `直近7日 ${l7rate}%(${l7n}件)が直近30日 ${l30rate}% を ${Math.abs(gapPt)}pt 下回り、本当に低下傾向`, direction: -1 });
     } else if (gapPt >= SELFASSESS_TREND_REGRESSION_PT) {
-      accuracyAxes.push({ axisJa: "的中率の傾向(直近7日 vs 直近30日)", valueJa: `直近7日 ${l7.hitRatePct}%(${l7.n}件)が直近30日 ${l30.hitRatePct}% を ${gapPt}pt 上回り、上昇傾向`, direction: 1 });
+      accuracyAxes.push({ axisJa: `的中率の傾向(直近7日 vs 直近30日・${prefTag(l7)})`, valueJa: `直近7日 ${l7rate}%(${l7n}件)が直近30日 ${l30rate}% を ${gapPt}pt 上回り、上昇傾向`, direction: 1 });
     } else {
-      referenceAxes.push({ axisJa: "的中率の傾向(直近7日 vs 直近30日)", valueJa: `直近7日 ${l7.hitRatePct}%(${l7.n}件)・直近30日 ${l30.hitRatePct}%(ほぼ横ばい)`, direction: 0 });
+      referenceAxes.push({ axisJa: "的中率の傾向(直近7日 vs 直近30日)", valueJa: `直近7日 ${l7rate}%(${l7n}件)・直近30日 ${l30rate}%(ほぼ横ばい)`, direction: 0 });
     }
-  } else if (l7 && Number.isFinite(l7.hitRatePct)) {
-    referenceAxes.push({ axisJa: "的中率(直近7日)", valueJa: `${l7.hitRatePct}%(${l7.n}件)${Number(l7.n) < SELFASSESS_MIN_TREND_N ? " ・傾向判定にはもう少し試合数が必要" : ""}`, direction: 0 });
+  } else if (l7 && Number.isFinite(l7rate)) {
+    referenceAxes.push({ axisJa: "的中率(直近7日)", valueJa: `${l7rate}%(${l7n}件)${l7n < SELFASSESS_MIN_TREND_N ? " ・傾向判定にはもう少し試合数が必要" : ""}`, direction: 0 });
   }
 
   // 仮説的中率(その日の実測。証明の補助として添える)
