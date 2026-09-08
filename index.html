@@ -524,6 +524,8 @@
   }
   var appLang = readLang() || "ja";
   try { window.appLang = appLang; window.appLangIsSet = (readLang() !== null); } catch (e) {}
+  // v83: 「翻訳しきれず日本語が残ったか」の判定(中文は漢字を共有するため仮名のみ)
+  var JA_LEFT_RE = appLang === "zh" ? /[ぁ-んァ-ヶ]/ : /[ぁ-んァ-ヶ一-龥]/;
 
   // ---- 対訳辞書(完全一致)。値は [英語, 中文(简体), Español] ----
   var X = {};
@@ -549,23 +551,33 @@
       var inner = tr(s.slice(1).trim(), d0 + 1);
       if (inner !== null) return "\u30fb" + inner;
     }
+    // v83(2026年9月8日): 「先に並んだ汎用型」が specific な型を食って半端な訳を作る
+    //   問題の根治(実例: 「(うち公式戦 1/2件)」に汎用の「(⦿件)」が先に一致し、
+    //   中身が日本語のまま「件」だけ剥がされていた)。
+    //   → 一致しても入れ子スロットに日本語が残る型は採用せず後続の型を探し、
+    //     どの型でも完訳できないときだけ従来どおり最初の一致結果を使う。
+    var firstMatchOut = null;
     for (var k = 0; k < P.length; k++) {
       var m = P[k][0].exec(s);
       if (m) {
         var tpl = P[k][1 + i];
         if (tpl) {
+          var slotJaLeft = false;
           // v82: $1〜$9に加えて ${10} 形式(2桁)にも対応(スロット10個以上の型のため)
-          return tpl.replace(/\$(?:\{(\d{1,2})\}|(\d))/g, function (_, d2, d1) {
+          var out = tpl.replace(/\$(?:\{(\d{1,2})\}|(\d))/g, function (_, d2, d1) {
             var v = m[+(d2 || d1)];
             if (v == null) return "";
             // 入れ子の既知フレーズ(要素ラベル・注記など)も翻訳する(深さ3まで)
             var sub = tr(String(v).trim(), d0 + 1);
+            if (sub === null && JA_LEFT_RE.test(String(v))) slotJaLeft = true;
             return sub === null ? v : sub;
           });
+          if (!slotJaLeft) return out;
+          if (firstMatchOut === null) firstMatchOut = out;
         }
       }
     }
-    return null;
+    return firstMatchOut;
   }
   // どこからでも使える翻訳関数(辞書に無ければ原文のまま返す)
   window.t = function (s) {
@@ -1161,8 +1173,8 @@
   add({
     "確信度(実績で補正)": ["Confidence (corrected by track record)", "置信度(按实绩校正)", "Confianza (corregida por el historial)"],
     "モデル生値": ["raw model value", "模型原始值", "valor bruto del modelo"],
-    "同じ自信帯の実測": ["measured results in the same confidence band", "同一置信区间的实测", "resultados medidos en la misma banda"],
-    "件から補正": [" cases", "场校正", " casos"],
+    "同じ自信帯の実測": ["measured results in the same confidence band: ", "同一置信区间的实测", "resultados medidos en la misma banda: "],
+    "件から補正": [" cases used for this correction", "场校正", " casos usados para esta corrección"],
     "この試合はモデルの推定が現実的な範囲を外れました(確率は割り引いて見てください)": ["The model's estimate for this match fell outside a realistic range — treat the probability with caution.", "本场比赛模型的估计超出了现实范围,请谨慎看待该概率。", "La estimación del modelo para este partido quedó fuera de un rango realista; toma la probabilidad con cautela."],
   });
   // ---- ⑪ 型テンプレート(実ソースから機械抽出・⦿=変数スロット) ----
@@ -1187,8 +1199,8 @@
     ["(的中数: あなた⦿ vs AI⦿)", "(hits: you $1 vs AI $2)", "(命中数: 你$1 vs AI$2)", "(aciertos: tú $1 vs IA $2)"],
     ["🔥⦿連勝中", "🔥 $1-win streak", "🔥 $1连胜中", "🔥 racha de $1 victorias"],
     ["AIとの対決: あなた⦿勝⦿分⦿敗", "Duel vs the AI: you $1W-$2D-$3L", "与AI对决: 你$1胜$2平$3负", "Duelo contra la IA: llevas $1V-$2E-$3D"],
-    ["・⦿日前の実測", "・measured $1 days ago", "・$1天前实测", "・medido hace $1 días"],
-    ["・⦿時間前の実測", "・measured $1 hours ago", "・$1小时前实测", "・medido hace $1 horas"],
+    ["・⦿日前の実測", "・measured $1 day(s) ago", "・$1天前实测", "・medido hace $1 día(s)"],
+    ["・⦿時間前の実測", "・measured $1 hour(s) ago", "・$1小时前实测", "・medido hace $1 hora(s)"],
     ["が条件に一致しました(全 ⦿人中)。⦿人を表示中。", "matched your filters (of $1 total). Showing $2.", "符合条件(共$1名)。正在显示$2名。", "coinciden con tus filtros (de $1 en total). Mostrando $2."],
     ["すべて表示しました(⦿人)", "All shown ($1 players)", "已全部显示($1名)", "Mostrados todos ($1 jugadores)"],
     ["(最有力スコア ⦿)", "(most likely score $1)", "(最可能比分 $1)", "(marcador más probable $1)"],
@@ -3307,6 +3319,33 @@
     ["「ビッグクラブ級の⦿」", "“Big-club-calibre $1”", "「豪门级$1」", "«$1 de nivel de club grande»"],
   ];
   for (var rp2 = 0; rp2 < RAWP2.length; rp2++) P.push([pat(RAWP2[rp2][0]), RAWP2[rp2][1], RAWP2[rp2][2], RAWP2[rp2][3]]);
+  /* ==== v83(2026年9月8日): 実データ表示行の漏れ修正 ==== */
+  add({
+    "順位": ["Position", "排名", "Posición"],
+    "上位": ["Top", "前列", "Zona alta"],
+    "下位": ["Bottom", "后列", "Zona baja"],
+    "リーグ順位": ["League position", "联赛排名", "Posición en liga"],
+    "補正後の": ["corrected ", "校正后", "corregida "],
+    "予想スコア": ["predicted score", "预想比分", "marcador previsto"],
+    "うち公式戦": ["of which competitive", "其中正式比赛", "de ellos oficiales"],
+  });
+  var RAWP3 = [
+    ["⦿勝利(⦿)", "$1 win ($2)", "$1胜($2)", "victoria de $1 ($2)"],
+    ["引き分け(⦿)", "Draw ($1)", "平局($1)", "Empate ($1)"],
+    ["⦿特徴量(フォーム・得点力・順位・xG・怪我・日程)が似た状況の過去⦿試合の実結果: ⦿", "$1Real results of $2 past matches with similar features (form, scoring, position, xG, injuries, schedule): $3", "$1特征(状态、进球能力、排名、xG、伤病、赛程)相似的过去$2场比赛的实际结果: $3", "$1Resultados reales de $2 partidos pasados con rasgos similares (forma, gol, posición, xG, lesiones, calendario): $3"],
+    ["ホーム勝ち⦿・引き分け⦿・アウェイ勝ち⦿", "home wins $1, draws $2, away wins $3", "主胜$1・平局$2・客胜$3", "victorias locales $1, empates $2, visitantes $3"],
+    ["ホーム勝ち⦿・アウェイ勝ち⦿", "home wins $1, away wins $2", "主胜$1・客胜$2", "victorias locales $1, visitantes $2"],
+    ["ホーム勝ち⦿・引き分け⦿", "home wins $1, draws $2", "主胜$1・平局$2", "victorias locales $1, empates $2"],
+    ["引き分け⦿・アウェイ勝ち⦿", "draws $1, away wins $2", "平局$1・客胜$2", "empates $1, visitantes $2"],
+    ["(うち公式戦 ⦿/⦿件)", "(competitive: $1/$2)", "(其中正式比赛 $1/$2场)", "(oficiales: $1/$2)"],
+    ["・最重要要素: ⦿", "・top factor: $1", "・最重要因素: $1", "・factor principal: $1"],
+    ["(予想スコア ⦿)", "(predicted score $1)", "(预想比分 $1)", "(marcador previsto $1)"],
+    ["アウェイ勝ち⦿", "away wins $1", "客胜$1", "victorias visitantes $1"],
+    ["ホーム勝ち⦿", "home wins $1", "主胜$1", "victorias locales $1"],
+    ["引き分け⦿", "draws $1", "平局$1", "empates $1"],
+    ["⦿ vs ⦿", "$1 vs $2", "$1 vs $2", "$1 vs $2"],
+  ];
+  for (var rp3 = 0; rp3 < RAWP3.length; rp3++) P.push([pat(RAWP3[rp3][0]), RAWP3[rp3][1], RAWP3[rp3][2], RAWP3[rp3][3]]);
   /* ==== 辞書ここまで ==== */
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
   else boot();
@@ -9264,19 +9303,54 @@ function buildDiscussSubject(q, contextPlayer, forcedPlayerName) {
 // (サーバー側のLLM呼び出しだけで最大30秒×複数段)。75秒まで待つ。
 const DISCUSS_TIMEOUT_MS = 75000;
 
-async function fetchDiscussApi(question, subject, playerHint, history) {
+// ---- v84(2026年9月8日・利用者の指摘「チャットが接続できませんと言って会話にならない」) ----
+//   本番調査の結論: LLMのAPIキーは設定済み・予算も潤沢で、機能自体は動く。あの
+//   「接続できませんでした」は"通信が返ってこなかった時"にアプリが出す文だった。
+//   無料ホスティングは15分アクセスが無いとサーバーが眠り、次の最初のアクセスで
+//   起床に50秒以上かかる。チャットはアプリで最も重い処理のため、起床待ち+考察生成が
+//   重なると待ち時間を超えて失敗し、最初の1回でこれに当たると会話にならないように見えた。
+//   対策: ①先にサーバーを温める(軽いhealthを叩いて起床させる) ②失敗しても
+//   自動で1回やり直す(1回目で起床が済むので2回目は通ることが多い)。
+async function warmUpBackendForChat() {
+  if (backendConfirmedWarm) return true;
   try {
-    const url = `${API_PROXY_BASE}/discuss`;
-    // v56: 利用者の言語設定を渡す(AIの回答はサーバー側で選択言語のまま生成される)
-    const lang = (typeof window !== "undefined" && window.appLang) ? window.appLang : "ja";
-    return await fetchJsonWithTimeout(url, DISCUSS_TIMEOUT_MS, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      // v79(案5): 直近の会話(最大3往復・要旨のみ)を文脈として渡す
-      body: JSON.stringify({ question, subject, playerHint, lang, history: Array.isArray(history) ? history.slice(-3) : [] }),
-    });
-  } catch (e) {
-    return null;
+    // /api/health は最軽量。起床の口火を切り、温まったフラグを立てる。
+    await fetchJsonWithTimeout(`${API_PROXY_BASE.replace(/\/api$/, "")}/api/health`, COLD_START_TIMEOUT_MS);
+    backendConfirmedWarm = true;
+    return true;
+  } catch (e) { return false; }
+}
+async function fetchDiscussApiOnce(question, subject, playerHint, history) {
+  const url = `${API_PROXY_BASE}/discuss`;
+  // v56: 利用者の言語設定を渡す(AIの回答はサーバー側で選択言語のまま生成される)
+  const lang = (typeof window !== "undefined" && window.appLang) ? window.appLang : "ja";
+  const data = await fetchJsonWithTimeout(url, DISCUSS_TIMEOUT_MS, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    // v79(案5): 直近の会話(最大3往復・要旨のみ)を文脈として渡す
+    body: JSON.stringify({ question, subject, playerHint, lang, history: Array.isArray(history) ? history.slice(-3) : [] }),
+  });
+  backendConfirmedWarm = true; // 200が返った=サーバーは起きている
+  return data;
+}
+async function fetchDiscussApi(question, subject, playerHint, history, onColdStart) {
+  // 1回目の前に、まだ温まっていなければ先に起床させる(重いPOSTでの起床待ちを避ける)
+  if (!backendConfirmedWarm) {
+    if (typeof onColdStart === "function") { try { onColdStart(); } catch (e) {} }
+    await warmUpBackendForChat();
+  }
+  try {
+    return await fetchDiscussApiOnce(question, subject, playerHint, history);
+  } catch (e1) {
+    // 通信失敗(起床待ちのタイムアウト等)。サーバーはこの時点で起きている可能性が
+    // 高いので、少し待って自動でもう1回だけ試す。
+    if (typeof onColdStart === "function") { try { onColdStart(); } catch (e) {} }
+    try { await new Promise((r) => setTimeout(r, 1500)); } catch (e) {}
+    try {
+      return await fetchDiscussApiOnce(question, subject, playerHint, history);
+    } catch (e2) {
+      return null;
+    }
   }
 }
 
@@ -9457,7 +9531,12 @@ async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn, forced
   pushFn(pendingMsg);
   renderFn();
 
-  const resp = await fetchDiscussApi(q, subject, playerHint, mem.turns);
+  // v84: 起床待ちのあいだは「起動中」と正直に出す(黙って固まったように見せない)。
+  const onColdStart = () => {
+    pendingMsg.text = `<p class="value-note">⏳ AIサーバーを起動しています…(しばらく使われていなかったため、目を覚ますのに最大1分ほどかかります。そのままお待ちください)</p>`;
+    try { renderFn(); } catch (e) {}
+  };
+  const resp = await fetchDiscussApi(q, subject, playerHint, mem.turns, onColdStart);
 
   if (resp && resp.ok) {
     const rendered = renderDiscussReplyHtml(resp);
@@ -9475,7 +9554,7 @@ async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn, forced
   } else {
     // 議論エンジンに接続できなかった/失敗した場合: 「考えたふり」はせず正直に状況を
     // 伝えた上で、参考情報として従来のデータ要約(キーワードベース)を添える。
-    const reason = (resp && resp.message) ? resp.message : "AIの考察機能に接続できませんでした(サーバーの起動直後、通信の一時的な不調、またはAIのAPIキーが未設定の可能性があります)。";
+    const reason = (resp && resp.message) ? resp.message : "AIサーバーの起動に時間がかかっているようです(しばらく使われていなかったサーバーが目を覚ますまで最大1分ほどかかります)。もう一度送信すると、多くの場合そのまま話せます。";
     let fallback = "";
     if (subject.type === "club" && subject.labelJa) fallback = buildClubAnswer(subject.labelJa, dLevel);
     else if (subject.type === "player" && resolvedPlayer) {
@@ -10764,7 +10843,7 @@ function predResultBadgeHtml(p) {
 // 成長可視化ラウンド⑤: 判断根拠のスコア行(この予測に実際に影響した要素と影響度)
 function predFactorsLineHtml(p) {
   if (!p.factors || !p.factors.length) return "";
-  const parts = p.factors.map((f) => `${escapeHtml(f.labelJa)}${"★".repeat(Math.max(1, Math.min(5, Number(f.stars) || 1)))}`);
+  const parts = p.factors.map((f) => `${escapeHtml(typeof window !== "undefined" && window.t ? window.t(f.labelJa) : f.labelJa)}${"★".repeat(Math.max(1, Math.min(5, Number(f.stars) || 1)))}`);
   return `<div class="value-note" style="margin-top:2px;">🧮 根拠スコア: ${parts.join("・")}(★=この予測への影響度。市場オッズは予測には未使用・比較専用)</div>`;
 }
 // 成長可視化ラウンド④: 情報の鮮度(この予想がいつの材料で作られたか)
@@ -11470,7 +11549,16 @@ async function renderDailyReportWidget() {
   let selfAssessHtml = "";
   if (sa) {
     const color = sa.verdict === "YES" ? "#1e8449" : sa.verdict === "NO" ? "#b3541e" : "#666";
-    const proofsList = (sa.proofs || []).map((pr) => `<li class="value-note">${escapeHtml(pr.axisJa)}: ${escapeHtml(pr.valueJa)}(${escapeHtml(pr.direction)})</li>`).join("");
+    // v84: 判定に使った軸と「参考(判定外)」の軸を見分けられるように分けて表示する。
+    //   少数サンプルの的中率の揺れは参考として残す(隠さない)が、赤い「悪化」では
+    //   なく灰色の「参考」として出し、見出しの判定と矛盾して見えないようにする。
+    const dirTag = (pr) => {
+      if (pr.counted === false) return `<span class="value-note" style="opacity:.7;">参考・判定外</span>`;
+      return pr.direction === "改善" ? `<span style="color:#1e8449; font-weight:700;">改善</span>`
+        : pr.direction === "悪化" ? `<span style="color:#b3541e; font-weight:700;">悪化</span>`
+        : `<span class="value-note">不変</span>`;
+    };
+    const proofsList = (sa.proofs || []).map((pr) => `<li class="value-note">${escapeHtml(pr.axisJa)}: ${escapeHtml(pr.valueJa)}(${dirTag(pr)})</li>`).join("");
     selfAssessHtml = `
       <div style="margin-top:6px; padding:8px; border-left:3px solid ${color}; background:rgba(0,0,0,.03); border-radius:4px;">
         <strong>🧠 ${escapeHtml(sa.questionJa || "今日のAIは昨日より賢くなったか?")}</strong>
@@ -12198,7 +12286,7 @@ async function renderReflectionsCard() {
           : "");
       return `<div style="padding:10px 0; border-bottom:1px solid var(--border);">
         <div><strong>${home} vs ${away}</strong>${refTag} <span class="value-note">${esc(it.league || "")}${when ? " ・ " + when : ""}</span></div>
-        <div style="margin-top:2px;">AIの予想: <strong>${esc(reflClubJa(it.predictedJa.replace("勝利", "")) + (it.predictedJa.includes("勝利") ? "勝利" : ""))}</strong>${it.predictedScoreline ? `(予想スコア ${esc(it.predictedScoreline)})` : ""} → 実際: <strong style="color:var(--critical);">${esc(reflClubJa(it.actualJa.replace("勝利", "")) + (it.actualJa.includes("勝利") ? "勝利" : ""))}${it.actualScore ? `(${esc(it.actualScore)})` : ""}</strong> ❌</div>
+        <div style="margin-top:2px;">AIの予想: <strong>${esc(myClubName(it.predictedJa.replace("勝利", "")) + (it.predictedJa.includes("勝利") ? "勝利" : ""))}</strong>${it.predictedScoreline ? `(予想スコア ${esc(it.predictedScoreline)})` : ""} → 実際: <strong style="color:var(--critical);">${esc(myClubName(it.actualJa.replace("勝利", "")) + (it.actualJa.includes("勝利") ? "勝利" : ""))}${it.actualScore ? `(${esc(it.actualScore)})` : ""}</strong> ❌</div>
         <div class="value-note" style="margin-top:3px;">外した理由(実測データからの機械的な分類):</div>
         ${reasons}
       </div>`;
@@ -12263,6 +12351,10 @@ async function renderMyClubCard() {
   if (!clubEn) { renderMyClubPicker(el); return; }
   return renderMyClubCardWith(clubEn);
 }
+function myClubName(en) {
+  const ja = reflClubJa(en);
+  return (typeof window !== "undefined" && window.appLang && window.appLang !== "ja" && window.t) ? window.t(ja) : ja;
+}
 async function renderMyClubCardWith(clubEn) {
   const el = document.getElementById("myClubBody");
   if (!el) return;
@@ -12306,7 +12398,7 @@ async function renderMyClubCardWith(clubEn) {
     const when = np.kickoff ? new Date(np.kickoff).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
     parts.push(`<div style="margin-top:6px; padding:8px 10px; background:rgba(0,0,0,.04); border-radius:8px;">
       <div class="value-note">次の試合(日本時間 ${esc(when)})${np.official === false ? ' <span class="smarter-tag smarter-tag-ai">参考(親善など)</span>' : ""}</div>
-      <div style="margin-top:2px;"><strong>${esc(reflClubJa(np.homeEn))} vs ${esc(reflClubJa(np.awayEn))}</strong></div>
+      <div style="margin-top:2px;"><strong>${esc(myClubName(np.homeEn))} vs ${esc(myClubName(np.awayEn))}</strong></div>
       <div style="margin-top:2px;">AIの予想: <strong>${esc(reflClubJa(np.predictedJa.replace("勝利", "")) + (np.predictedJa.includes("勝利") ? "勝利" : ""))}</strong>${np.predictedScoreline ? `(予想スコア ${esc(np.predictedScoreline)})` : ""}</div>
     </div>`);
   } else {
@@ -12329,7 +12421,7 @@ async function renderMyClubCardWith(clubEn) {
     if (rec.last && rec.last.length) {
       parts.push(`<div style="margin-top:4px;">${rec.last.map((r) => {
         const when = r.kickoff ? new Date(r.kickoff).toLocaleDateString("ja-JP", { timeZone: "Asia/Tokyo", month: "numeric", day: "numeric" }) : "";
-        return `<div class="value-note" style="margin:2px 0;">${r.correct ? "⭕" : "❌"} ${esc(when)} ${esc(reflClubJa(r.homeEn))} ${r.actualScore ? esc(r.actualScore) : "-"} ${esc(reflClubJa(r.awayEn))}${r.official === false ? ' <span class="smarter-tag smarter-tag-ai">参考</span>' : ""}</div>`;
+        return `<div class="value-note" style="margin:2px 0;">${r.correct ? "⭕" : "❌"} ${esc(when)} ${esc(myClubName(r.homeEn))} ${r.actualScore ? esc(r.actualScore) : "-"} ${esc(myClubName(r.awayEn))}${r.official === false ? ' <span class="smarter-tag smarter-tag-ai">参考</span>' : ""}</div>`;
       }).join("")}</div>`);
     }
   } else {
