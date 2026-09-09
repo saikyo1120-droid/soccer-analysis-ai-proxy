@@ -27,6 +27,27 @@ const DIGEST_HISTORY_KEY = "learn:digest:history";
 const DIGEST_HISTORY_KEEP = 12;
 const JST_OFFSET_MS = 9 * 3600 * 1000;
 
+/**
+ * v86: リストを100件ずつの分割で全件読み出す(Upstash RESTの1応答サイズ上限対策)。
+ *   dailyJob.js の lrangeAllChunked と同じ実装の双子(循環requireを避けるための
+ *   意図的な複製。直す時は両方を直すこと)。途中失敗は全体失敗([])として扱う。
+ */
+async function lrangeAllChunkedDigest(upstashCmdFn, key, chunkSize) {
+  const size = Number.isFinite(chunkSize) && chunkSize > 0 ? chunkSize : 100;
+  const out = [];
+  try {
+    for (let start = 0; ; start += size) {
+      const part = (await upstashCmdFn(["LRANGE", key, String(start), String(start + size - 1)])) || [];
+      for (const p of part) out.push(p);
+      if (part.length < size) break;
+    }
+  } catch (e) {
+    console.error(`[lrangeAllChunkedDigest] ${key} の分割読み出しに失敗しました:`, e.message);
+    return [];
+  }
+  return out;
+}
+
 const RANK_BY_EN = new Map(CLUB_UNIVERSE.map((c) => [c.nameEn.toLowerCase(), c.rank]));
 const JA_BY_EN = new Map(CLUB_UNIVERSE.map((c) => [c.nameEn.toLowerCase(), c.nameJa]));
 
@@ -248,7 +269,11 @@ async function generateAndStoreWeeklyDigest(deps, runAt) {
     return { generated: false, reasonJa: `今週分(${wantKey}週)は生成済みです。`, weekKey: wantKey };
   }
 
-  const rawRecent = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "-400", "-1"]).catch(() => [])) || [];
+  // v86(2026年9月9日): 記録の窓が300→2000件に拡大されたため、「末尾400件」の一括読みは
+  // 1応答が大きくなりUpstash RESTの応答上限に近づく。分割で全件読んでから末尾400件を
+  // 使う(週1回の処理なので+約20コマンドは誤差。負のインデックスの端数挙動が実Redisと
+  // モックで食い違うのを避け、絶対インデックスの前進読みに統一)。
+  const rawRecent = (await lrangeAllChunkedDigest(upstashCmd, "learn:ownpred:recent", 100)).slice(-400);
   const resolvedRecords = rawRecent
     .map((x) => { try { return typeof x === "object" ? x : JSON.parse(x); } catch (e) { return null; } })
     .filter(Boolean);
@@ -279,4 +304,5 @@ async function generateAndStoreWeeklyDigest(deps, runAt) {
 module.exports = {
   DIGEST_LATEST_KEY, DIGEST_HISTORY_KEY,
   lastCompletedWeekRange, weekKeyOf, buildWeeklyDigest, generateAndStoreWeeklyDigest,
+  lrangeAllChunkedDigest,
 };

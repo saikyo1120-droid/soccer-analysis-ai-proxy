@@ -197,7 +197,44 @@ const FORM_FACT_DELTA_THRESHOLD = 0.3; // このゲーム差分以上変化し�
 // ノイズに毎回振り回されるだけになる(=改善しているように見えて
 // 実際には安定しない/頭打ちになる設計上のバグ)。300件に拡大し、
 // 積み上がったデータが実際に学習の安定性・精度向上に寄与するようにする。
-const OWN_PRED_RECENT_KEEP = 300;
+// ---- v86(2026年9月9日・利用者の指示「窓を2000に増やして」) ----
+//   重み学習・似た試合検索・失敗学習が見る「採点済み自社予測」の窓を300→2000件へ。
+//   効果: 学習用データが最大6.7倍、ホールドアウト検証が約600件になり
+//   「たまたま当たっただけの改善」の誤採用が大きく減る。似た試合検索の母集団も拡大。
+//   費用: 保存は+約4MB(Upstash無料枠256MBの2%以下)。新しいAPI取得は発生しない
+//   (すでに作っている記録を捨てずに残すだけ)。過去の自社予測をさかのぼって
+//   作ることはしない(でっち上げ禁止)ので、窓は毎日の答え合わせぶんだけ伸び、
+//   満杯には約2〜3ヶ月かかる(その間も検証の信頼性は着実に上がる)。
+//   必須の同時改修: 全件読み出しは lrangeAllChunked(分割読み出し)を使うこと。
+//   一括のLRANGE 0..-1は、窓が伸びるとUpstash RESTの1応答の上限を超えて
+//   毎日の学習が読み出しに失敗する恐れがある(300件の従来もきわどかった)。
+const OWN_PRED_RECENT_KEEP = 2000;
+
+/**
+ * v86: リストを100件ずつの分割で全件読み出す(Upstash RESTの1応答サイズ上限対策)。
+ *   ・絶対インデックスの前進読みだけを使う(負のインデックスの端数挙動は実Redisと
+ *     モックで食い違うことがあるため使わない)。
+ *   ・途中のチャンクが失敗したら全体を失敗([])として返す(半端なデータで学習して
+ *     「静かに劣化」するより、従来の全か無かの挙動を保つ方が正直)。
+ *   ・読み出し中にリストが伸びる可能性はあるが、末尾に追記されるだけなので
+ *     取りこぼしても「最新の数件が次回に回る」だけで、重複・欠落は起きない。
+ *   weeklyDigest.js にも同じ実装の双子がある(循環requireを避けるための意図的な複製)。
+ */
+async function lrangeAllChunked(upstashCmdFn, key, chunkSize) {
+  const size = Number.isFinite(chunkSize) && chunkSize > 0 ? chunkSize : 100;
+  const out = [];
+  try {
+    for (let start = 0; ; start += size) {
+      const part = (await upstashCmdFn(["LRANGE", key, String(start), String(start + size - 1)])) || [];
+      for (const p of part) out.push(p);
+      if (part.length < size) break;
+    }
+  } catch (e) {
+    console.error(`[lrangeAllChunked] ${key} の分割読み出しに失敗しました(${out.length}件まで取得済みでしたが、半端な学習を避けるため全体を失敗として扱います):`, e.message);
+    return [];
+  }
+  return out;
+}
 // 2026年8月・「議論できるAI」強化フェーズ(ご要望②・Knowledge Engineの毎日成長):
 // 監督交代・補強の確認(/coachs, /transfers)を全11クラブ毎日行うと+22リクエスト/日
 // となり、既存の新規予測ロジック(最大約30リクエスト/日)と合わせてAPI-Football
@@ -1517,7 +1554,9 @@ async function runDailyLearning(deps) {
   let recentRecordsShared = null;
   async function loadRecentRecordsOnce() {
     if (recentRecordsShared) return recentRecordsShared;
-    const raw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "0", "-1"]).catch(() => [])) || [];
+    // v86: 窓が2000件になったため、一括読み(LRANGE 0..-1)ではなく分割読み出しを使う
+    // (一括だと1応答が約4MBになり、Upstash RESTの応答上限を超えて失敗する恐れがある)。
+    const raw = await lrangeAllChunked(upstashCmd, "learn:ownpred:recent", 100);
     recentRecordsShared = raw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
     return recentRecordsShared;
   }
@@ -3149,7 +3188,7 @@ module.exports = {
   computeFormScore, predictOutcome, backtestAccuracy, outcomeFromScore,
   DEFAULT_WEIGHTS, REGISTERED_TEAMS, LEARNING_STAGES,
   buildReflectionText, mergeGrowthLogs,
-  MIN_RESOLVED_FOR_RECALIBRATION, OWN_PRED_RECENT_KEEP, OWN_PREDICT_LOG_CAP,
+  MIN_RESOLVED_FOR_RECALIBRATION, OWN_PRED_RECENT_KEEP, OWN_PREDICT_LOG_CAP, lrangeAllChunked,
   // v80(案8): 全試合拡張(テスト対象)+公開前フルスロットルの状態
   buildExtraFixtureTeams, EXTRA_FIXTURES_CAP, PRELAUNCH_LEARNING,
   getTuningHistory,
