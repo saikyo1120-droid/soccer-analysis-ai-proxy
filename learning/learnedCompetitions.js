@@ -27,11 +27,10 @@
  *
  * ■ v87③(2026年9月9日): 学習対象が12大会→15大会に拡張された
  *   (J1リーグ98・チャンピオンシップ40・ブラジル全国選手権71)。
- *   ID判定はDEFAULT_BACKFILL_LEAGUES由来なので自動で追従。名前の補助判定
- *   (IDの無い古い記録用)にはJ1とチャンピオンシップを追加した。ブラジル全国
- *   選手権のAPI英語名は「Serie A」でイタリアと同名のため、名前では追加しない
- *   (IDの無い古い記録の「serie a」は当時学習していたイタリアの記録。
- *    新しい記録はすべてIDを持つので、ブラジルはID判定で正しく学習済みになる)。
+ *   ID判定はDEFAULT_BACKFILL_LEAGUES由来なので自動で追従。
+ *   名前の補助判定には新3リーグを**入れない**(v87.1で確定。LEARNED_LEAGUE_NAMESの
+ *   コメント参照: 名前判定はID保存開始前の古い記録専用で、その時代に新3リーグは
+ *   学習されていなかったため、名前で学習済み扱いにすると集計が遡って化ける)。
  */
 
 const { DEFAULT_BACKFILL_LEAGUES } = require("./historicalBackfill");
@@ -49,9 +48,13 @@ const LEARNED_LEAGUE_NAMES = [
   "eredivisie", "primeira liga", "super lig", "süper lig", "jupiler pro league",
   "first division a", "uefa champions league", "uefa europa league",
   "uefa europa conference league",
-  // v87③: 追加リーグ(ブラジル全国選手権はAPI英語名がイタリアと同名「Serie A」の
-  // ため名前では追加しない。ヘッダーコメント参照)
-  "j1 league", "championship",
+  // v87.1(監査を受けた修正): v87③の新リーグ(J1・チャンピオンシップ・ブラジル)は
+  // この名前リストに**入れない**。理由は2つ:
+  //   ①この補助判定は「IDの無い古い記録」(v62でID保存を始める前)専用で、その時代に
+  //     新3リーグは学習されていなかった。名前で学習済み扱いにすると、実際には学習データ
+  //     ゼロで出した古い予想が遡って「学習済み」に化ける(集計のでっち上げ)。
+  //   ②名前の衝突: 「Championship」はスコットランド2部も同名、「Serie A」はイタリアと
+  //     ブラジルが同名。新しい記録はすべてIDを持つので、ID判定だけで正しく学習済みになる。
 ];
 
 function normLeagueName(s) {

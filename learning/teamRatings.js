@@ -175,11 +175,18 @@ function fitTeamRatings(rows, opts) {
 
   // ---- v87①: リーグ別ホームアドバンテージのずれ offset[リーグ] ----
   //   perLeagueHomeAdv が真のときだけ学習する(既定は従来どおり=挙動不変)。
+  // v87.1(監査での指摘③): リーグにも下限試合数を設ける。チーム別のminMatchesと同じ
+  //   思想で、学習対象の試合が少なすぎるリーグはoffsetを学習しない(=全体値のまま)。
+  //   収縮(リッジ)だけでは「1試合9-0のリーグ」でも有限のoffsetが残ることが監査の
+  //   数値実験で確認されたため、少数の極端なスコアからリーグ特性を断定しない線を明示する。
   const perLeague = o.perLeagueHomeAdv === true;
+  const minLeagueMatches = Number.isFinite(o.minLeagueMatches) ? o.minLeagueMatches : 50;
   const leagueOf = (r) => (Number.isFinite(r.leagueId) ? r.leagueId : null);
   const off = new Map(); // leagueId -> homeAdvからのずれ(平均0)
   if (perLeague) {
-    for (const r of train) { const l = leagueOf(r); if (l !== null && !off.has(l)) off.set(l, 0); }
+    const lgCount = new Map();
+    for (const r of train) { const l = leagueOf(r); if (l !== null) lgCount.set(l, (lgCount.get(l) || 0) + 1); }
+    for (const [l, n] of lgCount) { if (n >= minLeagueMatches) off.set(l, 0); }
   }
   let wLgRef = null; // 収縮の基準となる標準的なリーグの重み(中央値・初回反復で決める)
 
@@ -190,7 +197,9 @@ function fitTeamRatings(rows, opts) {
     for (const r of train) {
       const w = wOf(r);
       totalW += w;
-      const lg = perLeague ? leagueOf(r) : null;
+      // v87.1: 下限未満のリーグ(offに無い)はリーグ不明と同じ扱い=全体値のみに寄与
+      const lg0 = perLeague ? leagueOf(r) : null;
+      const lg = (lg0 !== null && off.has(lg0)) ? lg0 : null;
       const advL = homeAdv + (lg !== null ? off.get(lg) : 0); // v87①: リーグ別の下駄
       const lh = Math.exp(mu + advL + att.get(r.homeId) - def.get(r.awayId));
       const la = Math.exp(mu + att.get(r.awayId) - def.get(r.homeId));

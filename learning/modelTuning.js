@@ -661,7 +661,15 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   let ratingsSaved = false;
   try {
     // v71③: 本番保存用も選ばれたξで学習。v87①: 門番を通った日はリーグ別ホームアドバンテージ付きで学習
-    const ratingsFull = fitTeamRatings(ds.rows, { nowMs: nowMsForRatings, xgAlpha: xgAlphaChosen, decayXiPerDay: xiChosen, perLeagueHomeAdv: homeAdvModeChosen === "perLeague" });
+    let ratingsFull = fitTeamRatings(ds.rows, { nowMs: nowMsForRatings, xgAlpha: xgAlphaChosen, decayXiPerDay: xiChosen, perLeagueHomeAdv: homeAdvModeChosen === "perLeague" });
+    // v87.1(監査での指摘⑨の予防): リーグ別モードの本番学習だけが失敗した日は、全体値モードで
+    // 学習し直してから保存する。これが無いと保存がスキップされ、昨日のレーティングが
+    // 黙って残り続ける(リーグ別の導入が「保存されない日」を新たに作ってはならない=劣化禁止)。
+    let homeAdvFullFitFallback = false;
+    if (!ratingsFull.available && homeAdvModeChosen === "perLeague") {
+      const fallbackGlobal = fitTeamRatings(ds.rows, { nowMs: nowMsForRatings, xgAlpha: xgAlphaChosen, decayXiPerDay: xiChosen });
+      if (fallbackGlobal.available) { ratingsFull = fallbackGlobal; homeAdvFullFitFallback = true; }
+    }
     if (ratingsFull.available && upstashEnabled) {
       ratingsFull.builtAt = runAt.toISOString();
       // v53: 表示用のチーム名(データセットのメタから)。
@@ -704,6 +712,8 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
       // v87①: 保存したレーティングのホームアドバンテージ方式(説明責任)
       homeAdvMode: ratingsFull.homeAdvMode || "global",
       leaguesWithHomeAdv: ratingsFull.homeAdvByLeague ? Object.keys(ratingsFull.homeAdvByLeague).length : 0,
+      // v87.1: リーグ別の本番学習が失敗して全体値で保存し直した日はその旨を正直に残す
+      homeAdvFullFitFallback: homeAdvFullFitFallback || undefined,
       reasonJa: ratingsFull.reasonJa || null,
     };
   } catch (e) {
