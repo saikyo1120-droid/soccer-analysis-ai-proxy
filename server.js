@@ -4572,7 +4572,7 @@ async function handleMatchup(query) {
   if (failed) {
     const messageJa = failed.r.reason === "ambiguous"
       ? `「${failed.raw}」はどのクラブか1つに絞れませんでした(候補: ${(failed.r.candidates || []).join(" / ")})。正式名称で教えてください。`
-      : `「${failed.raw}」に一致するクラブが、AIが学習しているクラブの中に見つかりませんでした。学習対象は欧州の12大会に出場したクラブです。`;
+      : `「${failed.raw}」に一致するクラブが、AIが学習しているクラブの中に見つかりませんでした。学習対象は15大会(欧州12大会+J1・イングランド2部・ブラジル全国選手権)に出場したクラブです。`;
     const body = { ok: true, available: false, reason: failed.r.reason, side: failed.side, queryJa: failed.raw, candidates: failed.r.candidates || null, messageJa };
     cacheSet(ckey, body, MATCHUP_CTX_TTL_MS);
     return { status: 200, body };
@@ -4769,6 +4769,10 @@ async function handleMatchAnalysis(query, clientIp) {
       ratingsData = UPSTASH_ENABLED ? await upstashGetJSON(RATINGS_KEY).catch(() => null) : null;
       cacheSet(ratingsCacheKey, ratingsData || null, 10 * 60 * 1000);
     }
+    // v87①の注記: マッチ分析は利用者が任意の2チームを選ぶ(仮想対戦を含む)ため、
+    // 「この試合のリーグ」を断定できない。リーグ別ホームアドバンテージは使わず
+    // 全体共通値で計算する(でっち上げ禁止。実際の試合の予測記録は毎日の学習側で
+    // リーグ別の値を使う)。
     ratingEgAnalysis = expGoalsFromRatings(ratingsData, homeTeamId, awayTeamId);
   } catch (e) { /* レーティングは付加情報。無くても分析は返す */ }
   const homeSrcRaw = { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXgInfo, topScorer: homeTopScorerInfo, ratingExpGoals: ratingEgAnalysis ? ratingEgAnalysis.home : null };
@@ -6767,6 +6771,25 @@ function readJsonBody(req) {
   });
 }
 
+// v87④: 生テキストのPOST本文を読む(clubElo中継のCSV用。上限はJSONと同じ2MB)
+function readTextBody(req) {
+  return new Promise((resolve, reject) => {
+    let received = 0;
+    const chunks = [];
+    req.on("data", (chunk) => {
+      received += chunk.length;
+      if (received > MAX_POST_BODY_BYTES) {
+        reject(new Error("request body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
 const server = http.createServer((req, res) => {
   // 実測課金のため、1リクエストの処理全体を専用の箱の中で走らせる。
   // 引き落としは「処理が最後まで終わったとき」に必ず1回だけ行う
@@ -6865,7 +6888,8 @@ async function handleHttpRequest(req, res) {
         let savedDaily = null;
         try {
           const sd = UPSTASH_ENABLED ? await upstashGetJSON(CLUBELO_DAILY_KEY).catch(() => null) : null;
-          if (sd && sd.date) savedDaily = { date: sd.date, rowCount: Array.isArray(sd.list) ? sd.list.length : null };
+          // v87④: source は「どの経路で届いたか」の開示(gh-relay=GitHub Actions中継 / 無印=直接取得)
+          if (sd && sd.date) savedDaily = { date: sd.date, rowCount: Array.isArray(sd.list) ? sd.list.length : null, source: sd.source || "direct", ingestedAt: sd.ingestedAt || null };
         } catch (e) { /* 保存の有無は付加情報 */ }
         const probe = await clubEloDiag.probeDaily({ timeoutMs: 8000 });
         const body = {
@@ -6964,7 +6988,7 @@ async function handleHttpRequest(req, res) {
         } else {
           const ratings = await upstashGetJSON(RATINGS_KEY).catch(() => null);
           if (!ratings || !ratings.available || !ratings.byTeam) {
-            rkBody = { ok: true, available: false, reasonJa: "地力レーティングは、次の朝の学習(12大会×5シーズンの実試合からの初回学習)のあとに公開されます。でっち上げの暫定値は出しません。" };
+            rkBody = { ok: true, available: false, reasonJa: "地力レーティングは、次の朝の学習(15大会×5シーズンの実試合からの初回学習)のあとに公開されます。でっち上げの暫定値は出しません。" };
           } else {
             const prev = await upstashGetJSON("learn:ratings:ranks:prev").catch(() => null);
             const prevRanks = (prev && prev.ranks) || {};
@@ -7039,7 +7063,7 @@ async function handleHttpRequest(req, res) {
               teamsRated: ratings.teamsRated || teams.length,
               prevWeekKey: (prev && prev.weekKey) || null,
               teams: teamsRanked,
-              noteJa: `12大会×5シーズン(欧州カップ戦を含む)の実試合${ratings.matchesUsed ? `(${ratings.matchesUsed}試合)` : ""}から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。${Number.isFinite(ratings.minMatches) ? `対象は、このデータの中に${ratings.minMatches}試合以上の実績があり、かつ他の対象クラブと十分に対戦しているクラブだけです(数試合だけの記録から地力を断定しないため)。` : ""}${unnamedCount > 0 ? `※一部クラブ(${unnamedCount}件)の名前を提供元から自動取得しています。数分後に再読み込みすると表示されます。` : ""}`,
+              noteJa: `15大会×5シーズン(欧州カップ戦・J1・イングランド2部・ブラジルを含む)の実試合${ratings.matchesUsed ? `(${ratings.matchesUsed}試合)` : ""}から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。${Number.isFinite(ratings.minMatches) ? `対象は、このデータの中に${ratings.minMatches}試合以上の実績があり、かつ他の対象クラブと十分に対戦しているクラブだけです(数試合だけの記録から地力を断定しないため)。` : ""}${unnamedCount > 0 ? `※一部クラブ(${unnamedCount}件)の名前を提供元から自動取得しています。数分後に再読み込みすると表示されます。` : ""}`,
             };
           }
         }
@@ -7416,7 +7440,7 @@ async function handleHttpRequest(req, res) {
                 })(),
               },
               // ---- v62: 学習した大会 / 学習していない大会 を分けて数える ----
-              //   学習データは欧州12大会のみ。ハンガリーNB I・MLS等の予想も出し続けるが、
+              //   学習データは15大会のみ(v87③で12→15)。ハンガリーNB I・MLS等の予想も出し続けるが、
               //   実力は「同じ条件で測った数字」=学習済み大会の的中率で見る。
               //   参考側の数字も必ず一緒に出す(良く見せるための隠蔽をしない)。
               learnedSummary: (() => {
@@ -7425,7 +7449,7 @@ async function handleHttpRequest(req, res) {
                   learned: split.learnedOfficial,
                   unlearned: split.unlearnedOfficial,
                   unofficial: split.unofficial,
-                  noteJa: "AIが過去試合を学習しているのは欧州12大会(9リーグ+CL・EL・ECL)です。それ以外の大会は学習データが無いため、予想は出しますが実力を測る集計とは分けています。",
+                  noteJa: "AIが過去試合を学習しているのは15大会(欧州9リーグ+CL・EL・ECL+J1・イングランド2部・ブラジル全国選手権)です。それ以外の大会は学習データが無いため、予想は出しますが実力を測る集計とは分けています。",
                 };
               })(),
               items, topReasons,
@@ -7787,6 +7811,88 @@ async function handleHttpRequest(req, res) {
         const { status, body } = await handleAutoCollectPredictions();
         res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
+        return;
+      }
+      if (pathname === "/api/clubelo/ingest") {
+        // ---- v87④(2026年9月9日・利用者の選択「クラブElo復旧」): GitHub Actions中継の受け口 ----
+        //   本番実測(/api/diag/clubelo): Renderからのapi.clubelo.com直取得は
+        //   HTTPS=TIMEOUT・HTTP=502で全滅し、8月30日を最後に日次Eloが止まっていた
+        //   (リトライ計画は既に3ラウンド×最大30秒まで強化済み=Render側からは打つ手なし。
+        //    データセンターIPが先方またはその手前で弾かれている可能性が高い)。
+        //   一方、GitHubのランナー(Actions)からは取得できる見込みが高いため、
+        //   毎朝の学習の前にActionsがCSVを取得してここへ中継する(clubelo-relay.yml)。
+        //   設計:
+        //   ・鍵は必須: 学習に使うデータへの書き込みなので、AUTO_COLLECT_SECRET未設定の
+        //     環境では受け付けない(他の管理エンドポイントの「開放+レート制限」方式に
+        //     しない。第三者が偽のEloを注入できてはならない=でっち上げ防止)。
+        //   ・検証: CSVとして解釈でき、かつ100行以上(全クラブ一覧は本番実測で約600行)。
+        //     半端なデータで既存の保存を上書きしない。
+        //   ・保存形式は getDailyElo の保存と完全に同一({date, list})+来歴(source)。
+        //     getDailyEloは「同日の保存があれば再取得しない」設計なので、学習前に
+        //     届いてさえいれば、学習側は1行も変えずに自動でこのデータを使う。
+        //   ・直接取得は従来どおり残る(中継が止まった日は、今までと同じ
+        //     「直接試行→7日以内の保存で代用」に自然に戻るだけ。劣化なし)。
+        if (req.method !== "POST") {
+          res.writeHead(405, { "Content-Type": "application/json; charset=utf-8", "Allow": "POST" });
+          res.end(JSON.stringify({ ok: false, error: "method not allowed, use POST" }));
+          return;
+        }
+        const ingestSecret = process.env.AUTO_COLLECT_SECRET || "";
+        if (!ingestSecret) {
+          res.writeHead(503, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, messageJa: "AUTO_COLLECT_SECRETが未設定のため、Elo中継の受け口は無効です(学習データへの書き込みを無認証で開放しないための設計)。Renderの環境変数に設定してください。" }));
+          return;
+        }
+        if (parsed.searchParams.get("key") !== ingestSecret) {
+          res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "invalid or missing key" }));
+          return;
+        }
+        if (!UPSTASH_ENABLED) {
+          res.writeHead(503, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, messageJa: "保存先(Upstash)が未設定のため、受け取ったEloを保存できません。" }));
+          return;
+        }
+        let csvText;
+        try {
+          csvText = await readTextBody(req);
+        } catch (e) {
+          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+          return;
+        }
+        const eloRows = clubEloDiag.parseCsv(csvText);
+        if (eloRows.length < 100) {
+          // 全クラブ一覧は約600行。極端に少ない=取得側の失敗ページやエラーHTMLの可能性が
+          // 高いので、既存の保存(7日以内なら代用に使える)を壊さないよう受け取らない。
+          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, rows: eloRows.length, messageJa: `CSVとして解釈できた行が${eloRows.length}行しかありません(全クラブ一覧は約600行)。半端なデータで上書きしないため、受け取りませんでした。` }));
+          return;
+        }
+        // 日付: 中継側が取得したURLの日付(?date=)を優先。未指定はサーバーの今日(UTC)。
+        // ±2日を超える日付は受け取らない(誤設定・再送の古いデータで上書きしない)。
+        const todayStr = new Date().toISOString().slice(0, 10);
+        let dateStr = parsed.searchParams.get("date") || todayStr;
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)
+          || Math.abs(Date.parse(dateStr) - Date.parse(todayStr)) > 2 * 86400000) {
+          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, messageJa: `dateの形式が不正か、今日から2日超離れています(${String(dateStr).slice(0, 20)})。` }));
+          return;
+        }
+        const payload = {
+          date: dateStr,
+          list: eloRows.map((r) => [r.club, r.country, r.elo]),
+          source: "gh-relay", // 来歴の開示(/api/diag/clubelo の savedDaily.source に出る)
+          ingestedAt: new Date().toISOString(),
+        };
+        const savedOk = await upstashSetJSON(CLUBELO_DAILY_KEY, payload);
+        if (savedOk === false) {
+          res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, messageJa: "Eloの保存に失敗しました(保存先のエラー)。" }));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: true, date: dateStr, rows: eloRows.length, noteJa: "受け取りました。今日の朝の学習は(再取得せずに)このデータを使います。" }));
         return;
       }
       if (pathname === "/api/learning/run-daily") {

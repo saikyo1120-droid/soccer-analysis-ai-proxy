@@ -1116,7 +1116,7 @@
   });
   // ---- ⑩b 追加(実バイト抽出キー: ホーム説明・接続不可メッセージ・質問チップ) ----
   add({
-    "🧠 予測モデルは12大会×5シーズン(欧州カップ戦を含む)の実試合とAI自身の的中記録から毎日学習しています。2026年8月18日からは、①市場オッズ(ブックメーカーの評価) ②チーム別の地力レーティング(約200クラブの攻撃力・守備力を過去試合から学習) ③市場ブレンド(最終確率にオッズを混ぜる比率。使った予想には内訳を明記)も加わりました。影響の強さはすべてAI自身が実データから学習し、データが無い試合では使いません。": ["🧠 The prediction model learns daily from real matches across 12 competitions × 5 seasons (including European cups) plus its own hit/miss record. Since Aug 18, 2026 it also uses ① market odds (bookmakers' view), ② per-club power ratings (attack/defence of ~200 clubs learned from past matches) and ③ a market blend (how much odds mix into the final probability — every blended pick discloses its ratio). All influence strengths are learned by the AI itself from real data, and none are used for matches without data.","🧠 预测模型每天从12项赛事×5个赛季(含欧洲杯赛)的实际比赛及AI自身的命中记录中学习。自2026年8月18日起还加入了:①市场赔率(博彩公司评估)②各俱乐部实力评级(从过往比赛学习约200家俱乐部的攻防)③市场混合(最终概率中掺入赔率的比例,使用时必在预测中注明构成)。所有影响强度均由AI自己从实测数据学习,无数据的比赛不使用。","🧠 El modelo de predicción aprende a diario de partidos reales de 12 competiciones × 5 temporadas (incluidas las copas europeas) y de su propio historial de aciertos. Desde el 18/8/2026 usa además ① cuotas del mercado (visión de las casas), ② ratings de fuerza por club (ataque/defensa de ~200 clubes aprendidos de partidos pasados) y ③ una mezcla de mercado (cuánto pesan las cuotas en la probabilidad final; cada predicción mezclada declara su proporción). Todas las influencias las aprende la propia IA de datos reales y no se usan en partidos sin datos."],
+    "🧠 予測モデルは15大会×5シーズン(欧州カップ戦・J1・イングランド2部・ブラジルを含む)の実試合とAI自身の的中記録から毎日学習しています。2026年8月18日からは、①市場オッズ(ブックメーカーの評価) ②チーム別の地力レーティング(約200クラブの攻撃力・守備力を過去試合から学習) ③市場ブレンド(最終確率にオッズを混ぜる比率。使った予想には内訳を明記)も加わりました。影響の強さはすべてAI自身が実データから学習し、データが無い試合では使いません。": ["🧠 The prediction model learns daily from real matches across 15 competitions × 5 seasons (including European cups, the J1 League, the English Championship and Brazil) plus its own hit/miss record. Since Aug 18, 2026 it also uses ① market odds (bookmakers' view), ② per-club power ratings (attack/defence of ~200 clubs learned from past matches) and ③ a market blend (how much odds mix into the final probability — every blended pick discloses its ratio). All influence strengths are learned by the AI itself from real data, and none are used for matches without data.","🧠 预测模型每天从15项赛事×5个赛季(含欧洲杯赛、J1联赛、英冠、巴西联赛)的实际比赛及AI自身的命中记录中学习。自2026年8月18日起还加入了:①市场赔率(博彩公司评估)②各俱乐部实力评级(从过往比赛学习约200家俱乐部的攻防)③市场混合(最终概率中掺入赔率的比例,使用时必在预测中注明构成)。所有影响强度均由AI自己从实测数据学习,无数据的比赛不使用。","🧠 El modelo de predicción aprende a diario de partidos reales de 15 competiciones × 5 temporadas (incluidas las copas europeas, la J1 japonesa, el Championship inglés y Brasil) y de su propio historial de aciertos. Desde el 18/8/2026 usa además ① cuotas del mercado (visión de las casas), ② ratings de fuerza por club (ataque/defensa de ~200 clubes aprendidos de partidos pasados) y ③ una mezcla de mercado (cuánto pesan las cuotas en la probabilidad final; cada predicción mezclada declara su proporción). Todas las influencias las aprende la propia IA de datos reales y no se usan en partidos sin datos."],
     "サーバーに接続できないため、昨日との比較を読み込めませんでした。": ["Couldn't reach the server, so yesterday's comparison couldn't be loaded.","无法连接服务器,无法加载与昨日的对比。","No se pudo conectar con el servidor; no se cargó la comparación con ayer."],
     "サーバーに接続できないため、昨日との違いを読み込めませんでした。": ["Couldn't reach the server, so the changes since yesterday couldn't be loaded.","无法连接服务器,无法加载与昨日的变化。","No se pudo conectar con el servidor; no se cargaron los cambios desde ayer."],
     "サーバーに接続できないため、反省の記録を読み込めませんでした。": ["Couldn't reach the server, so the reflections couldn't be loaded.","无法连接服务器,无法加载反思记录。","No se pudo conectar con el servidor; no se cargaron las reflexiones."],
@@ -1168,6 +1168,15 @@
     "全大会混合(公式戦全体)": ["All competitions mixed (all competitive)", "全部赛事混合(全部正式比赛)", "Todas las competiciones (mezcla, oficiales)"],
     "学習していない大会(参考)": ["Unlearned competitions (reference)", "未学习的赛事(参考)", "Competiciones no aprendidas (referencia)"],
     "AIが過去試合を学習しているのは欧州12大会(9リーグ+CL・EL・ECL)です。それ以外の大会は学習データが無いため、予想は出しますが実力を測る集計とは分けています。": ["The AI has learned from past matches in 12 European competitions (9 leagues + UCL/UEL/UECL). It still makes picks elsewhere, but those are counted separately from the figure that measures its skill.", "AI从欧洲12项赛事(9个联赛+欧冠/欧联/欧协联)的过往比赛中学习。其他赛事仍会给出预测,但与衡量实力的命中率分开统计。", "La IA ha aprendido de partidos de 12 competiciones europeas (9 ligas + UCL/UEL/UECL). Sigue dando pronósticos en otras, pero se contabilizan aparte de la cifra que mide su nivel."],
+    // ---- v87: 対決モードの「⚽ 日本代表 vs 韓国代表」が英西で日本語のまま漏れていた修正 ----
+    //   (枠テンプレート「⚽ ⦿ vs ⦿」は有るが、代表チーム名の辞書行が無く、
+    //    v83の安全装置「訳し残しがある行はテンプレートを使わない」が働いて全体が
+    //    日本語のまま残っていた。本番でも発生していたのをv87の検査で発見・根治)
+    "日本代表": ["Japan national team", "日本国家队", "Selección de Japón"],
+    "韓国代表": ["South Korea national team", "韩国国家队", "Selección de Corea del Sur"],
+    // ---- v87③(学習リーグ拡張 12→15大会): サーバー文言の新版。旧行は過去表示の互換用に残す ----
+    "学習した大会(15大会)": ["Learned competitions (15)", "已学习的赛事(15项)", "Competiciones aprendidas (15)"],
+    "AIが過去試合を学習しているのは15大会(欧州9リーグ+CL・EL・ECL+J1・イングランド2部・ブラジル全国選手権)です。それ以外の大会は学習データが無いため、予想は出しますが実力を測る集計とは分けています。": ["The AI has learned from past matches in 15 competitions (9 European leagues + UCL/UEL/UECL + J1 League, the English Championship and Brazil's Série A). It still makes picks elsewhere, but those are counted separately from the figure that measures its skill.", "AI从15项赛事(欧洲9个联赛+欧冠/欧联/欧协联+J1联赛、英冠、巴西全国锦标赛)的过往比赛中学习。其他赛事仍会给出预测,但与衡量实力的命中率分开统计。", "La IA ha aprendido de partidos de 15 competiciones (9 ligas europeas + UCL/UEL/UECL + la J1 japonesa, el Championship inglés y el Brasileirão). Sigue dando pronósticos en otras, pero se contabilizan aparte de la cifra que mide su nivel."],
   });
   // ---- ⑭ v63「極端な確率の是正」(較正後の確信度・範囲外の開示) ----
   add({
@@ -1220,6 +1229,7 @@
     ["多段思考: 調査計画AIが追加データ⦿件を要求し、実データ⦿件を追加取得しました。", "Multi-step thinking: the planner AI requested $1 extra data items and $2 real data items were fetched.", "多段思考: 调查规划AI要求追加$1项数据,实际补充获取了$2项实测数据。", "Pensamiento multietapa: la IA planificadora pidió $1 datos extra y se obtuvieron $2 datos reales adicionales."],
     ["この試合の参加が上限(⦿人)に達しました。", "This match reached its participant cap ($1).", "该比赛参与人数已达上限($1人)。", "Este partido alcanzó el límite de participantes ($1)."],
     ["12大会×5シーズン(欧州カップ戦を含む)の実試合⦿から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。⦿", "Learned by the AI from real matches across 12 competitions × 5 seasons (incl. European cups)$1: each club's attack and defence strength (Dixon-Coles method, time-decayed, updated daily). Power = attack + defence. ↑↓ compares with last week. Not a subjective ranking — a purely mechanical calculation from measured data, with no manual adjustment.$2", "由AI从12项赛事×5个赛季(含欧洲杯赛)的实际比赛$1中学习得出: 各俱乐部的攻击力与防守力(Dixon-Coles法、含时间衰减、每日更新)。实力=攻击+防守。↑↓为与上周对比。这不是主观排名——全部由实测数据机械计算,无人工调整。$2", "Aprendido por la IA de partidos reales de 12 competiciones × 5 temporadas (incl. copas europeas)$1: fuerza ofensiva y defensiva de cada club (método Dixon-Coles, con decaimiento temporal, actualización diaria). Fuerza = ataque + defensa. ↑↓ compara con la semana pasada. No es un ranking subjetivo: cálculo puramente mecánico de datos medidos, sin ajustes manuales.$2"],
+    ["15大会×5シーズン(欧州カップ戦・J1・イングランド2部・ブラジルを含む)の実試合⦿から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。⦿", "Learned by the AI from real matches across 15 competitions × 5 seasons (incl. European cups, the J1 League, the English Championship and Brazil)$1: each club's attack and defence strength (Dixon-Coles method, time-decayed, updated daily). Power = attack + defence. ↑↓ compares with last week. Not a subjective ranking — a purely mechanical calculation from measured data, with no manual adjustment.$2", "由AI从15项赛事×5个赛季(含欧洲杯赛、J1联赛、英冠、巴西联赛)的实际比赛$1中学习得出: 各俱乐部的攻击力与防守力(Dixon-Coles法、含时间衰减、每日更新)。实力=攻击+防守。↑↓为与上周对比。这不是主观排名——全部由实测数据机械计算,无人工调整。$2", "Aprendido por la IA de partidos reales de 15 competiciones × 5 temporadas (incl. copas europeas, la J1 japonesa, el Championship inglés y Brasil)$1: fuerza ofensiva y defensiva de cada club (método Dixon-Coles, con decaimiento temporal, actualización diaria). Fuerza = ataque + defensa. ↑↓ compara con la semana pasada. No es un ranking subjetivo: cálculo puramente mecánico de datos medidos, sin ajustes manuales.$2"],
     ["(⦿試合)", "($1 matches)", "($1场)", "($1 partidos)"],
     ["(⦿/⦿件)", "($1/$2)", "($1/$2)", "($1/$2)"],
     ["学習した大会の的中率(勝敗): ⦿%", "Learned-competition accuracy (result): $1%", "已学习赛事命中率(胜负): $1%", "Acierto en competiciones aprendidas (resultado): $1%"],
@@ -2119,6 +2129,7 @@
     "圧倒的な視野": ["Overwhelming vision", "碾压级视野", "Visión arrolladora"],
     "地力ベースの総得点予想の重要度": ["Importance of the strength-based total-goals forecast", "基于实力的总进球预测的重要度", "Importancia del pronóstico de goles basado en fuerza"],
     "地力レーティングは、次の朝の学習(12大会×5シーズンの実試合からの初回学習)のあとに公開されます。でっち上げの暫定値は出しません。": ["True-strength ratings go public after the next morning learning run (first learned from real matches across 12 competitions × 5 seasons). No made-up provisional values.", "实力评级将在下一次晨间学习(以12项赛事×5个赛季的实际比赛首次学习)之后公开。不给出杜撰的临时值。", "El rating de fuerza se publicará tras el próximo aprendizaje matinal (primero aprendido de partidos reales de 12 competiciones × 5 temporadas). Sin valores provisionales inventados."],
+    "地力レーティングは、次の朝の学習(15大会×5シーズンの実試合からの初回学習)のあとに公開されます。でっち上げの暫定値は出しません。": ["True-strength ratings go public after the next morning learning run (first learned from real matches across 15 competitions × 5 seasons). No made-up provisional values.", "实力评级将在下一次晨间学习(以15项赛事×5个赛季的实际比赛首次学习)之后公开。不给出杜撰的临时值。", "El rating de fuerza se publicará tras el próximo aprendizaje matinal (primero aprendido de partidos reales de 15 competiciones × 5 temporadas). Sin valores provisionales inventados."],
     "基礎技術の習得": ["Mastering the basics", "基础技术的掌握", "Dominio de los fundamentos"],
     "堅い守備からのカウンターを軸にする監督": ["Managers built on solid defence and counters", "以稳固防守加反击为轴的教练", "Técnicos de defensa sólida y contragolpe"],
     "堅守速攻・ロングボール型": ["Defend-and-counter / long-ball style", "防守反击·长传冲吊型", "Estilo defensa y contra / balón largo"],
@@ -2819,6 +2830,7 @@
     ["API-Football予想つきで答え合わせ済みの記録が⦿件で、学習に必要な⦿件に達していません(v79導入後の予測から自動で貯まります)。", "Only $1 verified records carry an API-Football prediction, below the $2 needed for learning (they accumulate automatically from post-v79 predictions).", "带API-Football预测且已核对的记录只有$1条,未达到学习所需的$2条(自v79之后的预测起自动积累)。", "Solo $1 registros verificados llevan predicción de API-Football, por debajo de los $2 necesarios para aprender (se acumulan automáticamente desde las predicciones post-v79)."],
     ["⦿は⦿歳で脂の乗った年代に入っており、AIの将来性評価は⦿、即戦力評価は⦿です。大きな伸びよりも高いレベルでの安定的な活躍が期待されます。", "$1, at $2, is in the prime years; the AI's potential rating is $3 and ready-now rating $4. Expect sustained high-level output rather than big further growth.", "$1现年$2岁,正值当打之年;AI潜力评价为$3,即战力评价为$4。与其说还有大幅成长,不如期待其在高水平上的稳定发挥。", "$1, con $2 años, está en plena madurez; proyección IA: $3, rendimiento inmediato: $4. Más que un gran salto, cabe esperar continuidad a alto nivel."],
     ["⦿AIの学習データに含まれていない大会です(学習しているのは欧州12大会)。参考予想として扱い、実力を測る的中率とは分けて集計しています。", "$1This competition isn't in the AI's learning data (it learns 12 European competitions). It's treated as a reference prediction and tallied separately from the accuracy that measures real ability.", "$1该赛事不在AI的学习数据内(AI学习的是12项欧洲赛事)。作为参考预测处理,与衡量实力的命中率分开统计。", "$1Esta competición no está en los datos de aprendizaje de la IA (aprende 12 competiciones europeas). Se trata como predicción de referencia y se cuenta aparte de la precisión que mide la capacidad real."],
+    ["⦿AIの学習データに含まれていない大会です(学習しているのは15大会)。参考予想として扱い、実力を測る的中率とは分けて集計しています。", "$1This competition isn't in the AI's learning data (it learns 15 competitions). It's treated as a reference prediction and tallied separately from the accuracy that measures real ability.", "$1该赛事不在AI的学习数据内(AI学习的是15项赛事)。作为参考预测处理,与衡量实力的命中率分开统计。", "$1Esta competición no está en los datos de aprendizaje de la IA (aprende 15 competiciones). Se trata como predicción de referencia y se cuenta aparte de la precisión que mide la capacidad real."],
     ["※少ないデータで重みを動かすと過学習(たまたまの偏りに合わせて悪化させる)おそれがあるため、あえて⦿件貯まるまでは重みを固定しています。", "* Moving the weights on little data risks overfitting (tuning to chance noise and getting worse), so the weights are deliberately frozen until $1 samples accumulate.", "※数据太少时调整权重有过拟合风险(迁就偶然偏差反而变差),因此在积累到$1条之前特意冻结权重。", "* Ajustar los pesos con pocos datos arriesga sobreajuste (adaptarse al azar y empeorar), así que se congelan a propósito hasta reunir $1 muestras."],
     ["能力値ベースでは⦿(⦿)の高さが代表チームでも武器になり得ますが、これは公式データではなく能力値からのAI推定である点にご注意ください。", "On ability ratings, high $1 ($2) could be a weapon even at national-team level — but note this is an AI estimate from ratings, not official data.", "从能力值看,$1($2)之高在国家队层面也可能成为武器——但请注意,这是基于能力值的AI推定,并非官方数据。", "Por atributos, un alto $1 ($2) podría ser un arma incluso en la selección; ojo: es una estimación de la IA a partir de los atributos, no datos oficiales."],
     ["⦿。一方で、⦿。知識は増えましたが、的中率が下がったため「賢くなった」とは言い切りません(検証データが少ないうちは的中率が上下します)。", "$1. On the other hand, $2. Knowledge grew, but accuracy fell, so we won't claim it \"got smarter\" (accuracy swings while verification data is scarce).", "$1。另一方面,$2。知识增加了,但命中率下降,因此不断言「变聪明了」(验证数据少时命中率会上下波动)。", "$1. Por otro lado, $2. El conocimiento creció, pero la precisión bajó, así que no afirmamos que «se volvió más lista» (la precisión oscila con pocos datos de verificación)."],
@@ -3576,7 +3588,7 @@
          ・過去試合の学習を5リーグ→9リーグ×3シーズンに拡張(実試合のみ)
          ・市場オッズを特徴量に追加(丸写しではなく、影響の強さはAIが実データから学習。
            オッズを取得できない試合では一切使わない=推測で埋めない) -->
-    <p class="value-note" style="margin:0 0 8px; opacity:.85;">🧠 予測モデルは12大会×5シーズン(欧州カップ戦を含む)の実試合とAI自身の的中記録から毎日学習しています。2026年8月18日からは、①市場オッズ(ブックメーカーの評価) ②チーム別の地力レーティング(約200クラブの攻撃力・守備力を過去試合から学習) ③市場ブレンド(最終確率にオッズを混ぜる比率。使った予想には内訳を明記)も加わりました。影響の強さはすべてAI自身が実データから学習し、データが無い試合では使いません。</p>
+    <p class="value-note" style="margin:0 0 8px; opacity:.85;">🧠 予測モデルは15大会×5シーズン(欧州カップ戦・J1・イングランド2部・ブラジルを含む)の実試合とAI自身の的中記録から毎日学習しています。2026年8月18日からは、①市場オッズ(ブックメーカーの評価) ②チーム別の地力レーティング(約200クラブの攻撃力・守備力を過去試合から学習) ③市場ブレンド(最終確率にオッズを混ぜる比率。使った予想には内訳を明記)も加わりました。影響の強さはすべてAI自身が実データから学習し、データが無い試合では使いません。</p>
     <div id="reflectionsBody" class="muted" style="font-size:13px;">読み込み中…</div>
   </div>
   </div>
@@ -10995,7 +11007,7 @@ function predConfidenceLineHtml(p) {
   return lines.join("");
 }
 // ---- 2026年8月20日・v62「学習していない大会は、その旨を1行で断る」 ----
-//   AIが過去試合を学習しているのは欧州12大会だけ。それ以外の大会でも予想は
+//   AIが過去試合を学習しているのは15大会だけ(v87③で12→15)。それ以外の大会でも予想は
 //   出し続けるが、「どれくらい根拠があるのか」を利用者が分かるようにする。
 //   画面が混まないよう、出すのは学習していない大会のときの1行だけ。
 function predUnlearnedLineHtml(p) {
@@ -12311,7 +12323,7 @@ async function renderReflectionsCard() {
     parts.push(`<div class="value-note" style="margin-bottom:8px;">${esc(off.noteJa || "")}</div>`);
   }
   // ---- v62: 学習した大会と、していない大会を分けて出す ----
-  //   AIが過去試合を学習しているのは欧州12大会だけ。ハンガリーNB I・MLS等の
+  //   AIが過去試合を学習しているのは15大会だけ(v87③で12→15)。ハンガリーNB I・MLS等の
   //   予想も出し続けるが、実力は「同じ条件で測った数字」で見る。
   //   参考側の数字も必ず並べて出す(良く見せるための隠蔽をしない)。
   const ls = d.learnedSummary || null;
@@ -12326,7 +12338,7 @@ async function renderReflectionsCard() {
       : "";
     parts.push(`<div style="margin:6px 0 8px; padding:8px 10px; background:rgba(0,0,0,.03); border-radius:6px;">
       <div style="font-weight:700; font-size:13px;"><span>大会別の内訳</span></div>
-      ${row("学習した大会(欧州12大会)", ls.learned)}${row("学習していない大会(参考)", ls.unlearned)}${mixedRow}
+      ${row("学習した大会(15大会)", ls.learned)}${row("学習していない大会(参考)", ls.unlearned)}${mixedRow}
       <div class="value-note" style="margin-top:4px; opacity:.9;">${esc(ls.noteJa || "")}</div>
     </div>`);
   }
