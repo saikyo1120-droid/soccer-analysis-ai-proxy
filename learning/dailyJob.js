@@ -1836,7 +1836,10 @@ async function runDailyLearning(deps) {
       }
 
       // v50: 地力レーティング由来の期待得点(両チームのレーティングがあるときだけ)
-      const ratingEg = expGoalsFromRatings(teamRatingsData, homeTeamId, awayTeamId);
+      // v87①: 実際の試合はリーグが分かるので、リーグ別ホームアドバンテージが
+      // 学習・採用されている日はそのリーグの値が使われる(無ければ従来の全体値)
+      const fxLeagueId = (fx.league && Number.isFinite(Number(fx.league.id))) ? Number(fx.league.id) : null;
+      const ratingEg = expGoalsFromRatings(teamRatingsData, homeTeamId, awayTeamId, fxLeagueId);
       // v55: teamId→名前の採集(レーティング表示用)
       if (Number.isFinite(homeTeamId) && fx.teams && fx.teams.home && fx.teams.home.name) teamNamesCollected.set(homeTeamId, fx.teams.home.name);
       if (Number.isFinite(awayTeamId) && fx.teams && fx.teams.away && fx.teams.away.name) teamNamesCollected.set(awayTeamId, fx.teams.away.name);

@@ -24,6 +24,14 @@
  *   「学習した大会」の定義は、実際に過去試合を取得している
  *   historicalBackfill.DEFAULT_BACKFILL_LEAGUES と**同一のリスト**を使う。
  *   人が別に決めた表ではないので、学習対象を増やせば判定も自動で追従する。
+ *
+ * ■ v87③(2026年9月9日): 学習対象が12大会→15大会に拡張された
+ *   (J1リーグ98・チャンピオンシップ40・ブラジル全国選手権71)。
+ *   ID判定はDEFAULT_BACKFILL_LEAGUES由来なので自動で追従。名前の補助判定
+ *   (IDの無い古い記録用)にはJ1とチャンピオンシップを追加した。ブラジル全国
+ *   選手権のAPI英語名は「Serie A」でイタリアと同名のため、名前では追加しない
+ *   (IDの無い古い記録の「serie a」は当時学習していたイタリアの記録。
+ *    新しい記録はすべてIDを持つので、ブラジルはID判定で正しく学習済みになる)。
  */
 
 const { DEFAULT_BACKFILL_LEAGUES } = require("./historicalBackfill");
@@ -41,6 +49,9 @@ const LEARNED_LEAGUE_NAMES = [
   "eredivisie", "primeira liga", "super lig", "süper lig", "jupiler pro league",
   "first division a", "uefa champions league", "uefa europa league",
   "uefa europa conference league",
+  // v87③: 追加リーグ(ブラジル全国選手権はAPI英語名がイタリアと同名「Serie A」の
+  // ため名前では追加しない。ヘッダーコメント参照)
+  "j1 league", "championship",
 ];
 
 function normLeagueName(s) {
@@ -58,7 +69,7 @@ function classifyLearnedCompetition(leagueId, leagueName, learnedIds) {
   const ids = learnedIds || LEARNED_LEAGUE_IDS;
   const unlearned = () => ({
     learned: false,
-    reasonJa: `${leagueName ? `「${leagueName}」は` : "この大会は"}AIの学習データに含まれていない大会です(学習しているのは欧州12大会)。参考予想として扱い、実力を測る的中率とは分けて集計しています。`,
+    reasonJa: `${leagueName ? `「${leagueName}」は` : "この大会は"}AIの学習データに含まれていない大会です(学習しているのは15大会)。参考予想として扱い、実力を測る的中率とは分けて集計しています。`,
   });
   // Number(null) も Number("") も 0 になってしまうため、空の値は先に弾く
   // (これを怠ると、IDが無い古い記録が「ID=0の未知の大会」として扱われ、

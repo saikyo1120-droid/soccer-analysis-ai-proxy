@@ -14,7 +14,7 @@
  *   各チーム t に攻撃力 att_t と守備力 def_t を持たせ、
  *     λ(ホーム得点) = exp(mu + homeAdv + att_home − def_away)
  *     λ(アウェイ得点) = exp(mu + att_away − def_home)
- *   のポアソン尤度を、過去試合(12大会×5シーズン・時間減衰つき)で最大化する。
+ *   のポアソン尤度を、過去試合(15大会×5シーズン・時間減衰つき)で最大化する。
  *   ・勾配は解析形(∂NLL/∂θ = Σ(λ−k)×∂logλ/∂θ)なので高速・正確。
  *   ・識別性: att と def は毎反復で平均0に再センタリングする。
  *   ・過学習防止: L2正則化 + 出場試合数が閾値未満のチームは評価しない
@@ -100,6 +100,25 @@ function extractRatedCore(rows, minMatches) {
 //   毎日の学習時に候補と比較されるようになった(modelTuning参照)。既定値も必ず候補に入る。
 const XI_DEFAULT = 0.0065;
 
+/**
+ * v87①(2026年9月9日・利用者の選択「リーグ別ホームアドバンテージ」)
+ * ------------------------------------------------------------------
+ * これまでホームの下駄 homeAdv は全リーグ共通の1つの数字だった。実際には
+ * ホームの強さはリーグごとに差がある(観客の圧・移動距離・環境など)ことが
+ * サッカー統計では広く知られている。そこで
+ *   λ(ホーム得点) = exp(mu + homeAdv + offset[リーグ] + att_home − def_away)
+ * と、リーグ別のずれ offset を追加で学習できるようにした(opts.perLeagueHomeAdv)。
+ *
+ * 設計上の約束(劣化禁止・でっち上げ禁止):
+ *  ・offset は「全体平均からのずれ」。毎反復で加重平均0に再センタリングし、
+ *    平均は homeAdv が吸収する(att/defとmuの関係と同じ識別性の処理)。
+ *  ・試合数の少ないリーグの offset は、チーム別レーティングと同じ
+ *    「基準重み÷そのリーグの重み」型の収縮で強く0(=全体平均)へ引き戻す。
+ *    少ないデータからリーグ特性を断定しない。
+ *  ・リーグIDが無い行は offset の学習に参加しない(homeAdvのみに寄与)。
+ *  ・採用は modelTuning 側の門番(検証データのLogLoss比較)が決める。
+ *    検証で勝てなければこのモードは使われず、従来と完全に同一。
+ */
 function fitTeamRatings(rows, opts) {
   const o = opts || {};
   const usable = (rows || []).filter((r) => r
@@ -154,19 +173,36 @@ function fitTeamRatings(rows, opts) {
   const iterations = o.iterations ?? 150;
   let wRef = null; // v60: 収縮の基準となる標準的なチームの重み(初回反復で決める)
 
+  // ---- v87①: リーグ別ホームアドバンテージのずれ offset[リーグ] ----
+  //   perLeagueHomeAdv が真のときだけ学習する(既定は従来どおり=挙動不変)。
+  const perLeague = o.perLeagueHomeAdv === true;
+  const leagueOf = (r) => (Number.isFinite(r.leagueId) ? r.leagueId : null);
+  const off = new Map(); // leagueId -> homeAdvからのずれ(平均0)
+  if (perLeague) {
+    for (const r of train) { const l = leagueOf(r); if (l !== null && !off.has(l)) off.set(l, 0); }
+  }
+  let wLgRef = null; // 収縮の基準となる標準的なリーグの重み(中央値・初回反復で決める)
+
   for (let iter = 0; iter < iterations; iter++) {
     const gAtt = new Map(), gDef = new Map(), wTeam = new Map();
+    const gOff = new Map(), wLeague = new Map(); // v87①: リーグ別の勾配と重み合計
     let gMu = 0, gHome = 0, totalW = 0;
     for (const r of train) {
       const w = wOf(r);
       totalW += w;
-      const lh = Math.exp(mu + homeAdv + att.get(r.homeId) - def.get(r.awayId));
+      const lg = perLeague ? leagueOf(r) : null;
+      const advL = homeAdv + (lg !== null ? off.get(lg) : 0); // v87①: リーグ別の下駄
+      const lh = Math.exp(mu + advL + att.get(r.homeId) - def.get(r.awayId));
       const la = Math.exp(mu + att.get(r.awayId) - def.get(r.homeId));
       const [gH, gA] = effGoals(r); // v57: xGブレンド(α=0なら実ゴールそのもの)
       const dh = (lh - gH) * w; // ∂NLL/∂(logλH)
       const da = (la - gA) * w;
       gMu += dh + da;
       gHome += dh;
+      if (lg !== null) {
+        gOff.set(lg, (gOff.get(lg) || 0) + dh); // offset_l はそのリーグのホーム側勾配だけを受ける
+        wLeague.set(lg, (wLeague.get(lg) || 0) + w);
+      }
       gAtt.set(r.homeId, (gAtt.get(r.homeId) || 0) + dh);
       gAtt.set(r.awayId, (gAtt.get(r.awayId) || 0) + da);
       gDef.set(r.awayId, (gDef.get(r.awayId) || 0) - dh);
@@ -183,6 +219,32 @@ function fitTeamRatings(rows, opts) {
     }
     mu -= lr * (gMu / (2 * totalW));      // 全試合×2得点分の平均勾配
     homeAdv -= lr * (gHome / totalW);     // ホーム側のみの平均勾配
+    // ---- v87①: リーグ別ずれの更新(チーム別レーティングと同じ収縮の型) ----
+    if (perLeague && off.size) {
+      if (wLgRef === null) {
+        const lv = [...wLeague.values()].filter((v) => v > 0).sort((a, b) => a - b);
+        wLgRef = lv.length ? lv[Math.floor(lv.length / 2)] : 1;
+      }
+      for (const lg of off.keys()) {
+        const wl = Math.max(1e-9, wLeague.get(lg) || 0);
+        const l2Lg = l2 * (wLgRef / wl); // 試合の少ないリーグほど強く0(全体平均)へ収縮
+        off.set(lg, off.get(lg) - lr * ((gOff.get(lg) || 0) / wl + l2Lg * off.get(lg)));
+      }
+      // 識別性: offset の加重平均を0へ再センタリング(平均は homeAdv が吸収する)
+      let sw = 0, swo = 0;
+      for (const [lg, v] of off) { const wl = wLeague.get(lg) || 0; sw += wl; swo += wl * v; }
+      if (sw > 0) {
+        const mean = swo / sw;
+        for (const lg of off.keys()) off.set(lg, off.get(lg) - mean);
+        homeAdv += mean;
+      }
+      // 発散ガード(offset版): 壊れたら正直に学習失敗を返す
+      for (const v of off.values()) {
+        if (!Number.isFinite(v)) {
+          return { available: false, byTeam: {}, matchesUsed: train.length, teamsRated: rated.size, reasonJa: "リーグ別ホームアドバンテージの学習が数値的に発散したため、結果を採用しません。" };
+        }
+      }
+    }
     for (const id of rated) {
       // チームごとの勾配は「そのチームが関わった試合の重み合計」で平均する
       // (試合数の多いチームと少ないチームで学習の歩幅を揃える。標準的な正規化)
@@ -211,10 +273,25 @@ function fitTeamRatings(rows, opts) {
     if (!Number.isFinite(a) || !Number.isFinite(d) || Math.abs(a) > 3 || Math.abs(d) > 3) continue; // 壊れた値は保存しない
     byTeam[id] = { att: Math.round(a * 1000) / 1000, def: Math.round(d * 1000) / 1000, n: counts.get(id) || 0 };
   }
+  // ---- v87①: リーグ別ホームアドバンテージの出力(perLeagueHomeAdvのときだけ) ----
+  //   保存するのは「homeAdv + ずれ」のリーグ別絶対値。|ずれ|>1(e倍で2.7倍超)は
+  //   壊れた値として保存しない(そのリーグは全体値homeAdvで動く=安全側)。
+  let homeAdvByLeague = null;
+  if (perLeague && off.size) {
+    homeAdvByLeague = {};
+    for (const [lg, v] of off) {
+      if (!Number.isFinite(v) || Math.abs(v) > 1) continue;
+      homeAdvByLeague[lg] = Math.round((homeAdv + v) * 1000) / 1000;
+    }
+    if (!Object.keys(homeAdvByLeague).length) homeAdvByLeague = null;
+  }
   return {
     available: Object.keys(byTeam).length >= 20,
     xgAlpha, // v57: 学習に使ったxGブレンド率(0=実ゴールのみ)
     byTeam, mu: Math.round(mu * 1000) / 1000, homeAdv: Math.round(homeAdv * 1000) / 1000,
+    // v87①: リーグ別ホームアドバンテージ(perLeagueHomeAdv=false の日は null で従来と同一)
+    homeAdvMode: perLeague ? "perLeague" : "global",
+    homeAdvByLeague,
     matchesUsed: train.length, teamsRated: Object.keys(byTeam).length,
     // v60: 何を根拠に「評価できる」と判断したかを開示する(説明責任)
     minMatches, coreIterations: core.iterations, teamsDropped: Math.max(0, core.droppedTotal || 0),
@@ -225,12 +302,19 @@ function fitTeamRatings(rows, opts) {
 /**
  * レーティングから「地力ベースの期待得点」を求める。
  * どちらかのチームのレーティングが無ければ null(=特徴量0・影響なし)。
+ * v87①: 第4引数 leagueId(任意)。リーグ別ホームアドバンテージが学習・採用
+ * されている場合はそのリーグの値を使い、無ければ従来どおり全体値 homeAdv。
+ * 既存の3引数呼び出し(対戦シミュレーション等・リーグ不明の場面)は挙動不変。
  */
-function expGoalsFromRatings(ratings, homeId, awayId) {
+function expGoalsFromRatings(ratings, homeId, awayId, leagueId) {
   if (!ratings || !ratings.available || !ratings.byTeam) return null;
   const h = ratings.byTeam[homeId], a = ratings.byTeam[awayId];
   if (!h || !a) return null;
-  const lh = Math.exp(ratings.mu + ratings.homeAdv + h.att - a.def);
+  const perLeague = ratings.homeAdvByLeague;
+  const adv = (perLeague && leagueId !== null && leagueId !== undefined && Number.isFinite(perLeague[leagueId]))
+    ? perLeague[leagueId]
+    : ratings.homeAdv;
+  const lh = Math.exp(ratings.mu + adv + h.att - a.def);
   const la = Math.exp(ratings.mu + a.att - h.def);
   if (!Number.isFinite(lh) || !Number.isFinite(la)) return null;
   return { home: Math.round(lh * 100) / 100, away: Math.round(la * 100) / 100 };

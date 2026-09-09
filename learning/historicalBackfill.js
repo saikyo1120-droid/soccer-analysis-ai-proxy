@@ -54,14 +54,29 @@ const DEFAULT_BACKFILL_LEAGUES = [
   { id: 2, nameJa: "チャンピオンズリーグ", cup: true },
   { id: 3, nameJa: "ヨーロッパリーグ", cup: true },
   { id: 848, nameJa: "カンファレンスリーグ", cup: true },
+  // ---- v87③(2026年9月9日・利用者の選択): 学習リーグの拡張 12大会→15大会 ----
+  // 利用者が推奨3候補すべてを選択: J1リーグ・イングランド2部・ブラジル全国選手権。
+  //   ・J1: 日本語ファーストのサイトの中核需要なのに、学習データが0件だった
+  //   ・チャンピオンシップ: 24チーム×46節=シーズン552試合の大量データ。PLとの
+  //     昇降格でクラブが行き来するため、既存レーティングと自然に繋がる(橋の役割)
+  //   ・ブラジル全国選手権: 南米最大リーグ。欧州主要リーグへの選手供給元
+  // IDはAPI-Footballの標準ID。万一IDが違っても per-league のエラー記録
+  // (backfill_failed:league=…)が正直に残り、他リーグの学習は影響を受けない。
+  // このリストを増やすと、learnedCompetitions.js の「学習した大会」判定と、
+  // 日次の「学習済み大会の全試合を予測対象に足す」処理も自動で追従する。
+  { id: 98, nameJa: "J1リーグ" },
+  { id: 40, nameJa: "チャンピオンシップ(イングランド2部)" },
+  { id: 71, nameJa: "ブラジル全国選手権" },
 ];
 
 const BACKFILL_KEY = "learn:backfill:dataset";
 const BACKFILL_META_KEY = "learn:backfill:meta";
 // v58: 12大会×5シーズン ≒ 18,000〜20,000件(国内306〜380試合/シーズン+カップ戦)。
-// 保存はブロック分割(下のBACKFILL_SHARD_SIZE)なので1キー上限の心配はなく、
-// 上限は「12ブロック×1,200件=14,400件」の範囲内に収める。
-const MAX_STORED_MATCHES = 22000;
+// v87③: 15大会×5シーズン ≒ 24,000〜26,000件(チャンピオンシップ552試合/シーズンが大きい)。
+//   旧上限22,000のままだと切り詰めが発動して古いシーズンが黙って欠けるため、
+//   28,000へ引き上げた(保存は下のブロック分割。増分は約5ブロック=数MBで、
+//   保存先(Upstash無料枠256MB)には全く影響しない)。
+const MAX_STORED_MATCHES = 28000;
 
 const FINISHED = new Set(["FT", "AET", "PEN"]);
 
@@ -250,7 +265,7 @@ function timeDecayWeight(matchDateIso, referenceMs, xi) {
 // 版が上がると modelTuning 側が週1回の更新日を待たずに作り直す。
 const ROWS_VERSION = 3;
 const BACKFILL_SHARD_SIZE = 1200;                       // 1ブロックあたりの試合数
-const BACKFILL_MAX_SHARDS = 19;                          // 上限22,800件(v58: 5シーズン+カップ戦ぶん)
+const BACKFILL_MAX_SHARDS = 24;                          // v87③: 19→24(上限28,800件。15大会×5シーズンが切り詰め無しで収まる)
 const backfillShardKey = (i) => `${BACKFILL_KEY}:s${i}`;
 
 async function saveDataset(deps, rows, meta) {

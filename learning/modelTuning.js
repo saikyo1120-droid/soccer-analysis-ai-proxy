@@ -53,6 +53,8 @@ const LEAGUE_NAMES_JA = {
   88: "エールディヴィジ", 94: "プリメイラ・リーガ", 203: "シュペル・リグ", 144: "ベルギー・プロ・リーグ",
   // v58で追加した欧州カップ戦(リーグ間の実対戦=レーティングの相互較正用)
   2: "チャンピオンズリーグ", 3: "ヨーロッパリーグ", 848: "カンファレンスリーグ",
+  // v87③で追加した3リーグ(historicalBackfill.jsのDEFAULT_BACKFILL_LEAGUESと対応)
+  98: "J1リーグ", 40: "チャンピオンシップ(イングランド2部)", 71: "ブラジル全国選手権",
 };
 const TUNING_LOG_KEEP = 60;
 // データセットを作り直す間隔。
@@ -104,8 +106,8 @@ async function ensureDataset(deps, runAt) {
     return { ...existing, refreshed: false, reasonJa: null };
   }
 
-  // 15リクエスト程度。余裕が無ければ次回に回す。
-  const NEEDED = (DEFAULT_BACKFILL_LEAGUES.length * 5) + 2; // v58: 12大会×5シーズン+予備 ≒ 62件(週1回/構成変更時のみ)
+  // 約77リクエスト(15大会×5シーズン+予備)。余裕が無ければ次回に回す。
+  const NEEDED = (DEFAULT_BACKFILL_LEAGUES.length * 5) + 2; // 大会数×5シーズン+予備(v87③で15大会=77件。週1回/構成変更時のみ)
   if (apiBudget && typeof apiBudget.canAfford === "function" && !apiBudget.canAfford(NEEDED)) {
     return {
       ...existing, refreshed: false,
@@ -324,7 +326,9 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     if (!ratings || !ratings.available) return 0;
     let attached = 0;
     for (const r of rows) {
-      const eg = expGoalsFromRatings(ratings, r.homeId, r.awayId);
+      // v87①: 行のリーグIDを渡す(リーグ別ホームアドバンテージ学習時のみ効く。
+      // 全体値モードのレーティングでは第4引数は無視され従来と完全に同一)
+      const eg = expGoalsFromRatings(ratings, r.homeId, r.awayId, r.leagueId);
       if (eg) {
         r.homeCtx = { ...r.homeCtx, ratingExpGoals: eg.home };
         r.awayCtx = { ...r.awayCtx, ratingExpGoals: eg.away };
@@ -415,6 +419,48 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     xiDetail = { chosen: XI_DEFAULT, default: XI_DEFAULT, reasonJa: `学習用の過去試合が${train.length}件で、減衰率ξの探索に必要な500件に達していません(それまで既定値で学習します)。` };
   }
   if (!ratingsTrain) ratingsTrain = fitTeamRatings(train, { nowMs: nowMsForRatings, xgAlpha: xgAlphaChosen, decayXiPerDay: xiChosen });
+
+  // ---- v87①(2026年9月9日・利用者の選択): リーグ別ホームアドバンテージの門番付き採用 ----
+  //   これまで全リーグ共通だったホームの下駄を、リーグ別に学習した候補と毎日比較する。
+  //   α・ξと同じ門番方式: 学習用データだけで両方のレーティングを作り、検証用データの
+  //   LogLossで比較して、意味のある差(0.0005以上)で勝ったときだけリーグ別を採用する。
+  //   勝てない日は従来どおり全体値のまま(劣化禁止)。逐次探索(α→ξ→本項)にする理由は
+  //   v71③と同じ(総当たりで学習時間を爆発させない。62分事件の教訓)。
+  let homeAdvModeChosen = "global", homeAdvDetail = null;
+  if (train.length >= 500) {
+    const scoreRatings = (rt) => {
+      const testCopy = test.map((r) => ({ ...r }));
+      attachRatings(testCopy, rt);
+      const ev = evaluate(testCopy, base);
+      return ev.measurable ? ev.logLoss : Infinity;
+    };
+    const globalLoss = scoreRatings(ratingsTrain);
+    let perLoss = Infinity, perLeagueCount = 0, rtPerLeague = null;
+    try {
+      rtPerLeague = fitTeamRatings(train, { nowMs: nowMsForRatings, xgAlpha: xgAlphaChosen, decayXiPerDay: xiChosen, perLeagueHomeAdv: true });
+      if (rtPerLeague && rtPerLeague.available) {
+        perLoss = scoreRatings(rtPerLeague);
+        perLeagueCount = rtPerLeague.homeAdvByLeague ? Object.keys(rtPerLeague.homeAdvByLeague).length : 0;
+      }
+    } catch (e) { /* リーグ別学習の失敗は「採用しない」に落ちるだけ(従来と同一動作) */ }
+    const HOMEADV_ADOPT_MARGIN = 0.0005; // ξと同じ「僅差・同点では乗り換えない」閾値
+    if (Number.isFinite(perLoss) && Number.isFinite(globalLoss) && perLoss <= globalLoss - HOMEADV_ADOPT_MARGIN) {
+      homeAdvModeChosen = "perLeague";
+      ratingsTrain = rtPerLeague; // 以後の重み学習も勝った方のλで行う
+    }
+    const r4 = (v) => (Number.isFinite(v) ? Math.round(v * 10000) / 10000 : null);
+    homeAdvDetail = {
+      chosen: homeAdvModeChosen,
+      globalLogLoss: r4(globalLoss), perLeagueLogLoss: r4(perLoss),
+      leagues: perLeagueCount,
+      noteJa: homeAdvModeChosen === "perLeague"
+        ? `検証データのLogLossがリーグ別ホームアドバンテージ(${perLeagueCount}大会分)の方が0.0005以上小さかったため、リーグ別の値を採用しました。`
+        : "リーグ別ホームアドバンテージは検証データで全体共通値を意味のある差(LogLoss 0.0005以上)で上回らなかったため、従来どおり全体共通値を使います(僅差・同点では乗り換えません)。",
+    };
+  } else {
+    homeAdvDetail = { chosen: "global", reasonJa: `学習用の過去試合が${train.length}件で、リーグ別ホームアドバンテージの検証に必要な500件に達していません(それまで全体共通値で学習します)。` };
+  }
+
   const ratingsAttachedTrain = attachRatings(train, ratingsTrain);
   const ratingsAttachedTest = attachRatings(test, ratingsTrain);
 
@@ -554,6 +600,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
       clubEloRows: clubEloRowsCount, // v57: Elo付きで学習に使えた試合数(実測)
       xgAlpha: xgAlphaChosen, xgAlphaDetail, xgRows: xgRowsCount, // v57: xGブレンドの実測
       xi: xiChosen, xiDetail, // v71③: 時間減衰ξの実測(候補ごとの検証LogLossと選ばれた値)
+      homeAdvMode: homeAdvModeChosen, homeAdvDetail, // v87①: リーグ別ホームアドバンテージの検証実測
       drawBand: drawBandChosen, drawBandDetail, // v78(案1): 引き分け帯の実測(候補ごとの検証的中率と選ばれた帯)
     trainSize: train.length,
     testSize: test.length,
@@ -613,7 +660,8 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   //   保存に失敗したら既存のレーティングが残る(読み出し側は無ければ影響0)。
   let ratingsSaved = false;
   try {
-    const ratingsFull = fitTeamRatings(ds.rows, { nowMs: nowMsForRatings, xgAlpha: xgAlphaChosen, decayXiPerDay: xiChosen }); // v71③: 本番保存用も選ばれたξで学習
+    // v71③: 本番保存用も選ばれたξで学習。v87①: 門番を通った日はリーグ別ホームアドバンテージ付きで学習
+    const ratingsFull = fitTeamRatings(ds.rows, { nowMs: nowMsForRatings, xgAlpha: xgAlphaChosen, decayXiPerDay: xiChosen, perLeagueHomeAdv: homeAdvModeChosen === "perLeague" });
     if (ratingsFull.available && upstashEnabled) {
       ratingsFull.builtAt = runAt.toISOString();
       // v53: 表示用のチーム名(データセットのメタから)。
@@ -651,7 +699,13 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
         await upstashSetJSON("learn:ratings:ranks:latest", { weekKey: curWeekKey, ranks, savedAt: runAt.toISOString() });
       } catch (e) { /* スナップショットはベストエフォート(ランキング表示は変動なしで出る) */ }
     }
-    record.teamRatings.fullFit = { available: ratingsFull.available, teams: ratingsFull.teamsRated, matches: ratingsFull.matchesUsed, saved: ratingsSaved, reasonJa: ratingsFull.reasonJa || null };
+    record.teamRatings.fullFit = {
+      available: ratingsFull.available, teams: ratingsFull.teamsRated, matches: ratingsFull.matchesUsed, saved: ratingsSaved,
+      // v87①: 保存したレーティングのホームアドバンテージ方式(説明責任)
+      homeAdvMode: ratingsFull.homeAdvMode || "global",
+      leaguesWithHomeAdv: ratingsFull.homeAdvByLeague ? Object.keys(ratingsFull.homeAdvByLeague).length : 0,
+      reasonJa: ratingsFull.reasonJa || null,
+    };
   } catch (e) {
     record.teamRatings.fullFit = { available: false, saved: false, reasonJa: `レーティング学習でエラー(${e && e.message})` };
   }
@@ -697,6 +751,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     teamStats: record.teamStats, // v59: 派生指標の集計結果(実測)
     modelFormDetail: record.modelFormDetail, // v66: 加法/乗法の比較実測と選ばれた形
     xi: record.xi, xiDetail: record.xiDetail, // v71③: 時間減衰ξの実測
+    homeAdvMode: record.homeAdvMode, homeAdvDetail: record.homeAdvDetail, // v87①: リーグ別ホームアドバンテージの実測
     drawBand: record.drawBand, drawBandDetail: record.drawBandDetail, // v78(案1): 引き分け帯の実測
     consistencyChecked: record.consistencyChecked,
     reasonJa: record.reasonJa,
