@@ -71,7 +71,9 @@ function startMockApiFootball() {
       }
       if (!isAscii(search)) return validationError(); // ← 本番実測どおりの拒否
       if (/^mbappe$/i.test(search || "") || /^kylian mbappe$/i.test(search || "")) return reply({ response: [mbappeEntry] });
-      if (/^odegaard$/i.test(search || "") || /^martin odegaard$/i.test(search || "")) return reply({ response: [odegaardEntry] });
+      // v88.2: 本番実測に忠実なモックへ修正。ø(独立した特殊文字)は畳んでも先方の
+      // 部分一致に合わない: search=Odegaard → 0件 / search=degaard → ヒット(2026-09-09実測)
+      if (/^degaard$/i.test(search || "")) return reply({ response: [odegaardEntry] });
       if (/^saka$/i.test(search || "")) return reply({ response: [sakaEntry] });
       return reply({ response: [] });
     }
@@ -111,12 +113,13 @@ function startMockApiFootball() {
       assert.strictEqual(b.stats.goals, 4);
     });
 
-    await t("② NFDで分解できないø(Martin Ødegaard)も畳まれて取得できる", async () => {
+    await t("② ø(Martin Ødegaard)は最長ASCII連続部分『degaard』の候補で取得できる(v88.2・本番実測に忠実なモック)", async () => {
       const r = await httpGet(`${base}?name=${encodeURIComponent("Martin Ødegaard")}&teamEn=Arsenal`);
       const b = JSON.parse(r.body);
       assert.strictEqual(b.found, true, "found=false: " + r.body.slice(0, 200));
       assert.strictEqual(b.player.id, 986);
       assert.strictEqual(b.stats.goals, 1);
+      assert.ok(seenSearches.some((s) => /^degaard$/i.test(s)), "『degaard』候補が送られていない: " + JSON.stringify(seenSearches));
     });
 
     await t("④ ASCIIの名前(Bukayo Saka)は従来どおり姓で検索されヒットする(挙動不変)", async () => {

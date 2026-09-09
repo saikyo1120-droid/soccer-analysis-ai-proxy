@@ -118,7 +118,7 @@ const { TEAM_STATS_KEY, combineVolatility: _combineVolatility } = require("./lea
 const { buildEloByNorm: buildEloByNormMU, DAILY_KEY: CLUBELO_DAILY_KEY } = require("./learning/clubElo");
 const clubEloDiag = require("./learning/clubElo"); // v73: 診断エンドポイント用(probeDaily)
 // 選手個人の実データ統計(2026年8月・知識拡張フェーズ)。
-const { computePlayerRealStats } = require("./learning/playerFeatures");
+const { computePlayerRealStats, filterMensStatEntries } = require("./learning/playerFeatures");
 const { createPlayerProfileEngine } = require("./knowledge/playerProfileEngine");
 
 // ---- .env を自前で読み込む(dotenvパッケージ不使用) ----
@@ -1233,8 +1233,21 @@ function searchTermVariants(name) {
   const trimmed = (name || "").trim();
   const parts = trimmed.split(/\s+/).filter(Boolean);
   const variants = [];
-  if (parts.length > 1) variants.push(parts[parts.length - 1]); // surname
-  variants.push(trimmed); // full name, as a fallback
+  const push = (v) => { if (v && !variants.includes(v)) variants.push(v); };
+  const surname = parts.length > 1 ? parts[parts.length - 1] : trimmed;
+  if (parts.length > 1) push(surname); // surname
+  // ---- v88.2(2026年9月9日・本番照合で発見したøの残件) ----
+  // é等の合成アクセントはASCII畳み込み(callApiFootballのfoldSearchAscii)で先方の
+  // 検索にヒットするが、ø・đ・łのような「独立した特殊文字」は畳んでも合わないことが
+  // 本番実測で確定した: search=Odegaard → 0件 / search=degaard → M. Ødegaard にヒット
+  // (先方の検索は部分一致なので、特殊文字を避けたASCII連続部分なら届く)。
+  // 特殊文字を含む姓は「最長のASCII英字連続部分」(4文字以上)も候補に加える。
+  // 対象は登録名簿では Ødegaard・Nørgaard の2名(ø)。ASCII名の挙動は不変。
+  if (/[^\x00-\x7F]/.test(surname)) {
+    const runs = surname.split(/[^A-Za-z]+/).filter((r) => r.length >= 4).sort((a, b) => b.length - a.length);
+    if (runs[0]) push(runs[0]);
+  }
+  push(trimmed); // full name, as a fallback
   return variants;
 }
 
@@ -1499,10 +1512,19 @@ async function handlePlayerSeasonStats(query) {
     }
 
     let statsBlock = null, usedSeason = null;
+    let sawWomensOnly = false; // v89: どのシーズンも女子大会の成績しか無かった場合の正直な理由分け
     for (const s of candidateSeasons) {
       const data = await callApiFootball("/players", { id: player.id, season: s });
       const entry = (data.response || [])[0];
       if (!entry || !entry.statistics || !entry.statistics.length) continue;
+
+      // ---- v89(2026年9月9日・利用者の指摘「まだ女性の選手が混ざっています」) ----
+      // 提供元がクラブの男子チームIDに女子部門の成績を紐づけている選手が本番で実測された。
+      // 成績エントリーの中身(実際の出場大会名)で判定し、女子大会のエントリーは
+      // 表示・考察の対象から外す(このサイトは男子サッカー専用)。
+      const womensSplit = filterMensStatEntries(entry.statistics);
+      if (womensSplit.womensOnly) { sawWomensOnly = true; continue; }
+      entry.statistics = womensSplit.mens;
 
       // A player's statistics array can contain BOTH club-level entries (e.g. Arsenal)
       // AND national-team entries (e.g. England), one per competition they appeared in
@@ -1531,7 +1553,11 @@ async function handlePlayerSeasonStats(query) {
     }
 
     if (!statsBlock) {
-      const payload = { found: false, reason: "no_statistics", name: safeEcho(name), season: seasonBase };
+      // v89: 女子大会の成績しか見つからなかった選手は、理由を偽らず明示する
+      // (「成績が無い」のではなく「男子サッカー専用のため対象外」)。
+      const payload = sawWomensOnly
+        ? { found: false, reason: "womens_football_not_covered", noteJa: "このサイトは男子サッカー専用のため、女子サッカーの成績は扱っていません。", name: safeEcho(name), season: seasonBase }
+        : { found: false, reason: "no_statistics", name: safeEcho(name), season: seasonBase };
       cacheSet(cacheKey, payload, 6 * 60 * 60 * 1000);
       return { status: 200, body: payload };
     }
