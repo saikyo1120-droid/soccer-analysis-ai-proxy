@@ -240,7 +240,7 @@ test("★欠陥7: fetchが失敗しても、消費した1件を必ず書き戻�
   // 失敗時に maybeFlushBudget へ到達しないと、未書き戻し件数が0のままになり、
   // プロセス終了時の書き戻しも行われず、消費が丸ごと記録から消えていた。
   const src = fs.readFileSync(path.join(ROOT, "server/server.js"), "utf8");
-  const fn = src.slice(src.indexOf("async function callApiFootball"), src.indexOf("async function callApiFootball") + 4000);
+  const fn = src.slice(src.indexOf("async function callApiFootball"), src.indexOf("async function callApiFootball") + 8000); // v88: 検索語の畳み込み追加で関数が伸びたため窓を拡大(audit7の欠陥77と同じ対処)
   assert.ok(/finally\s*\{\s*await maybeFlushBudget\(budget\);/.test(fn),
     "fetchをtry/finallyで囲み、失敗時も必ず書き戻し対象にすべき");
 });

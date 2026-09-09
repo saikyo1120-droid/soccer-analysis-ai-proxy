@@ -167,5 +167,28 @@ t("能力が伸びず後退も無い日(前日と同一)は NO だが『後退�
   assert.ok(r.answerJa.includes("後退はしていません"), "『後退はしていない』の明記が無い");
 });
 
+// ---- v88(2026年9月9日・本番初日の実測で発見した文言バグの再発防止) ----
+// 旧文言「本日の的中率は下がっていますが…」は方向を決め打ちしており、的中率が
+// **上がった**日(本番実測: 前日30%→本日63.6%)にも「下がっています」と表示していた。
+t("[v88] 的中率が上がった少数日に『下がっています』と言わない(本番9/9の実データ形)", () => {
+  const r = buildSelfAssessment({
+    accuracyTrend: {
+      available: true,
+      today: mkt(11, 63.6), yesterday: mkt(10, 30),   // 本番2026-09-09の実測値
+      last7Days: mkt(135, 53.4), last30Days: mkt(469, 52.5),
+      vsYesterday: { hitRateDeltaPct: 33.6 },
+    },
+    metricsComparison: { hasBaseline: true, knowledgeDelta: 143, memoryDelta: 18 },
+    intelTrend: { vsYesterday: { reasoningScoreDelta: 5.9 } },
+    weightsUpdated: true,
+  });
+  assert.strictEqual(r.verdict, "YES", "verdict=" + r.verdict + " / " + r.answerJa);
+  assert.ok(!r.answerJa.includes("下がっています"), "上がった日に『下がっています』と言っている: " + r.answerJa);
+  // 参考軸(揺れ)があるときは、方向に依存しない注記が付く
+  if (/揺れ|下回|低下/.test(r.proofs.filter((p) => p.counted === false).map((p) => p.valueJa).join(""))) {
+    assert.ok(r.answerJa.includes("判定には使っていません"), "方向非依存の注記が無い: " + r.answerJa);
+  }
+});
+
 console.log(`\n結果: ${pass}件成功 / ${fail}件失敗`);
 process.exit(fail ? 1 : 0);

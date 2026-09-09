@@ -158,7 +158,9 @@ const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 const UPSTASH_ENABLED = !!(UPSTASH_URL && UPSTASH_TOKEN);
 
 const API_HOST = "v3.football.api-sports.io";
-const API_BASE = `https://${API_HOST}`;
+// v88: テストがモックAPIサーバーへ向け替えられるように環境変数で上書き可能にする
+// (v85でAnthropic側に導入した ANTHROPIC_API_BASE と同じ仕組み。本番では未設定=従来どおり)
+const API_BASE = process.env.API_FOOTBALL_API_BASE || `https://${API_HOST}`;
 
 // index.html がどこに置かれているかは、デプロイ方法によって2パターンある:
 //   (a) このファイル(server.js)と同じフォルダに index.html を置く
@@ -1038,6 +1040,28 @@ function apiCallStatsSnapshot() {
   };
 }
 
+/**
+ * v88(2026年9月9日・利用者の実機報告「今回もKylian Mbappéの実成績データを取得できず」の根治)
+ * ------------------------------------------------------------------------------
+ * API-Footballの検索(search=)は**アクセント付き文字を受け付けない**ことが本番実測で確定した:
+ *   /api/player-season-stats?name=Kylian Mbappé → 毎回 TRANSIENT_ERROR
+ *   /api/player-season-stats?name=Kylian Mbappe → 即ヒット(出場4・4得点まで取得)
+ * 先方はHTTP 200+errors(「only alpha characters」系のパラメータ検証)を返し、こちらは
+ * API_ERROR=一時障害と分類するため、「一時的な障害」という表示のまま**恒久的に**失敗していた。
+ * 登録選手のうち約25名(Mbappé・Ødegaard・Rüdiger・Díaz・Vinícius等)が該当し、全員の
+ * 実成績取得・毎日の選手知識更新が失敗し続けていた(実成績が取れないと考察も軽量モデルに
+ * 落ちる仕様のため、回答の質まで下がっていた)。
+ * 対処: searchパラメータをASCIIへ畳んでから送る(é→e、ø→o等)。先方の検索は
+ * アクセント無しでアクセント付きの登録名にヒットする(上の実測で確認済み)。
+ * 呼び出し箇所ごとではなく全API呼び出しの通り道(この関数)で畳む=直し漏れが構造的に出ない。
+ */
+function foldSearchAscii(s) {
+  let out = String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "");
+  // NFD分解では消えない文字の個別対応(登録名簿に実在する文字+定番のみ。無関係な文字は触らない)
+  const MAP = { "ø": "o", "Ø": "O", "đ": "d", "Đ": "D", "ł": "l", "Ł": "L", "ß": "ss", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ı": "i" };
+  return out.replace(/[øØđĐłŁßæÆœŒı]/g, (c) => MAP[c] || c);
+}
+
 async function callApiFootball(endpoint, params, opts) {
   if (!API_KEY) {
     const err = new Error("API_FOOTBALL_KEY が設定されていません(.envを確認してください)");
@@ -1048,6 +1072,14 @@ async function callApiFootball(endpoint, params, opts) {
   Object.entries(params || {}).forEach(([k, v]) => {
     if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, v);
   });
+  // v88: searchパラメータのアクセント畳み込み(上のfoldSearchAscii参照)。
+  // 畳んだ結果が完全なASCIIになった場合だけ差し替える(日本語名などの非ラテン文字は
+  // 畳んでも直らないため従来どおり送る=挙動不変。ASCIIの名前も従来どおり=挙動不変)。
+  if (url.searchParams.has("search")) {
+    const rawSearch = url.searchParams.get("search");
+    const folded = foldSearchAscii(rawSearch);
+    if (folded !== rawSearch && /^[\x20-\x7E]+$/.test(folded)) url.searchParams.set("search", folded);
+  }
 
   const headers = VIA_RAPIDAPI
     ? { "X-RapidAPI-Key": API_KEY, "X-RapidAPI-Host": API_HOST }
@@ -7861,22 +7893,47 @@ async function handleHttpRequest(req, res) {
           res.end(JSON.stringify({ ok: false, error: e.message }));
           return;
         }
-        const eloRows = clubEloDiag.parseCsv(csvText);
+        const eloRowsAll = clubEloDiag.parseCsv(csvText);
+        // v87.1(監査での指摘⑥): Eloの値域チェック。実際のClubEloは約1000〜2200なので、
+        // 500〜3000を外れる行は壊れたデータとして数えない・保存しない(範囲は緩めに取り、
+        // 本物のデータを誤って弾かない)。保存するのは正常行だけ。
+        const eloRows = eloRowsAll.filter((r) => Number.isFinite(r.elo) && r.elo >= 500 && r.elo <= 3000);
         if (eloRows.length < 100) {
           // 全クラブ一覧は約600行。極端に少ない=取得側の失敗ページやエラーHTMLの可能性が
           // 高いので、既存の保存(7日以内なら代用に使える)を壊さないよう受け取らない。
           res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
-          res.end(JSON.stringify({ ok: false, rows: eloRows.length, messageJa: `CSVとして解釈できた行が${eloRows.length}行しかありません(全クラブ一覧は約600行)。半端なデータで上書きしないため、受け取りませんでした。` }));
+          res.end(JSON.stringify({ ok: false, rows: eloRows.length, rowsRaw: eloRowsAll.length, messageJa: `CSVとして解釈できた正常な行が${eloRows.length}行しかありません(全クラブ一覧は約600行)。半端なデータで上書きしないため、受け取りませんでした。` }));
           return;
         }
         // 日付: 中継側が取得したURLの日付(?date=)を優先。未指定はサーバーの今日(UTC)。
-        // ±2日を超える日付は受け取らない(誤設定・再送の古いデータで上書きしない)。
+        // v87.1(監査での指摘①②の修正):
+        //   ・実在しない日付を弾く。正規表現だけでは "2026-13-45"(Date.parseがNaN→
+        //     大小比較が常にfalseで素通り)や "2026-02-31"(3月3日へ繰り上がる)が通り、
+        //     保存の日付が壊れて当日の学習が0行になるうえ、7日以内の代用も壊れる。
+        //     数値として有効+往復一致(文字列⇄日付で同じ日に戻る)の両方を要求する。
+        //   ・未来の日付は受け取らない(-2日〜今日のみ)。未来日付の保存は「まだ来ない日」
+        //     としてstaleDays<0になり、既存の良い保存を潰したうえ当日分が0行になるため。
+        //     中継(GitHub)は取得時のUTC日付を送るので、正常運用で未来になることはない。
         const todayStr = new Date().toISOString().slice(0, 10);
         let dateStr = parsed.searchParams.get("date") || todayStr;
+        const dateMs = Date.parse(dateStr);
+        const dateDelta = dateMs - Date.parse(todayStr); // 負=過去・正=未来
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)
-          || Math.abs(Date.parse(dateStr) - Date.parse(todayStr)) > 2 * 86400000) {
+          || !Number.isFinite(dateMs)
+          || new Date(dateMs).toISOString().slice(0, 10) !== dateStr
+          || dateDelta > 0
+          || dateDelta < -2 * 86400000) {
           res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
-          res.end(JSON.stringify({ ok: false, messageJa: `dateの形式が不正か、今日から2日超離れています(${String(dateStr).slice(0, 20)})。` }));
+          res.end(JSON.stringify({ ok: false, messageJa: `dateが不正です(実在する日付で、2日前〜今日(UTC)のみ受け取ります): ${String(dateStr).slice(0, 20)}` }));
+          return;
+        }
+        // v87.1(監査での指摘②): 鮮度ガード。既に保存されているデータの方が新しい日付なら
+        // 上書きしない(再送・遅延した古い中継が、新しい保存を潰さないように)。同日は上書き可。
+        const existingDaily = await upstashGetJSON(CLUBELO_DAILY_KEY).catch(() => null);
+        if (existingDaily && typeof existingDaily.date === "string"
+          && /^\d{4}-\d{2}-\d{2}$/.test(existingDaily.date) && existingDaily.date > dateStr) {
+          res.writeHead(409, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, messageJa: `既に新しい日付(${existingDaily.date})のEloが保存されているため、${dateStr}のデータでは上書きしませんでした。` }));
           return;
         }
         const payload = {

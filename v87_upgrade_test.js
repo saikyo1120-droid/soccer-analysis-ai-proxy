@@ -109,6 +109,8 @@ function httpReq(method, url, body, headers) {
     assert.ok(src.includes("expGoalsFromRatings(ratings, r.homeId, r.awayId, r.leagueId)"), "検証時の期待得点計算にリーグIDが渡っていない");
     // 劣化禁止: 学習データ不足時は探索せず全体値
     assert.ok(src.includes("リーグ別ホームアドバンテージの検証に必要な500件"), "データ不足時のガードが無い");
+    // v87.1(監査での指摘⑨の予防): リーグ別の本番学習だけが失敗した日は全体値で保存し直す
+    assert.ok(src.includes("homeAdvFullFitFallback = true"), "本番学習失敗時の全体値フォールバックが無い");
   });
 
   await t("③-1 15大会になっている(J1=98・チャンピオンシップ=40・ブラジル=71・既存12はそのまま)", async () => {
@@ -125,13 +127,27 @@ function httpReq(method, url, body, headers) {
       assert.strictEqual(LEARNED_LEAGUE_IDS.has(id), true, `LEARNED_LEAGUE_IDSに${id}が無い`);
       assert.strictEqual(classifyLearnedCompetition(id, null).learned, true, `ID${id}が学習済みにならない`);
     }
-    // IDの無い古い記録の名前補助(J1・チャンピオンシップ。ブラジルは伊と同名のため意図的に名前では判定しない)
-    assert.strictEqual(classifyLearnedCompetition(null, "J1 League").learned, true, "名前『J1 League』が学習済みにならない");
-    assert.strictEqual(classifyLearnedCompetition(null, "Championship").learned, true, "名前『Championship』が学習済みにならない");
+    // v87.1(監査を受けた修正): 名前の補助判定はID保存開始前の古い記録専用。その時代に
+    // 新3リーグは学習されていなかったので、名前では学習済みに**しない**(遡っての化けを防ぐ)。
+    // これは「Championship」(スコットランド2部と同名)の誤マッチも同時に防ぐ。
+    assert.strictEqual(classifyLearnedCompetition(null, "J1 League").learned, false, "IDの無い古いJ1記録が学習済みに化けている");
+    assert.strictEqual(classifyLearnedCompetition(null, "Championship").learned, false, "IDの無い古いChampionship記録が学習済みに化けている");
+    assert.strictEqual(classifyLearnedCompetition(null, "Premier League").learned, true, "既存の名前補助(当時から学習済み)が壊れた");
     const un = classifyLearnedCompetition(999, "Major League Soccer");
     assert.strictEqual(un.learned, false);
     assert.ok(un.reasonJa.includes("15大会"), "未学習の説明が15大会になっていない: " + un.reasonJa);
     assert.ok(!un.reasonJa.includes("12大会"), "未学習の説明に古い12大会が残っている");
+  });
+
+  await t("①-6 v87.1: 試合数が下限未満のリーグはoffsetを学習しない(1試合9-0でもリーグ別値を作らない)", async () => {
+    // 大量データのリーグ100+「1試合だけ9-0」のリーグ999を混ぜる
+    const tiny = rows.concat([{ leagueId: 999, homeId: 1, awayId: 2, date: new Date(2026, 0, 5).toISOString(), actualHomeGoals: 9, actualAwayGoals: 0 }]);
+    const p = fitTeamRatings(tiny, { minMatches: 10, perLeagueHomeAdv: true });
+    assert.strictEqual(p.available, true);
+    assert.ok(p.homeAdvByLeague && Number.isFinite(p.homeAdvByLeague[100]), "正常リーグの値が消えた");
+    assert.strictEqual(p.homeAdvByLeague[999], undefined, "1試合のリーグにoffsetができている(でっち上げ)");
+    // 下限未満リーグの試合も全体値の学習には正常に寄与する(NaN化しない)
+    assert.ok(Number.isFinite(p.homeAdv) && Number.isFinite(p.mu), "下限未満リーグの混入で数値が壊れた");
   });
 
   await t("③-3 保存容量が15大会×5シーズンに足りる(上限28,000・ブロック容量がそれ以上)", async () => {
@@ -153,8 +169,9 @@ function httpReq(method, url, body, headers) {
   const CSV_HEADER = "Rank,Club,Country,Level,Elo,From,To";
   const bigCsv = [CSV_HEADER].concat(Array.from({ length: 594 }, (_, i) => `${i + 1},Club${i + 1},XX,1,${1500 + (i % 300)},2026-09-09,2026-09-09`)).join("\n");
 
-  await t("④-1 受け口: 405/403/短いCSV400/日付400/正常200と正しい保存形", async () => {
+  await t("④-1 受け口: 405/403/短いCSV400/日付検証/鮮度ガード/値域検証/正常200と正しい保存形", async () => {
     const setCalls = [];
+    const kv = new Map(); // v87.1: 鮮度ガードのテストにはGETが実際に保存値を返る必要がある
     const mockUpstash = http.createServer((req, res) => {
       let body = "";
       req.on("data", (c) => { body += c; });
@@ -162,7 +179,8 @@ function httpReq(method, url, body, headers) {
         let cmds = [];
         try { const j = JSON.parse(body); cmds = Array.isArray(j[0]) ? j : [j]; } catch (e) {}
         const results = cmds.map((c) => {
-          if (c[0] === "SET") { setCalls.push(c); return { result: "OK" }; }
+          if (c[0] === "SET") { setCalls.push(c); kv.set(c[1], c[2]); return { result: "OK" }; }
+          if (c[0] === "GET") return { result: kv.has(c[1]) ? kv.get(c[1]) : null };
           return { result: null };
         });
         res.writeHead(200, { "content-type": "application/json" });
@@ -199,6 +217,19 @@ function httpReq(method, url, body, headers) {
       assert.ok(rShort.body.includes("半端なデータで上書きしない"), "短いCSV拒否の正直な説明が無い");
       const rDate = await httpReq("POST", `${base}?key=v87secret&date=2020-01-01`, bigCsv, { "Content-Type": "text/csv" });
       assert.strictEqual(rDate.status, 400, "古い日付が400でない: " + rDate.status);
+      // ---- v87.1(監査での指摘①): 実在しない日付・繰り上がる日付を弾く ----
+      for (const bad of ["2026-13-45", "2026-02-31", "2026-00-10"]) {
+        const rBad = await httpReq("POST", `${base}?key=v87secret&date=${bad}`, bigCsv, { "Content-Type": "text/csv" });
+        assert.strictEqual(rBad.status, 400, `実在しない日付${bad}が通ってしまう: ` + rBad.status);
+      }
+      // ---- v87.1(監査での指摘②): 未来の日付を弾く ----
+      const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+      const rFuture = await httpReq("POST", `${base}?key=v87secret&date=${tomorrow}`, bigCsv, { "Content-Type": "text/csv" });
+      assert.strictEqual(rFuture.status, 400, "未来の日付が通ってしまう: " + rFuture.status);
+      // ---- v87.1(監査での指摘⑥): 値域外のEloだらけのCSVは保存しない ----
+      const junkCsv = [CSV_HEADER].concat(Array.from({ length: 150 }, (_, i) => `${i + 1},Junk${i + 1},XX,1,99999999,,`)).join("\n");
+      const rJunk = await httpReq("POST", `${base}?key=v87secret`, junkCsv, { "Content-Type": "text/csv" });
+      assert.strictEqual(rJunk.status, 400, "値域外のEloが受理されてしまう: " + rJunk.status);
       const rOk = await httpReq("POST", `${base}?key=v87secret&date=${today}`, bigCsv, { "Content-Type": "text/csv" });
       assert.strictEqual(rOk.status, 200, `正常系が200でない: ${rOk.status} ${rOk.body.slice(0, 200)}`);
       const okBody = JSON.parse(rOk.body);
@@ -211,6 +242,20 @@ function httpReq(method, url, body, headers) {
       assert.strictEqual(saved.source, "gh-relay", "来歴sourceが無い");
       assert.strictEqual(saved.list.length, 594);
       assert.deepStrictEqual(saved.list[0], ["Club1", "XX", 1500], "listの形が[[club,country,elo]]でない: " + JSON.stringify(saved.list[0]));
+      // ---- v87.1(監査での指摘②): 鮮度ガード=新しい保存を古い日付で潰せない(同日の再送は可) ----
+      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+      const rStale = await httpReq("POST", `${base}?key=v87secret&date=${yesterday}`, bigCsv, { "Content-Type": "text/csv" });
+      assert.strictEqual(rStale.status, 409, "古い日付が新しい保存を潰せてしまう: " + rStale.status);
+      const rResend = await httpReq("POST", `${base}?key=v87secret&date=${today}`, bigCsv, { "Content-Type": "text/csv" });
+      assert.strictEqual(rResend.status, 200, "同日の再送が拒否された: " + rResend.status);
+      // ---- v87.1: 値域外の行が混ざったCSVは、正常行だけを保存する ----
+      const mixedCsv = bigCsv + "\n999,BrokenClub,XX,1,99999999,,";
+      const rMixed = await httpReq("POST", `${base}?key=v87secret&date=${today}`, mixedCsv, { "Content-Type": "text/csv" });
+      assert.strictEqual(rMixed.status, 200);
+      const lastSet = setCalls.filter((c) => c[1] === "learn:clubelo:daily").pop();
+      const savedMixed = JSON.parse(lastSet[2]);
+      assert.strictEqual(savedMixed.list.length, 594, "壊れた行が保存に混ざった: " + savedMixed.list.length);
+      assert.ok(!savedMixed.list.some((row) => row[0] === "BrokenClub"), "値域外のクラブが保存されている");
     } finally {
       srv.kill("SIGKILL");
       await new Promise((r) => mockUpstash.close(r));
