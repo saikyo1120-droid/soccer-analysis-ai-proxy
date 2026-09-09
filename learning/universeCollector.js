@@ -40,7 +40,7 @@ const {
   computeInjuryCountFeature, computeStandingsFeature, inferLeagueIdFromFixtures,
   fetchTeamXgAverage,
 } = require("./features");
-const { computePlayerRealStats } = require("./playerFeatures");
+const { computePlayerRealStats, filterMensStatEntries } = require("./playerFeatures");
 const { summarizeTransfers } = require("../rag/knowledgeSource");
 const playerSearch = require("../knowledge/playerSearch");
 
@@ -127,6 +127,18 @@ async function collectUniverse(deps, runAt, dateKey) {
   };
   const canSpend = (n) => (apiBudget ? apiBudget.remainingForJob() >= BUDGET_FLOOR + n : true);
   const skip = (stage, reasonJa) => { stats.skipped.push({ stage, reasonJa }); };
+
+  // ---- v89(2026年9月9日・利用者の指摘「まだ女性の選手が混ざっています」) ----
+  // 提供元がクラブの男子チームIDに女子部門の成績を紐づけている選手が本番で実測された
+  // (行にはクラブ設定の男子ラベルが刻印されるため、v74のチーム名フィルタでは見えない)。
+  // 成績エントリーの中身(実際の出場大会名)で選手単位に判定し、女子大会の成績しか
+  // 持たない選手はこの日の収集から除外+既存の索引行も持ち越さず削除する。
+  // playerId -> { name, evidenceJa(判定根拠になった大会/チーム名) }
+  const womensExcluded = new Map();
+  const noteWomensExcluded = (id, name, st) => {
+    const ev = (st && ((st.league && st.league.name) || (st.team && st.team.name))) || "womens";
+    womensExcluded.set(Number(id), { name: name || null, evidenceJa: String(ev).slice(0, 60) });
+  };
 
   // ---- 第8次監査(Medium)の修正: 同日の再実行ガード ----
   // 輪番は日付で決まるため、同日に再実行すると全く同じ収集(コア約70クラブ×4
@@ -561,7 +573,12 @@ async function collectUniverse(deps, runAt, dateKey) {
         for (const entry of rows) {
           const pl = entry && entry.player;
           if (!pl || !pl.id) continue;
-          const list = Array.isArray(entry.statistics) ? entry.statistics : [];
+          const listAll = Array.isArray(entry.statistics) ? entry.statistics : [];
+          // v89: 女子大会の成績しか持たない選手は収集しない(男子サッカー専用)。
+          // 男子大会の成績を持つ選手は、代表値も男子大会のエントリーからだけ選ぶ。
+          const womensSplit = filterMensStatEntries(listAll);
+          if (womensSplit.womensOnly) { noteWomensExcluded(pl.id, pl.name, listAll[0]); continue; }
+          const list = womensSplit.mens;
           // 出場数が最も多い大会の成績を代表値にする(既存④と同じ基準)
           const best = list.length
             ? list.reduce((acc, cur) =>
@@ -719,6 +736,7 @@ async function collectUniverse(deps, runAt, dateKey) {
   stats.squadOnlySaved = 0;
   for (const p of squadOnlyPending) {
     if (bulkPlayers.has(Number(p.id))) continue;   // 一括取得のほうが情報量が多い
+    if (womensExcluded.has(Number(p.id))) continue; // v89: 女子と判定済みの選手は名簿経由でも保存しない
     try {
       const res = await clubDossier.savePlayer(p);
       if (res && res.saved) {
@@ -830,8 +848,17 @@ async function collectUniverse(deps, runAt, dateKey) {
           indexDirty = true;
           done++; continue;
         }
-        const best = entry.statistics.reduce((acc, cur) =>
-          (((cur.games && cur.games.appearences) || 0) > ((acc.games && acc.games.appearences) || 0) ? cur : acc), entry.statistics[0]);
+        // v89: 女子大会の成績しか持たない選手は記録しない(男子サッカー専用)。
+        // 輪番は前進させる(毎日同じ選手で空振りしないため)。
+        const womensSplitD = filterMensStatEntries(entry.statistics);
+        if (womensSplitD.womensOnly) {
+          noteWomensExcluded(c.playerId, c.name, entry.statistics[0]);
+          statsIndex[c.playerId] = runAt.toISOString();
+          indexDirty = true;
+          done++; continue;
+        }
+        const best = womensSplitD.mens.reduce((acc, cur) =>
+          (((cur.games && cur.games.appearences) || 0) > ((acc.games && acc.games.appearences) || 0) ? cur : acc), womensSplitD.mens[0]);
         const real = computePlayerRealStats(best) || {};
         const detailRecord = {
           id: c.playerId, name: c.name, teamEn: c.club.nameEn, teamJa: c.club.nameJa,
@@ -977,6 +1004,9 @@ async function collectUniverse(deps, runAt, dateKey) {
       for (const [id, rec] of detailPlayers) put(id, rec);
       for (const [id, rec] of bulkPlayers) put(id, rec);   // 最も新しいので最後
 
+      // ---- v89: 女子と判定した選手は、どの情報源(名簿・詳細・一括)経由でも索引に載せない ----
+      for (const id of womensExcluded.keys()) merged.delete(id);
+
       // ---- 索引の行を作る ----
       const rows = [];
       const changed = [];  // { row, prev } — 変化があった選手(速報と保存の対象)
@@ -1008,12 +1038,23 @@ async function collectUniverse(deps, runAt, dateKey) {
       // 今日どの情報源にも現れなかった選手は、前回の行をそのまま残す
       // (クラブの名簿更新が輪番待ちのときに、索引から人が消えないようにする)。
       // ただし60日以上更新が無い行は退団などとみなして落とす。
-      let carried = 0, dropped = 0;
+      let carried = 0, dropped = 0, droppedWomens = 0;
       for (const [id, prev] of prevMap) {
         if (merged.has(id)) continue;
+        // v89: 今日「女子大会の成績しか無い」と判定した選手は、過去に混入した索引行も
+        // 持ち越さずここで削除する(これが既存混入の自動掃除になる。個別記録・詳細データは
+        // この後の「索引に載っている選手だけ残す」刈り込みで同時に消える)。
+        if (womensExcluded.has(id)) { droppedWomens++; continue; }
         const age = playerSearch.daysBetweenKeys(prev[playerSearch.COL.updatedAt], todayKey);
         if (age !== null && age > 60) { dropped++; continue; }
         rows.push(prev); carried++;
+      }
+      // v89: 除外の実測を隠さず記録する(件数と判定根拠の例)
+      if (womensExcluded.size) {
+        const samples = [...womensExcluded.values()].slice(0, 8)
+          .map((x) => (x.name ? `${x.name}(${x.evidenceJa})` : x.evidenceJa)).filter(Boolean);
+        stats.womensExcluded = { count: womensExcluded.size, droppedFromIndex: droppedWomens, samples };
+        skip("womensFilter", `男子サッカー専用の方針により、女子大会の成績しか持たない選手${womensExcluded.size}人を収集・索引から除外しました(提供元がクラブの男子チームIDに女子部門の成績を紐づけているための混入。例: ${samples.slice(0, 3).join("、")})。`);
       }
 
       const C = playerSearch.COL;
@@ -1382,7 +1423,12 @@ async function collectClubPlayersBatch(deps, opts) {
         for (const entry of rows) {
           const pl = entry && entry.player;
           if (!pl || !pl.id) continue;
-          const list = Array.isArray(entry.statistics) ? entry.statistics : [];
+          const listAll = Array.isArray(entry.statistics) ? entry.statistics : [];
+          // v89: 女子大会の成績しか持たない選手は収集しない(collectUniverse側と同じ判定。
+          // 男子の成績を持つ選手は、代表値も男子大会のエントリーからだけ選ぶ)
+          const womensSplitB = filterMensStatEntries(listAll);
+          if (womensSplitB.womensOnly) continue;
+          const list = womensSplitB.mens;
           const best = list.length
             ? list.reduce((acc, cur) =>
               (((cur.games && cur.games.appearences) || 0) > ((acc.games && acc.games.appearences) || 0) ? cur : acc), list[0])

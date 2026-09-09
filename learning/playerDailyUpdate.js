@@ -36,7 +36,7 @@
  *   データで証明できる形になります(このプロジェクトの最優先目標)。
  */
 const { REGISTERED_PLAYERS } = require("./registeredPlayers");
-const { computePlayerRealStats } = require("./playerFeatures");
+const { computePlayerRealStats, filterMensStatEntries } = require("./playerFeatures");
 
 // v78(2026年9月1日・利用者の指示 案3): 「商品として出すまでは、APIの余りは
 // 全て学習に回してよい」との明示指示を受け、既定値を3→20名/日へ引き上げ
@@ -134,7 +134,11 @@ async function resolvePlayerIdCached(player, deps) {
 // 「主戦場」とみなす(リーグ戦を選びたいが、大会名は言語や年度で揺れるため
 // 出場数で選ぶ方が頑健)。
 function pickPrimaryStats(statistics) {
-  const list = Array.isArray(statistics) ? statistics.filter(Boolean) : [];
+  // v89: 女子大会のエントリーは主戦場の候補から外す(男子サッカー専用。
+  // 提供元が男子チームIDに女子部門の成績を紐づけている実例が本番で見つかったため、
+  // 登録選手の日次更新でも同じ判定を通す)
+  const { mens } = filterMensStatEntries(Array.isArray(statistics) ? statistics.filter(Boolean) : []);
+  const list = mens;
   if (!list.length) return null;
   let best = list[0];
   let bestApps = -1;
