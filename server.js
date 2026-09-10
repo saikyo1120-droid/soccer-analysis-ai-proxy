@@ -2540,7 +2540,7 @@ async function handlePredictionsToday() {
           // 知識収集の対象(UEFA上位100クラブ)全部で予想が出ると読めた。
           // 実際には1回の学習で新規記録するのは上限件数までなので、
           // 「今日は順番が回ってこなかった」場合があることを正直に書く。
-          ? `本日の試合${fixtures.length}件の中に、AIが予想を保存している試合はまだありません。AIはUEFA上位100クラブ+登録クラブを日替わりの順番で回り、毎朝の学習で1回あたり最大${OWN_PREDICT_LOG_CAP_DISPLAY}件の予想を新しく作ります。そのため「今日はまだ順番が回っていない」ことがあります。オフシーズン中は対象試合そのものが少ないのも正常です。`
+          ? `本日の試合${fixtures.length}件の中に、AIが予想を保存している試合はまだありません。AIは追跡172クラブ(欧州上位100+J1・5大リーグ全部)+登録クラブを日替わりの順番で回り、毎朝の学習で1回あたり最大${OWN_PREDICT_LOG_CAP_DISPLAY}件の予想を新しく作ります。そのため「今日はまだ順番が回っていない」ことがあります。オフシーズン中は対象試合そのものが少ないのも正常です。`
           : "本日は対象となる試合がありません。シーズン中は毎朝の学習で、ここにAI予想が並びます。")),
   };
   cacheSet(cacheKey, payload, 5 * 60 * 1000);
@@ -7255,7 +7255,7 @@ async function handleHttpRequest(req, res) {
         const club = discussMultiStep.resolveUniverseClub(clubParam);
         if (!club) {
           res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-          res.end(JSON.stringify({ ok: false, reason: "unknown_club", messageJa: "このクラブは予測対象100クラブの中に見つかりませんでした。" }));
+          res.end(JSON.stringify({ ok: false, reason: "unknown_club", messageJa: "このクラブは予測対象の追跡172クラブの中に見つかりませんでした。" }));
           return;
         }
         const csCacheKey = `clubsummary:${club.nameEn.toLowerCase()}`;
@@ -8413,7 +8413,7 @@ async function handleHttpRequest(req, res) {
           res.end(JSON.stringify({
             ok: false, available: state.rows.length > 0,
             reasonJa: state.rows.length
-              ? "この選手は索引に入っていません(TOP100クラブの所属選手のみを収集しています)。"
+              ? "この選手は索引に入っていません(追跡172クラブの所属選手のみを収集しています)。"
               : (state.reasonJa || "索引がまだ作られていません。"),
           }));
           return;

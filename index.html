@@ -1176,6 +1176,17 @@
     "韓国代表": ["South Korea national team", "韩国国家队", "Selección de Corea del Sur"],
     // ---- v87③(学習リーグ拡張 12→15大会): サーバー文言の新版。旧行は過去表示の互換用に残す ----
     "学習した大会(15大会)": ["Learned competitions (15)", "已学习的赛事(15项)", "Competiciones aprendidas (15)"],
+    // ---- v90(追跡クラブ 100→172拡張): 新文言の翻訳。旧行は過去表示の互換用に残す ----
+    "クラブを選ぶ(予測対象172クラブ)…": ["Choose a club (172 covered clubs)…", "选择俱乐部(覆盖172家)…", "Elige un club (172 clubes cubiertos)…"],
+    "この選手は索引に入っていません(追跡172クラブの所属選手のみを収集しています)。": ["This player isn't in the index (only players at the 172 tracked clubs are collected).", "该球员不在索引中(仅收集172家跟踪俱乐部的球员)。", "Este jugador no está en el índice (solo se recogen jugadores de los 172 clubes seguidos)."],
+    "追跡172クラブのうち": ["Of the 172 tracked clubs", "在172家跟踪俱乐部中", "De los 172 clubes seguidos"],
+    "このクラブは予測対象の追跡172クラブの中に見つかりませんでした。": ["This club was not found among the 172 tracked clubs in the prediction pool.", "在预测对象的172家跟踪俱乐部中未找到该俱乐部。", "Este club no figura entre los 172 clubes seguidos del grupo de predicción."],
+    "🌍 追跡クラブの収集(本日)": ["🌍 Tracked-club collection (today)", "🌍 跟踪俱乐部收集(今日)", "🌍 Recogida de clubes seguidos (hoy)"],
+    "🌍 追跡クラブの収集: この日の記録がありません(日次学習が走ると表示されます)。": ["🌍 Tracked-club collection: no record for this day (shown once daily learning runs).", "🌍 跟踪俱乐部收集: 当天无记录(每日学习运行后显示)。", "🌍 Recogida de clubes seguidos: sin registro ese día (aparece al correr el aprendizaje diario)."],
+    "クラブ(追跡対象)": ["clubs (tracked)", "俱乐部(跟踪对象)", "clubes (seguidos)"],
+    "J1リーグ": ["J1 League", "J1联赛", "J1 japonesa"],
+    "チャンピオンシップ(イングランド2部)": ["Championship (England 2nd tier)", "英冠(英格兰第二级)", "Championship (2ª inglesa)"],
+    "ブラジル全国選手権": ["Brazilian Série A", "巴西全国锦标赛", "Brasileirão"],
     "AIが過去試合を学習しているのは15大会(欧州9リーグ+CL・EL・ECL+J1・イングランド2部・ブラジル全国選手権)です。それ以外の大会は学習データが無いため、予想は出しますが実力を測る集計とは分けています。": ["The AI has learned from past matches in 15 competitions (9 European leagues + UCL/UEL/UECL + J1 League, the English Championship and Brazil's Série A). It still makes picks elsewhere, but those are counted separately from the figure that measures its skill.", "AI从15项赛事(欧洲9个联赛+欧冠/欧联/欧协联+J1联赛、英冠、巴西全国锦标赛)的过往比赛中学习。其他赛事仍会给出预测,但与衡量实力的命中率分开统计。", "La IA ha aprendido de partidos de 15 competiciones (9 ligas europeas + UCL/UEL/UECL + la J1 japonesa, el Championship inglés y el Brasileirão). Sigue dando pronósticos en otras, pero se contabilizan aparte de la cifra que mide su nivel."],
   });
   // ---- ⑭ v63「極端な確率の是正」(較正後の確信度・範囲外の開示) ----
@@ -2794,6 +2805,7 @@
     ["具体的な対戦カードが分からなかったため、本日のAIおすすめカード「⦿ vs ⦿」を表示しました。下に分析を表示しています。特定の対戦を知りたい場合は「(クラブ名)と(クラブ名)どっちが勝つ？」のようにクラブ名を含めて聞いてください。📡「本日の実際の試合」に実データがある場合は、そちらも合わせてチェックしてみてください。", "I couldn't tell which fixture you meant, so I'm showing today's AI featured match, \"$1 vs $2\", with the analysis below. To ask about a specific matchup, include both club names, e.g. \"Who wins, (club) or (club)?\". If 📡 \"Today's real matches\" has live data, check that too.", "无法确定你想问哪场对阵,因此展示了今日AI推荐卡「$1 vs $2」,分析在下方。想了解特定对阵时,请在提问中包含两个俱乐部名,例如「(俱乐部)和(俱乐部)谁会赢?」。若📡「今日实际比赛」有实际数据,也建议一并查看。", "No pude identificar el partido que querías, así que muestro el duelo destacado de hoy, «$1 vs $2», con su análisis debajo. Para preguntar por un cruce concreto, incluye ambos nombres, p. ej. «¿Quién gana, (club) o (club)?». Si 📡 «Partidos reales de hoy» tiene datos, revísalo también."],
     ["?force=1(二重起動の保護を外す指定)は、AUTO_COLLECT_SECRETを設定していない場合、1日⦿回までに制限しています。無制限に使えると、外部から何度でも学習ジョブを起動でき、APIの利用枠を使い切られてしまうためです。AUTO_COLLECT_SECRETを設定すると制限なく使えます。", "?force=1 (which bypasses the double-start guard) is limited to $1 uses per day when AUTO_COLLECT_SECRET is unset — otherwise anyone could repeatedly trigger the learning job from outside and drain the API quota. Set AUTO_COLLECT_SECRET to lift the limit.", "在未设置AUTO_COLLECT_SECRET时,?force=1(解除防双重启动保护)每天最多使用$1次——否则外部可反复触发学习任务,耗尽API配额。设置AUTO_COLLECT_SECRET后不受限制。", "?force=1 (que anula la protección de doble arranque) se limita a $1 usos al día si AUTO_COLLECT_SECRET no está configurado; de lo contrario, cualquiera podría lanzar el aprendizaje repetidamente y agotar la cuota de la API. Configure AUTO_COLLECT_SECRET para quitar el límite."],
     ["本日の試合⦿件の中に、AIが予想を保存している試合はまだありません。AIはUEFA上位100クラブ+登録クラブを日替わりの順番で回り、毎朝の学習で1回あたり最大⦿件の予想を新しく作ります。そのため「今日はまだ順番が回っていない」ことがあります。オフシーズン中は対象試合そのものが少ないのも正常です。", "Among today's $1 matches, none has a saved AI prediction yet. The AI rotates daily through the UEFA top-100 plus registered clubs, creating up to $2 new predictions per morning learning run — so some days \"the rotation just hasn't reached them yet\". Fewer eligible matches in the off-season is also normal.", "今天的$1场比赛中,尚无AI已保存预测的比赛。AI每天轮换遍历UEFA前100+注册俱乐部,每次早晨学习最多新建$2条预测,因此可能出现「今天还没轮到」的情况。休赛期对象比赛本身较少也属正常。", "Entre los $1 partidos de hoy, ninguno tiene aún predicción guardada. La IA rota a diario por el top-100 UEFA más los clubes registrados y crea hasta $2 predicciones nuevas por sesión matinal — algunos días «la rotación aún no ha llegado». En temporada baja también es normal que haya pocos partidos elegibles."],
+    ["本日の試合⦿件の中に、AIが予想を保存している試合はまだありません。AIは追跡172クラブ(欧州上位100+J1・5大リーグ全部)+登録クラブを日替わりの順番で回り、毎朝の学習で1回あたり最大⦿件の予想を新しく作ります。そのため「今日はまだ順番が回っていない」ことがあります。オフシーズン中は対象試合そのものが少ないのも正常です。", "Among today's $1 matches, none has a saved AI prediction yet. The AI rotates daily through the 172 tracked clubs (Europe's top-100 plus all of the J1 League and the big-five leagues) plus registered clubs, creating up to $2 new predictions per morning learning run — so some days the rotation just hasn't reached them yet. Fewer eligible matches in the off-season is also normal.", "今天的$1场比赛中,尚无AI已保存预测的比赛。AI每天轮换遍历172家跟踪俱乐部(欧洲前100+J1联赛与五大联赛全部)+注册俱乐部,每次早晨学习最多新建$2条预测,因此可能出现「今天还没轮到」的情况。休赛期对象比赛本身较少也属正常。", "Entre los $1 partidos de hoy, ninguno tiene aún predicción guardada. La IA rota a diario por los 172 clubes seguidos (top-100 europeo más toda la J1 y las cinco grandes ligas) y los clubes registrados, y crea hasta $2 predicciones nuevas por sesión matinal — algunos días «la rotación aún no ha llegado». En temporada baja también es normal que haya pocos partidos elegibles."],
     ["【AIによる推定・戦術傾向】戦術スタイル: ⦿ / フォーメーション傾向: ⦿ / 強み: ⦿ / 弱み: ⦿ / ビルドアップ: ⦿ / プレス: ⦿ / セットプレー: ⦿ / カウンター: ⦿ / ボール保持傾向: ⦿ / ホーム/アウェイ傾向: ⦿", "[AI-estimated tactical profile] Style: $1 / Formation tendency: $2 / Strengths: $3 / Weaknesses: $4 / Build-up: $5 / Pressing: $6 / Set pieces: $7 / Counters: $8 / Possession tendency: $9 / Home-away tendency: ${10}", "【AI推定·战术倾向】战术风格: $1 / 阵型倾向: $2 / 强项: $3 / 弱点: $4 / 出球组织: $5 / 逼抢: $6 / 定位球: $7 / 反击: $8 / 控球倾向: $9 / 主客场倾向: ${10}", "[Perfil táctico estimado por IA] Estilo: $1 / Tendencia de formación: $2 / Fortalezas: $3 / Debilidades: $4 / Salida de balón: $5 / Presión: $6 / Balón parado: $7 / Contras: $8 / Tendencia de posesión: $9 / Tendencia local-visitante: ${10}"],
     ["(accuracy-stats)直前の自動照合で⦿を確認しましたが、まだ結果が確定していないため答え合わせできませんでした(日程変更などで「未開始」に戻った試合が含まれます)。変更後の日程を記録に反映したので、次回は別の試合を確認します。", "The last auto check looked at $1, but results weren't final yet so no verification happened (this includes matches reverted to \"not started\" by schedule changes). The updated schedule has been recorded, so other matches will be checked next time.", "上次自动核对确认了$1,但结果尚未确定,无法完成核对(包括因改期而回到「未开始」状态的比赛)。改期后的赛程已记入记录,下次将确认其他比赛。", "La última verificación automática revisó $1, pero los resultados aún no eran definitivos (incluye partidos que volvieron a «no iniciado» por cambios de calendario). El nuevo calendario quedó registrado; la próxima vez se revisarán otros partidos."],
     ["現時点では⦿・⦿どちらも登録選手データがないため、選手個別の予想は提供できません(実際の試合結果や選手データが揃い次第、対応クラブを拡大予定です)。試合が終了すると、実データに基づいた選手評価と振り返りをこの場所で見られます。", "Neither $1 nor $2 has registered player data yet, so player-level predictions aren't available (coverage will expand as real results and player data come in). Once the match ends, you'll see data-based player ratings and a review here.", "目前$1与$2都没有已登记的球员数据,无法提供球员层面的预测(待真实比赛结果与球员数据齐备后将扩大覆盖)。比赛结束后,可在此看到基于实际数据的球员评价与复盘。", "Ni $1 ni $2 tienen aún datos de jugadores registrados, así que no hay predicciones a nivel de jugador (la cobertura se ampliará según lleguen resultados y datos). Al terminar el partido, aquí verás valoraciones y un repaso basados en datos reales."],
@@ -11647,7 +11659,7 @@ async function renderDailyReportWidget() {
     <span class="value-note">(${escapeHtml(data.noteJa || "")})</span>
     <button class="more-details-btn" id="dailyReportToggleBtn" type="button" style="margin-left:8px; display:inline-block; width:auto; padding:4px 10px;">詳しく見る ▼</button>
     <div class="value-note" style="margin-top:6px;">
-      🏟️ クラブ更新: <strong>${num(u.universeClubsUpdated)}</strong>/${num(u.universeClubsPlanned)}クラブ(TOP100) ・
+      🏟️ クラブ更新: <strong>${num(u.universeClubsUpdated)}</strong>/${num(u.universeClubsPlanned)}クラブ(追跡対象) ・
       👤 選手更新: <strong>${num(u.universePlayersUpdated)}</strong>人 ・
       📚 知識: <strong>+${num(u.knowledgeAdded)}</strong>件(重複${num(u.knowledgeDuplicate)}件・失敗${num(u.failures)}件)
     </div>
@@ -11881,7 +11893,7 @@ async function renderDailyReportWidget() {
   const pc = data.predictionCoverage;
   const coverageHtml = pc
     ? `<div style="margin-top:8px;"><strong>🎯 予測できているクラブの範囲</strong>
-        <div class="value-note">上位100クラブのうち <strong>${num(pc.top100Covered)}クラブ</strong>${Number.isFinite(pc.top100CoveredPct) ? `(${pc.top100CoveredPct}%)` : ""} を予測済み${Number.isFinite(pc.neverPredictedCount) ? ` / 未予測 ${pc.neverPredictedCount}クラブ` : ""}</div>
+        <div class="value-note">追跡172クラブのうち <strong>${num(pc.top100Covered)}クラブ</strong>${Number.isFinite(pc.top100CoveredPct) ? `(${pc.top100CoveredPct}%)` : ""} を予測済み${Number.isFinite(pc.neverPredictedCount) ? ` / 未予測 ${pc.neverPredictedCount}クラブ` : ""}</div>
         ${Array.isArray(pc.neverPredictedSample) && pc.neverPredictedSample.length
           ? `<div class="value-note" style="opacity:.85;">まだ予測していないクラブの例: ${pc.neverPredictedSample.slice(0, 8).map((n) => escapeHtml(n)).join("、")}</div>` : ""}
         ${pc.stoppedReason ? `<div class="value-note">打ち切りの理由: ${escapeHtml(pc.stoppedReason)}</div>` : ""}
@@ -11903,7 +11915,7 @@ async function renderDailyReportWidget() {
   const uErrorCount = (uni && uni.errorCount) ?? upd.universeErrorCount ?? uErrors.length;
   const uUnresolved = (uni && uni.unresolvedClubs) || upd.unresolvedClubs || [];
   const universeHtml = uRan
-    ? `<div style="margin-top:8px;"><strong>🌍 上位100クラブの収集(本日)</strong>
+    ? `<div style="margin-top:8px;"><strong>🌍 追跡クラブの収集(本日)</strong>
         <div class="value-note">
           コア更新 <strong>${num(uGet("universeClubsUpdated", "coreClubsUpdated"))}</strong>/${num(uGet("universeClubsPlanned", "coreClubsPlanned"))}クラブ ・
           名簿 ${num(uGet("universeSquadsUpdated", "squadsUpdated"))} ・ 順位表 ${num(uGet("universeStandingsLeagues", "standingsLeaguesUpdated"))}リーグ ・ xG ${num(uGet("universeXgClubsUpdated", "xgClubsUpdated"))}
@@ -11916,7 +11928,7 @@ async function renderDailyReportWidget() {
         ${uErrorCount ? `<div class="value-note" style="color:var(--critical);">⚠️ 収集エラー ${uErrorCount}件: ${uErrors.slice(0, 3).map((e) => escapeHtml(String(e))).join(" / ")}</div>` : `<div class="value-note" style="opacity:.8;">収集エラーはありませんでした。</div>`}
         ${uUnresolved.length ? `<div class="value-note">🔎 名前を照合できなかったクラブ ${uUnresolved.length}件: ${uUnresolved.slice(0, 4).map((c) => escapeHtml(c.nameJa || c.nameEn || String(c))).join("、")}</div>` : ""}
       </div>`
-    : `<div class="value-note" style="margin-top:8px;">🌍 上位100クラブの収集: この日の記録がありません(日次学習が走ると表示されます)。</div>`;
+    : `<div class="value-note" style="margin-top:8px;">🌍 追跡クラブの収集: この日の記録がありません(日次学習が走ると表示されます)。</div>`;
 
   const roi = data.intelligence && data.intelligence.roi;
   const cal = data.intelligence && data.intelligence.calibration;
@@ -12393,7 +12405,7 @@ function renderMyClubPicker(el) {
     <p class="value-note" style="margin:0 0 8px;">好きなクラブを1つ選ぶと、この場所が「あなたのクラブ」専用の見出しになります(次の試合のAI予想・調子・このクラブでのAIの成績)。登録はこの端末の中だけに保存されます。</p>
     <div style="display:flex; gap:8px; flex-wrap:wrap;">
       <select id="myClubSelect" style="flex:1; min-width:200px; padding:9px 12px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary); font-size:14px;">
-        <option value="">クラブを選ぶ(予測対象100クラブ)…</option>${opts}
+        <option value="">クラブを選ぶ(予測対象172クラブ)…</option>${opts}
       </select>
       <button class="apply-btn" id="myClubSaveBtn" style="margin-top:0; width:auto; padding:9px 16px;">登録する</button>
     </div>`;
@@ -12786,7 +12798,7 @@ async function psLoadFacets() {
 
   const leagueSel = document.getElementById("psLeague");
   if (leagueSel) {
-    const names = { 39: "プレミアリーグ", 140: "ラ・リーガ", 78: "ブンデスリーガ", 135: "セリエA", 61: "リーグ・アン", 94: "プリメイラ・リーガ", 88: "エールディヴィジ", 203: "スュペル・リグ", 218: "オーストリア・ブンデスリーガ", 197: "スーパーリーグ・ギリシャ", 179: "スコティッシュ・プレミアシップ", 106: "エクストラクラサ", 144: "ジュピラー・プロ・リーグ", 207: "スーパーリーグ(スイス)", 210: "プルヴァHNL", 119: "スーペルリーガ", 113: "アリエクスプレスリーグ", 283: "リーガ1", 345: "チェコ・ファーストリーグ", 333: "ウクライナ・プレミアリーグ", 286: "スーパーリーガ(セルビア)", 172: "パルヴァ・リーガ", 235: "ロシア・プレミアリーグ", 271: "NBIリーグ" };
+    const names = { 98: "J1リーグ", 40: "チャンピオンシップ(イングランド2部)", 71: "ブラジル全国選手権", 39: "プレミアリーグ", 140: "ラ・リーガ", 78: "ブンデスリーガ", 135: "セリエA", 61: "リーグ・アン", 94: "プリメイラ・リーガ", 88: "エールディヴィジ", 203: "スュペル・リグ", 218: "オーストリア・ブンデスリーガ", 197: "スーパーリーグ・ギリシャ", 179: "スコティッシュ・プレミアシップ", 106: "エクストラクラサ", 144: "ジュピラー・プロ・リーグ", 207: "スーパーリーグ(スイス)", 210: "プルヴァHNL", 119: "スーペルリーガ", 113: "アリエクスプレスリーグ", 283: "リーガ1", 345: "チェコ・ファーストリーグ", 333: "ウクライナ・プレミアリーグ", 286: "スーパーリーガ(セルビア)", 172: "パルヴァ・リーガ", 235: "ロシア・プレミアリーグ", 271: "NBIリーグ" };
     leagueSel.innerHTML = `<option value="">すべて</option>` + (data.leagues || []).map((l) =>
       `<option value="${psEsc(l.leagueId)}">${psEsc(names[l.leagueId] || `リーグID ${l.leagueId}`)}(${l.count}人)</option>`).join("");
   }
@@ -12829,7 +12841,7 @@ async function psLoadFacets() {
         const ratedNote = Number.isFinite(rated) && psState.indexedCount
           ? ` 成績(平均評価)まで取得できているのは ${rated.toLocaleString()}人です。`
           : "";
-        return `毎日の学習でUEFA上位100クラブから収集した <b>${psState.indexedCount.toLocaleString()}人</b> を、名前・国籍・クラブから探せます。`
+        return `毎日の学習で追跡172クラブ(欧州上位100+J1・5大リーグ全部)から収集した <b>${psState.indexedCount.toLocaleString()}人</b> を、名前・国籍・クラブから探せます。`
           + `現在 ${coverage}・国籍 ${(data.nationalities || []).length}種類。${ratedNote}`
           + ` 新加入・移籍・怪我・成績・調子は毎日の学習の翌日に自動で反映されます。`;
       })()

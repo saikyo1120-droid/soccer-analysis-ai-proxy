@@ -78,8 +78,12 @@ async function main() {
 
   await ok("コア更新の対象が全100クラブ×毎日になっている(universe_knowledge_test A5でも検証)", () => {
     const { clubsForCoreUpdate } = require("../server/learning/clubUniverse");
-    assert.strictEqual(clubsForCoreUpdate("2026-08-10").length, 100);
-    assert.strictEqual(clubsForCoreUpdate("2026-08-11").length, 100);
+    // v90: 宇宙が100→172クラブへ拡張されたため、検査の意図(「全クラブが毎日対象」)を
+    // 固定値100ではなくCLUB_UNIVERSE.lengthとの一致で検証する(拡張しても検査が生きる)
+    const { CLUB_UNIVERSE: CU90 } = require("../server/learning/clubUniverse");
+    assert.strictEqual(clubsForCoreUpdate("2026-08-10").length, CU90.length);
+    assert.strictEqual(clubsForCoreUpdate("2026-08-11").length, CU90.length);
+    assert.ok(CU90.length >= 100, "宇宙が縮んでいる(データ削減の禁止)");
   });
 
   console.log(`\n結果: ${passed}件成功 / ${failed}件失敗`);
