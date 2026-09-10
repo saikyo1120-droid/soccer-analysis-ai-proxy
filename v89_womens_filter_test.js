@@ -131,7 +131,9 @@ function httpGet(url) {
     assert.ok(uc.includes("filterMensStatEntries") && uc.includes("womensExcluded"), "収集側に判定が無い");
     assert.ok(uc.includes("if (womensSplit.womensOnly) { noteWomensExcluded(pl.id, pl.name, listAll[0]); continue; }"), "一括取得(③-b)に判定が無い");
     assert.ok(uc.includes("if (womensSplitD.womensOnly) {"), "詳細取得(④)に判定が無い");
-    assert.ok(uc.includes("if (womensExcluded.has(Number(p.id))) continue;"), "名簿経由の保存に判定が無い");
+    // v91: 名簿経由の判定は「当日の判定 or 過去の記憶」に強化された(復帰者は除く)
+    assert.ok(uc.includes("if ((womensExcluded.has(Number(p.id)) || womensKnown.has(Number(p.id))) && !womensCleared.has(Number(p.id))) continue;"),
+      "名簿経由の保存に判定が無い");
     assert.ok(uc.includes("if (womensSplitB.womensOnly) continue;"), "バッチ収集(collect-players)に判定が無い");
     const pdu = fs.readFileSync(path.join(__dirname, "learning", "playerDailyUpdate.js"), "utf8");
     assert.ok(pdu.includes("filterMensStatEntries"), "登録選手の日次更新に判定が無い");
@@ -139,8 +141,12 @@ function httpGet(url) {
 
   await t("④ 既存混入の自動掃除: 索引に載せない+持ち越しでも落とす+除外を隠さず記録(ソース検査)", async () => {
     const uc = fs.readFileSync(path.join(__dirname, "learning", "universeCollector.js"), "utf8");
-    assert.ok(uc.includes("for (const id of womensExcluded.keys()) merged.delete(id);"), "当日分の除外が無い");
-    assert.ok(uc.includes("if (womensExcluded.has(id)) { droppedWomens++; continue; }"), "持ち越し行の掃除が無い(過去の混入が60日残ってしまう)");
+    // v91: 除外は「当日の判定」から「記憶を含む有効集合(womensEffective)」へ強化された。
+    //   これが無いと、提供元が成績を返さない日に持ち越し行が消えない(M. Tanikawaの実例)。
+    assert.ok(uc.includes("for (const id of womensEffective) merged.delete(id);"), "当日分の除外が無い");
+    assert.ok(uc.includes("if (womensEffective.has(id)) { droppedWomens++; continue; }"), "持ち越し行の掃除が無い(過去の混入が60日残ってしまう)");
+    assert.ok(uc.includes("const womensEffective = new Set([...womensKnown.keys(), ...womensExcluded.keys()]"),
+      "有効集合(記憶+当日)が作られていない");
     assert.ok(uc.includes("stats.womensExcluded = {"), "除外の実測記録が無い");
     assert.ok(uc.includes("男子サッカー専用の方針により"), "除外理由の開示文が無い");
   });

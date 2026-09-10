@@ -4093,10 +4093,22 @@ async function loadPlayerIndex(force) {
         // ---- v74(2026年9月1日・利用者の指摘): 読み込み時にも女子・ユース等を弾く ----
         //   索引の作り直しは夜間なので、保存済みの索引に混入が残っている間も
         //   画面には出さない(即日で直る防波堤)。外した件数は隠さず記録する。
+        // ---- v91(2026年9月10日): 同じ防波堤を「選手IDの記憶」にも広げる ----
+        //   v89でチーム名による判定を入れたが、提供元がクラブの**男子チームID**に
+        //   女子部門の成績を紐づけている選手は、行のチーム名が男子クラブ名のため
+        //   この名前フィルタでは構造的に弾けない(M. Tanikawaが実際にそうだった)。
+        //   毎晩の学習が記録する kb:player:womensexcluded を読み、IDでも弾く。
+        let womensIds = null;
+        try {
+          const wk = UPSTASH_ENABLED ? await upstashGetJSON("kb:player:womensexcluded").catch(() => null) : null;
+          if (wk && wk.ids) womensIds = new Set(Object.keys(wk.ids).map(Number));
+        } catch (e) { /* 読めなくても名前フィルタは効く(劣化しない) */ }
         const allRows = r.rows || [];
         const VAR_RE = matchupLib.SQUAD_VARIANT_RE;
         const CI = playerSearch.COL;
-        playerIndexState.rows = allRows.filter((row) => !VAR_RE.test(String(row[CI.teamEn] || "")) && !VAR_RE.test(String(row[CI.teamJa] || "")));
+        playerIndexState.rows = allRows.filter((row) => !VAR_RE.test(String(row[CI.teamEn] || ""))
+          && !VAR_RE.test(String(row[CI.teamJa] || ""))
+          && !(womensIds && womensIds.has(Number(row[CI.id]))));
         playerIndexState.droppedVariantRows = allRows.length - playerIndexState.rows.length;
         playerIndexState.meta = r.meta || null;
         // 「目次があるのか無いのか」は原因の切り分けに直結するので必ず持ち回す
@@ -6949,13 +6961,38 @@ async function handleHttpRequest(req, res) {
           // v87④: source は「どの経路で届いたか」の開示(gh-relay=GitHub Actions中継 / 無印=直接取得)
           if (sd && sd.date) savedDaily = { date: sd.date, rowCount: Array.isArray(sd.list) ? sd.list.length : null, source: sd.source || "direct", ingestedAt: sd.ingestedAt || null };
         } catch (e) { /* 保存の有無は付加情報 */ }
+        // v91: 中継(GitHub Actions)の最終試行を読む。これが無かったために、11日間
+        //   「中継が動いていないのか、提供元が落ちているのか」を判別できなかった。
+        let lastRelayAttempt = null;
+        try {
+          const ra = UPSTASH_ENABLED ? await upstashGetJSON("learn:clubelo:relay:last").catch(() => null) : null;
+          if (ra && ra.at) lastRelayAttempt = ra;
+        } catch (e) { /* 付加情報 */ }
         const probe = await clubEloDiag.probeDaily({ timeoutMs: 8000 });
+        // v91: 3つの実測(保存・中継の最終試行・たった今の直接接続)から、状態を1行の
+        //   日本語で言い切る。推測は書かない(材料が無い項目は「不明」と正直に言う)。
+        const stateJa = (() => {
+          const relayJa = !lastRelayAttempt
+            ? "中継(GitHub Actions)からの報告は一度もありません(中継が動いていないか、報告機能の配備前です)"
+            : (lastRelayAttempt.ok
+              ? `中継は${String(lastRelayAttempt.at).slice(0, 16)}に成功しています`
+              : `中継は${String(lastRelayAttempt.at).slice(0, 16)}に動きましたが失敗しました(${lastRelayAttempt.messageJa || "理由不明"})`);
+          const probeJa = probe && probe.ok
+            ? "本番サーバーからの直接接続はいま成功しています"
+            : "本番サーバーからの直接接続はいま失敗しています";
+          const savedJa = savedDaily
+            ? `保存されている最新データは${savedDaily.date}(${savedDaily.rowCount}件・経路=${savedDaily.source})`
+            : "保存されているデータがありません";
+          return `${savedJa}。${probeJa}。${relayJa}。`;
+        })();
         const body = {
           ok: true,
           generatedAt: new Date().toISOString(),
           probe,
           savedDaily,
-          noteJa: "probe.attempts が「本番サーバーからclubeloへ実際に接続した結果」です(方式・エラーコード・所要ms)。10分キャッシュされます。",
+          lastRelayAttempt, // v91: 中継の最終試行(成功・失敗の別、段階、HTTPコード)
+          stateJa,          // v91: 上の3点から導いた状態の要約(実測のみ)
+          noteJa: "probe.attempts が「本番サーバーからclubeloへ実際に接続した結果」、lastRelayAttempt が「GitHub Actions中継の最終試行」です。10分キャッシュされます。",
         };
         cacheSet("diag:clubelo", body, 10 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
@@ -7911,6 +7948,29 @@ async function handleHttpRequest(req, res) {
           res.end(JSON.stringify({ ok: false, messageJa: "保存先(Upstash)が未設定のため、受け取ったEloを保存できません。" }));
           return;
         }
+        // ---- v91(2026年9月10日・利用者の指示「中継が届いていない。今すぐ直せ」)の中核 ----
+        //   本当の欠陥は「中継が動いたのか、提供元が落ちているのか、こちらから判別できない」
+        //   ことだった。11日間ずっと推測で話していた。中継は**成功でも失敗でも必ず**
+        //   ここへ結果を報告し、/api/diag/clubelo がそれを開示する。
+        //   これにより「GitHubは動いた/動かなかった」「提供元は何を返した」が実測で分かる。
+        const relayAttemptKey = "learn:clubelo:relay:last";
+        const recordRelayAttempt = async (rec) => {
+          try { await upstashSetJSON(relayAttemptKey, { at: new Date().toISOString(), ...rec }); } catch (e) { /* 記録の失敗で中継本体を止めない */ }
+        };
+        // 中継側が「取得できなかった」ことを報告してくるパス(データは書かない)。
+        // これが無いと、失敗した日はサーバー側に痕跡が1つも残らない。
+        if (parsed.searchParams.get("status") === "failed") {
+          const failStage = String(parsed.searchParams.get("stage") || "fetch").slice(0, 40);
+          const failCode = String(parsed.searchParams.get("code") || "").slice(0, 40);
+          const failDetail = String(parsed.searchParams.get("detail") || "").slice(0, 200);
+          await recordRelayAttempt({
+            ok: false, stage: failStage, httpCode: failCode || null, detail: failDetail || null,
+            messageJa: `中継(GitHub Actions)は動きましたが、提供元からCSVを取得できませんでした(段階=${failStage}${failCode ? `・コード=${failCode}` : ""})。`,
+          });
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: true, recorded: true, noteJa: "失敗の記録を受け取りました(データは変更していません)。/api/diag/clubelo で確認できます。" }));
+          return;
+        }
         let csvText;
         try {
           csvText = await readTextBody(req);
@@ -7927,6 +7987,10 @@ async function handleHttpRequest(req, res) {
         if (eloRows.length < 100) {
           // 全クラブ一覧は約600行。極端に少ない=取得側の失敗ページやエラーHTMLの可能性が
           // 高いので、既存の保存(7日以内なら代用に使える)を壊さないよう受け取らない。
+          await recordRelayAttempt({ // v91: 拒否も記録する(中継は動いたのに中身が駄目だった、が分かる)
+            ok: false, stage: "validate", rowsSeen: eloRows.length, rowsRaw: eloRowsAll.length,
+            messageJa: `中継は届きましたが、CSVの正常な行が${eloRows.length}行しかないため受け取りませんでした。`,
+          });
           res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
           res.end(JSON.stringify({ ok: false, rows: eloRows.length, rowsRaw: eloRowsAll.length, messageJa: `CSVとして解釈できた正常な行が${eloRows.length}行しかありません(全クラブ一覧は約600行)。半端なデータで上書きしないため、受け取りませんでした。` }));
           return;
@@ -7970,10 +8034,15 @@ async function handleHttpRequest(req, res) {
         };
         const savedOk = await upstashSetJSON(CLUBELO_DAILY_KEY, payload);
         if (savedOk === false) {
+          await recordRelayAttempt({ ok: false, stage: "save", dateTried: dateStr, rowsSeen: eloRows.length, messageJa: "中継のデータは正常でしたが、保存先への書き込みに失敗しました。" });
           res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
           res.end(JSON.stringify({ ok: false, messageJa: "Eloの保存に失敗しました(保存先のエラー)。" }));
           return;
         }
+        await recordRelayAttempt({ // v91: 成功も記録する(「最後に中継が成功したのはいつか」が一目で分かる)
+          ok: true, stage: "saved", dateTried: dateStr, rowsSeen: eloRows.length,
+          messageJa: `中継成功: ${dateStr} のクラブElo ${eloRows.length}件を受け取り保存しました。`,
+        });
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify({ ok: true, date: dateStr, rows: eloRows.length, noteJa: "受け取りました。今日の朝の学習は(再取得せずに)このデータを使います。" }));
         return;

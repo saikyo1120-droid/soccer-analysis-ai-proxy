@@ -305,10 +305,12 @@ function httpReq(method, url, body, headers) {
     const y = fs.readFileSync(p, "utf8");
     assert.ok(y.includes('cron: "51 18 * * *"'), "学習(19:17)前のcronが無い");
     assert.ok(y.includes('cron: "21 23 * * *"'), "バックアップ学習(23:43)前のcronが無い");
-    assert.ok(y.includes("api.clubelo.com/${DATE_UTC}"), "clubeloからの取得が無い");
-    assert.ok(y.includes("/api/clubelo/ingest?key="), "本番へのPOSTが無い");
+    // v91: 取得URLは「今日/昨日/一昨日」を回す形に変わった(意図=提供元から取りに行く、は不変)
+    assert.ok(y.includes("api.clubelo.com/${D}"), "clubeloからの取得が無い");
+    assert.ok(y.includes("/api/clubelo/ingest"), "本番へのPOSTが無い");
     assert.ok(y.includes("--data-binary @elo.csv"), "CSV本文の送信が無い");
-    assert.ok(y.includes('-lt 100'), "行数の検証(半端なデータを送らない)が無い");
+    // v91: 行数の検証は取得ループ内の -ge 100 に移った(半端なデータを送らない、は不変)
+    assert.ok(y.includes('[ "${LINES}" -ge 100 ]'), "行数の検証(半端なデータを送らない)が無い");
   });
 
   console.log(`\n結果: ${pass}件成功 / ${fail}件失敗`);
