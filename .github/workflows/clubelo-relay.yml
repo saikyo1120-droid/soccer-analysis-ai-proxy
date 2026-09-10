@@ -1,23 +1,30 @@
 name: ClubElo Relay
 
-# ---- v87④(2026年9月9日・利用者の選択「クラブElo復旧」) ----
-# 本番実測(/api/diag/clubelo)で、Render(本番サーバー)から api.clubelo.com への
-# 直接取得が HTTPS=タイムアウト・HTTP=502 で全滅していることが分かりました
-# (2026年8月30日を最後に日次Eloが止まっていた。リトライは既に3ラウンド×最大30秒
-#  まで強化済みで、サーバー側からはこれ以上打つ手がない=データセンターのIPが
-#  先方またはその手前で弾かれている可能性が高い)。
+# ---- v91(2026年9月10日・利用者の指示「中継が届いていない。今すぐ直せ」) ----
+# v87④で作った中継が、9/9の2回の予約実行のあとも本番にデータを届けていませんでした。
+# 調べたところ、本当の欠陥は中継そのものより「**結果が誰にも分からない**」ことでした:
+#   ・失敗した日はサーバー側に痕跡が1つも残らない
+#   ・そのため「GitHubが動かなかった」のか「提供元が落ちていた」のか判別できず、
+#     11日間ずっと推測で話していた
+# v91での変更:
+#   ①**成功でも失敗でも必ず本番へ報告する**(失敗時は POST ?status=failed)。
+#     結果は /api/diag/clubelo の lastRelayAttempt / stateJa に出ます。
+#   ②curlの終了コードを信用しない。-sS だけだと**HTTP 502でも成功扱い(exit 0)**になり、
+#     エラーページをCSVとして掴んでしまう。HTTPコードを %{http_code} で明示的に見る。
+#   ③今日だけでなく**昨日・一昨日**も試す(提供元が当日分をまだ公開していない場合や、
+#     当日分だけ壊れている場合に自動で拾う。本番の受け口は2日前まで受け付ける設計)。
+#   ④接続タイムアウトを分けて指定し、1回あたりの上限を短くして全体を回しきる。
 #
-# このワークフローは、GitHubの実行機(ここは弾かれていない)が毎朝の学習の前に
-# CSVを取得し、本番の POST /api/clubelo/ingest へ中継します。
-# 本番側は「同日の保存があれば再取得しない」設計なので、学習はこのデータを
-# 自動で使います。中継が失敗した日は、従来どおりの直接取得+7日以内の保存で
-# 代用する動きに自然に戻ります(この仕組みで何かが悪くなることはありません)。
+# 判明している事実(2026年9月10日の実測):
+#   ・clubelo.com 本体サイトは稼働中
+#   ・api.clubelo.com は HTTPS=タイムアウト / HTTP=502 で応答しない(複数の異なる
+#     ネットワークから確認)。つまり提供元のAPI側の問題である可能性が高い。
+#   そのため中継が今日すぐデータを取れる保証はありません。このワークフローの役割は
+#   「**提供元が復旧した瞬間に自動で拾い、復旧していないなら、そのことを実測として残す**」ことです。
 #
-# 使うシークレットは日次学習と同じ2つ(新しい登録は不要です):
-#   LEARNING_ENDPOINT_URL : https://…/api/learning/run-daily(末尾から受け口URLを組み立てます)
+# 使うシークレットは日次学習と同じ2つ(新しい登録は不要):
+#   LEARNING_ENDPOINT_URL : https://…/api/learning/run-daily(末尾から受け口URLを組み立て)
 #   LEARNING_SECRET_KEY   : Renderの環境変数 AUTO_COLLECT_SECRET と同じ値
-# 注意: 受け口はAUTO_COLLECT_SECRET必須です(未設定だと503を返します。
-#       第三者が偽のEloを学習データへ注入できないようにするための設計です)。
 
 on:
   schedule:
@@ -27,50 +34,73 @@ on:
     - cron: "51 18 * * *" # 毎日 UTC 18:51 = 日本時間 翌3:51(学習の約26分前)
     # 保険: 上が遅延・失敗しても、バックアップ学習(UTC 23:43)の前にもう一度。
     - cron: "21 23 * * *" # 毎日 UTC 23:21 = 日本時間 翌8:21
-  workflow_dispatch: {} # 「Actions」タブから手動実行もできる(動作確認用)
+    # v91: 提供元の復旧をなるべく早く捕まえるため、昼にもう1回だけ試す(1日3回)。
+    - cron: "37 11 * * *" # 毎日 UTC 11:37 = 日本時間 20:37
+  workflow_dispatch: {} # 「Actions」タブから手動実行もできる(動作確認用・今すぐ試すとき)
 
 jobs:
   relay-clubelo:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch today's ClubElo CSV and relay it to the server
-        run: |
-          DATE_UTC=$(date -u +%F)
-          echo "取得対象: api.clubelo.com/${DATE_UTC}"
-          # まずhttps、だめならhttp(clubelo側はhttpsが不安定な時期がある)
-          ok=0
-          for SCHEME in https http; do
-            if curl -sS --max-time 60 --retry 2 --retry-delay 10 \
-                 -A "soccer-analysis-ai/1.0 (github-actions clubelo relay)" \
-                 "${SCHEME}://api.clubelo.com/${DATE_UTC}" -o elo.csv; then
-              ok=1; echo "取得成功: ${SCHEME}"; break
-            fi
-            echo "${SCHEME} での取得に失敗。次の方式を試します。"
-          done
-          if [ "$ok" != "1" ]; then
-            echo "::error::clubelo.comからCSVを取得できませんでした(GitHub側からも接続不可)。本番は従来どおり直接取得+保存の代用で動きます。"
-            exit 1
-          fi
-          LINES=$(wc -l < elo.csv)
-          echo "取得したCSVの行数: ${LINES}"
-          if [ "$LINES" -lt 100 ]; then
-            echo "::error::CSVの行数が${LINES}行しかありません(全クラブ一覧は約600行)。エラーページを受け取った可能性が高いため、中継しません。"
-            head -c 500 elo.csv || true
-            exit 1
-          fi
-          BASE="${LEARNING_ENDPOINT_URL%/api/learning/run-daily}"
-          echo "中継先: ${BASE}/api/clubelo/ingest"
-          curl -sS -X POST "${BASE}/api/clubelo/ingest?key=${LEARNING_SECRET_KEY}&date=${DATE_UTC}" \
-            --max-time 60 --retry 2 --retry-delay 15 \
-            -H "Content-Type: text/csv" \
-            --data-binary @elo.csv \
-            -w "\nHTTP status: %{http_code}\n" -o response.json
-          cat response.json
-          if ! grep -q '"ok":true' response.json; then
-            echo "::error::本番への中継に失敗しました(応答に \"ok\":true が含まれません)。よくある原因: LEARNING_SECRET_KEYとRenderのAUTO_COLLECT_SECRETの不一致/Render側でAUTO_COLLECT_SECRET未設定(503)。"
-            exit 1
-          fi
-          echo "中継完了。今日の朝の学習はこのEloデータを使います。"
+      - name: Fetch ClubElo CSV (today / yesterday / 2 days ago) and relay it
         env:
           LEARNING_ENDPOINT_URL: ${{ secrets.LEARNING_ENDPOINT_URL }}
           LEARNING_SECRET_KEY: ${{ secrets.LEARNING_SECRET_KEY }}
+        run: |
+          set -u
+          BASE="${LEARNING_ENDPOINT_URL%/api/learning/run-daily}"
+          INGEST="${BASE}/api/clubelo/ingest"
+          echo "受け口: ${INGEST}"
+
+          # 失敗を本番へ報告する関数(v91の中核。これが無いと痕跡が残らない)
+          report_failure () {
+            STAGE="$1"; CODE="$2"; DETAIL="$3"
+            echo "::warning::中継失敗を本番へ報告します stage=${STAGE} code=${CODE}"
+            curl -sS --max-time 45 --retry 2 --retry-delay 10 -X POST \
+              "${INGEST}?key=${LEARNING_SECRET_KEY}&status=failed&stage=${STAGE}&code=${CODE}&detail=${DETAIL}" \
+              -o report.json -w "\n報告のHTTP: %{http_code}\n" || true
+            cat report.json 2>/dev/null || true
+          }
+
+          FOUND=""
+          LAST_CODE="none"
+          # ③ 今日・昨日・一昨日の順に試す(本番の受け口は2日前まで受け付ける)
+          for BACK in 0 1 2; do
+            D=$(date -u -d "-${BACK} day" +%F)
+            for SCHEME in https http; do
+              URL="${SCHEME}://api.clubelo.com/${D}"
+              echo "--- 取得を試行: ${URL}"
+              # ② 終了コードではなくHTTPコードで判定する(-sS単体だと502でもexit 0になる)
+              CODE=$(curl -sS --connect-timeout 20 --max-time 45 \
+                -A "soccer-analysis-ai/1.0 (github-actions clubelo relay)" \
+                -o elo.csv -w "%{http_code}" "${URL}" 2>curlerr.txt || echo "000")
+              ERR=$(tr -d '\r\n' < curlerr.txt | cut -c1-120)
+              LINES=$(wc -l < elo.csv 2>/dev/null || echo 0)
+              echo "    HTTP=${CODE} 行数=${LINES} ${ERR:+エラー=$ERR}"
+              LAST_CODE="${CODE}"
+              if [ "${CODE}" = "200" ] && [ "${LINES}" -ge 100 ]; then
+                FOUND="${D}"; break 2
+              fi
+            done
+          done
+
+          if [ -z "${FOUND}" ]; then
+            echo "::error::提供元(api.clubelo.com)からCSVを取得できませんでした(最後のHTTPコード: ${LAST_CODE})。本番は従来どおり直接取得+保存の代用で動きます。"
+            head -c 300 elo.csv 2>/dev/null || true
+            report_failure "fetch" "${LAST_CODE}" "no_csv_from_provider"
+            exit 1
+          fi
+
+          echo "取得成功: ${FOUND}(行数 $(wc -l < elo.csv))"
+          HTTP=$(curl -sS --max-time 90 --retry 2 --retry-delay 15 -X POST \
+            "${INGEST}?key=${LEARNING_SECRET_KEY}&date=${FOUND}" \
+            -H "Content-Type: text/csv" --data-binary @elo.csv \
+            -o response.json -w "%{http_code}" || echo "000")
+          echo "中継のHTTP: ${HTTP}"
+          cat response.json 2>/dev/null || true
+          if ! grep -q '"ok":true' response.json 2>/dev/null; then
+            echo "::error::本番への中継に失敗しました(HTTP ${HTTP})。よくある原因: LEARNING_SECRET_KEYとRenderのAUTO_COLLECT_SECRETの不一致/Render側でAUTO_COLLECT_SECRET未設定(503)。"
+            report_failure "post" "${HTTP}" "ingest_rejected"
+            exit 1
+          fi
+          echo "中継完了。今日の朝の学習はこのEloデータを使います。"
