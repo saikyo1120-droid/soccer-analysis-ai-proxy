@@ -57,7 +57,7 @@ const PLAYER_CAP_DEFAULT = Number(process.env.UNIVERSE_PLAYER_CAP) || 300;
 // 従来の1人ずつの詳細取得は**残したまま**併用する
 // (最終方針①劣化禁止・③データ取得量の削減は禁止)。
 const BULK_PAGE_LIMIT = Number(process.env.UNIVERSE_BULK_PAGE_LIMIT) || 4;   // 1クラブあたり最大ページ数(=最大80人)
-const BULK_CLUB_LIMIT = Number(process.env.UNIVERSE_BULK_CLUB_LIMIT) || 100; // 1日あたり一括取得するクラブ数
+const BULK_CLUB_LIMIT = Number(process.env.UNIVERSE_BULK_CLUB_LIMIT) || 200; // 1日あたり一括取得するクラブ数(v90: 100→200。宇宙が172クラブへ拡張されたため。100のままだと101番目以降が永久に成績を取得されない)
 
 function seasonOf(runAt) {
   const m = runAt.getMonth() + 1;

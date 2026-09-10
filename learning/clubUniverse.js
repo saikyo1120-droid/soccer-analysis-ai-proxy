@@ -21,6 +21,18 @@
  *   それ以外のリーグは null とし、実行時に各クラブの直近試合から
  *   inferLeagueIdFromFixtures() で逆算します(誤ったIDの決め打ちをしないため)。
  *
+ * ■ v90(2026年9月10日・利用者の指示): 追跡クラブを100→172へ拡張
+ *   上のUEFA上位100(rank 1〜100)に加えて、rank 101〜172として
+ *   「J1リーグ全20クラブ」と「欧州5大リーグの未追跡クラブ全部」を追加した。
+ *   顔ぶれは2026/27シーズンの実所属をウェブの複数情報源で照合してから登録
+ *   (昇降格を推測で書かない)。同じ照合で、既存クラブのうちウェストハム・
+ *   ジローナ・ヴォルフスブルクが2部へ降格していたことも判明し、静的リーグIDを
+ *   nullへ修正した(追跡は継続。リーグは実行時に直近試合から逆算される)。
+ *   rank 101〜はUEFA係数ではなく「リーグ補完枠」の連番で、全員tier B
+ *   (=xGの高価な収集対象には入らない)。1日の追加コストは
+ *   コア更新288+一括取得約180+名簿輪番約10 ≒ 約480リクエスト
+ *   (Proプラン7,500/日の6〜7%。実測の総消費は約1,200→約1,700/日の見込み)。
+ *
  * ■ 更新頻度の階層(ご指示の「追加のおすすめ」に対応)
  *   tier A(1〜40位)  : 毎日更新(フォーム・怪我・監督/布陣)
  *   tier B(41〜100位): 毎日更新(2026年8月・最終方針でtier Aと同格へ格上げ)
@@ -73,7 +85,9 @@ const CLUB_UNIVERSE = [
   { rank: 38, nameEn: "Olympiakos Piraeus", nameJa: "オリンピアコス", country: "ギリシャ", leagueId: null },
   { rank: 39, nameEn: "Lille", nameJa: "リール", country: "フランス", leagueId: 61 },
   { rank: 40, nameEn: "Marseille", nameJa: "マルセイユ", country: "フランス", leagueId: 61 },
-  { rank: 41, nameEn: "West Ham", nameJa: "ウェストハム", country: "イングランド", leagueId: 39 },
+  // v90: 2025-26シーズンで2部(チャンピオンシップ)へ降格(ウェブ照合済み)。追跡は継続し、
+  //   リーグは実行時に直近試合から逆算する(チャンピオンシップはv87で学習対象になっている)
+  { rank: 41, nameEn: "West Ham", nameJa: "ウェストハム", country: "イングランド", leagueId: null },
   { rank: 42, nameEn: "Lyon", nameJa: "リヨン", country: "フランス", leagueId: 61 },
   { rank: 43, nameEn: "Monaco", nameJa: "モナコ", country: "フランス", leagueId: 61 },
   { rank: 44, nameEn: "Galatasaray", nameJa: "ガラタサライ", country: "トルコ", leagueId: 203 },
@@ -103,12 +117,14 @@ const CLUB_UNIVERSE = [
   { rank: 68, nameEn: "SC Freiburg", nameJa: "SCフライブルク", country: "ドイツ", leagueId: 78 },
   { rank: 69, nameEn: "1899 Hoffenheim", nameJa: "ホッフェンハイム", country: "ドイツ", leagueId: 78 },
   { rank: 70, nameEn: "Union Berlin", nameJa: "ウニオン・ベルリン", country: "ドイツ", leagueId: 78 },
-  { rank: 71, nameEn: "VfL Wolfsburg", nameJa: "VfLヴォルフスブルク", country: "ドイツ", leagueId: 78 },
+  // v90: 2025-26で2部へ降格(ウェブ照合済み)。追跡は継続、リーグは実行時に逆算
+  { rank: 71, nameEn: "VfL Wolfsburg", nameJa: "VfLヴォルフスブルク", country: "ドイツ", leagueId: null },
   { rank: 72, nameEn: "Bologna", nameJa: "ボローニャ", country: "イタリア", leagueId: 135 },
   { rank: 73, nameEn: "Torino", nameJa: "トリノ", country: "イタリア", leagueId: 135 },
   { rank: 74, nameEn: "Athletic Club", nameJa: "アスレティック・ビルバオ", country: "スペイン", leagueId: 140 },
   { rank: 75, nameEn: "Valencia", nameJa: "バレンシア", country: "スペイン", leagueId: 140 },
-  { rank: 76, nameEn: "Girona", nameJa: "ジローナ", country: "スペイン", leagueId: 140 },
+  // v90: 2025-26で2部へ降格(ウェブ照合済み)。追跡は継続、リーグは実行時に逆算
+  { rank: 76, nameEn: "Girona", nameJa: "ジローナ", country: "スペイン", leagueId: null },
   { rank: 77, nameEn: "Besiktas", nameJa: "ベシクタシュ", country: "トルコ", leagueId: 203 },
   { rank: 78, nameEn: "Trabzonspor", nameJa: "トラブゾンスポル", country: "トルコ", leagueId: 203 },
   { rank: 79, nameEn: "AZ Alkmaar", nameJa: "AZアルクマール", country: "オランダ", leagueId: 88 },
@@ -133,6 +149,95 @@ const CLUB_UNIVERSE = [
   { rank: 98, nameEn: "Royal Antwerp", nameJa: "ロイヤル・アントワープ", country: "ベルギー", leagueId: 144 },
   { rank: 99, nameEn: "Standard Liege", nameJa: "スタンダール・リエージュ", country: "ベルギー", leagueId: 144 },
   { rank: 100, nameEn: "Servette", nameJa: "セルヴェット", country: "スイス", leagueId: null },
+
+  // ================================================================
+  // v90(2026年9月10日・利用者の指示「情報をとっていないクラブを無理なく増やして」)
+  // ----------------------------------------------------------------
+  // 拡張の範囲(利用者が選択): J1全20クラブ + 欧州5大リーグの未追跡クラブ全部。
+  // 所属クラブの顔ぶれは2026/27シーズン(J1は秋春制移行後の2026-27)の実際の
+  // メンバーを、複数のウェブ情報源で照合してから登録した(推測で書いていない)。
+  // rank 101〜はUEFA係数のスナップショットではなく「リーグ補完枠」の連番
+  // (tier判定はrank>40=Bになり、xGの高価な収集対象には入らない=無理のない範囲)。
+  // J1のleagueIdは動作確認前のためnull(既存方針どおり実行時に直近試合から逆算。
+  // 実測確認後に98を静的化してよい)。
+  // ---- J1リーグ 2026-27(20クラブ) ----
+  { rank: 101, nameEn: "Kashima Antlers", nameJa: "鹿島アントラーズ", country: "日本", leagueId: null },
+  { rank: 102, nameEn: "Mito Hollyhock", nameJa: "水戸ホーリーホック", country: "日本", leagueId: null },
+  { rank: 103, nameEn: "Urawa Red Diamonds", nameJa: "浦和レッズ", country: "日本", leagueId: null, searchAs: "Urawa" },
+  { rank: 104, nameEn: "JEF United Chiba", nameJa: "ジェフユナイテッド千葉", country: "日本", leagueId: null },
+  { rank: 105, nameEn: "Kashiwa Reysol", nameJa: "柏レイソル", country: "日本", leagueId: null },
+  { rank: 106, nameEn: "FC Tokyo", nameJa: "FC東京", country: "日本", leagueId: null },
+  { rank: 107, nameEn: "Tokyo Verdy", nameJa: "東京ヴェルディ", country: "日本", leagueId: null },
+  { rank: 108, nameEn: "Machida Zelvia", nameJa: "FC町田ゼルビア", country: "日本", leagueId: null },
+  { rank: 109, nameEn: "Kawasaki Frontale", nameJa: "川崎フロンターレ", country: "日本", leagueId: null },
+  { rank: 110, nameEn: "Yokohama F. Marinos", nameJa: "横浜F・マリノス", country: "日本", leagueId: null, searchAs: "Marinos" },
+  { rank: 111, nameEn: "Shimizu S-Pulse", nameJa: "清水エスパルス", country: "日本", leagueId: null, searchAs: "Shimizu" },
+  { rank: 112, nameEn: "Nagoya Grampus", nameJa: "名古屋グランパス", country: "日本", leagueId: null },
+  { rank: 113, nameEn: "Kyoto Sanga", nameJa: "京都サンガF.C.", country: "日本", leagueId: null },
+  { rank: 114, nameEn: "Gamba Osaka", nameJa: "ガンバ大阪", country: "日本", leagueId: null },
+  { rank: 115, nameEn: "Cerezo Osaka", nameJa: "セレッソ大阪", country: "日本", leagueId: null },
+  { rank: 116, nameEn: "Vissel Kobe", nameJa: "ヴィッセル神戸", country: "日本", leagueId: null },
+  { rank: 117, nameEn: "Fagiano Okayama", nameJa: "ファジアーノ岡山", country: "日本", leagueId: null },
+  { rank: 118, nameEn: "Sanfrecce Hiroshima", nameJa: "サンフレッチェ広島", country: "日本", leagueId: null },
+  { rank: 119, nameEn: "Avispa Fukuoka", nameJa: "アビスパ福岡", country: "日本", leagueId: null },
+  { rank: 120, nameEn: "V-Varen Nagasaki", nameJa: "V・ファーレン長崎", country: "日本", leagueId: null, searchAs: "Nagasaki" },
+  // ---- プレミアリーグ 2026-27の未追跡11クラブ ----
+  { rank: 121, nameEn: "Bournemouth", nameJa: "ボーンマス", country: "イングランド", leagueId: 39 },
+  { rank: 122, nameEn: "Brentford", nameJa: "ブレントフォード", country: "イングランド", leagueId: 39 },
+  { rank: 123, nameEn: "Coventry", nameJa: "コヴェントリー・シティ", country: "イングランド", leagueId: 39 },
+  { rank: 124, nameEn: "Crystal Palace", nameJa: "クリスタル・パレス", country: "イングランド", leagueId: 39 },
+  { rank: 125, nameEn: "Everton", nameJa: "エヴァートン", country: "イングランド", leagueId: 39 },
+  { rank: 126, nameEn: "Fulham", nameJa: "フラム", country: "イングランド", leagueId: 39 },
+  { rank: 127, nameEn: "Hull City", nameJa: "ハル・シティ", country: "イングランド", leagueId: 39 },
+  { rank: 128, nameEn: "Ipswich", nameJa: "イプスウィッチ・タウン", country: "イングランド", leagueId: 39 },
+  { rank: 129, nameEn: "Leeds", nameJa: "リーズ・ユナイテッド", country: "イングランド", leagueId: 39 },
+  { rank: 130, nameEn: "Nottingham Forest", nameJa: "ノッティンガム・フォレスト", country: "イングランド", leagueId: 39 },
+  { rank: 131, nameEn: "Sunderland", nameJa: "サンダーランド", country: "イングランド", leagueId: 39 },
+  // ---- ラ・リーガ 2026-27の未追跡11クラブ ----
+  { rank: 132, nameEn: "Osasuna", nameJa: "オサスナ", country: "スペイン", leagueId: 140 },
+  { rank: 133, nameEn: "Alaves", nameJa: "アラベス", country: "スペイン", leagueId: 140 },
+  { rank: 134, nameEn: "Elche", nameJa: "エルチェ", country: "スペイン", leagueId: 140 },
+  { rank: 135, nameEn: "Getafe", nameJa: "ヘタフェ", country: "スペイン", leagueId: 140 },
+  { rank: 136, nameEn: "Levante", nameJa: "レバンテ", country: "スペイン", leagueId: 140 },
+  { rank: 137, nameEn: "Malaga", nameJa: "マラガ", country: "スペイン", leagueId: 140 },
+  { rank: 138, nameEn: "Racing Santander", nameJa: "ラシン・サンタンデール", country: "スペイン", leagueId: 140 },
+  { rank: 139, nameEn: "Rayo Vallecano", nameJa: "ラージョ・バジェカーノ", country: "スペイン", leagueId: 140 },
+  { rank: 140, nameEn: "Celta Vigo", nameJa: "セルタ", country: "スペイン", leagueId: 140 },
+  { rank: 141, nameEn: "Deportivo La Coruna", nameJa: "デポルティーボ・ラ・コルーニャ", country: "スペイン", leagueId: 140, searchAs: "Coruna" },
+  { rank: 142, nameEn: "Espanyol", nameJa: "エスパニョール", country: "スペイン", leagueId: 140 },
+  // ---- セリエA 2026-27の未追跡10クラブ ----
+  { rank: 143, nameEn: "Udinese", nameJa: "ウディネーゼ", country: "イタリア", leagueId: 135 },
+  { rank: 144, nameEn: "Sassuolo", nameJa: "サッスオーロ", country: "イタリア", leagueId: 135 },
+  { rank: 145, nameEn: "Parma", nameJa: "パルマ", country: "イタリア", leagueId: 135 },
+  { rank: 146, nameEn: "Cagliari", nameJa: "カリアリ", country: "イタリア", leagueId: 135 },
+  { rank: 147, nameEn: "Genoa", nameJa: "ジェノア", country: "イタリア", leagueId: 135 },
+  { rank: 148, nameEn: "Lecce", nameJa: "レッチェ", country: "イタリア", leagueId: 135 },
+  { rank: 149, nameEn: "Como", nameJa: "コモ", country: "イタリア", leagueId: 135 },
+  { rank: 150, nameEn: "Frosinone", nameJa: "フロジノーネ", country: "イタリア", leagueId: 135 },
+  { rank: 151, nameEn: "Venezia", nameJa: "ヴェネツィア", country: "イタリア", leagueId: 135 },
+  { rank: 152, nameEn: "Monza", nameJa: "モンツァ", country: "イタリア", leagueId: 135 },
+  // ---- ブンデスリーガ 2026-27の未追跡10クラブ ----
+  { rank: 153, nameEn: "FC Augsburg", nameJa: "アウクスブルク", country: "ドイツ", leagueId: 78 },
+  { rank: 154, nameEn: "Borussia Monchengladbach", nameJa: "ボルシアMG", country: "ドイツ", leagueId: 78, searchAs: "Gladbach" },
+  { rank: 155, nameEn: "Werder Bremen", nameJa: "ヴェルダー・ブレーメン", country: "ドイツ", leagueId: 78 },
+  { rank: 156, nameEn: "FC Koln", nameJa: "1.FCケルン", country: "ドイツ", leagueId: 78, searchAs: "Koln" },
+  { rank: 157, nameEn: "SV Elversberg", nameJa: "エルフェアスベルク", country: "ドイツ", leagueId: 78 },
+  { rank: 158, nameEn: "Hamburger SV", nameJa: "ハンブルガーSV", country: "ドイツ", leagueId: 78 },
+  { rank: 159, nameEn: "FSV Mainz 05", nameJa: "マインツ", country: "ドイツ", leagueId: 78, searchAs: "Mainz" },
+  { rank: 160, nameEn: "SC Paderborn 07", nameJa: "パーダーボルン", country: "ドイツ", leagueId: 78, searchAs: "Paderborn" },
+  { rank: 161, nameEn: "Schalke 04", nameJa: "シャルケ", country: "ドイツ", leagueId: 78 },
+  { rank: 162, nameEn: "VfB Stuttgart", nameJa: "シュトゥットガルト", country: "ドイツ", leagueId: 78 },
+  // ---- リーグ・アン 2026-27の未追跡10クラブ ----
+  { rank: 163, nameEn: "Lens", nameJa: "RCランス", country: "フランス", leagueId: 61 },
+  { rank: 164, nameEn: "Strasbourg", nameJa: "ストラスブール", country: "フランス", leagueId: 61 },
+  { rank: 165, nameEn: "Lorient", nameJa: "ロリアン", country: "フランス", leagueId: 61 },
+  { rank: 166, nameEn: "Paris FC", nameJa: "パリFC", country: "フランス", leagueId: 61 },
+  { rank: 167, nameEn: "Stade Brestois 29", nameJa: "ブレスト", country: "フランス", leagueId: 61, searchAs: "Brestois" },
+  { rank: 168, nameEn: "Angers", nameJa: "アンジェ", country: "フランス", leagueId: 61 },
+  { rank: 169, nameEn: "Le Havre", nameJa: "ル・アーヴル", country: "フランス", leagueId: 61 },
+  { rank: 170, nameEn: "Auxerre", nameJa: "オセール", country: "フランス", leagueId: 61 },
+  { rank: 171, nameEn: "Troyes", nameJa: "トロワ", country: "フランス", leagueId: 61 },
+  { rank: 172, nameEn: "Le Mans", nameJa: "ル・マン", country: "フランス", leagueId: 61 },
 ];
 
 const UEFA_SNAPSHOT_NOTE_JA =
