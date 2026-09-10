@@ -139,6 +139,26 @@ async function collectUniverse(deps, runAt, dateKey) {
     const ev = (st && ((st.league && st.league.name) || (st.team && st.team.name))) || "womens";
     womensExcluded.set(Number(id), { name: name || null, evidenceJa: String(ev).slice(0, 60) });
   };
+  // ---- v91(2026年9月10日・利用者の報告「まだ索引に残っている」への根治) ----
+  // v89の穴: 除外判定は「その日に成績が取れた選手」にしか効かなかった。提供元が
+  // その選手の成績を1件も返さない日は、女子かどうか判定できず(未出場の男子選手を
+  // 誤って消さないための正しい仕様)、過去に混入した索引行がそのまま持ち越されていた。
+  // 実際、v89の配備後に24人を除外できたのに M. Tanikawa は索引に残り続けた。
+  // 対策: 一度でも「女子大会の成績しか無い」と判定した選手IDを**保存して覚える**。
+  // 以後は毎日、その日の判定に関係なく除外する。
+  // 誤判定の逃げ道も必ず用意する(でっち上げの逆=無実の選手を永久追放しない):
+  // 男子大会の成績が1件でも観測された日は、記憶から消して復帰させる。
+  const WOMENS_KNOWN_KEY = "kb:player:womensexcluded";
+  const WOMENS_KNOWN_CAP = 2000; // 保存サイズの上限(超えたら古いものから捨てる)
+  const womensKnown = new Map();   // 保存済み: id -> {name, evidenceJa, at}
+  const womensCleared = new Set(); // 今日、男子の成績が観測された= 記憶から外す
+  const noteMensConfirmed = (id) => { if (womensKnown.has(Number(id))) womensCleared.add(Number(id)); };
+  try {
+    const savedWomens = deps.upstashGetJSON ? await deps.upstashGetJSON(WOMENS_KNOWN_KEY).catch(() => null) : null;
+    for (const [id, v] of Object.entries((savedWomens && savedWomens.ids) || {})) {
+      if (Number.isFinite(Number(id))) womensKnown.set(Number(id), v || {});
+    }
+  } catch (e) { /* 読めなくても当日の判定は動く(劣化しない) */ }
 
   // ---- 第8次監査(Medium)の修正: 同日の再実行ガード ----
   // 輪番は日付で決まるため、同日に再実行すると全く同じ収集(コア約70クラブ×4
@@ -578,6 +598,9 @@ async function collectUniverse(deps, runAt, dateKey) {
           // 男子大会の成績を持つ選手は、代表値も男子大会のエントリーからだけ選ぶ。
           const womensSplit = filterMensStatEntries(listAll);
           if (womensSplit.womensOnly) { noteWomensExcluded(pl.id, pl.name, listAll[0]); continue; }
+          // v91: 男子大会の成績が観測できた選手は「女子」の記憶から外す(誤判定の逃げ道)
+          if (womensSplit.mens.length) noteMensConfirmed(pl.id);
+          if (womensKnown.has(Number(pl.id)) && !womensCleared.has(Number(pl.id))) continue; // v91: 記憶済みは今日の判定に関係なく除外
           const list = womensSplit.mens;
           // 出場数が最も多い大会の成績を代表値にする(既存④と同じ基準)
           const best = list.length
@@ -736,7 +759,8 @@ async function collectUniverse(deps, runAt, dateKey) {
   stats.squadOnlySaved = 0;
   for (const p of squadOnlyPending) {
     if (bulkPlayers.has(Number(p.id))) continue;   // 一括取得のほうが情報量が多い
-    if (womensExcluded.has(Number(p.id))) continue; // v89: 女子と判定済みの選手は名簿経由でも保存しない
+    // v89/v91: 女子と判定済み(今日の判定+過去の記憶)の選手は名簿経由でも保存しない
+    if ((womensExcluded.has(Number(p.id)) || womensKnown.has(Number(p.id))) && !womensCleared.has(Number(p.id))) continue;
     try {
       const res = await clubDossier.savePlayer(p);
       if (res && res.saved) {
@@ -851,6 +875,7 @@ async function collectUniverse(deps, runAt, dateKey) {
         // v89: 女子大会の成績しか持たない選手は記録しない(男子サッカー専用)。
         // 輪番は前進させる(毎日同じ選手で空振りしないため)。
         const womensSplitD = filterMensStatEntries(entry.statistics);
+        if (womensSplitD.mens.length) noteMensConfirmed(c.playerId); // v91: 男子成績が観測できたら記憶から復帰
         if (womensSplitD.womensOnly) {
           noteWomensExcluded(c.playerId, c.name, entry.statistics[0]);
           statsIndex[c.playerId] = runAt.toISOString();
@@ -1004,8 +1029,13 @@ async function collectUniverse(deps, runAt, dateKey) {
       for (const [id, rec] of detailPlayers) put(id, rec);
       for (const [id, rec] of bulkPlayers) put(id, rec);   // 最も新しいので最後
 
-      // ---- v89: 女子と判定した選手は、どの情報源(名簿・詳細・一括)経由でも索引に載せない ----
-      for (const id of womensExcluded.keys()) merged.delete(id);
+      // ---- v89/v91: 女子と判定した選手は、どの情報源(名簿・詳細・一括)経由でも索引に載せない ----
+      //   v91: 「今日そう判定した人」だけでなく「過去に一度でもそう判定した人」も対象にする。
+      //   これが無いと、提供元が成績を返さない日に過去の混入行が持ち越されて消えない
+      //   (M. Tanikawaが実際にそうだった)。男子成績が観測できた人(womensCleared)は除く。
+      const womensEffective = new Set([...womensKnown.keys(), ...womensExcluded.keys()]
+        .filter((id) => !womensCleared.has(Number(id))).map(Number));
+      for (const id of womensEffective) merged.delete(id);
 
       // ---- 索引の行を作る ----
       const rows = [];
@@ -1041,20 +1071,43 @@ async function collectUniverse(deps, runAt, dateKey) {
       let carried = 0, dropped = 0, droppedWomens = 0;
       for (const [id, prev] of prevMap) {
         if (merged.has(id)) continue;
-        // v89: 今日「女子大会の成績しか無い」と判定した選手は、過去に混入した索引行も
-        // 持ち越さずここで削除する(これが既存混入の自動掃除になる。個別記録・詳細データは
-        // この後の「索引に載っている選手だけ残す」刈り込みで同時に消える)。
-        if (womensExcluded.has(id)) { droppedWomens++; continue; }
+        // v89/v91: 女子と判定した選手は、過去に混入した索引行も持ち越さずここで削除する
+        // (これが既存混入の自動掃除。個別記録・詳細データはこの後の「索引に載っている
+        //  選手だけ残す」刈り込みで同時に消える)。v91で判定を「今日の分」から
+        // 「記憶を含む有効集合」へ広げた=成績が返ってこない日でも確実に消える。
+        if (womensEffective.has(id)) { droppedWomens++; continue; }
         const age = playerSearch.daysBetweenKeys(prev[playerSearch.COL.updatedAt], todayKey);
         if (age !== null && age > 60) { dropped++; continue; }
         rows.push(prev); carried++;
       }
-      // v89: 除外の実測を隠さず記録する(件数と判定根拠の例)
-      if (womensExcluded.size) {
+      // ---- v91: 判定結果を保存して次回以降も効かせる(これが持ち越し混入の根治) ----
+      //   保存するのは「女子大会の成績しか無い」と実際に観測した選手だけ。推測では書かない。
+      //   男子成績が観測できた選手(womensCleared)は記憶から外して復帰させる。
+      try {
+        if (deps.upstashSetJSON) {
+          const mergedIds = {};
+          for (const [id, v] of womensKnown) if (!womensCleared.has(id)) mergedIds[id] = v;
+          for (const [id, v] of womensExcluded) mergedIds[id] = { ...v, at: runAt.toISOString() };
+          // 上限を超えたら古い記録から捨てる(保存サイズを無制限に伸ばさない)
+          let entries = Object.entries(mergedIds);
+          if (entries.length > WOMENS_KNOWN_CAP) {
+            entries = entries.sort((a, b) => String(b[1].at || "").localeCompare(String(a[1].at || ""))).slice(0, WOMENS_KNOWN_CAP);
+          }
+          await deps.upstashSetJSON(WOMENS_KNOWN_KEY, {
+            ids: Object.fromEntries(entries), updatedAt: runAt.toISOString(), count: entries.length,
+          });
+          stats.womensKnownSaved = entries.length;
+        }
+      } catch (e) { /* 記憶の保存に失敗しても当日の除外は効いている(劣化しない) */ }
+      // v89/v91: 除外の実測を隠さず記録する(件数と判定根拠の例)
+      if (womensExcluded.size || droppedWomens || womensCleared.size) {
         const samples = [...womensExcluded.values()].slice(0, 8)
           .map((x) => (x.name ? `${x.name}(${x.evidenceJa})` : x.evidenceJa)).filter(Boolean);
-        stats.womensExcluded = { count: womensExcluded.size, droppedFromIndex: droppedWomens, samples };
-        skip("womensFilter", `男子サッカー専用の方針により、女子大会の成績しか持たない選手${womensExcluded.size}人を収集・索引から除外しました(提供元がクラブの男子チームIDに女子部門の成績を紐づけているための混入。例: ${samples.slice(0, 3).join("、")})。`);
+        stats.womensExcluded = {
+          count: womensExcluded.size, droppedFromIndex: droppedWomens,
+          knownRemembered: womensKnown.size, restoredAsMens: womensCleared.size, samples,
+        };
+        skip("womensFilter", `男子サッカー専用の方針により、女子大会の成績しか持たない選手を収集・索引から除外しました(本日の新規判定${womensExcluded.size}人・記憶済み${womensKnown.size}人・索引から削除${droppedWomens}人${womensCleared.size ? `・男子成績が確認できて復帰${womensCleared.size}人` : ""})。提供元がクラブの男子チームIDに女子部門の成績を紐づけているための混入です。${samples.length ? `例: ${samples.slice(0, 3).join("、")}` : ""}`);
       }
 
       const C = playerSearch.COL;
@@ -1429,6 +1482,8 @@ async function collectClubPlayersBatch(deps, opts) {
           const womensSplitB = filterMensStatEntries(listAll);
           if (womensSplitB.womensOnly) continue;
           const list = womensSplitB.mens;
+          // 注: このバッチ関数(collectClubPlayersBatch)はcollectUniverseとは別の入口で、
+          // 記憶(kb:player:womensexcluded)を持たない。当日の判定だけで十分な軽い経路のため。
           const best = list.length
             ? list.reduce((acc, cur) =>
               (((cur.games && cur.games.appearences) || 0) > ((acc.games && acc.games.appearences) || 0) ? cur : acc), list[0])
