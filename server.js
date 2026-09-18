@@ -3951,7 +3951,12 @@ const thoughtTimeline = createThoughtTimeline({
 // 「直近の実測値で補い、いつのデータかを明示する」動きになる。
 const { createClubDossier } = require("./knowledge/clubDossier");
 const clubDossier = createClubDossier({
-  upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
+  upstashEnabled: UPSTASH_ENABLED,
+  // v92: 関数の参照を写し取らず、呼び出し時点の入口を通す(本番の挙動は同一。
+  //   テストが保存先を差し替えたとき、ここだけ本物へ素通りしていた穴を塞ぐ)
+  upstashCmd: (cmd) => upstashCmd(cmd),
+  upstashGetJSON: (key) => upstashGetJSON(key),
+  upstashSetJSON: (key, value) => upstashSetJSON(key, value),
 });
 
 // ---- 2026年8月・選手スカウティングの全面刷新(ご要望①〜⑩) ----
@@ -7427,7 +7432,9 @@ async function handleHttpRequest(req, res) {
           body = { ok: true, available: false, reasonJa: "保存先(Upstash)が未設定のため、答え合わせの記録がありません。" };
         } else {
           try {
-            const raw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", "-300", "-1"])) || [];
+            // v92: 表示窓の大きさに名前を付ける(値は従来どおり300。v86で保存2000件・表示300件と意図的に分けた)
+            const REFLECTIONS_WINDOW = 300;
+            const raw = (await upstashCmd(["LRANGE", "learn:ownpred:recent", String(-REFLECTIONS_WINDOW), "-1"])) || [];
             const recs = raw.map((x) => { try { return typeof x === "object" ? x : JSON.parse(x); } catch (e) { return null; } })
               .filter((r) => r && r.resolved);
             recs.sort((a, b) => String(b.resolvedAt || "").localeCompare(String(a.resolvedAt || "")));
@@ -7512,6 +7519,15 @@ async function handleHttpRequest(req, res) {
                 hits: officialHits.length,
                 hitRatePct: officialRecs.length ? Math.round((officialHits.length / officialRecs.length) * 1000) / 10 : null,
                 referenceN: recs.length - officialRecs.length,
+                // ---- v92(2026年9月18日・利用者の承認「開示だけ追加」): この成績の「窓」を明記する ----
+                //   上の数字は LRANGE -300 -1、つまり答え合わせ済み予測の**直近300件**だけの
+                //   ローリング窓(累計ではない)。古い記録は窓から抜けるため、的中数が前日より
+                //   減ることが正常に起きる(2026年9月12→13日の実測: 173→168)。連続的中の行だけが
+                //   窓を開示していて見出しには無かったため、訪問者が「これまでの全成績」と読める
+                //   状態だった。数字・集計は一切変えず、開示の1文だけを足す。
+                windowSize: REFLECTIONS_WINDOW,
+                windowN: recs.length,
+                windowNoteJa: `答え合わせ済みの直近${recs.length}件(公式戦${officialRecs.length}件)の成績です。古い試合から順に入れ替わります(累計ではありません)。`,
                 noteJa: "公式戦のみの成績です。親善試合・2軍戦は主力を休ませるため予測が難しく、参考扱いとして分けています(予想自体は出し続けています)。",
                 // ---- v70(2026年8月28日・利用者のご要望): 「何対何」まで当てたかを別枠で数える ----
                 //   上のhitRatePctは勝敗(ホーム勝ち/引き分け/アウェイ勝ち)だけの的中率。
@@ -8789,6 +8805,13 @@ async function handleHttpRequest(req, res) {
             knowledgeAdded: g.knowledgeItemsSavedToday ?? 0,
             knowledgeDuplicate: g.knowledgeItemsDuplicateToday ?? 0,
             failures: Array.isArray(g.errors) ? g.errors.length : 0,
+            // ---- v92(2026年9月18日): 「黙って続行した失敗」の開示 ----
+            //   errors(本体の失敗)とは別に、付加的な処理が失敗して黙って続行した件数と内訳。
+            //   これまでは catch で捨てられ、失敗した事実が誰にも見えなかった(クラブElo中継と同じ欠陥クラス)。
+            //   公開画面には出さない(情報過多禁止)。このJSONで確認する。
+            silentFailures: (g.warnings && typeof g.warnings === "object")
+              ? { count: g.warnings.count ?? 0, dropped: g.warnings.dropped ?? 0, items: Array.isArray(g.warnings.items) ? g.warnings.items.slice(0, 40) : [], noteJa: g.warnings.noteJa || null }
+              : { count: null, dropped: 0, items: [], noteJa: "v92より前の学習記録のため、付加処理の失敗は記録されていません(0件という意味ではありません)。" },
             universeSkipped: (g.universe && g.universe.skipped) || [],
             // 本番エラー調査: データ提供元の表記差で照合できなかったクラブ
             unresolvedClubs: (g.universe && g.universe.unresolvedClubs) || [],
@@ -8840,6 +8863,7 @@ async function handleHttpRequest(req, res) {
           knowledgeCoverage: coverage && coverage.available ? {
             clubCount: coverage.clubCount, playerCount: coverage.playerCount,
             staleClubs: coverage.staleClubs,
+            readMode: coverage.readMode || null, // v92: 全クラブの読み出し経路("mget"=まとめ読み / "per-key"=従来)
           } : null,
           // ---- 最終方針「使用回数まで管理」: 実際によく使われている知識の上位 ----
           // (使用回数は応答速度を守るためメモリ集計→日次保存の近似値)
@@ -9053,6 +9077,12 @@ function __setTestHooks(hooks) {
   if (hooks.upstashCmd) upstashCmd = hooks.upstashCmd;
   if (hooks.upstashGetJSON) upstashGetJSON = hooks.upstashGetJSON;
   if (hooks.upstashSetJSON) upstashSetJSON = hooks.upstashSetJSON;
+  // v92: learningDeps は起動時に関数の参照を写し取っているため、上の差し替えだけでは
+  //   学習モジュール(精度トレンドのMGET等)が本物の保存先へ素通りしていた(テストで発見)。
+  //   差し替えを同じ入口に揃える(本番では誰も呼ばないので挙動は変わらない)。
+  if (hooks.upstashCmd) learningDeps.upstashCmd = hooks.upstashCmd;
+  if (hooks.upstashGetJSON) learningDeps.upstashGetJSON = hooks.upstashGetJSON;
+  if (hooks.upstashSetJSON) learningDeps.upstashSetJSON = hooks.upstashSetJSON;
   if (hooks.callApiFootball) callApiFootball = hooks.callApiFootball;
   if (hooks.handleFixturesToday) handleFixturesToday = hooks.handleFixturesToday;
   // 自己修復のテストで「学習が始まったか」だけを見たいときに差し替える

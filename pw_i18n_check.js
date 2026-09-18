@@ -113,6 +113,9 @@ const STUB = {
     streak: { official: { current: 2, best: 5, windowN: 200, noteJa: "連続的中は保存済みの直近200件の公式戦の実測です。" } },
     officialSummary: {
       n: 256, hits: 141, hitRatePct: 55.1, referenceN: 41,
+      // v92: 見出し直下の「窓」の開示(サーバーの新項目。翻訳行の検証)
+      windowSize: 300, windowN: 297,
+      windowNoteJa: "答え合わせ済みの直近297件(公式戦256件)の成績です。古い試合から順に入れ替わります(累計ではありません)。",
       noteJa: "公式戦のみの成績です。親善試合・2軍戦は主力を休ませるため予測が難しく、参考扱いとして分けています(予想自体は出し続けています)。",
       scoreline: { n: 240, hits: 11, hitRatePct: 4.6, noteJa: "予想時に保存した「最も可能性の高いスコア」が実スコアと完全一致した割合です。勝敗より桁違いに難しく、世界の強い予測モデルでも10%前後が普通です。" },
     },
@@ -177,15 +180,30 @@ const ck = (label, ok, detail) => { results.push([label, ok]); console.log(`  [$
   const browser = await chromium.launch();
   const BASE = "http://127.0.0.1:8787/index.html";
 
-  async function walkAllTabs(page) {
+  // v92(2026年9月18日): 検査の盲点を塞ぐ。従来は全タブを巡回したあと「最後に開いていたタブ」しか
+  //   走査していなかった(他タブの区画は display:none で offsetParent が無く、走査から外れる)。
+  //   そのため反省タブ・ランキングタブの漏れ(「・ほかに親善試合など参考扱いが41」等)を
+  //   v83以降ずっと見逃していた。タブごとに走査して合算する。
+  async function walkAllTabs(page, lang) {
     const tabs = await page.$$eval("#modeSwitch button", (bs) => bs.map((b) => b.dataset.mode).filter(Boolean)).catch(() => []);
+    const merged = new Map();
     for (const mode of tabs) {
       await page.click(`#modeSwitch button[data-mode="${mode}"]`).catch(() => {});
       await page.waitForTimeout(1200);
       await page.$$eval("details:not([open])", (ds) => ds.forEach((d) => { d.open = true; })).catch(() => {});
-      await page.waitForTimeout(400);
+      await page.waitForTimeout(900);
+      if (lang && lang !== "ja") {
+        for (const [s, c] of await scanLeaks(page, lang)) merged.set(s, (merged.get(s) || 0) + c);
+      }
     }
     await page.waitForTimeout(1500);
+    return merged;
+  }
+  // 巡回中の各タブの漏れ + 最後の状態の漏れを合算して返す
+  async function scanAllTabsLeaks(page, lang) {
+    const merged = await walkAllTabs(page, lang);
+    for (const [s, c] of await scanLeaks(page, lang)) merged.set(s, Math.max(merged.get(s) || 0, c));
+    return [...merged.entries()];
   }
 
   async function scanLeaks(page, lang) {
@@ -220,8 +238,7 @@ const ck = (label, ok, detail) => { results.push([label, ok]); console.log(`  [$
     page.on("response", (r) => { if (r.url().includes(`i18n.${lang}.json`)) packStatus = r.status(); });
     await page.goto(BASE, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(2500);
-    await walkAllTabs(page);
-    const leaks = await scanLeaks(page, lang);
+    const leaks = await scanAllTabsLeaks(page, lang);
     await ctx.close();
     return { leaks, packStatus };
   }
@@ -244,8 +261,7 @@ const ck = (label, ok, detail) => { results.push([label, ok]); console.log(`  [$
     page.on("request", (r) => { if (r.url().includes("i18n.")) packReqs++; });
     await page.goto(BASE, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(2500);
-    await walkAllTabs(page);
-    const leaks = await scanLeaks(page, lang);
+    const leaks = await scanAllTabsLeaks(page, lang);
     const bodyText = await page.evaluate(() => document.body.innerText || "");
     await ctx.close();
     return { leaks, bodyText, packReqs };

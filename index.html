@@ -547,9 +547,16 @@
     if (e && e[i]) return e[i];
     if (d0 >= 3) return null;
     // 箇条書きの「・」は先に剥がして中身を翻訳する(質問チップなど)
+    // v92(2026年9月18日): 中身の訳に日本語が残る(汎用型「⦿件」が半端に一致した等)ときは
+    //   ここで確定せず、全文の型(例:「・ほかに親善試合など参考扱いが⦿件」)を先に探す。
+    //   どの型でも完訳できないときだけ、従来どおり半端な訳を最後の手段として使う。
+    var innerOut = null;
     if (s.charAt(0) === "\u30fb") {
       var inner = tr(s.slice(1).trim(), d0 + 1);
-      if (inner !== null) return "\u30fb" + inner;
+      if (inner !== null) {
+        if (!JA_LEFT_RE.test(inner)) return "\u30fb" + inner;
+        innerOut = "\u30fb" + inner;
+      }
     }
     // v83(2026年9月8日): 「先に並んだ汎用型」が specific な型を食って半端な訳を作る
     //   問題の根治(実例: 「(うち公式戦 1/2件)」に汎用の「(⦿件)」が先に一致し、
@@ -577,7 +584,7 @@
         }
       }
     }
-    return firstMatchOut;
+    return firstMatchOut !== null ? firstMatchOut : innerOut;
   }
   // どこからでも使える翻訳関数(辞書に無ければ原文のまま返す)
   window.t = function (s) {
@@ -790,6 +797,9 @@
     "勝利": ["Win", "胜", "Victoria"],
     "引分": ["Draw", "平", "Empate"],
     "引き分け": ["Draw", "平局", "Empate"],
+    // v92: 外れ理由の文中「実際の結果(ホームチームの勝利)」の入れ子スロット(反省タブで日本語が残っていた)
+    "ホームチームの勝利": ["a home win", "主队获胜", "victoria local"],
+    "アウェイチームの勝利": ["an away win", "客队获胜", "victoria visitante"],
     "勝ち": ["Win", "胜", "Victoria"],
     "✅ 的中": ["✅ Hit", "✅ 命中", "✅ Acierto"],
     "❌ 外れ": ["❌ Miss", "❌ 未中", "❌ Fallo"],
@@ -1080,6 +1090,7 @@
     "参考(親善など)": ["Reference (friendlies etc.)", "参考(友谊赛等)", "Referencia (amistosos, etc.)"],
     "外した理由(実測データからの機械的な分類):": ["Why it missed (mechanically classified from real data):", "失误原因(由实测数据机械分类):", "Por qué falló (clasificado mecánicamente con datos reales):"],
     "よく外す理由(累計):": ["Common miss reasons (cumulative):", "常见失误原因(累计):", "Motivos de fallo frecuentes (acumulado):"],
+    "よく外す理由(同じ期間の集計):": ["Common miss reasons (same period):", "常见失误原因(同一期间):", "Motivos de fallo frecuentes (mismo periodo):"],
     "直近フォーム": ["Recent form", "近期状态", "Forma reciente"],
     "得点力・失点率": ["Scoring & concession rates", "进攻与失球率", "Goles a favor y en contra"],
     "怪我人": ["Injuries", "伤病", "Lesionados"],
@@ -3063,6 +3074,7 @@
     ["本日、実際に取得できなかったものが⦿件あります。", "Today, $1 items genuinely couldn't be fetched.", "今天有$1项确实未能获取。", "Hoy hubo $1 elementos que realmente no pudieron obtenerse."],
     ["AIが最も重視したのは「⦿」です(寄与度⦿%)。", "What the AI weighted most was \"$1\" (contribution $2%).", "AI最重视的是「$1」(贡献度$2%)。", "Lo que más pesó para la IA fue «$1» (contribución $2 %)."],
     ["直近の採用フォーメーションは⦿が⦿、⦿が⦿です。", "Recent formations: $1 in $2, $3 in $4.", "近期采用的阵型: $1为$2,$3为$4。", "Formaciones recientes: $1 en $2 y $3 en $4."],
+    ["答え合わせ済みの直近⦿件(公式戦⦿件)の成績です。古い試合から順に入れ替わります(累計ではありません)。", "Results over the last $1 settled predictions ($2 competitive matches). Older matches roll out as new ones settle — this is not an all-time total.", "以最近$1场已核对预测(其中正式比赛$2场)统计。旧比赛会依次被新比赛替换(并非累计)。", "Resultados de las últimas $1 predicciones resueltas ($2 partidos oficiales). Los partidos antiguos van saliendo a medida que entran nuevos: no es un total acumulado."],
     ["連続的中は保存済みの直近⦿件の公式戦の実測です。", "The streak is measured over the last $1 stored competitive matches.", "连续命中是基于已保存的最近$1场正式比赛的实测。", "La racha se mide sobre los últimos $1 partidos oficiales guardados."],
     ["⦿(ただし保存に失敗したため反映されていません)", "$1 (but saving failed, so it isn't reflected)", "$1(但保存失败,尚未反映)", "$1 (pero el guardado falló y no se refleja)"],
     ["対抗する仮説が無いため、「⦿」が唯一の候補です。", "With no rival hypothesis, \"$1\" is the only candidate.", "由于没有对立假设,「$1」是唯一候选。", "Sin hipótesis rival, «$1» es el único candidato."],
@@ -3341,6 +3353,16 @@
     ["🔥 いまAIに⦿連勝中", "🔥 On a $1-game streak against the AI", "🔥 目前对AI $1连胜中", "🔥 Racha de $1 victorias contra la IA"],
     ["⚽ ⦿ vs ⦿", "⚽ $1 vs $2", "⚽ $1 vs $2", "⚽ $1 vs $2"],
     ["「ビッグクラブ級の⦿」", "“Big-club-calibre $1”", "「豪门级$1」", "«$1 de nivel de club grande»"],
+    // v92(2026年9月18日): 検証で見つかった既存の漏れ。選手カードの一行評価(buildVerdictLine)は
+    //   6段階のうち「ビッグクラブ級の」しか型が無く、総合85以上・78未満の選手で
+    //   「世界的な実力を持つ魔法使い」等が日本語のまま表示されていた(本番v91で再現を確認)。
+    ["「世界最高峰の⦿」", "“World's-best-level $1”", "「世界最高水平的$1」", "«$1 del máximo nivel mundial»"],
+    ["「世界トップクラスの⦿」", "“World-class $1”", "「世界顶级的$1」", "«$1 de clase mundial»"],
+    ["「世界的な実力を持つ⦿」", "“$1 of world-class ability”", "「具备世界级实力的$1」", "«$1 con capacidad de nivel mundial»"],
+    ["「実力派の⦿」", "“Proven $1”", "「实力派的$1」", "«$1 contrastado»"],
+    ["「伸びしろのある⦿」", "“$1 with room to grow”", "「有成长空间的$1」", "«$1 con margen de mejora»"],
+    // v92: 地力ランキングの注記の末尾(対象クラブの条件)。v87で文が増えたが型が無かった。
+    ["対象は、このデータの中に⦿試合以上の実績があり、かつ他の対象クラブと十分に対戦しているクラブだけです(数試合だけの記録から地力を断定しないため)。", "Only clubs with at least $1 matches in this data and enough games against the other listed clubs are included (so strength isn't judged from a handful of records).", "仅包含在该数据中至少有$1场记录、且与其他入选俱乐部有足够交手的俱乐部(避免凭寥寥数场断定实力)。", "Solo se incluyen clubes con al menos $1 partidos en estos datos y suficientes duelos contra los demás clubes listados (para no juzgar la fuerza con unos pocos registros)."],
   ];
   for (var rp2 = 0; rp2 < RAWP2.length; rp2++) P.push([pat(RAWP2[rp2][0]), RAWP2[rp2][1], RAWP2[rp2][2], RAWP2[rp2][3]]);
   /* ==== v83(2026年9月8日): 実データ表示行の漏れ修正 ==== */
@@ -12322,6 +12344,13 @@ async function renderReflectionsCard() {
       parts.push(`<div style="margin-bottom:4px;"><span style="font-size:15px; font-weight:700;">公式戦の的中率(勝敗): ${Number(off.hitRatePct)}%</span> <span class="value-note">(${Number(off.hits)}/${Number(off.n)}件)</span>${
         off.referenceN ? ` <span class="value-note">・ほかに親善試合など参考扱いが${Number(off.referenceN)}件</span>` : ""}</div>`);
     }
+    // ---- v92(2026年9月18日・利用者の承認「開示だけ追加」): この成績の「窓」を見出しの直下に明記 ----
+    //   数字は答え合わせ済みの直近300件のローリング窓(累計ではない)。連続的中の行だけが
+    //   窓を開示していて見出しには無かった。数字は一切変えず、1行足すだけ。
+    //   古いサーバー応答(windowNoteJaが無い)では何も出さない=劣化なし。
+    if (off.windowNoteJa) {
+      parts.push(`<div class="value-note" style="margin:-2px 0 6px;">${esc(off.windowNoteJa)}</div>`);
+    }
     // ---- v70(2026年8月28日・利用者のご要望): 勝敗だけでなく「何対何」まで当てた率も並べて出す ----
     //   上の数字は勝敗(ホーム勝ち/引き分け/アウェイ勝ち)だけの的中率。スコア完全一致は
     //   別物なので、混ざらないよう両方を明記する。採点できる記録が無ければ正直にその旨を出す。
@@ -12379,8 +12408,10 @@ async function renderReflectionsCard() {
     }).join(""));
   }
   if (d.topReasons && d.topReasons.length) {
-    parts.push(`<div style="margin-top:10px;"><span class="value-note">よく外す理由(累計): </span>${
-      d.topReasons.map((r) => `<span class="smarter-tag smarter-tag-lost" style="margin-right:6px;">${esc(r.labelJa)} ×${Number(r.count)}</span>`).join("")}</div>`);
+    // v92: この集計も上と同じ「直近300件」の窓から数えている。「累計」は誤りだったので訂正する。
+    parts.push(`<div style="margin-top:10px;"><span class="value-note">よく外す理由(同じ期間の集計): </span>${
+      // v92: ラベルと回数を別のテキストノードにする(「ラベル ×12」が1ノードだと辞書に一致せず翻訳されなかった)
+      d.topReasons.map((r) => `<span class="smarter-tag smarter-tag-lost" style="margin-right:6px;">${esc(r.labelJa)}<span> ×${Number(r.count)}</span></span>`).join("")}</div>`);
   }
   parts.push(`<p class="value-note" style="margin-top:10px;">${esc(d.honestyJa || "")}</p>`);
   el.innerHTML = parts.join("");
