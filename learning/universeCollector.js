@@ -41,6 +41,7 @@ const {
   fetchTeamXgAverage,
 } = require("./features");
 const { computePlayerRealStats, filterMensStatEntries } = require("./playerFeatures");
+const { noteWarning } = require("./warnings"); // v92: 黙って続行した失敗の痕跡
 const { summarizeTransfers } = require("../rag/knowledgeSource");
 const playerSearch = require("../knowledge/playerSearch");
 
@@ -124,6 +125,7 @@ async function collectUniverse(deps, runAt, dateKey) {
     unresolvedClubs: [], // 名前が照合できず収集できなかったクラブ(データ提供元の表記差。正直に開示)
     agendaClubsApplied: priorityClubs.map((c) => c.nameEn), // 学習計画で優先したクラブ(実行の証拠)
     errors: [],
+    warnings: [], warningsDropped: 0, // v92: 黙って続行した付加処理の失敗(成長ログへ合流)
   };
   const canSpend = (n) => (apiBudget ? apiBudget.remainingForJob() >= BUDGET_FLOOR + n : true);
   const skip = (stage, reasonJa) => { stats.skipped.push({ stage, reasonJa }); };
@@ -158,7 +160,7 @@ async function collectUniverse(deps, runAt, dateKey) {
     for (const [id, v] of Object.entries((savedWomens && savedWomens.ids) || {})) {
       if (Number.isFinite(Number(id))) womensKnown.set(Number(id), v || {});
     }
-  } catch (e) { /* 読めなくても当日の判定は動く(劣化しない) */ }
+  } catch (e) { noteWarning(stats, "womens_memory_read_failed", e); } // 読めなくても当日の判定は動く(劣化しない。v92: 痕跡は残す)
 
   // ---- 第8次監査(Medium)の修正: 同日の再実行ガード ----
   // 輪番は日付で決まるため、同日に再実行すると全く同じ収集(コア約70クラブ×4
@@ -768,7 +770,7 @@ async function collectUniverse(deps, runAt, dateKey) {
         savedTodayIds.add(Number(p.id));
         emittedByPlayer.set(Number(p.id), new Set((res.events || []).map((ev) => ev.type)));
       }
-    } catch (e) { /* 1人の失敗で名簿全体を止めない */ }
+    } catch (e) { noteWarning(stats, `squad_player_save_failed:${p && p.id}`, e); } // 1人の失敗で名簿全体を止めない(v92: 痕跡は残す)
   }
 
   // ============================================================
@@ -1098,7 +1100,7 @@ async function collectUniverse(deps, runAt, dateKey) {
           });
           stats.womensKnownSaved = entries.length;
         }
-      } catch (e) { /* 記憶の保存に失敗しても当日の除外は効いている(劣化しない) */ }
+      } catch (e) { noteWarning(stats, "womens_memory_save_failed", e); } // 記憶の保存に失敗しても当日の除外は効いている(劣化しない。v92: 痕跡は残す)
       // v89/v91: 除外の実測を隠さず記録する(件数と判定根拠の例)
       if (womensExcluded.size || droppedWomens || womensCleared.size) {
         const samples = [...womensExcluded.values()].slice(0, 8)
@@ -1312,7 +1314,7 @@ async function collectUniverse(deps, runAt, dateKey) {
       } else if (deps.upstashSetJSON) {
         await deps.upstashSetJSON(`kb:universe:ran:${dateKey}`, { ranAt: runAt.toISOString() });
       }
-    } catch (e) { /* 記録できなくても収集自体は完了している */ }
+    } catch (e) { noteWarning(stats, "universe_run_marker_failed", e); } // 記録できなくても収集自体は完了している(v92: 痕跡は残す)
   }
 
   return stats;
@@ -1390,6 +1392,7 @@ async function collectClubPlayersBatch(deps, opts) {
     clubsPlanned: 0, clubsFetched: 0, playersFetched: 0, apiRequests: 0,
     recordsSaved: 0, indexCount: null, indexClubs: null, withRating: null,
     unresolvedClubs: [], errors: [], notesJa: [],
+    warnings: [], warningsDropped: 0, // v92
     cursorBefore: null, cursorAfter: null, reasonJa: null,
   };
   if (typeof callApiFootball !== "function" || !clubDossier) {
@@ -1588,7 +1591,7 @@ async function collectClubPlayersBatch(deps, opts) {
         await clubDossier.savePlayer(rec);
         statsIndex[id] = runAt.toISOString();
         saved++;
-      } catch (e) { /* 1件失敗しても続ける */ }
+      } catch (e) { noteWarning(stats, `stats_index_save_failed:${id}`, e); } // 1件失敗しても続ける(v92: 痕跡は残す)
     }
     if (saved) await clubDossier.saveStatsIndex(statsIndex).catch(() => {});
     stats.recordsSaved = saved;

@@ -22,6 +22,7 @@
  *     みなさない)。3回持ち越したら「効果を確認できないまま維持」と記録する。
  */
 
+const { noteVia } = require("./warnings"); // v92: 黙って続行した失敗の痕跡(deps.noteWarning があれば記録)
 const TUNE_CONFIG_KEY = "learn:selftune:config";
 const HISTORY_KEY = "learn:selfimprove:log";
 const HISTORY_MAX = 200;
@@ -61,7 +62,7 @@ async function loadTuneConfig(deps) {
       }
       if (Array.isArray(stored.pendingEvaluations)) cfg.pendingEvaluations = stored.pendingEvaluations;
     }
-  } catch (e) { /* 読めなければ既定値(安全側) */ }
+  } catch (e) { noteVia(deps, "tune_config_read_failed", e); } // 読めなければ既定値(安全側。v92: 痕跡は残す=自己調整値が既定に戻った事実を隠さない)
   return cfg;
 }
 
@@ -79,7 +80,7 @@ async function appendHistory(deps, events) {
     try {
       await upstashCmd(["RPUSH", HISTORY_KEY, JSON.stringify(ev)]);
       appended++;
-    } catch (e) { /* 1件の失敗で止めない */ }
+    } catch (e) { noteVia(deps, `self_improvement_history_append_failed:${ev && ev.type}`, e); } // 1件の失敗で止めない(v92: 痕跡は残す)
   }
   await upstashCmd(["LTRIM", HISTORY_KEY, String(-HISTORY_MAX), "-1"]).catch(() => {});
   return appended;

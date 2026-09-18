@@ -55,12 +55,14 @@ function createApiBudget({
   const counterKeyFor = (dk) => `learn:apibudget:n:${dk}`;
   const atomic = typeof upstashCmd === "function";
 
+  const initWarnings = []; // v92: 初期化時に黙って続行した失敗(summary() で開示)
   async function init(dk) {
     dateKey = dk;
     spentThisRun = 0;
     spentBefore = 0;
     spentFlushed = 0;
     persisted = false;
+    initWarnings.length = 0;
     if (!upstashEnabled) return;
     if (atomic) {
       try {
@@ -79,7 +81,7 @@ function createApiBudget({
           if (legacy && Number.isFinite(legacy.spent) && legacy.spent > spentBefore) {
             spentBefore = legacy.spent;
           }
-        } catch (e) { /* 旧データが読めなくても続行する */ }
+        } catch (e) { initWarnings.push(`legacy_budget_read_failed:${String((e && e.message) || e).slice(0, 120)}`); } // 旧データが読めなくても続行する(v92: 痕跡は残す)
       }
       return;
     }
@@ -225,6 +227,8 @@ function createApiBudget({
       remainingForJob: remainingForJob(),
       // Upstashが無いと日をまたいだ累積が取れないことを正直に示す
       persistent: persisted,
+      // v92: 初期化時に黙って続行した失敗(空配列が正常)
+      initWarnings: initWarnings.slice(),
     };
   }
 

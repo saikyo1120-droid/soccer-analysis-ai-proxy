@@ -393,16 +393,44 @@ async function saveDailyAccuracy(deps, dateKey, aggToday) {
  * 昨日・直近7日・直近30日との比較(ご指示⑨「昨日/先週/先月との比較」)。
  * 記録の無い日は欠落として扱い、推測で埋めない。
  */
+// ---- v92(2026年9月18日): 30日ぶんの日次集計を「1件ずつ30往復」から「1回のMGET」へ ----
+//   実測: /api/learning/daily-report のキャッシュ切れ直後の1回目が6日連続でタイムアウト。
+//   原因はこの関数の for ループ(await を30回直列=30往復)。読む内容・返す数字は
+//   まったく同じで、往復回数だけを減らす(2026年8月8日のpipeline化と同じ考え方)。
+//   MGETが使えない環境(depsにupstashCmdが無い/モック/応答が配列でない)は従来の
+//   1件ずつの読み出しにそのまま戻る=結果は常に同一。
+async function readDailyAggregates(deps, keys) {
+  const { upstashCmd, upstashGetJSON } = deps || {};
+  if (typeof upstashCmd === "function" && keys.length) {
+    try {
+      const raw = await upstashCmd(["MGET", ...keys]);
+      if (Array.isArray(raw) && raw.length === keys.length) {
+        return {
+          readMode: "mget", // v92: 本番で「速い経路が実際に使われたか」を確認できるように残す
+          values: raw.map((v) => {
+            if (v === null || v === undefined) return null;
+            if (typeof v === "object") return v; // 既に展開済みの応答にも耐える
+            try { return JSON.parse(v); } catch (e) { return null; }
+          }),
+        };
+      }
+    } catch (e) { /* 従来経路(1件ずつ)へ。readMode="per-key" として結果に残る=黙らない */ }
+  }
+  const out = [];
+  for (const k of keys) out.push(await upstashGetJSON(k).catch(() => null));
+  return { readMode: "per-key", values: out };
+}
+
 async function getAccuracyTrend(deps, todayDateKey) {
-  const { upstashEnabled, upstashGetJSON } = deps || {};
+  const { upstashEnabled } = deps || {};
   if (!upstashEnabled) return { available: false, reasonJa: "Upstashが未設定のため測定記録を読み出せません。" };
   const base = new Date(`${todayDateKey}T00:00:00Z`).getTime();
+  const dateKeys = [];
+  for (let i = 0; i < 30; i++) dateKeys.push(new Date(base - i * 86400000).toISOString().slice(0, 10));
+  const read = await readDailyAggregates(deps, dateKeys.map((dk) => `${ACCURACY_KEY_PREFIX}${dk}`));
+  const aggs = read.values;
   const daily = [];
-  for (let i = 0; i < 30; i++) {
-    const dk = new Date(base - i * 86400000).toISOString().slice(0, 10);
-    const agg = await upstashGetJSON(`${ACCURACY_KEY_PREFIX}${dk}`).catch(() => null);
-    if (agg) daily.push({ date: dk, agg });
-  }
+  dateKeys.forEach((dk, i) => { if (aggs[i]) daily.push({ date: dk, agg: aggs[i] }); });
   const sumRange = (rows) => rows.reduce((acc, r) => mergeDailyAccuracy(acc, r.agg), null);
   const today = daily.find((d) => d.date === todayDateKey) || null;
   const yesterdayKey = new Date(base - 86400000).toISOString().slice(0, 10);
@@ -415,6 +443,7 @@ async function getAccuracyTrend(deps, todayDateKey) {
   return {
     available: true,
     recordedDays: daily.length,
+    readMode: read.readMode, // v92: "mget"(1往復) / "per-key"(従来の30往復)。数字は両経路で同一
     today: t, yesterday: y, last7Days: s(last7), last30Days: s(last30),
     // 「前日より精度が何%改善したか」: 両日とも測定できた市場だけ差を出す
     vsYesterday: (t && y && t.markets.oneX2.measurable && y.markets.oneX2.measurable)
@@ -433,5 +462,5 @@ module.exports = {
   computeMarketProbs, outcomesFromScore, scorePrediction, topScorelines,
   buildDailyAccuracy, mergeDailyAccuracy, emptyDailyAccuracy,
   computePrecisionRecallF1, computeEce,
-  summarizeAccuracy, saveDailyAccuracy, getAccuracyTrend,
+  summarizeAccuracy, saveDailyAccuracy, getAccuracyTrend, readDailyAggregates,
 };

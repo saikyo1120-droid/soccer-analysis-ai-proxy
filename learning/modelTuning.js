@@ -28,6 +28,7 @@ const {
   consistencyReport, shouldAdoptWithConsistency, formatLeagueTableJa,
 } = require("./modelBacktest");
 const { backfillSeasons, buildTrainingRows, saveDataset, loadDataset, DEFAULT_BACKFILL_LEAGUES, ROWS_VERSION, buildTeamNamesById } = require("./historicalBackfill");
+const { noteVia } = require("./warnings"); // v92: 黙って続行した失敗の痕跡(deps.noteWarning があれば記録)
 const { timeDecayWeight } = require("./historicalBackfill");
 // v47「予測モデルの根本強化」: 過去試合データセットで**全特徴量の重み**を
 // 勾配降下法で学習するために追加(従来はattackSum/concededSum/rhoの3個だけを
@@ -442,7 +443,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
         perLoss = scoreRatings(rtPerLeague);
         perLeagueCount = rtPerLeague.homeAdvByLeague ? Object.keys(rtPerLeague.homeAdvByLeague).length : 0;
       }
-    } catch (e) { /* リーグ別学習の失敗は「採用しない」に落ちるだけ(従来と同一動作) */ }
+    } catch (e) { noteVia(deps, "homeadv_perleague_fit_failed", e); } // リーグ別学習の失敗は「採用しない」に落ちるだけ(従来と同一動作。v92: 痕跡は残す)
     const HOMEADV_ADOPT_MARGIN = 0.0005; // ξと同じ「僅差・同点では乗り換えない」閾値
     if (Number.isFinite(perLoss) && Number.isFinite(globalLoss) && perLoss <= globalLoss - HOMEADV_ADOPT_MARGIN) {
       homeAdvModeChosen = "perLeague";
@@ -681,7 +682,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
         for (const id of Object.keys(ratingsFull.byTeam)) {
           if (collected[id]) names[id] = collected[id];
         }
-      } catch (e) { /* 採集名簿が無くても続行 */ }
+      } catch (e) { noteVia(deps, "teamnames_read_failed", e); } // 採集名簿が無くても続行(v92: 痕跡は残す)
       if (ds.meta && ds.meta.namesById) {
         for (const id of Object.keys(ratingsFull.byTeam)) {
           if (ds.meta.namesById[id]) names[id] = ds.meta.namesById[id]; // データセット由来を優先
@@ -705,7 +706,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
           await upstashSetJSON("learn:ratings:ranks:prev", latest);
         }
         await upstashSetJSON("learn:ratings:ranks:latest", { weekKey: curWeekKey, ranks, savedAt: runAt.toISOString() });
-      } catch (e) { /* スナップショットはベストエフォート(ランキング表示は変動なしで出る) */ }
+      } catch (e) { noteVia(deps, "ratings_rank_snapshot_failed", e); } // スナップショットはベストエフォート(ランキング表示は変動なしで出る。v92: 痕跡は残す)
     }
     record.teamRatings.fullFit = {
       available: ratingsFull.available, teams: ratingsFull.teamsRated, matches: ratingsFull.matchesUsed, saved: ratingsSaved,

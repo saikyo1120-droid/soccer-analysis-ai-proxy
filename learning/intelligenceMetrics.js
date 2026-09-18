@@ -22,6 +22,7 @@
  *   (近似値であることを正直に明記する)。
  */
 
+const { noteVia } = require("./warnings"); // v92: 黙って続行した失敗の痕跡(deps.noteWarning があれば記録)
 const INTEL_KEY_PREFIX = "learn:intel:";
 const INTEL_REPORT_KEY_PREFIX = "learn:intel:report:";
 const BUFFER_MAX = 500; // メモリ有界: 1日にこれ以上の考察が来たら古い順に落とす(件数はdroppedで正直に数える)
@@ -719,7 +720,7 @@ async function processAnswerability(deps, subjects, nowIso) {
         await upstashSetJSON(key, existing);
         updated++;
       }
-    } catch (e) { /* 1件の失敗で台帳全体を止めない */ }
+    } catch (e) { noteVia(deps, "answerability_ledger_item_failed", e); } // 1件の失敗で台帳全体を止めない(v92: 痕跡は残す)
   }
   return { updated, improvedEvents };
 }

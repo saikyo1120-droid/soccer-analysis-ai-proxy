@@ -106,6 +106,8 @@ const {
 // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ ----
 // ⑨ 予測精度の毎日測定(勝敗/BTTS/Over-Under、Brier・LogLoss・較正)
 const { scorePrediction, buildDailyAccuracy, saveDailyAccuracy, getAccuracyTrend } = require("./accuracyTracker");
+// v92: 「黙って飲み込む失敗」に痕跡を残す(挙動は変えない。learning/warnings.js 参照)
+const { noteWarning, summarizeWarnings, mergeWarningSummaries } = require("./warnings");
 // ---- 2026年8月・AI知能計測ラウンド(ご指示①〜⑨) ----
 // 考察の質・RAG使用率の日次保存、エンジン別成長率、Knowledgeの寄与ランキング、
 // 精度低下の自己分析、そして毎日の自己評価「今日のAIは昨日より賢くなったか?」
@@ -520,6 +522,8 @@ function mergeGrowthLogs(previous, current) {
     // 成長可視化ラウンド: カテゴリ別の学習内訳(その日最後に保存できた累計値)
     knowledgeByCategoryToday: current.knowledgeByCategoryToday || previous.knowledgeByCategoryToday || null,
     errors: capList([...(previous.errors || []), ...(current.errors || [])]),
+    // v92: 同日再実行では件数を合算し、内訳は重複排除して上限内に収める
+    warnings: mergeWarningSummaries(previous.warnings, current.warnings),
   };
 }
 
@@ -829,6 +833,12 @@ async function runDailyLearning(deps) {
   const clubProfileEngine = createClubProfileEngine({ generateLLM, knowledgeStore, setRelation: relationshipIndex.setRelation });
 
   const errors = [];
+  // v92: errors は「学習の本体が失敗した」記録。warnings は「付加的な処理が失敗したが本体は続行した」記録。
+  //   後者はこれまで catch で黙って捨てられ、失敗した事実が誰にも見えなかった(クラブElo中継と同じ欠陥クラス)。
+  const jobLog = { warnings: [], warningsDropped: 0 };
+  const warn = (tag, e) => noteWarning(jobLog, tag, e);
+  // 予算の初期化で黙って続行した失敗(旧形式の読み出し等)も合流させる
+  try { for (const w of ((apiBudget.summary() || {}).initWarnings || [])) warn(`apibudget:${w}`); } catch (e) { warn("apibudget_summary_failed", e); }
   const factsToday = [];
   const failureReasonsToday = []; // Failure Learning(ご要望①): 今日外れた予測の理由一覧
   const successReasonsToday = []; // 2026年8月・完全自動Learning Cycle ⑧: 今日当たった予測の理由一覧
@@ -868,7 +878,7 @@ async function runDailyLearning(deps) {
         at, elapsedSec: Math.max(0, Math.round((Date.now() - runAt.getTime()) / 1000)),
         finished: false, stages: stageLog.slice(-30),
       });
-    } catch (e) { /* 進捗の記録に失敗しても学習は止めない */ }
+    } catch (e) { warn(`progress_save_failed:${name}`, e); } // 進捗の記録に失敗しても学習は止めない(v92: 痕跡は残す)
   };
   await stage("開始");
 
@@ -1288,7 +1298,7 @@ async function runDailyLearning(deps) {
           lineupWatchScored.morningSum += pkScore.morningBrier;
           lineupWatchScored.preKickSum += pkScore.preKickBrier;
         }
-      } catch (e) { /* 採点は付加情報。失敗しても答え合わせ本体は続行 */ }
+      } catch (e) { warn(`lineup_prekick_score_failed:${fixtureIdStr}`, e); } // 採点は付加情報。失敗しても答え合わせ本体は続行(v92: 痕跡は残す)
 
       // ---- Failure Learning(ご要望①): 外れた場合は「何故外れたのか」を分類して保存する ----
       // 従来は正解/不正解のカウントだけで、原因は一切記録していなかった。
@@ -1547,7 +1557,7 @@ async function runDailyLearning(deps) {
   let agendaAppliedToday = null; // ご指示⑩: 前回の学習計画を今日の収集に反映した内容
   // 自己改善ループ③: AIが自分で調整した設定(安全な上下限つき)を読み、
   // 今日の収集(xG周期・選手詳細上限・優先クラブ数)へ実際に反映する。
-  const selfTuneConfig = await loadTuneConfig({ upstashEnabled, upstashGetJSON });
+  const selfTuneConfig = await loadTuneConfig({ upstashEnabled, upstashGetJSON, noteWarning: warn }); // v92: 読めず既定値に戻った事実を記録
 
   // 精度証明ラウンド: 直近の解決済み予測(似た試合の検索と重み学習で共有し、
   // 同一実行内で learn:ownpred:recent を二度読みしない。第8次監査の方針を維持)
@@ -1782,6 +1792,9 @@ async function runDailyLearning(deps) {
           teamTopScorerCache.set(key, r); return r;
         })(),
       ]);
+      // v92: xGの試合別統計が取れなかった件数を痕跡として残す(平均の計算は従来どおり=取れた分だけ)
+      if (homeXg && homeXg.fetchFailures > 0) warn(`xg_fixture_stats_failed:${fixtureId}:home:${homeXg.fetchFailures}`);
+      if (awayXg && awayXg.fetchFailures > 0) warn(`xg_fixture_stats_failed:${fixtureId}:away:${awayXg.fetchFailures}`);
       // ---- 第9次監査(v49)の修正: 重みの読み出しをオッズ取得の「前」へ移動 ----
       // v47でオッズ取得を予測の前へ移した際、重みの読み出し失敗→見送り(continue)の
       // 判定がオッズ取得の後ろに残っていた。そのため、Upstash障害の日は
@@ -1898,7 +1911,7 @@ async function runDailyLearning(deps) {
             apifbImplied = { homePct: h, drawPct: d, awayPct: a2 };
           }
         }
-      } catch (e) { /* 取得失敗は「無し」として続行(架空の値を作らない) */ }
+      } catch (e) { warn(`apifb_prediction_fetch_failed:${fixtureId}`, e); } // 取得失敗は「無し」として続行(架空の値を作らない。v92: 痕跡は残す)
       let apifbBlendUsed = null;
       const apifbW = Number.isFinite(weights.apifbBlend) ? weights.apifbBlend : 0;
       if (apifbW > 0 && apifbImplied) {
@@ -1947,7 +1960,7 @@ async function runDailyLearning(deps) {
       try {
         const recentForSimilarity = await loadRecentRecordsOnce();
         similarPast = findSimilarResolvedMatches(features, recentForSimilarity, 3);
-      } catch (e) { /* 似た試合が無くても予測自体は記録する */ }
+      } catch (e) { warn(`similar_search_failed:${fixtureId}`, e); } // 似た試合が無くても予測自体は記録する(v92: 痕跡は残す)
 
       const record = {
         fixtureId, homeTeamEn: isHome ? team.nameEn : opponentName, awayTeamEn: isHome ? opponentName : team.nameEn,
@@ -2110,7 +2123,7 @@ async function runDailyLearning(deps) {
           noteJa: `前回の学習計画に基づき、${priorityClubs.length}クラブ(苦手と実測されたクラブ)を今日の収集で優先しました(優先枠の上限${selfTuneConfig.priorityClubsMax}はAIの自己改善ループが管理)。`,
         };
       }
-    } catch (e) { /* 計画が無ければ通常の輪番のみ */ }
+    } catch (e) { warn("agenda_apply_failed", e); } // 計画が無ければ通常の輪番のみ(v92: 痕跡は残す)
     universeStats = await collectUniverse({
       callApiFootball, apiBudget, clubDossier, knowledgeStore,
       knowledgeGraph, thoughtTimeline, computeFormScore,
@@ -2122,6 +2135,9 @@ async function runDailyLearning(deps) {
       upstashCmd, upstashGetJSON, upstashSetJSON,
     }, runAt, dateKey);
     if (universeStats.errors && universeStats.errors.length) errors.push(...universeStats.errors);
+    // v92: 収集側で黙って続行した失敗も、成長ログの warnings に合流させる(内訳は universe: を前置)
+    if (Array.isArray(universeStats.warnings)) for (const w of universeStats.warnings) warn(`universe:${w}`);
+    if (Number.isFinite(universeStats.warningsDropped) && universeStats.warningsDropped > 0) warn(`universe:warnings_dropped:${universeStats.warningsDropped}`);
   } catch (e) {
     errors.push(`universe_collection_failed:${e.message}`);
   }
@@ -2414,7 +2430,7 @@ async function runDailyLearning(deps) {
         if (xgMapSaved && xgMapSaved.entries && Object.keys(xgMapSaved.entries).length) {
           xgLookup = xgCollectMod.makeXgLookup(xgMapSaved);
         }
-      } catch (e) { /* xGはあくまで追加材料。無くても学習は従来どおり進む */ }
+      } catch (e) { warn("xg_lookup_failed", e); } // xGはあくまで追加材料。無くても学習は従来どおり進む(v92: 痕跡は残す)
       // ---- v57: クラブEloの履歴(一度きりのバックフィル)と、当時のEloを引くlookup ----
       //   名簿(レーティングのnamesById→learn:teamnames)が揃っていれば約190クラブの
       //   履歴CSVを一度だけ取得して保存する(150ms間隔・失敗クラブは正直に記録)。
@@ -2450,7 +2466,7 @@ async function runDailyLearning(deps) {
         errors.push(`clubelo_hist_failed:${String((e && e.message) || e).slice(0, 40)}`);
       }
       modelTuning = await tuneModelOnHistory(
-        { upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON, callApiFootball, apiBudget, clubEloLookup, xgLookup },
+        { upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON, callApiFootball, apiBudget, clubEloLookup, xgLookup, noteWarning: warn },
         baseForTune, runAt
       );
       if (upstashEnabled) {
@@ -2586,7 +2602,7 @@ async function runDailyLearning(deps) {
       knowledgeNewToday += diff.newItems.length;
       knowledgeUpdatedToday += diff.updatedItems.length;
       knowledgeStaleTotal += diff.staleCount;
-    } catch (e) { /* ベストエフォート */ }
+    } catch (e) { warn(`knowledge_diff_failed:${team.nameEn}`, e); } // v92: 痕跡は残す
   }
 
   // ---- Failure Learning(ご要望①): 直近の外れた理由を頻度順に集計する ----
@@ -2609,7 +2625,7 @@ async function runDailyLearning(deps) {
       agendaToday = buildLearningAgenda(recentForFailures, topFailureReasonsRecent, { nowIso: runAt.toISOString() });
       await saveAgenda({ upstashEnabled, upstashSetJSON }, dateKey, agendaToday);
     } catch (e) { errors.push(`agenda_build_failed:${e.message}`); }
-  } catch (e) { /* ベストエフォート */ }
+  } catch (e) { warn("failure_summary_failed", e); } // v92: 痕跡は残す
 
   // ---- 2026年8月18日・v48: 週間AIダイジェストの生成(週1回・Redis読み書きのみ) ----
   //   直前の完了週(月曜〜日曜 JST)のダイジェストが未生成のときだけ作る。
@@ -2843,6 +2859,8 @@ async function runDailyLearning(deps) {
     } : null,
     // 1回の実行ぶんでも、エラーが大量に出た日にログが肥大化しないよう上限を設ける
     errors: capList(errors),
+    // v92: 黙って続行した付加処理の失敗(件数+内訳)。公開画面には出さず、日次レポートで確認する
+    warnings: summarizeWarnings(jobLog),
   };
 
   // 同じ日付の既存ログがあれば合算する(上のmergeGrowthLogsのコメント参照)。
@@ -2890,7 +2908,7 @@ async function runDailyLearning(deps) {
       memoryConclusionsTotal: parseInt(mRaw, 10) || 0,
       predictionsTotal: parseInt(pRaw, 10) || 0,
     };
-  } catch (e) { /* ベストエフォート */ }
+  } catch (e) { warn("engine_totals_read_failed", e); } // v92: 痕跡は残す
   const metricsSnapshot = buildDailySnapshot({ ...mergedGrowthLog, engineTotals: engineTotalsForMetrics }, {
     learningDurationMs: Date.now() - learningStartedAtMs,
   });
@@ -2899,7 +2917,7 @@ async function runDailyLearning(deps) {
 
   // 最終方針「Knowledge Engineは使用回数まで管理」: その日メモリに貯めた
   // 知識の使用回数を1日1回まとめて保存する(質問時にはRedisへ書かない設計)。
-  try { await knowledgeStore.flushUsageCounters(); } catch (e) { /* ベストエフォート */ }
+  try { await knowledgeStore.flushUsageCounters(); } catch (e) { warn("usage_counters_flush_failed", e); } // v92: 痕跡は残す
 
   await stage("⑥ 知能メトリクスの計測");
   // ---- 2026年8月・AI知能計測ラウンド(ご指示①〜⑨) ----
@@ -2910,7 +2928,7 @@ async function runDailyLearning(deps) {
     // 成長可視化ラウンド⑥: 「答えられるようになった」台帳の更新。
     // フラッシュでバッファが消える前に、対象ごとの最高星を回収してから処理する。
     const answerabilitySubjects = collectAnswerabilityFromBuffer();
-    await processAnswerability({ ...intelDeps, upstashCmd }, answerabilitySubjects, runAt.toISOString());
+    await processAnswerability({ ...intelDeps, upstashCmd, noteWarning: warn }, answerabilitySubjects, runAt.toISOString());
     // ③⑤ 考察の質・RAG使用率: メモリ集計をその日のキーへ保存
     await flushIntelDaily(intelDeps, dateKey);
     await upstashCmd(["EXPIRE", `${INTEL_KEY_PREFIX}${dateKey}`, String(120 * 86400)]).catch(() => {});
@@ -2922,7 +2940,7 @@ async function runDailyLearning(deps) {
       const catFlush = await knowledgeStore.flushCategoryCounters(dateKey);
       knowledgeByCategoryToday = catFlush.categories && Object.keys(catFlush.categories).length ? catFlush.categories : null;
       await upstashCmd(["EXPIRE", `learn:knowledge:categories:${dateKey}`, String(120 * 86400)]).catch(() => {});
-    } catch (e) { /* ベストエフォート */ }
+    } catch (e) { warn("category_counters_flush_failed", e); } // v92: 痕跡は残す
 
     // ---- 精度証明ラウンド⑤: 本日のROIを保存(オッズつきの答え合わせがあった日のみ加算) ----
     if (roiAggToday.bets || roiAggToday.oddsMissing) {
@@ -3039,7 +3057,7 @@ async function runDailyLearning(deps) {
       for (const ev of evaluations) {
         historyEvents.push({ at: ev.at, type: ev.type, knob: ev.knob, verdict: ev.verdict, summaryJa: ev.detailJa });
       }
-      await appendHistory({ upstashEnabled, upstashCmd }, historyEvents);
+      await appendHistory({ upstashEnabled, upstashCmd, noteWarning: warn }, historyEvents);
       selfImprovementReport = {
         diagnosis: {
           overallHitPct: diagnosis.overallHitPct,
@@ -3107,7 +3125,7 @@ async function runDailyLearning(deps) {
         elapsedSec: Math.max(0, Math.round((Date.now() - runAt.getTime()) / 1000)),
         finished: true, stages: stageLog.slice(-30),
       });
-    } catch (e) { /* ベストエフォート */ }
+    } catch (e) { warn("progress_finish_save_failed", e); } // v92: 痕跡は残す
   }
   return { ok: true, ...mergedGrowthLog };
 }
@@ -3124,11 +3142,12 @@ async function getGrowthLog(deps) {
   }
   const latest = await upstashGetJSON("learn:growthlog:latest");
   let learningSummary = [];
+  let learningSummaryReadWarning = null; // v92: 読み出し側の失敗も黙らない(本体は従来どおり返す)
   try {
     const historyRaw = (await upstashCmd(["LRANGE", "learn:weights:history", "-10", "-1"]).catch(() => [])) || [];
     const historyEntries = historyRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
     learningSummary = buildLearningSummary(historyEntries, 5);
-  } catch (e) { /* ベストエフォート: 失敗しても成長ログ本体は返す */ }
+  } catch (e) { learningSummaryReadWarning = `learning_summary_read_failed:${String((e && e.message) || e).slice(0, 200)}`; }
   const totalResolvedRaw = await upstashCmd(["GET", "learn:ownpred:resolved"]).catch(() => null);
   const totalResolved = parseInt(totalResolvedRaw, 10) || 0;
   const hasEnoughDataForLearning = totalResolved >= MIN_RESOLVED_FOR_RECALIBRATION;
@@ -3155,12 +3174,15 @@ async function getGrowthLog(deps) {
       configured: true, ranYet: false, message: "学習エンジンはまだ一度も実行されていません。",
       learningSummary, hasEnoughDataForLearning, totalOwnPredictionsResolvedSoFar: totalResolved,
       minResolvedForRecalibration: MIN_RESOLVED_FOR_RECALIBRATION, engineTotals,
+      learningSummaryReadWarning,
     };
   }
   return {
     configured: true, ranYet: true, ...latest,
     learningSummary, hasEnoughDataForLearning, totalOwnPredictionsResolvedSoFar: totalResolved,
     minResolvedForRecalibration: MIN_RESOLVED_FOR_RECALIBRATION, engineTotals,
+    // v92: 読み出し時に学習要約が作れなかった場合、その事実を隠さない(null=正常)
+    learningSummaryReadWarning,
   };
 }
 

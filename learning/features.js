@@ -361,6 +361,7 @@ async function fetchTeamXgAverage(fixtures, teamId, callApiFootball, opts) {
   const xgs = [];
   const xgas = [];
   let skippedForBudget = 0;
+  let fetchFailures = 0; // v92: 取れなかった試合数(黙って平均から外すだけでなく、件数を返す)
   for (const f of finished) {
     if (!canSpend()) { skippedForBudget++; continue; }
     try {
@@ -368,7 +369,7 @@ async function fetchTeamXgAverage(fixtures, teamId, callApiFootball, opts) {
       const { xg, xga } = computeXgFromFixtureStats(data && data.response, teamId);
       if (xg !== null) xgs.push(xg);
       if (xga !== null) xgas.push(xga);
-    } catch (e) { /* 1試合取れなくても他で平均できるので続行する */ }
+    } catch (e) { fetchFailures++; } // 1試合取れなくても他で平均できるので続行する(v92: 件数は返す)
   }
   const avg = (arr) => (arr.length ? Math.round((arr.reduce((a, b) => a + b, 0) / arr.length) * 100) / 100 : null);
   const xgFor = avg(xgs);
@@ -377,6 +378,7 @@ async function fetchTeamXgAverage(fixtures, teamId, callApiFootball, opts) {
     xgFor, xgAgainst,
     xgNet: (xgFor !== null && xgAgainst !== null) ? Math.round((xgFor - xgAgainst) * 100) / 100 : null,
     sampleSize: xgs.length,
+    fetchFailures, // v92: 統計の取得に失敗した試合数(0が正常)
     reasonJa: xgs.length ? null
       : (skippedForBudget ? "APIリクエスト予算が不足したため、xGの取得を見送りました(明日の実行で再試行します)。"
         : "このリーグ・シーズンではAPI-FootballがxG(expected_goals)を提供していないため、取得できませんでした。"),
