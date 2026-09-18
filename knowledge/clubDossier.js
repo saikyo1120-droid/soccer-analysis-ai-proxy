@@ -40,6 +40,8 @@ const UNAVAILABLE_FIELDS_JA = {
 
 const DIFF_LIST_CAP = 20; // 1クラブに保持する「最近の変化」の上限
 const SCOUT_FEED_KEEP = 300; // スカウト用フィード(新規/移籍/若手/フォーム急変)の保持件数
+// v92: 網羅率の一覧で1回のMGETにまとめるクラブ数(1応答を大きくしすぎない)
+const COVERAGE_MGET_CHUNK = 16;
 
 /**
  * 選手名の検索用に正規化する。
@@ -366,6 +368,37 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
    * 蓄積状況のまとめ(ご指示の最終確認「何クラブ・何選手・何件」に答えるための実測)。
    * 「実装しました」ではなく「実際に何件入っているか」を返す。
    */
+  // v92: 複数キーを1往復で読む(順序はキー順で保証)。応答が配列でない・件数が合わない・
+  // 例外のときは、そのチャンクだけ従来どおり1件ずつ読む(=結果は常に同じ)。
+  async function readDossiersInChunks(keys) {
+    const out = new Array(keys.length).fill(null);
+    let mgetChunks = 0, perKeyChunks = 0; // v92: どの経路で読めたかを結果に残す(黙らない)
+    for (let start = 0; start < keys.length; start += COVERAGE_MGET_CHUNK) {
+      const chunk = keys.slice(start, start + COVERAGE_MGET_CHUNK);
+      let got = null;
+      try {
+        const raw = await upstashCmd(["MGET", ...chunk]);
+        if (Array.isArray(raw) && raw.length === chunk.length) {
+          got = raw.map((v) => {
+            if (v === null || v === undefined) return null;
+            if (typeof v === "object") return v;
+            try { return JSON.parse(v); } catch (e) { return null; }
+          });
+        }
+      } catch (e) { got = null; }
+      if (!got) {
+        got = [];
+        for (const k of chunk) got.push(await upstashGetJSON(k).catch(() => null));
+        perKeyChunks++;
+      } else {
+        mgetChunks++;
+      }
+      for (let j = 0; j < chunk.length; j++) out[start + j] = got[j];
+    }
+    out.readMode = perKeyChunks === 0 ? "mget" : (mgetChunks === 0 ? "per-key" : "mixed");
+    return out;
+  }
+
   async function getCoverageSummary() {
     if (!upstashEnabled) return { available: false, reasonJa: "保存先(Upstash)が未設定です。" };
     const slugs = (await upstashCmd(["LRANGE", "kb:club:index", "0", "-1"]).catch(() => [])) || [];
@@ -374,8 +407,14 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
     const sectionCounts = {};
     let staleClubs = 0;
     const now = Date.now();
-    for (const slug of slugs) {
-      const d = await upstashGetJSON(`kb:club:${slug}`).catch(() => null);
+    // ---- v92(2026年9月18日): 全クラブの読み出しを「1クラブ1往復」から「まとめ読み」へ ----
+    //   v90でクラブが100→172になり、この一覧はキャッシュ切れのたびに最大172往復していた
+    //   (ホーム画面と /api/learning/daily-report の両方がこれを読む)。
+    //   読む内容・数え方・並び順は従来と同一。1応答が大きくなりすぎないよう
+    //   COVERAGE_MGET_CHUNK 件ずつに分け、MGETが使えない場合は従来の1件ずつに戻る。
+    const dossiers = await readDossiersInChunks(slugs.map((slug) => `kb:club:${slug}`));
+    for (let i = 0; i < slugs.length; i++) {
+      const d = dossiers[i];
       if (!d) continue;
       const sections = Object.keys(d.sections || {});
       sections.forEach((s) => { sectionCounts[s] = (sectionCounts[s] || 0) + 1; });
@@ -397,6 +436,7 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
       staleNoteJa: staleClubs > 0 ? `${staleClubs}クラブは72時間以上更新されていません(輪番の周期内であれば正常です)。` : null,
       clubs: clubs.sort((a, b) => (b.sectionsStored - a.sectionsStored)),
       unavailableFieldsJa: UNAVAILABLE_FIELDS_JA,
+      readMode: dossiers.readMode || "per-key", // v92: "mget"(まとめ読み) / "mixed" / "per-key"(従来)。中身は同一
     };
   }
 
