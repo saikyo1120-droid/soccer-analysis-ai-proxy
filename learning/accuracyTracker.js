@@ -416,9 +416,25 @@ async function readDailyAggregates(deps, keys) {
       }
     } catch (e) { /* 従来経路(1件ずつ)へ。readMode="per-key" として結果に残る=黙らない */ }
   }
+  // ---- v94: 1件ずつの経路では「読めなかった」を数える ----
+  //   9/25朝の本番で、保存先の一時失敗により30日中11日ぶんしか読めず、
+  //   「27日→11日で52%」と劣化した数字を(失敗と分からない形で)返していた。
+  //   upstashGetJSON は失敗を null に潰すため、upstashCmd があればそちらで読んで失敗を数える。
   const out = [];
-  for (const k of keys) out.push(await upstashGetJSON(k).catch(() => null));
-  return { readMode: "per-key", values: out };
+  let readFailures = 0;
+  for (const k of keys) {
+    if (typeof upstashCmd === "function") {
+      try {
+        const raw = await upstashCmd(["GET", k]);
+        if (raw === null || raw === undefined) { out.push(null); continue; }
+        if (typeof raw === "object") { out.push(raw); continue; }
+        try { out.push(JSON.parse(raw)); } catch (e) { out.push(null); }
+      } catch (e) { readFailures++; out.push(null); }
+    } else {
+      out.push(await upstashGetJSON(k).catch(() => { readFailures++; return null; }));
+    }
+  }
+  return { readMode: "per-key", values: out, readFailures };
 }
 
 async function getAccuracyTrend(deps, todayDateKey) {
@@ -428,6 +444,13 @@ async function getAccuracyTrend(deps, todayDateKey) {
   const dateKeys = [];
   for (let i = 0; i < 30; i++) dateKeys.push(new Date(base - i * 86400000).toISOString().slice(0, 10));
   const read = await readDailyAggregates(deps, dateKeys.map((dk) => `${ACCURACY_KEY_PREFIX}${dk}`));
+  // v94: 全日が読めなかった=保存先の障害。数字を出さず、正直に available:false で返す
+  if (read.readFailures && read.readFailures >= dateKeys.length) {
+    return {
+      available: false, readFailed: true, readMode: read.readMode, readFailures: read.readFailures,
+      reasonJa: "保存先(Upstash)から精度の記録を読み出せませんでした(記録が無いという意味ではありません)。",
+    };
+  }
   const aggs = read.values;
   const daily = [];
   dateKeys.forEach((dk, i) => { if (aggs[i]) daily.push({ date: dk, agg: aggs[i] }); });
@@ -444,6 +467,12 @@ async function getAccuracyTrend(deps, todayDateKey) {
     available: true,
     recordedDays: daily.length,
     readMode: read.readMode, // v92: "mget"(1往復) / "per-key"(従来の30往復)。数字は両経路で同一
+    // v94: 一部の日が読めなかった場合、その日数(0=全部読めた)。>0 なら 7日/30日の数字は不完全
+    readFailures: read.readFailures || 0,
+    partial: (read.readFailures || 0) > 0,
+    partialNoteJa: (read.readFailures || 0) > 0
+      ? `${read.readFailures}日ぶんの記録を保存先から読み出せなかったため、7日/30日の数字は不完全です(読めた日だけの集計)。`
+      : null,
     today: t, yesterday: y, last7Days: s(last7), last30Days: s(last30),
     // 「前日より精度が何%改善したか」: 両日とも測定できた市場だけ差を出す
     vsYesterday: (t && y && t.markets.oneX2.measurable && y.markets.oneX2.measurable)

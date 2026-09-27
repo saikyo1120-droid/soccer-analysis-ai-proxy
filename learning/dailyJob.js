@@ -3150,9 +3150,34 @@ async function getGrowthLog(deps) {
   if (!upstashEnabled) {
     return { configured: false, message: "Upstash未設定のため学習ログはまだありません(.envのUPSTASH_REDIS_REST_URL/TOKENを確認してください)。" };
   }
-  const latest = await upstashGetJSON("learn:growthlog:latest");
+  // ---- v94: 「読めなかった」と「無かった」を区別する ----
+  //   本番(2026年9月25〜26日)で保存先が月間上限で止まったとき、この読み出しが null になり
+  //   画面は「学習エンジンはまだ一度も実行されていません」と**事実と違う表示**をしていた。
+  //   GET の失敗はここで捕まえ、readFailed として正直に返す(ranYet は判定不能=null)。
+  let latest = null;
+  let latestReadError = null;
+  try {
+    const rawLatest = await upstashCmd(["GET", "learn:growthlog:latest"]);
+    if (rawLatest !== null && rawLatest !== undefined) {
+      try { latest = JSON.parse(rawLatest); } catch (e) { latestReadError = `growthlog_parse_failed:${String((e && e.message) || e).slice(0, 120)}`; }
+    }
+  } catch (e) {
+    latestReadError = String((e && e.message) || e).slice(0, 200);
+  }
   let learningSummary = [];
   let learningSummaryReadWarning = null; // v92: 読み出し側の失敗も黙らない(本体は従来どおり返す)
+  if (latestReadError) {
+    // v94: 読めなかった。「未実行」とは言わない。件数系も 0 ではなく null(不明)にする。
+    //   残りの読み出し(5コマンド)も同じ保存先なので、ここで打ち切る(無駄な失敗を重ねない)。
+    return {
+      configured: true, ranYet: null, readFailed: true, storeError: latestReadError,
+      message: `保存先(Upstash)から学習の記録を読み出せませんでした(${latestReadError})。学習が実行されていないという意味ではありません。`,
+      learningSummary, hasEnoughDataForLearning: null, totalOwnPredictionsResolvedSoFar: null,
+      minResolvedForRecalibration: MIN_RESOLVED_FOR_RECALIBRATION,
+      engineTotals: { knowledgeItemsTotal: null, memoryConclusionsTotal: null, predictionsTotal: null },
+      learningSummaryReadWarning: "skipped_after_store_read_failure",
+    };
+  }
   try {
     const historyRaw = (await upstashCmd(["LRANGE", "learn:weights:history", "-10", "-1"]).catch(() => [])) || [];
     const historyEntries = historyRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);

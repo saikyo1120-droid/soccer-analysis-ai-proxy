@@ -42,6 +42,7 @@ const ZERO_CAUSE = {
   HEALTHY_NO_CHANGE: "HEALTHY_NO_CHANGE",
   NOTHING_TO_VERIFY: "NOTHING_TO_VERIFY",
   UNKNOWN: "UNKNOWN",
+  STORE_UNAVAILABLE: "STORE_UNAVAILABLE", // v94: 保存先に接続できず、記録を読めなかった(未実行ではない)
 };
 
 /**
@@ -57,6 +58,18 @@ function diagnoseZeroKnowledge(growthLog) {
   const causes = [];
 
   const isZero = saved === 0;
+
+  // ---- v94: 記録が「読めなかった」ときは「未実行」と言わない ----
+  //   本番(2026年9月25〜26日)で保存先が月間上限で止まった際、読めない=null を
+  //   「一度も実行されていない」と表示していた(事実と違う)。
+  if (log.readFailed) {
+    causes.push({
+      code: ZERO_CAUSE.STORE_UNAVAILABLE, severity: "error",
+      titleJa: "保存先(Upstash)に接続できないため、学習の記録を読み出せません",
+      detailJa: `学習が実行されていないという意味ではありません。保存先が復旧すると記録は再び表示されます。${log.storeError ? `(原因: ${String(log.storeError).slice(0, 160)})` : ""}`,
+    });
+    return { isZero: true, healthy: false, unknown: true, causes };
+  }
 
   if (log.ranYet === false || (!log.date && !log.ranAt)) {
     causes.push({
@@ -154,6 +167,14 @@ function diagnoseZeroKnowledge(growthLog) {
  */
 function diagnoseZeroVerification(growthLog) {
   const log = growthLog || {};
+  // v94: 読めなかったときは「まだ1件も検証できていません」と言わない
+  if (log.readFailed) {
+    return {
+      isZero: true, healthy: false, unknown: true,
+      titleJa: "保存先(Upstash)に接続できないため、検証の記録を読み出せません",
+      detailJa: "検証が行われていないという意味ではありません。保存先が復旧すると記録は再び表示されます。",
+    };
+  }
   const resolved = log.matchesResolvedToday || 0;
   const logged = log.newPredictionsLogged || 0;
   const totalResolved = log.totalOwnPredictionsResolvedSoFar || 0;
@@ -185,19 +206,34 @@ function diagnoseZeroVerification(growthLog) {
  * 過去N日分の実行ログを実際に読み出して、「毎日動いているか」を実データで示す。
  * 欠けている日は推測で埋めず、正直に ran:false として返す。
  */
-async function getRunHistory(deps, days, todayDateKey) {
-  const { upstashEnabled, upstashGetJSON } = deps || {};
+async function getRunHistory(deps, days, todayDateKey, opts) {
+  const { upstashEnabled, upstashGetJSON, upstashCmd } = deps || {};
   const n = Math.max(1, Math.min(60, days || 14));
   const out = [];
   if (!upstashEnabled || typeof upstashGetJSON !== "function") {
     return { available: false, reasonJa: "Upstashが設定されていないため、過去の実行履歴を読み出せません。", days: [] };
   }
+  // ---- v94: 保存先が止まっていると分かっているときは読まない(読めない日を「未実行」にしない) ----
+  if (opts && opts.storeDown) {
+    return { available: false, storeDown: true, reasonJa: "保存先(Upstash)に接続できないため、過去の実行履歴を読み出せません(実行されていないという意味ではありません)。", days: [] };
+  }
   const base = new Date(`${todayDateKey}T00:00:00Z`).getTime();
+  // v94: 「読めなかった」日を数える。全日が読めなかったら available:false で返す
+  //   (以前は失敗を null に潰し、その日を ran:false=実行記録なし として表示していた)。
+  const strictGet = typeof upstashCmd === "function"
+    ? async (key) => { const raw = await upstashCmd(["GET", key]); return raw === null || raw === undefined ? null : JSON.parse(raw); }
+    : async (key) => upstashGetJSON(key);
+  let readFailures = 0;
+  let firstReadError = null;
   for (let i = 0; i < n; i++) {
     const dateKey = new Date(base - i * 86400000).toISOString().slice(0, 10);
     let log = null;
-    try { log = await upstashGetJSON(`learn:growthlog:${dateKey}`); } catch (e) { log = null; }
-    if (!log) {
+    let readFailed = false;
+    try { log = await strictGet(`learn:growthlog:${dateKey}`); }
+    catch (e) { log = null; readFailed = true; readFailures++; if (!firstReadError) firstReadError = String((e && e.message) || e).slice(0, 160); }
+    if (readFailed) {
+      out.push({ date: dateKey, ran: null, readFailed: true });
+    } else if (!log) {
       out.push({ date: dateKey, ran: false });
     } else {
       out.push({
@@ -218,6 +254,14 @@ async function getRunHistory(deps, days, todayDateKey) {
   //   いない日」として数えるのは、利用者を不必要に不安にさせる誤検出になる。
   //   そこで「最初に実行記録がある日」より前は集計から除外し、運用が始まって
   //   からの期間だけで判定する(推測で埋めるのではなく、対象外として明示する)。
+  // v94: 全日が読めなかった=保存先の障害。「実行記録が1件もありません」とは言わない。
+  if (readFailures === n) {
+    return {
+      available: false, storeDown: true, readFailures,
+      reasonJa: `保存先(Upstash)に接続できないため、過去${n}日の実行履歴を読み出せませんでした(実行されていないという意味ではありません)${firstReadError ? `(原因: ${firstReadError})` : ""}。`,
+      days: out,
+    };
+  }
   const out2 = out.slice();
   let firstRanIndex = -1;
   for (let i = out2.length - 1; i >= 0; i--) {
@@ -228,19 +272,24 @@ async function getRunHistory(deps, days, todayDateKey) {
   }
   const trackedDays = out2.filter((d) => !d.beforeStart);
   const ranDays = out2.filter((d) => d.ran).length;
-  const missingTracked = trackedDays.filter((d) => !d.ran);
+  // v94: 読めなかった日は「実行記録なし」に数えない(判定不能として別に数える)
+  const missingTracked = trackedDays.filter((d) => d.ran === false);
+  const unreadableTracked = trackedDays.filter((d) => d.readFailed);
   const excludedCount = out2.length - trackedDays.length;
   const excludedNote = excludedCount > 0
     ? `(このうち${excludedCount}日は運用開始前のため対象外としています)`
     : "";
+  const unreadableNote = unreadableTracked.length > 0
+    ? `(${unreadableTracked.map((d) => d.date).join("・")}は保存先から読み出せず判定できません)`
+    : "";
 
   let everyDayJa;
   if (firstRanIndex === -1) {
-    everyDayJa = `直近${n}日間に実行記録が1件もありません。GitHub Actionsのスケジュールが動いていない可能性があります。`;
+    everyDayJa = `直近${n}日間に実行記録が1件もありません。GitHub Actionsのスケジュールが動いていない可能性があります。${unreadableNote}`;
   } else if (missingTracked.length === 0) {
-    everyDayJa = `運用開始以降の${trackedDays.length}日間、毎日欠かさず実行されています${excludedNote}。`;
+    everyDayJa = `運用開始以降の${trackedDays.length}日間、毎日欠かさず実行されています${excludedNote}${unreadableNote}。`;
   } else {
-    everyDayJa = `運用開始以降の${trackedDays.length}日間のうち${trackedDays.length - missingTracked.length}日で実行されています(${missingTracked.map((d) => d.date).join("・")}は実行記録がありません)${excludedNote}。実行記録が無い日は、GitHub Actionsのスケジュールが動いていなかった可能性があります。`;
+    everyDayJa = `運用開始以降の${trackedDays.length}日間のうち${trackedDays.length - missingTracked.length - unreadableTracked.length}日で実行されています(${missingTracked.map((d) => d.date).join("・")}は実行記録がありません)${excludedNote}${unreadableNote}。実行記録が無い日は、GitHub Actionsのスケジュールが動いていなかった可能性があります。`;
   }
 
   return {
@@ -251,6 +300,8 @@ async function getRunHistory(deps, days, todayDateKey) {
     // 運用が始まってからの日数と、そのうち実行できていない日(誤検出を避けた指標)
     trackedDays: trackedDays.length,
     missingDays: missingTracked.map((d) => d.date),
+    unreadableDays: unreadableTracked.map((d) => d.date), // v94
+    readFailures,
     everyDayJa,
   };
 }
@@ -265,6 +316,47 @@ function buildEngineStatuses(ctx) {
   const totals = engineTotals || log.engineTotals || {};
   const s = [];
   const push = (id, labelJa, status, messageJa, actionJa) => s.push({ id, labelJa, status, messageJa, actionJa: actionJa || null });
+
+  // ---- v94: 保存先が読めないときは、読めないことを1か所で正直に言う ----
+  //   以前は読めない=null を「GitHub Actionsが動いていない」「学習が一度も実行されて
+  //   いない」「答え合わせが1件も終わっていない」と、**3か所で別々の誤診断**にしていた
+  //   (本番2026年9月26日・Upstash月間上限で実測)。保存先に依存する項目は unknown にし、
+  //   保存先の項目だけを error にする(API-Football・LLM・Renderは保存先と無関係なので通常判定)。
+  const storeCtx = (ctx && ctx.store) || null;
+  const storeUnreadable = !!(log.readFailed || (storeCtx && storeCtx.down) || (runHistory && runHistory.storeDown));
+  if (upstashEnabled && storeUnreadable) {
+    const why = (log.storeError && String(log.storeError).slice(0, 160))
+      || (storeCtx && storeCtx.lastErrorMessage && String(storeCtx.lastErrorMessage).slice(0, 160))
+      || "接続に失敗";
+    const unknownMsg = "保存先(Upstash)に接続できないため、いまは確認できません(動いていないという意味ではありません)。";
+    push("githubActions", "GitHub Actions / cron(毎日の起動)", "unknown", unknownMsg);
+    push("render", "Render(サーバー)", "ok",
+      "この診断結果を返せている時点で、Render上のサーバーは起動して応答しています。");
+    push("upstash", "Upstash Redis(知識の保存先)", "error",
+      `保存先に接続できません(${why})。${storeCtx && storeCtx.quotaExceeded ? "無料プランの月間コマンド上限に達しています。上限が戻るか、Pay as you go へ切り替えるまで、学習・記録は保存できません。" : "復旧するまで学習・記録は保存できません。"}`,
+      storeCtx && storeCtx.quotaExceeded
+        ? "Upstashの管理画面でプランを Pay as you go に切り替えると即時に復旧します(月額は使用量に応じて数ドル以内が目安)。"
+        : "Upstashの管理画面で稼働状況と、Renderの環境変数 UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN を確認してください。");
+    push("predictionAccuracy", "AI予測の正答率(答え合わせが進んでいるか)", "unknown", unknownMsg);
+    push("apiFootball", "API-Football(実データの取得元)",
+      apiKeyConfigured ? "ok" : "error",
+      apiKeyConfigured ? "APIキーが設定されています。" : "APIキーが未設定のため、実データを一切取得できません。",
+      apiKeyConfigured ? null : "Renderの環境変数 API_FOOTBALL_KEY を設定してください。");
+    if (apiPlan && apiPlan.detectedDailyLimit) {
+      push("apiPlan", "API-Footballの契約プラン", "ok",
+        `${apiPlan.planNameJa}(1日${apiPlan.detectedDailyLimit}件)として自動判定しています。${apiPlan.detectedRemaining != null ? `本日の残り: ${apiPlan.detectedRemaining}件。` : ""}`);
+    } else {
+      push("apiPlan", "API-Footballの契約プラン", "unknown", (apiPlan && apiPlan.noteJa) || "まだ契約プランを自動判定できていません。");
+    }
+    push("llm", "LLM(AIの考察生成)", llmConfigured ? "ok" : "warn",
+      llmConfigured ? "APIキーが設定されています。" : "未設定です。実データの蓄積は続きますが、AIによる考察・プロフィール生成は行われません。");
+    push("learning", "Learning Engine(日次学習)", "unknown", unknownMsg + "保存先が止まっている間は、保存できない学習を始めない設計です(v94)。");
+    push("knowledge", "Knowledge Engine(知識)", "unknown", unknownMsg);
+    push("prediction", "Prediction Engine(予測モデル)", "unknown", unknownMsg);
+    push("memory", "Memory Engine(振り返りの記憶)", "unknown", unknownMsg);
+    push("hypothesis", "Hypothesis Engine(仮説)", "unknown", unknownMsg);
+    return s;
+  }
 
   // 1. GitHub Actions / 2. cron(同じスケジュール実行の話なのでまとめて判定する)
   if (runHistory && runHistory.available) {
@@ -321,6 +413,10 @@ function buildEngineStatuses(ctx) {
   if (!pa || pa.configured === false) {
     push("predictionAccuracy", "AI予測の正答率(答え合わせが進んでいるか)", "unknown",
       "正答率の記録を読み出せませんでした。");
+  } else if (pa.error) {
+    // v94: 読み出し失敗を「まだ1件も答え合わせが終わっていません(記録済み0件)」と表示しない
+    push("predictionAccuracy", "AI予測の正答率(答え合わせが進んでいるか)", "unknown",
+      `正答率の記録を読み出せませんでした(${String(pa.error).slice(0, 160)})。答え合わせが止まっているという意味ではありません。`);
   } else if (!pa.resolved) {
     push("predictionAccuracy", "AI予測の正答率(答え合わせが進んでいるか)", "unknown",
       `まだ1件も答え合わせが終わっていません(記録済み${pa.total || 0}件・答え合わせ待ち${pa.pending == null ? "不明" : pa.pending}件)。`);
