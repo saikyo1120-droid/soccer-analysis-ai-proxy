@@ -8579,3 +8579,59 @@ apiBudget.js 1・clubElo.js 1・features.js 1・intelligenceMetrics.js 1)。
 2. 同 → `updates.silentFailures.count` が数字(翌朝の学習後。それまでは「記録されていません」)
 3. `/api/reflections` → `officialSummary.windowNoteJa` が入っている
 4. 毎日の精度報告で、初回取得のタイムアウトが消えること(数日追う)
+
+### v92.1 追記(2026年9月19日) — ②が初日に見つけた本物のバグ: v57「スタメン確定ウォッチ」の集計が一度も成功していなかった
+v92配備後、最初の学習(9/19朝)で `updates.silentFailures` に初めて実数が入った: **4件**、すべて
+`lineup_prekick_score_failed:<fixtureId>:Cannot access 'lineupWatchScored' before initialization`。
+
+**原因(コードで確認)**: `const lineupWatchScored = { n: 0, … }` の宣言が、それを更新する答え合わせループ
+(1297行付近)より**後ろ**(③の直前・1575行付近)にあった。JavaScriptの `const` は宣言行より前で触ると
+ReferenceError(一時的死角=TDZ)になるため、直前版の記録がある試合では**毎回例外→catchが握りつぶす→集計は常に n:0**。
+つまり v57(2026年8月)以降、「朝版 vs 直前版のBrier比較」は一度も成功しておらず、成長ログの `lineupWatch.comparedToday`
+は実測ゼロのまま2か月間動いていた。学習・予測の本体には影響が無かったため、痕跡が残るまで誰にも見えなかった
+(=②で塞ごうとした欠陥クラスそのもの)。
+
+**修正**: 宣言を答え合わせループの直前へ移す(値・使い方は不変・1行の移動)。
+**検証**: v92_ops_hardening_test ⑤ を追加 — 宣言がループより前にあること、加えて同じ欠陥クラスの再発防止として
+runDailyLearning 内の集計オブジェクト(`const X = {…}`)が宣言より前で `X.member++` 等と更新されていないことを走査。
+このテストを**配備中(v92)のコードに当てると失敗し**(use 1297 / decl 1575)、修正後は合格することを確認。
+既存50本すべて合格・起動スモーク合格。
+
+**併せて実測できたこと**: 9/18・9/19の2日連続で `/api/learning/daily-report` が初回のWebFetchで応答
+(v92前は6日連続で初回タイムアウト)。readMode は両方 "mget"。
+
+## 開発ログ・ラウンド74(2026年9月24日) — v93「Skill専用レーン」(Capafy公開前の必須対応・利用者の承認)
+
+### 見つかった問題
+Capafy公開の準備(規約・費用・Skill草案の確認)の中で、本番サーバーの保護が公開後に**利用者全員を巻き込む**
+ことが分かった。本番は「1つのIPから1分30回」(`RATE_LIMIT_PER_MINUTE`)と「1つのIPの重い呼び出しは1日120回」
+(`PER_IP_HEAVY_CALLS_PER_DAY`)で守られているが、Capafy の Run Online は**利用者全員が同じ出口IPを共有する**
+可能性が高い。そのままだと、有料利用者が数人増えた瞬間に全員がまとめて 429 になる。
+
+### 修正(server.js)
+- 環境変数 `SKILL_API_KEY` と一致する `X-Skill-Key` ヘッダーを持つ呼び出しだけを、IPではなく**1本の専用レーン**
+  (`skill-lane`)で数える。分あたり `SKILL_RATE_LIMIT_PER_MINUTE`(既定120)、重い呼び出しの日次
+  `SKILL_HEAVY_CALLS_PER_DAY`(既定1000)。既存の rateBuckets / 実測課金の表をそのまま使い、鍵だけを変える
+  (新しい状態を増やさない)。処理中の日次ガード(callApiFootball内)と文面も、レーンの上限を見るようにした。
+- **鍵が未設定なら機能そのものが無効**: ヘッダーは無視され、従来と完全に同じ挙動(テスト④)。
+- **鍵が違う場合は 403 にしない**: 「不一致」と数えるだけで従来のIP枠で扱う(鍵の有無を外に漏らさない)。
+- 比較は `crypto.timingSafeEqual`(定時間)。鍵の値・長さはログにも診断にも出さない。
+- 診断 `/api/diag/skill-lane`(他の診断と同じ `?key=AUTO_COLLECT_SECRET` 保護): 設定有無・上限・本日の件数・
+  制限回数・鍵の不一致回数・レーンの重い呼び出し使用量・状態の1行要約。`/api/health` に `skillLane: configured|off`。
+  応答ヘッダー `X-Skill-Lane: dedicated|shared` で動作確認できる(鍵の値は出ない)。
+- CORS の許可ヘッダーに `X-Skill-Key` を追加。
+
+### 鍵の置き場所(Skillのファイルには絶対に書かない)
+- Render: 環境変数 `SKILL_API_KEY=<32文字程度の英数字>`
+- Capafy コンソール: hosted API credentials に同じ値を、Skill側の環境変数名 `SOCCER_AI_SKILL_KEY` として登録
+  (SKILL.md は「この環境変数があれば `X-Skill-Key` ヘッダーに付ける」とだけ書いてある)
+
+### 検証(実測)
+新テスト `v93_skill_lane_test.js` **7/7**(3つの設定で実サーバーを起動しHTTPで叩く): ①鍵なし=従来のIP枠
+②正しい鍵=IP枠が尽きていても通り、レーン自身の上限で止まる ③間違った鍵=403にせずIP枠・不一致を数える
+④鍵未設定=ヘッダー無視で従来と同一 ⑤診断の保護と中身(鍵の値・長さが出ない) ⑥重い呼び出しの日次枠がレーン別
+⑦ソース検査(定時間比較・CORS・課金の宛先・Skill草案に鍵の値が無い)。既存50本+新1本=**51本合格**・起動スモーク合格。
+
+### 公開前の残り
+v92.1(未反映)→ v93(本作)→ Render常時起動の判断 → Capafyコンソール設定(認証情報・同時セッション3・purpose文)
+→ 30秒以内応答のテスト → 9/26に精度の門(②③)の達成を確認。

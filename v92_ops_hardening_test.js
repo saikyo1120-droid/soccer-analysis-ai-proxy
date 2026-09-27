@@ -299,6 +299,30 @@ function seedClubs(m, n) {
     assert.ok(sw.includes('CACHE_NAME = "soccer-ai-shell-v92"'), "sw.js のキャッシュ名が更新されていない(利用者に新画面が配られない)");
   });
 
+  // ================= v92.1: ②が初日に見つけた本物のバグ(v57の集計変数が使う場所より後ろで宣言=TDZ) =================
+  await t("⑤ v92.1: lineupWatchScored は答え合わせループより前で宣言されている(v57以降ずっと例外→握りつぶしで n:0 だった)", async () => {
+    const dj = fs.readFileSync(path.join(__dirname, "learning", "dailyJob.js"), "utf8");
+    const decl = dj.indexOf("const lineupWatchScored = { n: 0, morningSum: 0, preKickSum: 0 };");
+    const use = dj.indexOf("lineupWatchScored.n++;");
+    const loop = dj.indexOf('for (const fixtureIdStr of pendingIds) {');
+    assert.ok(decl > 0 && use > 0 && loop > 0, "対象の行が見つからない");
+    assert.ok(decl < loop && loop < use, `宣言(${decl})が答え合わせループ(${loop})より前に無い`);
+    assert.strictEqual((dj.match(/const lineupWatchScored = /g) || []).length, 1, "宣言が二重になっている");
+    // 同じ欠陥クラスの再発防止: runDailyLearning 内の「集計オブジェクト」(const X = {…})が、
+    // 宣言より前の行で X.member として使われていないこと(TDZ)。
+    const lines = dj.split("\n");
+    const start = lines.findIndex((l) => /^async function runDailyLearning\(/.test(l));
+    let end = lines.findIndex((l, i) => i > start && /^(async )?function /.test(l)); if (end < 0) end = lines.length;
+    assert.ok(start > 0, "runDailyLearning が見つからない");
+    const offenders = [];
+    for (let i = start; i < end; i++) {
+      const m = /^  (?:const|let) (\w+) = \{/.exec(lines[i]); if (!m) continue;
+      const re = new RegExp("\\b" + m[1] + "\\.(\\w+)\\s*(\\+\\+|--|\\+=|-=|=[^=])");
+      for (let j = start; j < i; j++) { if (re.test(lines[j].replace(/\/\/.*$/, ""))) { offenders.push(`${m[1]}: 使用 ${j + 1}行目 / 宣言 ${i + 1}行目`); break; } }
+    }
+    assert.deepStrictEqual(offenders, [], "宣言より前で更新されている集計オブジェクトがある: " + offenders.join(" ; "));
+  });
+
   // ================= 総合: サーバー本体を差し替え保存先で起動し、daily-report を実際に叩く =================
   await t("④ 実サーバー: /api/learning/daily-report が MGET 経路で応答し(accuracy.readMode/knowledgeCoverage.readMode)、silentFailures を返し、往復回数が少ない", async () => {
     process.env.PORT = "8905";

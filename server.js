@@ -27,6 +27,7 @@ const fs = require("fs");
 const path = require("path");
 const { URL } = require("url");
 const { AsyncLocalStorage } = require("async_hooks");
+const crypto = require("crypto"); // v93: Skill鍵の定時間比較
 
 // Stage C: 対話エンジン(議論モード)関連。実体は server/rag/ ・ server/discuss/ ・
 // server/llm/ にあり、ここではモジュールとして読み込むだけ(利用箇所は下の方の
@@ -518,10 +519,53 @@ const rateBuckets = new Map();
 const RATE_BUCKETS_MAX = 5000;
 // 上限は環境変数で調整できるようにする(既定30。検証用に一時的に緩めたい場合に使う)
 const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE) || 30;
-function rateLimited(ip) {
+
+// ---- v93(2026年9月24日): 正規のSkill呼び出し(Capafy等)のための「専用の枠」 ----
+//   Capafy の Run Online は利用者全員が同じ出口IPを共有する可能性が高い。上の「1IP=1分30回」
+//   と「1IP=1日の重い呼び出し枠」をそのまま当てると、利用者が増えた瞬間に全員がまとめて
+//   制限に当たる(公開前の確認で判明)。そこで、環境変数 SKILL_API_KEY と一致する
+//   `X-Skill-Key` ヘッダーを持つ呼び出しだけを、IPではなく1本の専用レーンで数える。
+//   ・鍵は Render の環境変数と Capafy コンソールの認証情報にだけ置く(Skillのファイルには書かない)
+//   ・鍵が未設定なら機能そのものが無効(ヘッダーは無視=従来と完全に同じ挙動)
+//   ・鍵が違う場合は「一致しなかった」と数えるだけで、従来どおりIPの枠で扱う(鍵の有無を外に漏らさない)
+//   ・比較は定時間(timingSafeEqual)。鍵の値はログにも診断にも出さない
+const SKILL_API_KEY = String(process.env.SKILL_API_KEY || "");
+const SKILL_RATE_LIMIT_PER_MINUTE = Number(process.env.SKILL_RATE_LIMIT_PER_MINUTE) || 120;
+const SKILL_HEAVY_CALLS_PER_DAY = parseInt(process.env.SKILL_HEAVY_CALLS_PER_DAY, 10) || 1000;
+const SKILL_LANE_KEY = "skill-lane"; // rateBuckets / heavy budget の中で使う専用の鍵(IPと衝突しない形)
+if (SKILL_API_KEY && SKILL_API_KEY.length < 16) {
+  console.warn("[skill-lane] SKILL_API_KEY が短すぎます(16文字以上を推奨)。値は表示しません。");
+}
+let skillLaneStats = { day: null, requests: 0, limited: 0, heavyLimited: 0, mismatched: 0, lastRequestAt: null, lastMismatchAt: null };
+function skillLaneStatsToday() {
+  const today = appDateKey();
+  if (skillLaneStats.day !== today) skillLaneStats = { day: today, requests: 0, limited: 0, heavyLimited: 0, mismatched: 0, lastRequestAt: null, lastMismatchAt: null };
+  return skillLaneStats;
+}
+function skillKeyMatches(provided) {
+  if (!SKILL_API_KEY || typeof provided !== "string" || !provided) return false;
+  const a = Buffer.from(provided, "utf8");
+  const b = Buffer.from(SKILL_API_KEY, "utf8");
+  if (a.length !== b.length) return false;
+  try { return crypto.timingSafeEqual(a, b); } catch (e) { return false; }
+}
+/** 要求がSkill専用レーンに乗るかを判定する。戻り値: { dedicated, key?, mismatched?, ignored? } */
+function skillLaneFor(req) {
+  const raw = req && req.headers ? req.headers["x-skill-key"] : undefined;
+  if (raw === undefined) return { dedicated: false };
+  if (!SKILL_API_KEY) return { dedicated: false, ignored: true }; // 未設定=機能無効(従来どおり)
+  const provided = Array.isArray(raw) ? raw.join(",") : String(raw);
+  if (skillKeyMatches(provided)) return { dedicated: true, key: SKILL_LANE_KEY };
+  const st = skillLaneStatsToday();
+  st.mismatched++; st.lastMismatchAt = new Date().toISOString();
+  return { dedicated: false, mismatched: true };
+}
+
+function rateLimited(ip, limitOverride) {
   const now = Date.now();
   const windowMs = 60 * 1000;
-  const limit = RATE_LIMIT_PER_MINUTE;
+  // v93: Skill専用レーンは別の上限で数える(未指定なら従来の値)
+  const limit = (Number.isFinite(limitOverride) && limitOverride > 0) ? limitOverride : RATE_LIMIT_PER_MINUTE;
   const bucket = rateBuckets.get(ip) || [];
   const fresh = bucket.filter((t) => now - t < windowMs);
   fresh.push(now);
@@ -1090,10 +1134,10 @@ async function callApiFootball(endpoint, params, opts) {
   // 契約枠を実際に使う直前が、最も確実に止められる場所。
   {
     const store = heavyCtx.getStore();
-    if (store && !store.jobOnly && !(opts && opts.jobCall) && store.ip && heavyBudgetExceeded(store.ip)) {
-      const err = new Error(heavyLimitMessageJa());
+    if (store && !store.jobOnly && !(opts && opts.jobCall) && store.ip && heavyBudgetExceeded(store.ip, store.heavyLimit)) {
+      const err = new Error(heavyLimitMessageJa(store.heavyLimit)); // v93: レーン別の上限(未設定なら従来値)
       err.code = "IP_DAILY_LIMIT";
-      err.messageJa = heavyLimitMessageJa();
+      err.messageJa = heavyLimitMessageJa(store.heavyLimit);
       throw err;
     }
   }
@@ -2914,26 +2958,29 @@ const heavyPathObserved = new Map(); // pathname -> これまでに観測した�
 function isObservedHeavyPath(pathname) {
   return (heavyPathObserved.get(pathname) || 0) > 0;
 }
-function heavyLimitMessageJa() {
-  return `この端末からの外部データ取得が本日の上限(${PER_IP_HEAVY_CALLS_PER_DAY}回)に達しました。`
+function heavyLimitMessageJa(limit) {
+  const cap = (Number.isFinite(limit) && limit > 0) ? limit : PER_IP_HEAVY_CALLS_PER_DAY; // v93: レーン別の上限を文面にも反映
+  return `この端末からの外部データ取得が本日の上限(${cap}回)に達しました。`
     + `翌日(日本時間0時)に自動で戻ります。1人の利用で契約枠を使い切ってしまうと、`
     + `他の方の分析も止まってしまうための保護です。`;
 }
-function heavyBudgetExceeded(ip) {
+function heavyBudgetExceeded(ip, limit) {
   const counts = heavyBudgetToday();
-  return (counts.get(ip || "unknown") || 0) >= PER_IP_HEAVY_CALLS_PER_DAY;
+  const cap = (Number.isFinite(limit) && limit > 0) ? limit : PER_IP_HEAVY_CALLS_PER_DAY; // v93
+  return (counts.get(ip || "unknown") || 0) >= cap;
 }
 // 受付時の判定: すでに本日の上限に達していて、かつ **実際に外部APIを使う画面** のときだけ断る。
 // 前払いはしないので、入力エラーやキャッシュ命中では1回も引かれない。
 // 軽い画面(/api/health など)は巻き添えで止めない。
-function heavyBudgetPrecheck(ip, pathname) {
+function heavyBudgetPrecheck(ip, pathname, limit) {
   const counts = heavyBudgetToday();
   const used = counts.get(ip || "unknown") || 0;
-  if (used >= PER_IP_HEAVY_CALLS_PER_DAY && isObservedHeavyPath(pathname)) {
+  const cap = (Number.isFinite(limit) && limit > 0) ? limit : PER_IP_HEAVY_CALLS_PER_DAY; // v93: レーン別の上限
+  if (used >= cap && isObservedHeavyPath(pathname)) {
     return {
       allowed: false,
       usedToday: used,
-      messageJa: heavyLimitMessageJa(),
+      messageJa: heavyLimitMessageJa(cap),
     };
   }
   return { allowed: true, usedToday: used };
@@ -6900,22 +6947,31 @@ async function handleHttpRequest(req, res) {
   if (pathname.startsWith("/api/")) {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Skill-Key"); // v93: Skill鍵ヘッダーを許可
     if (req.method === "OPTIONS") {
       res.writeHead(204);
       res.end();
       return;
     }
     const ip = clientKeyFromRequest(req);
-    if (rateLimited(ip)) {
+    // ---- v93: 正規のSkill呼び出しは、IPではなく専用レーンで数える(上の skillLaneFor 参照) ----
+    const lane = skillLaneFor(req);
+    const budgetKey = lane.dedicated ? lane.key : ip;
+    const perMinuteLimit = lane.dedicated ? SKILL_RATE_LIMIT_PER_MINUTE : undefined;
+    const heavyLimit = lane.dedicated ? SKILL_HEAVY_CALLS_PER_DAY : PER_IP_HEAVY_CALLS_PER_DAY;
+    if (lane.dedicated) { const st = skillLaneStatsToday(); st.requests++; st.lastRequestAt = new Date().toISOString(); }
+    res.setHeader("X-Skill-Lane", lane.dedicated ? "dedicated" : "shared"); // 動作確認用(鍵の値は出さない)
+    if (rateLimited(budgetKey, perMinuteLimit)) {
+      if (lane.dedicated) skillLaneStatsToday().limited++;
       res.writeHead(429, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ found: false, error: "レート制限に達しました。しばらく待ってから再試行してください。" }));
       return;
     }
     // 外部APIを多く消費する利用者を、1日の実測回数で制限する。
     // 前払いではないので、入力エラーやキャッシュ命中(外部API 0回)では1回も引かれない。
-    const heavy = heavyBudgetPrecheck(ip, pathname);
+    const heavy = heavyBudgetPrecheck(budgetKey, pathname, heavyLimit);
     if (!heavy.allowed) {
+      if (lane.dedicated) skillLaneStatsToday().heavyLimited++;
       res.writeHead(429, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ found: false, ok: false, error: "daily quota reached", messageJa: heavy.messageJa }));
       return;
@@ -6929,7 +6985,8 @@ async function handleHttpRequest(req, res) {
     //     (handleHttpRequest を包んでいる側で必ず実行される)。
     {
       const store = heavyCtx.getStore();
-      if (store) { store.ip = ip; store.pathname = pathname; }
+      // v93: 実測課金の宛先もレーンに揃える(専用レーンの呼び出しはIPではなくレーンに引く)
+      if (store) { store.ip = budgetKey; store.pathname = pathname; store.heavyLimit = heavyLimit; }
     }
     // 答え合わせと毎日の学習が止まっていないかを確認する(古すぎる場合だけ裏で走る)。
     // await しない = 利用者のリクエストは1ミリ秒も遅くならない。
@@ -6944,7 +7001,35 @@ async function handleHttpRequest(req, res) {
     try {
       if (pathname === "/api/health") {
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-        res.end(JSON.stringify({ ok: true, hasKey: !!API_KEY, viaRapidApi: VIA_RAPIDAPI }));
+        // v93: skillLane は「専用レーンの鍵が設定されているか」だけを示す(値も長さも出さない)
+        res.end(JSON.stringify({ ok: true, hasKey: !!API_KEY, viaRapidApi: VIA_RAPIDAPI, skillLane: SKILL_API_KEY ? "configured" : "off" }));
+        return;
+      }
+      if (pathname === "/api/diag/skill-lane") {
+        // ---- v93: Skill専用レーンの診断(本日の件数・制限回数・鍵の不一致回数) ----
+        //   公開前の確認と公開後の見守り用。AUTO_COLLECT_SECRET が設定されていれば他の診断と同じ ?key= 保護。
+        //   鍵の値・長さ・利用者のIPは一切出さない。
+        const requiredSecret = process.env.AUTO_COLLECT_SECRET || "";
+        if (requiredSecret && parsed.searchParams.get("key") !== requiredSecret) {
+          res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "invalid or missing key" }));
+          return;
+        }
+        const st = skillLaneStatsToday();
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({
+          ok: true,
+          configured: !!SKILL_API_KEY,
+          keyLooksStrong: SKILL_API_KEY.length >= 16,
+          limits: { perMinute: SKILL_RATE_LIMIT_PER_MINUTE, heavyCallsPerDay: SKILL_HEAVY_CALLS_PER_DAY, sharedPerMinute: RATE_LIMIT_PER_MINUTE, sharedHeavyCallsPerDay: PER_IP_HEAVY_CALLS_PER_DAY },
+          today: { date: st.day, requests: st.requests, limited: st.limited, heavyLimited: st.heavyLimited, mismatchedKey: st.mismatched, lastRequestAt: st.lastRequestAt, lastMismatchAt: st.lastMismatchAt },
+          heavyUsedToday: heavyBudgetToday().get(SKILL_LANE_KEY) || 0,
+          stateJa: !SKILL_API_KEY
+            ? "SKILL_API_KEY が未設定のため、専用レーンは無効です(X-Skill-Key ヘッダーは無視され、従来どおりIPごとの枠で扱います)。"
+            : (st.requests > 0
+              ? `本日、専用レーンの呼び出しが${st.requests}件ありました(分あたり制限${st.limited}回・日次上限${st.heavyLimited}回・鍵の不一致${st.mismatched}回)。`
+              : `専用レーンは有効ですが、本日はまだ呼び出しがありません(鍵の不一致${st.mismatched}回)。`),
+        }));
         return;
       }
       if (pathname === "/api/diag/clubelo") {
@@ -9092,6 +9177,8 @@ function __setTestHooks(hooks) {
 module.exports = {
   server,
   __setTestHooks,
+  // v93: Skill専用レーンの単体検証用(本番では誰も呼ばない)
+  __skillLaneForTest: { skillLaneFor, heavyBudgetPrecheck, heavyBudgetExceeded, chargeHeavyBudget, heavyBudgetToday, rateLimited, SKILL_LANE_KEY },
   // テスト専用: プロセス内キャッシュの特定キーを消す(本番では誰も呼ばない)
   __clearCacheForTest: (key) => { try { cache.delete(key); } catch (e) { /* noop */ } },
   // 2026年8月7日: 1分あたりの上限(HTTP 429)への対処の検証用
