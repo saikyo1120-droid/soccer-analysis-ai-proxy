@@ -1188,6 +1188,14 @@ async function runDailyLearning(deps) {
   // スコア)の採点を行い、日次の精度記録(learn:accuracy:<date>)に積む。
   const resolvedScoredToday = [];
   let duelScoredToday = 0; // v54: 今日採点した対決ピック数(実測)
+  // ---- v92.1(2026年9月19日): v57「スタメン確定ウォッチ」の集計変数を、使う場所より前で宣言する ----
+  //   v92で「黙って飲み込む失敗」を記録し始めた初日に、本番で4件すべてが
+  //   `lineup_prekick_score_failed: Cannot access 'lineupWatchScored' before initialization` だった。
+  //   宣言が答え合わせループ(下)より後ろ(③の直前)にあり、const の一時的死角(TDZ)で
+  //   毎回 ReferenceError → catch が握りつぶす → 集計は常に n:0。つまり v57(8月)以降、
+  //   朝版 vs 直前版のBrier比較は**一度も成功していなかった**(学習・予測の本体には影響なし)。
+  //   修正は宣言を前へ移すだけ(値・使い方は不変)。v92_ops_hardening_test ⑤ で固定。
+  const lineupWatchScored = { n: 0, morningSum: 0, preKickSum: 0 }; // v57: 朝版vs直前版
   const pendingIds = (await upstashCmd(["LRANGE", "learn:ownpred:pending", "0", String(OWN_PREDICT_RESOLVE_CAP - 1)]).catch(() => [])) || [];
   for (const fixtureIdStr of pendingIds) {
     try {
@@ -1572,7 +1580,9 @@ async function runDailyLearning(deps) {
   }
 
   let clubEloBackfillResult = null; // v57: クラブElo履歴の一度きりバックフィル結果
-  const lineupWatchScored = { n: 0, morningSum: 0, preKickSum: 0 }; // v57: 朝版vs直前版
+  // (v92.1) lineupWatchScored の宣言は答え合わせループより前(下記②-a の直前)へ移動した。
+  //   ここに置かれていたため、上の答え合わせ(1297行付近)で使う時点では未初期化
+  //   (JavaScriptの一時的死角=TDZ)となり、ReferenceError が毎回 catch で握りつぶされていた。
   let xgCollectResult = null; // v57: xG前向き収集の実測
   await stage("③ 新しい予測を立てる");
   // ---- v50: チーム別レーティング(前回の学習で保存済み)を1回だけ読み込む ----
