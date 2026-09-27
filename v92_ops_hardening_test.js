@@ -296,7 +296,9 @@ function seedClubs(m, n) {
     assert.ok(chk.includes("async function scanAllTabsLeaks(page, lang)") && (chk.match(/scanAllTabsLeaks\(page, lang\)/g) || []).length >= 3,
       "翻訳検査がタブごとに走査していない(最後のタブしか見ない盲点が戻っている)");
     const sw = fs.readFileSync(SW_JS, "utf8");
-    assert.ok(sw.includes('CACHE_NAME = "soccer-ai-shell-v92"'), "sw.js のキャッシュ名が更新されていない(利用者に新画面が配られない)");
+    // v92以降の版でも壊れないように「v92以上」を確認する(v94でキャッシュ名を更新)
+    const swVer = Number((sw.match(/CACHE_NAME = "soccer-ai-shell-v(\d+)"/) || [])[1]);
+    assert.ok(Number.isFinite(swVer) && swVer >= 92, "sw.js のキャッシュ名が更新されていない(利用者に新画面が配られない): v" + swVer);
   });
 
   // ================= v92.1: ②が初日に見つけた本物のバグ(v57の集計変数が使う場所より後ろで宣言=TDZ) =================

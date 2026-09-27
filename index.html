@@ -2178,6 +2178,11 @@
     "学習済みの予測モデル(重み)を読み込めなかったため、今回は学習前の初期設定で計算しています。時間をおいて再度お試しください。": ["The learned model weights couldn't be loaded, so this run uses pre-learning defaults. Please try again later.", "无法读取已学习的模型权重,本次按学习前的初始设置计算。请稍后再试。", "No se pudieron cargar los pesos aprendidos, así que se calculó con los valores iniciales. Inténtelo más tarde."],
     "学習結果": ["Learning results", "学习结果", "Resultados del aprendizaje"],
     "学習記録を取得できませんでした(サーバー起動待ちの可能性があります。しばらくして再読み込みしてください)。": ["Couldn't fetch the learning records (the server may still be starting; reload shortly).", "未能获取学习记录(服务器可能在启动中,请稍后刷新)。", "No se pudieron obtener los registros (el servidor puede estar arrancando; recargue en breve)."],
+    "保存先(Upstash)が月間の上限に達しているため、いまは学習の記録を読み出せません。学習が止まったという意味ではありません。復旧すると自動的に表示が戻ります。": ["The storage (Upstash) has hit its monthly limit, so the learning records can't be read right now. This does not mean learning has stopped; the display returns automatically once it recovers.", "存储(Upstash)已达到每月上限,目前无法读取学习记录。这并不表示学习已停止;恢复后会自动显示。", "El almacenamiento (Upstash) alcanzó su límite mensual, así que ahora no se pueden leer los registros. No significa que el aprendizaje se haya detenido; volverá a mostrarse al recuperarse."],
+    "📊 保存先(Upstash)が月間の上限に達しているため、いまはダッシュボードの数字を読み出せません(0件という意味ではありません)。復旧すると自動的に表示が戻ります。": ["📊 The storage (Upstash) has hit its monthly limit, so the dashboard numbers can't be read right now (this does not mean zero). The display returns automatically once it recovers.", "📊 存储(Upstash)已达到每月上限,目前无法读取仪表板数字(并不表示为0)。恢复后会自动显示。", "📊 El almacenamiento (Upstash) alcanzó su límite mensual, así que ahora no se pueden leer las cifras del panel (no significa cero). Volverá a mostrarse al recuperarse."],
+    "📊 保存先(Upstash)に接続できないため、いまはダッシュボードの数字を読み出せません(0件という意味ではありません)。復旧すると自動的に表示が戻ります。": ["📊 The storage (Upstash) can't be reached, so the dashboard numbers can't be read right now (this does not mean zero). The display returns automatically once it recovers.", "📊 无法连接存储(Upstash),目前无法读取仪表板数字(并不表示为0)。恢复后会自动显示。", "📊 No se puede conectar con el almacenamiento (Upstash), así que ahora no se pueden leer las cifras del panel (no significa cero). Volverá a mostrarse al recuperarse."],
+    "⚠️ 保存先から一部の記録を読み出せなかったため、この表示の一部は不完全です(60秒後に読み直します)。": ["⚠️ Some records couldn't be read from storage, so parts of this view are incomplete (it re-reads in 60 seconds).", "⚠️ 部分记录无法从存储读取,此视图的部分内容不完整(60秒后重新读取)。", "⚠️ Algunos registros no se pudieron leer del almacenamiento, así que partes de esta vista están incompletas (se vuelve a leer en 60 segundos)."],
+    "保存先(Upstash)に接続できないため、いまは学習の記録を読み出せません。学習が止まったという意味ではありません。復旧すると自動的に表示が戻ります。": ["The storage (Upstash) can't be reached, so the learning records can't be read right now. This does not mean learning has stopped; the display returns automatically once it recovers.", "无法连接存储(Upstash),目前无法读取学习记录。这并不表示学习已停止;恢复后会自动显示。", "No se puede conectar con el almacenamiento (Upstash), así que ahora no se pueden leer los registros. No significa que el aprendizaje se haya detenido; volverá a mostrarse al recuperarse."],
     "守備での1対1の安定感": ["Reliability in defensive 1v1s", "防守一对一的稳定性", "Solvencia en los 1v1 defensivos"],
     "守備での1対1対応": ["Handling defensive 1v1s", "防守端的一对一应对", "Respuesta en los 1v1 defensivos"],
     "守備での球際対応": ["Handling defensive duels", "防守拼抢的应对", "Respuesta en las disputas"],
@@ -10356,6 +10361,18 @@ async function renderGrowthLogWidget() {
     summaryEl.innerHTML = `🧠 <strong>昨日学んだこと</strong>: 学習エンジンの記録先(Upstash)が未設定のため、まだ表示できません。`;
     return;
   }
+  // ---- v94(2026年9月26日): 「読めなかった」を「未実行」と表示しない ----
+  //   保存先(Upstash)が月間上限で止まった本番で、この画面が「学習エンジンはまだ一度も
+  //   実行されていません」と事実と違う表示をしていた。サーバーが readFailed を返す
+  //   ときは、読めなかったこととその理由を出す(数字は出さない)。
+  if (log.readFailed) {
+    const msg = (log.store && log.store.quotaExceeded)
+      ? "保存先(Upstash)が月間の上限に達しているため、いまは学習の記録を読み出せません。学習が止まったという意味ではありません。復旧すると自動的に表示が戻ります。"
+      : "保存先(Upstash)に接続できないため、いまは学習の記録を読み出せません。学習が止まったという意味ではありません。復旧すると自動的に表示が戻ります。";
+    summaryEl.innerHTML = `🧠 <strong>昨日学んだこと</strong>: <span class="value-note">${msg}</span>`;
+    if (detailsEl) detailsEl.innerHTML = "";
+    return;
+  }
   if (!log.ranYet) {
     summaryEl.innerHTML = `🧠 <strong>昨日学んだこと</strong>: 学習エンジンはまだ一度も実行されていません。毎日決まった時間に実行されると、ここに実際の学習内容が表示されます。`;
     return;
@@ -11594,6 +11611,22 @@ async function renderDailyReportWidget() {
     summaryEl.innerHTML = `<span class="value-note">📊 ダッシュボードを取得できませんでした(サーバー起動待ちの可能性があります。しばらくして再読み込みしてください)。</span>`;
     return;
   }
+  // ---- v94(2026年9月26日): 保存先が止まっているときは 0 の数字を並べない ----
+  //   本番で保存先(Upstash)が月間上限で止まった際、この画面は「クラブ更新 0/0・知識 +0件…」と
+  //   実態と違う0を並べていた。読めなかったことを1行で言い、数字は出さない。
+  //   判定は「最新の学習記録そのものが読めなかったか」(latestReadFailed)。保存先の down 判定は
+  //   復旧後も最長10分残るため、それで画面を差し替えると復旧直後に嘘の「読めません」になる。
+  if (data.latestReadFailed) {
+    const msg = (data.store && data.store.quotaExceeded)
+      ? "保存先(Upstash)が月間の上限に達しているため、いまはダッシュボードの数字を読み出せません(0件という意味ではありません)。復旧すると自動的に表示が戻ります。"
+      : "保存先(Upstash)に接続できないため、いまはダッシュボードの数字を読み出せません(0件という意味ではありません)。復旧すると自動的に表示が戻ります。";
+    summaryEl.innerHTML = `<span class="value-note">📊 ${msg}</span>`;
+    if (detailsEl) detailsEl.innerHTML = "";
+    return;
+  }
+  const degradedLine = data.degraded
+    ? `<div class="value-note" style="margin-top:4px; color:var(--warn, #b3541e);">⚠️ 保存先から一部の記録を読み出せなかったため、この表示の一部は不完全です(60秒後に読み直します)。</div>`
+    : "";
   const u = data.updates || {};
   const p = data.predictions || {};
   const api = data.apiUsage || {};
@@ -11680,6 +11713,7 @@ async function renderDailyReportWidget() {
   summaryEl.innerHTML = `
     <span class="value-note">(${escapeHtml(data.noteJa || "")})</span>
     <button class="more-details-btn" id="dailyReportToggleBtn" type="button" style="margin-left:8px; display:inline-block; width:auto; padding:4px 10px;">詳しく見る ▼</button>
+    ${degradedLine}
     <div class="value-note" style="margin-top:6px;">
       🏟️ クラブ更新: <strong>${num(u.universeClubsUpdated)}</strong>/${num(u.universeClubsPlanned)}クラブ(追跡対象) ・
       👤 選手更新: <strong>${num(u.universePlayersUpdated)}</strong>人 ・

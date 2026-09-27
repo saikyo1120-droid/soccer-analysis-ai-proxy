@@ -21,7 +21,9 @@ const { chromium } = require("playwright");
 
   // ---- ④ タイムアウト定数 ----
   const t = await page.evaluate(() => (typeof DISCUSS_TIMEOUT_MS !== "undefined" ? DISCUSS_TIMEOUT_MS : null));
-  ck("④ AI考察の待ち時間が75秒(旧15秒)", t === 75000, `DISCUSS_TIMEOUT_MS=${t}`);
+  // v85: サーバー側の最悪待ち時間(heavy60秒→軽量モデル切替25秒=最大85秒)を
+  // 画面が先に打ち切らないよう95秒へ延長した(旧75秒。さらに旧15秒からの延長)。
+  ck("④ AI考察の待ち時間が85秒以上(サーバーの自動モデル切替を待ちきれる)", t >= 85000, `DISCUSS_TIMEOUT_MS=${t}`);
 
   // ---- 登録選手カードを直接描画して検証 ----
   const reg = await page.evaluate(() => {

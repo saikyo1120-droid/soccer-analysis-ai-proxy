@@ -100,6 +100,8 @@ test("buildLearningSummary: 採用分だけを新しい順(直近が先頭)に�
       const [op, args1] = [cmd[0], cmd[1]];
       if (op === "LRANGE" && args1 === "learn:weights:history") return [JSON.stringify(historyEntry)];
       if (op === "GET" && args1 === "learn:ownpred:resolved") return "30";
+      // v94: 最新の学習記録は「読めなかった」と「無かった」を区別するため upstashCmd(GET) で読む
+      if (op === "GET" && args1 === "learn:growthlog:latest") return JSON.stringify({ date: "2026-08-10", factsAddedToday: 3, facts: [], errors: [] });
       return null;
     };
     const log = await getGrowthLog({

@@ -8635,3 +8635,76 @@ Capafy公開の準備(規約・費用・Skill草案の確認)の中で、本番�
 ### 公開前の残り
 v92.1(未反映)→ v93(本作)→ Render常時起動の判断 → Capafyコンソール設定(認証情報・同時セッション3・purpose文)
 → 30秒以内応答のテスト → 9/26に精度の門(②③)の達成を確認。
+
+## 開発ログ・ラウンド75(2026年9月26日) — v94「保存先(Upstash)停止時の空回り防止」(本番事故からの修正・v92.1/v93を同梱)
+
+### 何が起きたか(すべて実測)
+- 9/25: Upstash 無料プランの月間上限(50万コマンド)に達し、全コマンドが
+  `Upstash error: ERR max requests limit exceeded. Limit: 500000, Usage: 500000` で拒否された(`/api/accuracy-stats` の error 欄)。
+- その状態で、サーバーは**約15分ごとに毎日の学習を繰り返し起動**していた。原因はコード上の2点:
+  1. 自己修復 `maybeSelfHealDailyLearning` が「最新の学習記録が読めない(null)」を「学習が古い」と誤判定した
+     (`upstashGetJSON` は「読めなかった」と「無かった」を両方 null に潰す)。
+  2. 実行ロック `tryAcquireDailyRunLock` が、保存先の失敗時に「許可」へ倒れていた(可用性優先の設計)。
+- 結果: 保存できない学習(成果ゼロ)が API-Football(Pro・1日7,500件)を消費し、**9/26 04:13 UTC の時点で残り20件**
+  (=利用者用の予約分だけ。`x-ratelimit-requests-remaining` の実測値)。日付が替わって約4時間で 7,480件を使い切っていた。
+  22:16 UTC の時点でも `dailyLearningRunning: true`(学習が実行中)。22:00〜22:10 は本番が10分間応答しなかった(5回タイムアウト)。
+- さらに、読めない状態を画面が**事実と違う言葉**で表示していた: 成長ログ「学習エンジンはまだ一度も実行されていません」、
+  健康診断「直近14日間に実行記録が1件もありません(GitHub Actionsが動いていない可能性)」「Learning Engine: まだ一度も実行されていません」、
+  日次レポート「学習ジョブの記録がまだありません」+ 0 の数字の羅列(しかも5分キャッシュ)。
+
+### 修正(server.js / learning/dailyJob.js / learning/healthCheck.js / learning/accuracyTracker.js / index.html / sw.js)
+1. **保存先の健全性を1か所で記録**(`storeHealth`): `upstashCmd` / `upstashPipeline` の成否を毎回記録。
+   `storeIsDown()` = 上限超過エラーを直近に見た(最低 `STORE_QUOTA_STICKY_MS`=10分は継続) or 連続 `STORE_DOWN_CONSECUTIVE`(3)回失敗が
+   `STORE_DOWN_WINDOW_MS`(60秒)以内。`storeStatusSnapshot()` を `/api/health`・`/api/growth-log`・`/api/learning/health`・
+   `/api/learning/progress`・`/api/learning/daily-report`・`/api/accuracy-stats`(失敗時)に同梱。
+2. **fail-closed**: `tryAcquireDailyRunLock` は保存先が確認できないとき `acquired:false, storeUnavailable:true`(理由つき)。
+   自己修復は `storeIsDown()` なら即見送り、そうでなくても最新記録を `upstashGetJSONOrThrow` で読み、**読めなかったら何もしない**。
+   見送りは `selfHealSkippedForStore` に数え、`/api/health`(`selfHealSkippedForStore`)と `/api/learning/health`(`selfHeal`)で開示。
+   `/api/learning/run-daily` は保存先停止中は **503 `STORE_UNAVAILABLE`**(GitHub Actions側は失敗として記録され、翌日の定期実行で再試行)。
+   スタメン監視・自動照合の自己修復・使用量の積み上げも停止中は保存先に触らない。
+3. **「読めなかった」を「未実行」と言わない**: `getGrowthLog` は `readFailed:true, ranYet:null` と件数 null(0ではない)を返す。
+   `diagnoseZeroKnowledge/Verification` に `STORE_UNAVAILABLE`。`buildEngineStatuses` は保存先だけ error、依存項目は unknown。
+   `getRunHistory` は読めなかった日を「実行記録なし」に数えない(全日読めなければ `available:false, storeDown:true`)。
+   `getAccuracyTrend` は読めなかった日数(`readFailures`)を返し、全日失敗なら `available:false, readFailed:true`、一部なら `partial:true`。
+   日次レポートは `degraded:true` のとき **60秒**だけキャッシュ(通常5分)。画面(index.html)は成長ログ/ダッシュボードで
+   「保存先に接続できないため、いまは読み出せません(0件・未実行という意味ではありません)」を4言語で表示し、0の数字を並べない。
+4. **Upstash コマンド使用量カウンター**(`upstashUsageSnapshot`): サーバーが送ったコマンド数を月・日で数える
+   (まとめ送りは中のコマンド数ぶん。MGET等の複数キーは1コマンドとして数え、引数総数を別欄に。複数キーの請求上の扱いは公式に未確認と明記)。
+   1時間に1回 `INCRBY ops:upstash:usage:<YYYY-MM>` で保存先に積み上げ(月720コマンド)、再起動後も推定が続く(`monthEstimateBasis: store+process`)。
+   上限 `UPSTASH_MONTHLY_LIMIT`(既定 500000・従量制なら 0=上限なし)、警告 `UPSTASH_MONTHLY_WARN`(既定 400000)。`level: ok|warn|exceeded|none`。
+5. **コマンド削減**: `/api/accuracy-stats` を10分キャッシュ(失敗は60秒)+保留41件を MGET 1回(表示1回 約48→約9コマンド)。
+   答え合わせ(auto-collect)完了時にキャッシュを捨てるので鮮度は変わらない。スタメン監視の保留60件も MGET 1回(61→2コマンド/30分)。
+6. **まとめ送りの停止を恒久にしない**: 以前は `/pipeline` が一度失敗するとプロセスが生きている限り1件ずつだった。
+   `PIPELINE_DISABLE_MS`(既定10分)で自動復帰。全要素が error の応答は「無かった」ではなく失敗として投げる(`PIPELINE_ALL_FAILED`)。
+
+### 今すぐの止血(コードを配備するまで)
+- A. Upstash を Pay as you go へ切り替える(根本解決。$0.2/10万コマンド、最初の1GBは無料)。
+- B. Render の環境変数 `SELF_HEAL_DAILY_LEARNING=0`(自己修復の学習を止める。v94配備後に外してよい)。
+
+### 検証(実測)
+新テスト `v94_store_outage_test.js` **22/22**: 差し替え保存先を「上限超過」に切り替えて実サーバーを叩き、①学習が始まらない・ロック fail-closed・run-daily 503
+②health/growth-log/learning-health/progress/daily-report/accuracy-stats が「読めなかった」を返す ③復旧で従来どおり(ロック取得・通常表示)
+④タイムアウト3連続でも down→成功で復帰 ⑤使用量カウンター(MGET=1コマンド+引数総数・INCRBY 1時間1回・store+process)
+⑥accuracy-stats の MGET/10分キャッシュ ⑦MGET非対応でも1件ずつに落ちて同じ結果 ⑧getAccuracyTrend の readFailed/partial ⑨ソース/画面/辞書/sw.js。
+既存: 全52本合格(v92テストは sw.js を「v92以上」に、learning_summary_test は最新記録の読み方を v94 に合わせて更新)・翻訳検査 17/17・起動スモーク合格。
+正常時の自己修復(古い記録で学習を起動)も同じテストで保持を確認(②)。
+
+### 配備後に確認すること(推測ではなく実測で)
+- `/api/health` の `store.down`・`upstashUsage.monthEstimate`・`selfHealSkippedForStore`。
+- Upstash 復旧後: `/api/learning/health` の `selfHeal.skippedForStore` が増えなくなる/ `runHistory` が戻る/ 成長ログが通常表示。
+- API-Football の `apiPlan.detectedRemaining` が日中も数千件残っていること(空回りが止まった証拠)。
+
+### v94 で追加した環境変数(すべて任意・未設定なら既定)
+
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `STORE_DOWN_CONSECUTIVE` | 3 | 保存先を「止まっている」と判定する連続失敗回数 |
+| `STORE_DOWN_WINDOW_MS` | 60000 | 連続失敗の判定が有効な時間(最後の失敗からの経過) |
+| `STORE_QUOTA_STICKY_MS` | 600000 | 上限超過エラーを見たあと、成功を観測しても「止まっている」扱いを続ける最低時間(上限中に稀に通るコマンドで空回りが再開しないため) |
+| `UPSTASH_MONTHLY_LIMIT` | 500000 | 月間コマンド上限(無料プラン)。**Pay as you go に切り替えたら 0(上限なし)にする** |
+| `UPSTASH_MONTHLY_WARN` | 400000 | 使用量の警告しきい値(`level: warn`) |
+| `UPSTASH_USAGE_FLUSH_MS` | 3600000 | 使用量を保存先へ積み上げる間隔(1時間) |
+| `PIPELINE_DISABLE_MS` | 600000 | まとめ送りが失敗したあと1件ずつに切り替える時間(自動復帰) |
+| `ACCURACY_STATS_CACHE_MS` | 600000 | `/api/accuracy-stats` の正常応答のキャッシュ(10分) |
+| `ACCURACY_STATS_FAIL_CACHE_MS` | 60000 | 同・失敗応答のキャッシュ(60秒) |
+| `SELF_HEAL_DAILY_LEARNING` | (有効) | 既存。`0` で自己修復の学習を止める(v94前の止血用。v94配備後は不要) |

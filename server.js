@@ -341,23 +341,262 @@ function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
 // RPUSH/LRANGE/LREM/LTRIM(未解決の予測一覧・直近の記録一覧)もすべて同じ関数で
 // 呼び出せる。値の中身(JSON文字列)にどんな文字が含まれていても、リクエスト自体を
 // JSON化して送るので壊れる心配がない。
+// ============================================================================
+// v94(2026年9月26日)・本番事故からの修正: 保存先(Upstash)の健全性と使用量
+// ----------------------------------------------------------------------------
+// 実測(9/25〜9/26): 無料プランの月間上限(50万コマンド)に達し、全コマンドが
+//   「ERR max requests limit exceeded」で拒否された。すると
+//   ① 自己修復(maybeSelfHealDailyLearning)が「学習の記録が読めない(null)」を
+//      「学習が古い」と誤判定し、
+//   ② 実行ロックの確認(tryAcquireDailyRunLock)は失敗時に「許可」へ倒れていたため、
+//   **約15分ごとに毎日の学習が繰り返し起動**した。保存できないので成果はゼロのまま、
+//   API-Football(Pro・1日7,500件)を 9/26 04:13 UTC の時点で利用者予約分の20件まで
+//   使い切っていた(x-ratelimit-requests-remaining=20 を実測)。
+//
+// 対策(このブロック+各呼び出し側):
+//   ・保存先の直近の成否をここで一元的に記録する(storeHealth)。
+//   ・「読めなかった」と「無かった」を区別する読み出し(upstashGetJSONOrThrow)。
+//   ・保存先が止まっている間は、保存できない重い処理(学習・監視・自己修復)を
+//     **始めない**(fail-closed)。保存できない学習は成果が残らず費用だけかかる。
+//   ・コマンド使用量を数え、月間上限に近づいたら日次レポート等で警告する。
+// ============================================================================
+const STORE_DOWN_WINDOW_MS = Number(process.env.STORE_DOWN_WINDOW_MS) || 60 * 1000;
+const STORE_DOWN_CONSECUTIVE = Number(process.env.STORE_DOWN_CONSECUTIVE) || 3;
+// 上限超過を見たら、最低この時間は「止まっている」扱いを続ける。
+// 実測(9/26)では上限中でも稀に通るコマンドがあり、1回の成功で解除すると
+// 空回りが再開してしまうため(テストでは 0 を指定して即時解除にできる)。
+const STORE_QUOTA_STICKY_MS = Number.isFinite(Number(process.env.STORE_QUOTA_STICKY_MS))
+  ? Number(process.env.STORE_QUOTA_STICKY_MS) : 10 * 60 * 1000;
+const storeHealth = {
+  consecutiveErrors: 0, totalErrors: 0, lastErrorAt: 0, lastErrorMessage: null,
+  lastOkAt: 0, quotaExceeded: false, quotaExceededAt: 0, downSince: 0,
+};
+function isQuotaExceededMessage(msg) {
+  return /max requests limit exceeded/i.test(String(msg || ""));
+}
+function noteStoreOk() {
+  const now = Date.now();
+  storeHealth.lastOkAt = now;
+  storeHealth.consecutiveErrors = 0;
+  // 上限超過の解除は、最後に上限エラーを見てから STORE_QUOTA_STICKY_MS 経過後の成功で行う
+  if (storeHealth.quotaExceeded && (now - storeHealth.quotaExceededAt) >= STORE_QUOTA_STICKY_MS) {
+    storeHealth.quotaExceeded = false;
+    console.log("[store] 保存先(Upstash)の上限超過が解除されたと判定しました(成功を観測)");
+  }
+  if (!storeHealth.quotaExceeded) storeHealth.downSince = 0;
+}
+function noteStoreError(e) {
+  const now = Date.now();
+  const msg = String((e && e.message) || e || "").slice(0, 200);
+  storeHealth.consecutiveErrors++;
+  storeHealth.totalErrors++;
+  storeHealth.lastErrorAt = now;
+  storeHealth.lastErrorMessage = msg;
+  if (isQuotaExceededMessage(msg)) { storeHealth.quotaExceeded = true; storeHealth.quotaExceededAt = now; }
+  if (!storeHealth.downSince && (storeHealth.quotaExceeded || storeHealth.consecutiveErrors >= STORE_DOWN_CONSECUTIVE)) {
+    storeHealth.downSince = now;
+    console.error("[store] 保存先(Upstash)が応答しない状態と判定しました:", msg);
+  }
+}
+// 保存先が「いま止まっている」か。
+//   ・上限超過のエラーを直近に見た → 止まっている(成功が観測されるまで)
+//   ・連続 N 回失敗し、最後の失敗が直近 STORE_DOWN_WINDOW_MS 以内 → 止まっている
+function storeIsDown() {
+  if (!UPSTASH_ENABLED) return false;
+  const now = Date.now();
+  if (storeHealth.quotaExceeded) return true;
+  return storeHealth.consecutiveErrors >= STORE_DOWN_CONSECUTIVE
+    && (now - storeHealth.lastErrorAt) < STORE_DOWN_WINDOW_MS;
+}
+function storeStatusSnapshot() {
+  const down = storeIsDown();
+  return {
+    configured: UPSTASH_ENABLED,
+    down,
+    quotaExceeded: storeHealth.quotaExceeded,
+    consecutiveErrors: storeHealth.consecutiveErrors,
+    totalErrorsThisProcess: storeHealth.totalErrors,
+    lastErrorAt: storeHealth.lastErrorAt ? new Date(storeHealth.lastErrorAt).toISOString() : null,
+    lastErrorMessage: storeHealth.lastErrorMessage,
+    lastOkAt: storeHealth.lastOkAt ? new Date(storeHealth.lastOkAt).toISOString() : null,
+    downSince: storeHealth.downSince ? new Date(storeHealth.downSince).toISOString() : null,
+    noteJa: !UPSTASH_ENABLED
+      ? "保存先(Upstash)が未設定です。"
+      : down
+        ? (storeHealth.quotaExceeded
+          ? "保存先(Upstash)が月間コマンド上限に達しており、読み書きが拒否されています。上限が戻るか、プランを切り替えるまで学習・記録は保存できません。"
+          : "保存先(Upstash)への接続が連続して失敗しています。復旧するまで学習・記録は保存できません。")
+        : "保存先(Upstash)は応答しています。",
+  };
+}
+
+// ---- 使用量カウンター(コマンド数) ----
+//   Upstashの課金・上限は「コマンド数」(まとめ送りは中のコマンド数ぶん)。
+//   MGET/MSET/DEL などの複数キーコマンドが何コマンド扱いになるかは公式に確認できて
+//   いないため、コマンド数(1)として数えたうえで、複数キーの引数総数を別に出す
+//   (実際の請求がどちら寄りかを利用者が照合できるようにする)。
+//   月をまたいだら数え直す。プロセス再起動で消えないよう、1時間に1回だけ
+//   INCRBY で保存先に積み上げる(=月720コマンド。保存先が止まっている間は送らない)。
+const UPSTASH_MONTHLY_LIMIT = Number.isFinite(Number(process.env.UPSTASH_MONTHLY_LIMIT))
+  ? Number(process.env.UPSTASH_MONTHLY_LIMIT) : 500000; // 無料プランの月間上限。従量制なら 0 で「上限なし」
+const UPSTASH_MONTHLY_WARN = Number.isFinite(Number(process.env.UPSTASH_MONTHLY_WARN))
+  ? Number(process.env.UPSTASH_MONTHLY_WARN) : 400000;
+const UPSTASH_USAGE_FLUSH_MS = Number(process.env.UPSTASH_USAGE_FLUSH_MS) || 60 * 60 * 1000;
+const MULTI_KEY_COMMANDS = new Set(["MGET", "MSET", "DEL", "UNLINK", "EXISTS", "TOUCH"]);
+function utcMonthKey(d) { return (d || new Date()).toISOString().slice(0, 7); }
+function utcDayKey(d) { return (d || new Date()).toISOString().slice(0, 10); }
+const upstashUsage = {
+  monthKey: utcMonthKey(), monthCommands: 0, monthMultiKeyArgs: 0,
+  dayKey: utcDayKey(), dayCommands: 0,
+  byKind: { single: 0, pipeline: 0, multiKey: 0 },
+  failedCommands: 0,
+  unflushed: 0, storedMonthTotal: null, lastFlushAt: 0, flushFailures: 0, flushInFlight: false,
+  processStartedAt: new Date().toISOString(),
+};
+function rolloverUsageIfNeeded() {
+  const m = utcMonthKey();
+  if (m !== upstashUsage.monthKey) {
+    upstashUsage.monthKey = m; upstashUsage.monthCommands = 0; upstashUsage.monthMultiKeyArgs = 0;
+    upstashUsage.byKind = { single: 0, pipeline: 0, multiKey: 0 };
+    upstashUsage.unflushed = 0; upstashUsage.storedMonthTotal = null;
+  }
+  const d = utcDayKey();
+  if (d !== upstashUsage.dayKey) { upstashUsage.dayKey = d; upstashUsage.dayCommands = 0; }
+}
+function countUpstashCommand(commandArray, kind) {
+  rolloverUsageIfNeeded();
+  upstashUsage.monthCommands++;
+  upstashUsage.dayCommands++;
+  upstashUsage.unflushed++;
+  upstashUsage.byKind[kind === "pipeline" ? "pipeline" : "single"]++;
+  const name = Array.isArray(commandArray) && commandArray.length ? String(commandArray[0]).toUpperCase() : "";
+  if (MULTI_KEY_COMMANDS.has(name) && commandArray.length > 2) {
+    upstashUsage.byKind.multiKey++;
+    upstashUsage.monthMultiKeyArgs += (commandArray.length - 1);
+  }
+}
+function upstashUsageSnapshot() {
+  rolloverUsageIfNeeded();
+  const stored = Number.isFinite(upstashUsage.storedMonthTotal) ? upstashUsage.storedMonthTotal : null;
+  // 推定月間使用量 = 保存先に積み上げ済みの合計(他プロセス分も含む) + まだ積み上げていない分
+  const monthEstimate = stored !== null ? stored + upstashUsage.unflushed : upstashUsage.monthCommands;
+  const limit = UPSTASH_MONTHLY_LIMIT > 0 ? UPSTASH_MONTHLY_LIMIT : null;
+  const pct = limit ? Math.round((monthEstimate / limit) * 1000) / 10 : null;
+  const level = !limit ? "none" : monthEstimate >= limit ? "exceeded" : monthEstimate >= UPSTASH_MONTHLY_WARN ? "warn" : "ok";
+  return {
+    monthKey: upstashUsage.monthKey,
+    monthEstimate,
+    monthEstimateBasis: stored !== null ? "store+process" : "process-only",
+    monthCommandsThisProcess: upstashUsage.monthCommands,
+    monthMultiKeyArgsThisProcess: upstashUsage.monthMultiKeyArgs,
+    todayCommandsThisProcess: upstashUsage.dayCommands,
+    byKindThisProcess: { ...upstashUsage.byKind },
+    failedCommandsThisProcess: upstashUsage.failedCommands,
+    monthlyLimit: limit, warnAt: limit ? UPSTASH_MONTHLY_WARN : null, pctOfLimit: pct, level,
+    processStartedAt: upstashUsage.processStartedAt,
+    lastFlushAt: upstashUsage.lastFlushAt ? new Date(upstashUsage.lastFlushAt).toISOString() : null,
+    flushFailures: upstashUsage.flushFailures,
+    noteJa: !limit
+      ? `今月の推定使用量 ${monthEstimate.toLocaleString("en-US")}コマンド(上限なし・従量制の設定)。`
+      : level === "exceeded"
+        ? `今月の推定使用量 ${monthEstimate.toLocaleString("en-US")}コマンドで、月間上限(${limit.toLocaleString("en-US")})に達しています。`
+        : level === "warn"
+          ? `今月の推定使用量 ${monthEstimate.toLocaleString("en-US")}コマンド(上限${limit.toLocaleString("en-US")}の${pct}%)。上限に近づいています。`
+          : `今月の推定使用量 ${monthEstimate.toLocaleString("en-US")}コマンド(上限${limit.toLocaleString("en-US")}の${pct}%)。`,
+    countingNoteJa: "サーバーが送ったコマンド数の実測です(まとめ送りは中のコマンド数ぶん、複数キーのコマンドは1として数え、引数総数は別欄)。サーバー以外(GitHub Actions等)からの直接アクセスは含みません。",
+  };
+}
+// 1時間に1回、まだ積み上げていない分を保存先へ加算する(保存先が止まっていれば送らない)
+async function maybeFlushUpstashUsage() {
+  if (!UPSTASH_ENABLED || upstashUsage.flushInFlight) return;
+  const now = Date.now();
+  if (now - upstashUsage.lastFlushAt < UPSTASH_USAGE_FLUSH_MS) return;
+  if (storeIsDown()) return;
+  const n = upstashUsage.unflushed;
+  if (n <= 0) { upstashUsage.lastFlushAt = now; return; }
+  upstashUsage.flushInFlight = true;
+  try {
+    const key = `ops:upstash:usage:${upstashUsage.monthKey}`;
+    // INCRBY 自身も1コマンド。送る前に数える(送った後に失敗しても数は残す)
+    const total = await upstashCmd(["INCRBY", key, String(n + 1)]);
+    upstashUsage.unflushed = Math.max(0, upstashUsage.unflushed - (n + 1));
+    if (Number.isFinite(Number(total))) upstashUsage.storedMonthTotal = Number(total);
+    upstashUsage.lastFlushAt = Date.now();
+    // 初回だけ寿命をつける(40日で自動削除。月キーなので翌月には不要になる)
+    if (Number(total) === n + 1) await upstashCmd(["EXPIRE", key, String(40 * 86400)]).catch(() => {});
+  } catch (e) {
+    upstashUsage.flushFailures++;
+    upstashUsage.lastFlushAt = Date.now(); // 失敗しても連打しない(次は1時間後)
+  } finally {
+    upstashUsage.flushInFlight = false;
+  }
+}
+// 起動時に、保存先に積み上げ済みの今月合計を1回だけ読む(再起動で推定がゼロに戻らないように)
+let upstashUsageBootLoaded = false;
+async function loadUpstashUsageFromStoreOnce() {
+  if (upstashUsageBootLoaded || !UPSTASH_ENABLED) return;
+  upstashUsageBootLoaded = true;
+  try {
+    const raw = await upstashCmd(["GET", `ops:upstash:usage:${upstashUsage.monthKey}`]);
+    if (raw !== null && raw !== undefined && Number.isFinite(Number(raw))) upstashUsage.storedMonthTotal = Number(raw);
+    else upstashUsage.storedMonthTotal = 0;
+  } catch (e) { /* 読めなければ process-only の推定のまま(嘘をつかない) */ }
+}
+
 async function upstashCmd(commandArray) {
   if (!UPSTASH_ENABLED) {
     const err = new Error("Upstash未設定(.envのUPSTASH_REDIS_REST_URL/TOKENを確認してください)");
     err.code = "NO_UPSTASH";
     throw err;
   }
-  const res = await fetchWithTimeout(UPSTASH_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify(commandArray),
-  }, UPSTASH_TIMEOUT_MS);
-  const json = await res.json();
+  countUpstashCommand(commandArray, "single");
+  let json;
+  try {
+    const res = await fetchWithTimeout(UPSTASH_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify(commandArray),
+    }, UPSTASH_TIMEOUT_MS);
+    json = await res.json();
+  } catch (e) {
+    upstashUsage.failedCommands++;
+    noteStoreError(e);
+    throw e;
+  }
   if (json && json.error) {
     const err = new Error("Upstash error: " + json.error);
+    upstashUsage.failedCommands++;
+    noteStoreError(err);
     throw err;
   }
+  noteStoreOk();
   return json ? json.result : null;
+}
+// 「読めなかった(通信・上限などの失敗)」と「無かった(null)」を区別する読み出し。
+//   upstashGetJSON は両方を null に潰すため、「記録が無い=一度も動いていない」と
+//   誤判定する場所(自己修復・成長ログ・健康診断)ではこちらを使う。
+async function upstashGetJSONOrThrow(key) {
+  const raw = await upstashCmd(["GET", key]);
+  if (raw === null || raw === undefined) return null;
+  return JSON.parse(raw);
+}
+// 複数キーを1コマンドで読む(往復を減らす)。失敗時は1件ずつに落として必ず返す。
+//   戻り値は keys と同じ長さの配列(読めなかった/無かった要素は null)。
+async function upstashMGetJSON(keys) {
+  const list = (keys || []).filter(Boolean);
+  if (!list.length) return { values: [], readMode: "none" };
+  try {
+    const raw = await upstashCmd(["MGET", ...list]);
+    if (Array.isArray(raw) && raw.length === list.length) {
+      return {
+        readMode: "mget",
+        values: raw.map((v) => { if (v === null || v === undefined) return null; try { return JSON.parse(v); } catch (e) { return null; } }),
+      };
+    }
+  } catch (e) { /* 下で1件ずつに落とす */ }
+  const values = [];
+  for (const k of list) values.push(await upstashGetJSON(k));
+  return { readMode: "per-key", values };
 }
 // ============================================================================
 // 2026年8月8日・「正答率の更新が遅い」の実測と対処
@@ -388,16 +627,41 @@ let upstashPipeline = async function upstashPipelineImpl(commands) {
   const out = [];
   for (let i = 0; i < list.length; i += CHUNK) {
     const chunk = list.slice(i, i + CHUNK);
-    const res = await fetchWithTimeout(`${UPSTASH_URL.replace(/\/$/, "")}/pipeline`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify(chunk),
-    }, UPSTASH_TIMEOUT_MS);
-    const json = await res.json();
+    chunk.forEach((c) => countUpstashCommand(c, "pipeline")); // v94: 使用量は中のコマンド数ぶん
+    let json;
+    try {
+      const res = await fetchWithTimeout(`${UPSTASH_URL.replace(/\/$/, "")}/pipeline`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify(chunk),
+      }, UPSTASH_TIMEOUT_MS);
+      json = await res.json();
+    } catch (e) {
+      upstashUsage.failedCommands += chunk.length;
+      noteStoreError(e);
+      throw e;
+    }
     if (!Array.isArray(json)) {
       const err = new Error("Upstash pipeline error: " + JSON.stringify(json && json.error ? json.error : json).slice(0, 200));
       err.code = "PIPELINE_ERROR";
+      upstashUsage.failedCommands += chunk.length;
+      noteStoreError(err);
       throw err;
+    }
+    // まとめ送りでは、個々のコマンドの失敗は要素ごとの error として返る
+    // (上限超過は全要素が error になる)。1つでも成功があれば保存先は生きている。
+    const anyOk = json.some((r) => r && Object.prototype.hasOwnProperty.call(r, "result"));
+    const allErr = json.length > 0 && json.every((r) => r && r.error);
+    if (allErr) {
+      // 全要素が失敗 = 保存先側の障害(上限超過など)。呼び出し側が「無かった(null)」と
+      // 取り違えないよう、まとめ送り全体の失敗として投げる(1件ずつの経路と同じ扱い)。
+      upstashUsage.failedCommands += chunk.length;
+      const err = new Error("Upstash error: " + String(json[0].error).slice(0, 200));
+      err.code = "PIPELINE_ALL_FAILED";
+      noteStoreError(err);
+      throw err;
+    } else if (anyOk) {
+      noteStoreOk();
     }
     json.forEach((r) => out.push(r && Object.prototype.hasOwnProperty.call(r, "result") ? r.result : null));
   }
@@ -406,16 +670,23 @@ let upstashPipeline = async function upstashPipelineImpl(commands) {
 
 // まとめて送るが、まとめ送りが使えない環境でも必ず動く(1件ずつに落とす)。
 // 「速くするために動かなくなる」ことが無いようにするための保険。
-let pipelineDisabled = false;
+// v94: 以前は一度失敗すると **プロセスが生きている限り** 1件ずつのままだった。
+//   保存先の一時的な障害(上限超過・タイムアウト)でもそうなり、復旧後も遅いまま
+//   だったため、切り替えは一定時間(既定10分)で自動的に元に戻す。
+const PIPELINE_DISABLE_MS = Number(process.env.PIPELINE_DISABLE_MS) || 10 * 60 * 1000;
+let pipelineDisabledUntil = 0;
+function pipelineDisabledNow() { return Date.now() < pipelineDisabledUntil; }
 let upstashHooksActive = false; // テストが保存先を差し替えているか
 async function upstashCmdBatch(commands) {
   const list = (commands || []).filter(Boolean);
   if (!list.length) return [];
-  if (!pipelineDisabled && !upstashHooksActive) {
+  if (!pipelineDisabledNow() && !upstashHooksActive) {
     try { return await upstashPipeline(list); }
     catch (e) {
-      pipelineDisabled = true;
-      console.error("[upstash] まとめ送りが使えないため、1件ずつに切り替えます:", e && e.message);
+      pipelineDisabledUntil = Date.now() + PIPELINE_DISABLE_MS;
+      console.error(`[upstash] まとめ送りが失敗したため、${Math.round(PIPELINE_DISABLE_MS / 60000)}分間は1件ずつに切り替えます:`, e && e.message);
+      // 保存先そのものが止まっているなら、1件ずつ送っても同じ失敗を繰り返すだけ
+      if (storeIsDown()) return list.map(() => null);
     }
   }
   const out = [];
@@ -433,13 +704,15 @@ async function upstashCmdBatch(commands) {
 async function upstashCmdBatchDetailed(commands) {
   const list = (commands || []).filter(Boolean);
   if (!list.length) return [];
-  if (!pipelineDisabled && !upstashHooksActive) {
+  if (!pipelineDisabledNow() && !upstashHooksActive) {
     try {
       const results = await upstashPipeline(list);
       return results.map((r) => ({ determined: true, result: r }));
     } catch (e) {
-      pipelineDisabled = true;
-      console.error("[upstash] まとめ送りが使えないため、1件ずつに切り替えます:", e && e.message);
+      pipelineDisabledUntil = Date.now() + PIPELINE_DISABLE_MS;
+      console.error(`[upstash] まとめ送りが失敗したため、${Math.round(PIPELINE_DISABLE_MS / 60000)}分間は1件ずつに切り替えます:`, e && e.message);
+      // 保存先そのものが止まっているなら「判定できなかった」を即時に返す(同じ失敗を繰り返さない)
+      if (storeIsDown()) return list.map(() => ({ determined: false, result: null }));
     }
   }
   const out = [];
@@ -888,9 +1161,18 @@ async function tryAcquireDailyRunLock() {
     if (acquired) dailyRunLockToken = token;
     return { acquired, skipped: false, token: acquired ? token : null };
   } catch (e) {
-    // ロックの取得可否が判断できない場合は、学習が一切動かなくなる方が困るため
-    // 実行を許可する(安全側=可用性優先)。
-    return { acquired: true, skipped: true, reasonJa: `実行ロックを確認できませんでした(${e.message})。` };
+    // ---- v94(2026年9月26日)・本番事故からの方針転換: fail-closed ----
+    //   以前は「ロックの取得可否が判断できない場合は実行を許可」(可用性優先)だった。
+    //   しかし本番で保存先(Upstash)が月間上限で止まったとき、この許可が
+    //   自己修復(15分ごと)と組み合わさって学習を**繰り返し起動**させ、
+    //   保存できない学習が API-Football の1日枠(7,500件)を4時間で使い切った。
+    //   保存先が確認できない状態では、学習しても成果が残らない(保存できない)ため、
+    //   実行しない方が正しい。一時的な失敗なら、次の確認(15分後・翌日の定期実行)で
+    //   自然に再開する。
+    return {
+      acquired: false, skipped: true, storeUnavailable: true,
+      reasonJa: `保存先(Upstash)に接続できないため、学習を見送りました(${String(e.message || e).slice(0, 160)})。保存できない学習は成果が残らず、外部APIの枠だけを消費するためです。保存先が復旧すると自動的に再開します。`,
+    };
   }
 }
 
@@ -2101,8 +2383,10 @@ async function handleAccuracyStats() {
       const ids = (await upstashCmd(["LRANGE", "pred:pending", "0", "40"])) || [];
       const now = Date.now();
       let awaitingKickoff = 0, dueForCheck = 0, unreadable = 0, oldestKickoff = null;
-      for (const idStr of ids) {
-        const rec = await upstashGetJSON(`pred:${idStr}`).catch(() => null);
+      // v94: 保留41件を1件ずつ読んでいた(=表示1回で約48コマンド)→ MGET 1コマンドに
+      //   (失敗時は従来どおり1件ずつに落ちる。読む内容は同じ)
+      const { values: pendingRecs, readMode: pendingReadMode } = await upstashMGetJSON(ids.map((idStr) => `pred:${idStr}`));
+      for (const rec of pendingRecs) {
         if (!rec) { unreadable++; continue; }
         const ko = rec.kickoff ? new Date(rec.kickoff).getTime() : null;
         if (ko && (!oldestKickoff || ko < oldestKickoff)) oldestKickoff = ko;
@@ -2116,6 +2400,7 @@ async function handleAccuracyStats() {
         unreadable,          // 記録本体が読めない(3回で自動的に外れる)
         oldestKickoff: oldestKickoff ? new Date(oldestKickoff).toISOString() : null,
         resolveCapPerRun: AUTO_COLLECT_RESOLVE_CAP,
+        readMode: pendingReadMode, // v94: "mget" | "per-key"(実測の開示)
       };
     } catch (e) { pendingDetail = { error: e.message }; }
     const total = parseInt(totalRaw, 10) || 0;
@@ -2172,8 +2457,27 @@ async function handleAccuracyStats() {
       },
     };
   } catch (e) {
-    return { status: 200, body: { configured: true, error: e.message, reasonJa: `予測実績の読み出しに失敗しました(${e.message})。0件という意味ではなく、集計できなかったという意味です。`, total: 0, resolved: 0, correct: 0, accuracyPct: null, since: null, pending: null, lastResolvedAt: null, recent: [] } };
+    return { status: 200, body: { configured: true, error: e.message, reasonJa: `予測実績の読み出しに失敗しました(${e.message})。0件という意味ではなく、集計できなかったという意味です。`, store: storeStatusSnapshot(), total: 0, resolved: 0, correct: 0, accuracyPct: null, since: null, pending: null, lastResolvedAt: null, recent: [] } };
   }
+}
+// ---- v94: 実績表示のキャッシュ ----
+//   /api/accuracy-stats はホーム画面を開くたびに呼ばれ、キャッシュ無しで毎回 約48コマンド
+//   (v94で約8コマンドに削減)を保存先へ送っていた。答え合わせは1時間ごとの自動照合で
+//   しか進まないため、10分キャッシュしても表示の鮮度は変わらない。
+//   読み出しに失敗した結果は60秒だけキャッシュする(壊れている間に連打されても
+//   保存先へ失敗を積み上げない・復旧は1分以内に画面へ反映される)。
+const ACCURACY_STATS_CACHE_MS = Number(process.env.ACCURACY_STATS_CACHE_MS) || 10 * 60 * 1000;
+const ACCURACY_STATS_FAIL_CACHE_MS = Number(process.env.ACCURACY_STATS_FAIL_CACHE_MS) || 60 * 1000;
+async function handleAccuracyStatsCached() {
+  const hit = cacheGet("accuracy-stats");
+  if (hit) return { status: 200, body: { ...hit, cached: true } };
+  const r = await handleAccuracyStats();
+  if (r && r.status === 200 && r.body) {
+    const failed = !!r.body.error;
+    cacheSet("accuracy-stats", { ...r.body, cachedAt: new Date().toISOString(), cacheTtlSec: Math.round((failed ? ACCURACY_STATS_FAIL_CACHE_MS : ACCURACY_STATS_CACHE_MS) / 1000) },
+      failed ? ACCURACY_STATS_FAIL_CACHE_MS : ACCURACY_STATS_CACHE_MS);
+  }
+  return r;
 }
 
 // Leagues/competitions to hide from "today's real fixtures" even though
@@ -3328,6 +3632,7 @@ async function handleAutoCollectPredictions(opts) {
     notes: notes.slice(0, 20),
   };
   await upstashSetJSON("pred:autocollect:lastrun", runRecord).catch(() => {});
+  cache.delete("accuracy-stats"); // v94: 答え合わせが進んだ直後は実績表示のキャッシュを捨てる(次の表示で最新に)
   await upstashCmd(["LPUSH", "pred:autocollect:log", JSON.stringify(runRecord)]).catch(() => {});
   await upstashCmd(["LTRIM", "pred:autocollect:log", "0", "29"]).catch(() => {});
   return {
@@ -3405,9 +3710,11 @@ async function maybeWatchLineups() {
     const nowMs = Date.now();
     if (nowMs - lineupWatchLastTickMs < 3 * 60 * 1000) return;
     lineupWatchLastTickMs = nowMs;
+    if (storeIsDown()) return; // v94: 保存先が止まっている間は観測しても記録できない
     if (nowMs - lineupKickoffCache.at > 30 * 60 * 1000) {
       const ids = (await upstashCmd(["LRANGE", "learn:ownpred:pending", "-60", "-1"]).catch(() => [])) || [];
-      const recs = await Promise.all(ids.map((id) => upstashGetJSON(`learn:ownpred:${id}`).catch(() => null)));
+      // v94: 60件を1件ずつ読んでいた(61コマンド/30分)→ MGET で1コマンドに(失敗時は従来どおり1件ずつ)
+      const { values: recs } = await upstashMGetJSON(ids.map((id) => `learn:ownpred:${id}`));
       lineupKickoffCache.byId = new Map();
       recs.forEach((r, i) => {
         if (r && !r.resolved && r.kickoff) lineupKickoffCache.byId.set(String(ids[i]), Date.parse(r.kickoff));
@@ -3483,6 +3790,7 @@ async function maybeSelfHealAutoCollect() {
   const now = Date.now();
   if (now - autoSweepLastCheckedAt < AUTO_SWEEP_CHECK_INTERVAL_MS) return;
   autoSweepLastCheckedAt = now;
+  if (storeIsDown()) return; // v94: 保存できない収集は始めない(ロックは元から fail-closed)
   try {
     const last = await upstashGetJSON("pred:autocollect:lastrun").catch(() => null);
     const lastMs = last && last.at ? new Date(last.at).getTime() : null;
@@ -3579,6 +3887,7 @@ async function maybeRepairPlayerIndex() {
   } catch (e) { /* 修復に失敗しても本体は止めない */ }
 }
 
+let selfHealSkippedForStore = { count: 0, lastAt: 0, lastReason: null }; // v94: 見送りの記録(診断で開示)
 async function maybeSelfHealDailyLearning() {
   if (!SELF_HEAL_DAILY_LEARNING) return;
   if (!UPSTASH_ENABLED) return;
@@ -3586,8 +3895,22 @@ async function maybeSelfHealDailyLearning() {
   const now = Date.now();
   if (now - learnSweepLastCheckedAt < LEARN_SWEEP_CHECK_INTERVAL_MS) return;
   learnSweepLastCheckedAt = now;
+  // ---- v94: 保存先が止まっている間は自己修復を始めない ----
+  //   保存できない学習は成果が残らない。しかも以前は「記録が読めない(null)」を
+  //   「学習が古い」と誤判定して起動していた(本番で15分ごとに空回り)。
+  if (storeIsDown()) {
+    selfHealSkippedForStore = { count: selfHealSkippedForStore.count + 1, lastAt: now, lastReason: "store_down" };
+    return;
+  }
   try {
-    const latest = await upstashGetJSON("learn:growthlog:latest").catch(() => null);
+    // 「読めなかった」と「無かった」を区別する(v94)。読めなかったら何もしない。
+    let latest = null;
+    try {
+      latest = await upstashGetJSONOrThrow("learn:growthlog:latest");
+    } catch (e) {
+      selfHealSkippedForStore = { count: selfHealSkippedForStore.count + 1, lastAt: now, lastReason: `read_failed:${String((e && e.message) || e).slice(0, 120)}` };
+      return;
+    }
     const ranMs = latest && latest.ranAt ? new Date(latest.ranAt).getTime() : null;
     const age = Number.isFinite(ranMs) ? now - ranMs : Infinity;
     let reason = age >= LEARN_SWEEP_STALE_MS ? "stale" : null;
@@ -3724,7 +4047,10 @@ async function triggerDailyLearningForRepair() {
   //   「本日はすでに2回起動し直しました」になり、その日は本当に必要な
   //   再起動ができなくなっていた。**先に実行権を取ってから数える**。
   const lock = await tryAcquireDailyRunLock();
-  if (!lock.acquired) return { started: false, reasonJa: "別のプロセスが学習の実行権を持っています。" };
+  if (!lock.acquired) {
+    // v94: 保存先が確認できない場合は、その理由をそのまま伝える(「別のプロセス」ではない)
+    return { started: false, reasonJa: lock.storeUnavailable ? lock.reasonJa : "別のプロセスが学習の実行権を持っています。" };
+  }
   if (UPSTASH_ENABLED) {
     const key = `qa:repair:learning:${appDateKey()}`;
     const n = await upstashCmd(["INCR", key]).catch(() => null);
@@ -5252,32 +5578,43 @@ async function handleMatchAnalysis(query, clientIp) {
 async function handleLearningHealth(searchParams) {
   const generatedAt = new Date().toISOString();
   const days = Math.max(1, Math.min(60, parseInt((searchParams && searchParams.get("days")) || "14", 10) || 14));
-  const growthLog = await getGrowthLog(learningDeps).catch(() => ({ ranYet: false }));
+  // v94: 例外時も「未実行(ranYet:false)」ではなく「読めなかった」として扱う
+  const growthLog = await getGrowthLog(learningDeps).catch((e) => ({ ranYet: null, readFailed: true, storeError: String((e && e.message) || e).slice(0, 160) }));
   const todayDateKey = appDateKey();
-  const runHistory = await getRunHistory(learningDeps, days, todayDateKey).catch(() => ({ available: false, reasonJa: "実行履歴の読み出しに失敗しました。", days: [] }));
+  // v94: 成長ログが読めなかった(=保存先が止まっている)ときは、14日ぶんの読み出しを
+  //   行わず「読めない」と返す(読めない日を「実行記録なし」と誤表示しない・無駄な失敗を重ねない)。
+  //   判定は「いま実際に読めたか」で行う(storeIsDown() は上限解除後も最長10分は down を返すため、
+  //   それを使うと復旧直後に「確認できません」を出し続けてしまう)。
+  const storeDownNow = !!growthLog.readFailed;
+  const runHistory = await getRunHistory(learningDeps, days, todayDateKey, { storeDown: storeDownNow })
+    .catch(() => ({ available: false, reasonJa: "実行履歴の読み出しに失敗しました。", days: [] }));
 
   // 第6次監査での追加: 重みを更新しなかった「本当の理由」は
   // learn:weights:history に記録されている。健康診断が理由を推測しないよう、
   // 実際に記録された理由を読み出して渡す。
-  try {
-    const hist = (await upstashCmd(["LRANGE", "learn:weights:history", "-1", "-1"])) || [];
-    if (hist.length) {
-      const last = JSON.parse(hist[0]);
-      if (last && last.date === todayDateKey && last.note) growthLog.weightsHistoryNoteJa = last.note;
-    }
-  } catch (e) { /* 読めなくても健康診断自体は返す(その場合は理由を推測しない) */ }
+  if (!storeDownNow) {
+    try {
+      const hist = (await upstashCmd(["LRANGE", "learn:weights:history", "-1", "-1"])) || [];
+      if (hist.length) {
+        const last = JSON.parse(hist[0]);
+        if (last && last.date === todayDateKey && last.note) growthLog.weightsHistoryNoteJa = last.note;
+      }
+    } catch (e) { /* 読めなくても健康診断自体は返す(その場合は理由を推測しない) */ }
+  }
 
-  const metricsTrend = await getMetricsTrend(learningDeps, 7, todayDateKey).catch(() => null);
+  const metricsTrend = storeDownNow ? null : await getMetricsTrend(learningDeps, 7, todayDateKey).catch(() => null);
   const zeroKnowledge = diagnoseZeroKnowledge(growthLog);
   const zeroVerification = diagnoseZeroVerification(growthLog);
   // 2026年8月・「正答率が何日も変わらない」調査を受けて追加:
   // ホーム画面に出る「AI予測の正答率」(pred:* 系)の詰まりを自動で検出させる。
-  const predictionAccuracy = await handleAccuracyStats()
+  const predictionAccuracy = await handleAccuracyStatsCached() // v94: 表示用と同じキャッシュを使う
     .then((r) => r.body).catch(() => null);
+  const storeNow = storeStatusSnapshot();
   const engines = buildEngineStatuses({
     growthLog,
     runHistory,
     predictionAccuracy,
+    store: storeNow, // v94
     upstashEnabled: UPSTASH_ENABLED,
     apiKeyConfigured: !!API_KEY,
     llmConfigured: !!process.env.ANTHROPIC_API_KEY,
@@ -5301,18 +5638,25 @@ async function handleLearningHealth(searchParams) {
   //   unknown になるため、これは日常的に起きる状態だった。
   const unknownCount = engines.filter((e) => e.status === "unknown").length;
   const overall = errorCount > 0 ? "error" : warnCount > 0 ? "warn" : unknownCount > 0 ? "unknown" : "ok";
-  const overallMessageJa = errorCount > 0
-    ? `${errorCount}件の重大な問題が見つかりました(下の一覧の❌印を確認してください)。`
-    : warnCount > 0
-      ? `重大な問題はありませんが、${warnCount}件の注意点があります。`
-      : unknownCount > 0
-        ? `異常は見つかりませんでしたが、${unknownCount}件は現時点で状態を確認できていません(下の一覧を確認してください)。`
-        : "すべての構成要素が正常に動作しています。";
+  const overallMessageJa = storeDownNow && UPSTASH_ENABLED
+    // v94: 保存先が読めない日は「N件の重大な問題」ではなく、原因を1文で言う
+    ? `保存先(Upstash)に接続できないため、学習・記録の状態を確認できません(${storeNow.quotaExceeded ? "月間コマンド上限に達しています" : "接続が失敗しています"})。学習が止まっているという意味ではなく、復旧すると記録は再び表示されます。`
+    : errorCount > 0
+      ? `${errorCount}件の重大な問題が見つかりました(下の一覧の❌印を確認してください)。`
+      : warnCount > 0
+        ? `重大な問題はありませんが、${warnCount}件の注意点があります。`
+        : unknownCount > 0
+          ? `異常は見つかりませんでしたが、${unknownCount}件は現時点で状態を確認できていません(下の一覧を確認してください)。`
+          : "すべての構成要素が正常に動作しています。";
 
   return {
     status: 200,
     body: {
       ok: true, generatedAt, overall, overallMessageJa,
+      // v94: 保存先の健全性・使用量・空回り防止の実測(プロセス内の値)
+      store: storeNow,
+      upstashUsage: upstashUsageSnapshot(),
+      selfHeal: { skippedForStore: selfHealSkippedForStore.count, lastSkipAt: selfHealSkippedForStore.lastAt ? new Date(selfHealSkippedForStore.lastAt).toISOString() : null, lastSkipReason: selfHealSkippedForStore.lastReason, learningRunningNow: dailyLearningRunning },
       zeroKnowledge, zeroVerification, engines, runHistory,
       // 2026年8月: 「昨日より賢くなったか」を数値の差分で示す(⑧のご要望)。
       growthComparison: metricsTrend ? metricsTrend.comparison : null,
@@ -6997,12 +7341,23 @@ async function handleHttpRequest(req, res) {
     runInBackgroundCtx(() => maybeSelfHealDailyLearning());
     // v57: キックオフ直前の試合のスタメン・直前オッズを裏で確認(3分に1回まで)
     runInBackgroundCtx(() => maybeWatchLineups());
+    // v94: 保存先の使用量カウンター(起動時に今月分を1回読む・1時間に1回積み上げる)
+    runInBackgroundCtx(() => loadUpstashUsageFromStoreOnce().then(() => maybeFlushUpstashUsage()));
 
     try {
       if (pathname === "/api/health") {
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         // v93: skillLane は「専用レーンの鍵が設定されているか」だけを示す(値も長さも出さない)
-        res.end(JSON.stringify({ ok: true, hasKey: !!API_KEY, viaRapidApi: VIA_RAPIDAPI, skillLane: SKILL_API_KEY ? "configured" : "off" }));
+        // v94: store(保存先の健全性)と upstashUsage(コマンド使用量)を同梱(どちらもプロセス内の値・保存先を読まない)
+        const storeNow = storeStatusSnapshot();
+        const usageNow = upstashUsageSnapshot();
+        res.end(JSON.stringify({
+          ok: true, hasKey: !!API_KEY, viaRapidApi: VIA_RAPIDAPI, skillLane: SKILL_API_KEY ? "configured" : "off",
+          store: { configured: storeNow.configured, down: storeNow.down, quotaExceeded: storeNow.quotaExceeded, downSince: storeNow.downSince, lastErrorAt: storeNow.lastErrorAt, noteJa: storeNow.noteJa },
+          upstashUsage: { monthKey: usageNow.monthKey, monthEstimate: usageNow.monthEstimate, monthEstimateBasis: usageNow.monthEstimateBasis, monthlyLimit: usageNow.monthlyLimit, level: usageNow.level, noteJa: usageNow.noteJa },
+          learningRunning: dailyLearningRunning,
+          selfHealSkippedForStore: selfHealSkippedForStore.count,
+        }));
         return;
       }
       if (pathname === "/api/diag/skill-lane") {
@@ -7723,14 +8078,23 @@ async function handleHttpRequest(req, res) {
         return;
       }
       if (pathname === "/api/learning/progress") {
-        const prog = await upstashGetJSON("learn:progress").catch(() => null);
-        const lastRebuild = await upstashGetJSON("kb:player:index:lastrebuild").catch(() => null);
+        // v94: 「読めなかった」と「無かった」を区別する(読めなかったら「1度も走っていません」と言わない)
+        let prog = null;
+        let progReadError = null;
+        try { prog = await upstashGetJSONOrThrow("learn:progress"); }
+        catch (e) { progReadError = String((e && e.message) || e).slice(0, 160); }
+        const lastRebuild = progReadError ? null : await upstashGetJSON("kb:player:index:lastrebuild").catch(() => null);
         const ageSec = prog && prog.at ? Math.round((Date.now() - new Date(prog.at).getTime()) / 1000) : null;
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify({
           ok: true,
           available: !!prog,
-          reasonJa: prog ? null : "まだ進捗の記録がありません(この機能を入れてから学習が1度も走っていません)。",
+          readFailed: !!progReadError,
+          store: storeStatusSnapshot(),
+          reasonJa: prog ? null
+            : progReadError
+              ? `保存先(Upstash)から進捗を読み出せませんでした(${progReadError})。学習が走っていないという意味ではありません。`
+              : "まだ進捗の記録がありません(この機能を入れてから学習が1度も走っていません)。",
           progress: prog || null,
           secondsSinceLastStage: ageSec,
           verdictJa: !prog ? null
@@ -7861,7 +8225,7 @@ async function handleHttpRequest(req, res) {
         return;
       }
       if (pathname === "/api/accuracy-stats") {
-        const { status, body } = await handleAccuracyStats();
+        const { status, body } = await handleAccuracyStatsCached(); // v94: 10分キャッシュ(失敗は60秒)
         res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
         return;
@@ -8212,6 +8576,17 @@ async function handleHttpRequest(req, res) {
         const runLockOk = forceRequested
           ? { acquired: true, skipped: false }
           : await tryAcquireDailyRunLock();
+        if (!runLockOk.acquired && runLockOk.storeUnavailable) {
+          // v94: 保存先が確認できない=保存できない学習は始めない(正直に503で返す)。
+          //   GitHub Actions 側は失敗として記録され、翌日の定期実行で自然に再試行される。
+          res.writeHead(503, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({
+            ok: false, started: false, reason: "STORE_UNAVAILABLE",
+            messageJa: runLockOk.reasonJa,
+            store: storeStatusSnapshot(),
+          }));
+          return;
+        }
         if (!runLockOk.acquired) {
           res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
           res.end(JSON.stringify({
@@ -8781,7 +9156,9 @@ async function handleHttpRequest(req, res) {
         // ホーム画面の「昨日学んだこと」ウィジェット用。Upstash未設定・未実行の
         // 場合も、架空の数字を返さず正直な状態を返す(既存のhandleAccuracyStats
         // と同じ方針)。
-        const result = await getGrowthLog(learningDeps);
+        // v94: 例外時も「未実行」ではなく「読めなかった」として返す
+        const result = await getGrowthLog(learningDeps)
+          .catch((e) => ({ configured: UPSTASH_ENABLED, ranYet: null, readFailed: true, storeError: String((e && e.message) || e).slice(0, 160), message: "保存先(Upstash)から学習の記録を読み出せませんでした。学習が実行されていないという意味ではありません。" }));
         // 2026年8月・優先順位⑨: 「0件」の理由をサーバー側で判定して同梱する。
         // これまでは画面に「0件」としか出ず、正常な0件(前回から変化なし)と
         // 異常な0件(未実行・キー未設定・予算切れ)を利用者が区別できなかった。
@@ -8793,9 +9170,11 @@ async function handleHttpRequest(req, res) {
           result.zeroVerificationDiagnosis = diagnoseZeroVerification(result);
           // 2026年8月・完全自動Learning Cycle ⑧: 「昨日より賢くなったか」の判定も
           // ホーム画面のウィジェットへ渡す(前日との実データの差分に基づく)。
-          const trend = await getMetricsTrend(learningDeps, 3, appDateKey()).catch(() => null);
+          // v94: 読めなかった直後に同じ保存先を読み直さない(無駄な失敗を重ねない)
+          const trend = result.readFailed ? null : await getMetricsTrend(learningDeps, 3, appDateKey()).catch(() => null);
           result.growthComparison = trend ? trend.comparison : null;
         } catch (e) { /* 診断は付加情報なので、失敗しても本体は返す */ }
+        result.store = storeStatusSnapshot(); // v94: 画面が「読めない理由」を出せるように
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(result));
         return;
@@ -8826,8 +9205,18 @@ async function handleHttpRequest(req, res) {
           return;
         }
         const todayKey = appDateKey();
+        // v94: 最新の学習記録は「読めなかった」と「無かった」を区別して読む。
+        //   読めなかった(保存先の障害)場合、以前は「学習ジョブの記録がまだありません」と表示し、
+        //   さらにその劣化した結果を5分キャッシュしていた(9/25朝に実例: 27日→11日ぶんで52%と誤表示)。
+        let latestReadFailed = null;
+        const readLatestStrict = async () => {
+          try {
+            const raw = await learningDeps.upstashCmd(["GET", "learn:growthlog:latest"]);
+            return raw === null || raw === undefined ? null : JSON.parse(raw);
+          } catch (e) { latestReadFailed = String((e && e.message) || e).slice(0, 160); return null; }
+        };
         const [growthRaw, accuracyTrend, agenda, intelReport, answerability, selfImproveHistory, coverage, weightsImpact] = await Promise.all([
-          learningDeps.upstashGetJSON("learn:growthlog:latest").catch(() => null),
+          readLatestStrict(),
           getAccuracyTrend(learningDeps, todayKey).catch(() => ({ available: false })),
           loadLatestAgenda(learningDeps).catch(() => null),
           // AI知能計測ラウンド(ご指示①〜⑨): 日次学習ジョブが保存した知能レポート
@@ -8860,10 +9249,23 @@ async function handleHttpRequest(req, res) {
           })(),
         ]);
         const g = growthRaw || {};
+        // v94: 保存先の状態(読めなかった・止まっている)を同梱し、劣化した結果は長くキャッシュしない
+        const storeNowDr = storeStatusSnapshot();
+        // 劣化の判定は「いま実際に読めたか」で行う(storeIsDown() は復旧後も最長10分 down を返すため使わない)
+        const drDegraded = !!latestReadFailed
+          || (accuracyTrend && accuracyTrend.available === false && UPSTASH_ENABLED)
+          || !!(accuracyTrend && accuracyTrend.partial);
         const body = {
           ok: true,
           generatedAt: new Date().toISOString(),
           date: g.date || todayKey,
+          store: storeNowDr,
+          upstashUsage: upstashUsageSnapshot(),
+          degraded: drDegraded,
+          latestReadFailed: !!latestReadFailed, // 最新の学習記録そのものが読めなかった(画面は数字を出さない)
+          degradedNoteJa: drDegraded
+            ? `保存先(Upstash)から一部または全部の記録を読み出せませんでした${latestReadFailed ? `(原因: ${latestReadFailed})` : ""}。数字が0や空になっている項目は「無い」のではなく「読めなかった」可能性があります。この結果は60秒後に読み直します。`
+            : null,
           // 学習が実際に予測を変えた記録(実測)
           weightsImpact,
           // 2026年8月・本番確認で判明: 予測カバー率と無駄削減の実測を
@@ -8878,7 +9280,9 @@ async function handleHttpRequest(req, res) {
           isToday: g.date === todayKey,
           noteJa: g.date
             ? (g.date === todayKey ? "本日の学習実行の実測値です。" : `最新の学習記録は${g.date}のものです(本日分はまだ実行されていません)。`)
-            : "学習ジョブの記録がまだありません。",
+            : latestReadFailed
+              ? "保存先(Upstash)から学習記録を読み出せませんでした(記録が無いという意味ではありません)。"
+              : "学習ジョブの記録がまだありません。",
           // ---- ② 更新量(何クラブ・何選手・何件) ----
           updates: {
             universeClubsUpdated: (g.universe && g.universe.coreClubsUpdated) ?? 0,
@@ -8977,7 +9381,8 @@ async function handleHttpRequest(req, res) {
           // (本日のループの中身は intelligence.selfImprovement に入っている)
           selfImprovementHistory: selfImproveHistory && selfImproveHistory.available ? selfImproveHistory : null,
         };
-        cacheSet("learn:daily-report", body, 5 * 60 * 1000);
+        // v94: 劣化した結果(読めなかった)は60秒だけ、通常は5分キャッシュ
+        cacheSet("learn:daily-report", body, drDegraded ? 60 * 1000 : 5 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
         return;
@@ -9159,6 +9564,23 @@ function __setTestHooks(hooks) {
   //   差し替えが行われたら、まとめ送りは使わず、差し替えられた入口を通す。
   if (hooks.upstashCmd || hooks.upstashGetJSON || hooks.upstashSetJSON) upstashHooksActive = true;
   if (hooks.upstashPipeline) upstashPipeline = hooks.upstashPipeline;
+  // v94: 差し替えた保存先でも、健全性(storeHealth)と使用量の記録は本物と同じ経路を通す
+  //   (保存先停止時の挙動をテストで再現するため。本番では誰も呼ばない)。
+  if (hooks.upstashCmd) {
+    const inner = hooks.upstashCmd;
+    hooks.upstashCmd = async function hookedUpstashCmd(cmd) {
+      countUpstashCommand(cmd, "single");
+      try {
+        const r = await inner(cmd);
+        noteStoreOk();
+        return r;
+      } catch (e) {
+        upstashUsage.failedCommands++;
+        noteStoreError(e);
+        throw e;
+      }
+    };
+  }
   if (hooks.upstashCmd) upstashCmd = hooks.upstashCmd;
   if (hooks.upstashGetJSON) upstashGetJSON = hooks.upstashGetJSON;
   if (hooks.upstashSetJSON) upstashSetJSON = hooks.upstashSetJSON;
@@ -9179,6 +9601,22 @@ module.exports = {
   __setTestHooks,
   // v93: Skill専用レーンの単体検証用(本番では誰も呼ばない)
   __skillLaneForTest: { skillLaneFor, heavyBudgetPrecheck, heavyBudgetExceeded, chargeHeavyBudget, heavyBudgetToday, rateLimited, SKILL_LANE_KEY },
+  // v94: 保存先の健全性・使用量・空回り防止の検証用(本番では誰も呼ばない)
+  __storeForTest: {
+    storeIsDown, storeStatusSnapshot, upstashUsageSnapshot, upstashMGetJSON, upstashGetJSONOrThrow,
+    tryAcquireDailyRunLock, maybeSelfHealDailyLearning, maybeWatchLineups, maybeFlushUpstashUsage,
+    isQuotaExceededMessage,
+    selfHealSkipped: () => ({ ...selfHealSkippedForStore }),
+    isLearningRunning: () => dailyLearningRunning,
+    resetForTest: () => {
+      storeHealth.consecutiveErrors = 0; storeHealth.totalErrors = 0; storeHealth.lastErrorAt = 0; storeHealth.lastErrorMessage = null;
+      storeHealth.lastOkAt = 0; storeHealth.quotaExceeded = false; storeHealth.quotaExceededAt = 0; storeHealth.downSince = 0;
+      learnSweepLastCheckedAt = 0; lineupWatchLastTickMs = 0; lineupKickoffCache.at = 0; lineupKickoffCache.byId = new Map();
+      selfHealSkippedForStore = { count: 0, lastAt: 0, lastReason: null };
+      upstashUsage.lastFlushAt = 0; upstashUsage.unflushed = 0; upstashUsage.storedMonthTotal = null; upstashUsage.flushFailures = 0;
+      upstashUsageBootLoaded = false;
+    },
+  },
   // テスト専用: プロセス内キャッシュの特定キーを消す(本番では誰も呼ばない)
   __clearCacheForTest: (key) => { try { cache.delete(key); } catch (e) { /* noop */ } },
   // 2026年8月7日: 1分あたりの上限(HTTP 429)への対処の検証用
