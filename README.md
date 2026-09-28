@@ -8708,3 +8708,49 @@ v92.1(未反映)→ v93(本作)→ Render常時起動の判断 → Capafyコン�
 | `ACCURACY_STATS_CACHE_MS` | 600000 | `/api/accuracy-stats` の正常応答のキャッシュ(10分) |
 | `ACCURACY_STATS_FAIL_CACHE_MS` | 60000 | 同・失敗応答のキャッシュ(60秒) |
 | `SELF_HEAL_DAILY_LEARNING` | (有効) | 既存。`0` で自己修復の学習を止める(v94前の止血用。v94配備後は不要) |
+
+## 開発ログ・ラウンド76(2026年9月28日) — v95「どこから何人・どれだけ残ったか」(利用者の指示)
+
+### 目的
+宣伝(X・YouTube・note など)の効果を、外部の解析ツールを入れずに**自前で・匿名で**測る。
+「どこから」は宣伝のURLに付ける印 `?from=x` `?from=youtube` など(無ければ参照元ドメインから推定、それも無ければ direct)。
+「どれだけ残ったか」は ①その到着で45秒以上いた/何か操作した(engaged) ②到着日ごとに翌日以降また来た(定着)。
+
+### 仕組み(方針⑥・10万人スケール・保存先のコマンド節約)
+- 画面(index.html `trackVisitSource`)が **POST /api/visit** に小さなJSONを送る: 開いたとき `land`、残ったと分かったとき `engage`(1到着につき最大1)。
+  端末の印(ID・Cookie)は**送らない**。新規/再訪は端末の localStorage(`visitAttribution` = 初回日・初回経路・最後に来た日)で端末が自分で申告する。
+  同じ日に何度開いても再訪は1回。日付は日本時間(サーバーの `appDateKey` と同じ計算)。サイト内の移動(参照元が自分のドメイン)は数えない。
+- サーバー(`recordVisit`)はプロセス内のカウンター(日 × 経路 × 種類)を増やすだけ(O(1)・保存先も外部APIも触らない)。
+  経路名は `[a-z0-9_-]{1,24}`(それ以外は other)、1日40種類まで(超えたら other)。
+  項目: `l:<経路>` 到着 / `n:` 新規 / `r:` 再訪 / `e:` 残った / `c:<初回日>|<初回経路>` コホートへの再訪(初回日が今日・未来・壊れているものは数えない、60日より古いものは older)。
+- **積み上げ**(`maybeFlushTraffic`): 最後のビーコンから60秒後(`TRAFFIC_FLUSH_MS`)に、増えた項目だけを `HINCRBY growth:traffic:<日>` でまとめ送り(0は送らない)。
+  日キーの初回だけ `EXPIRE` 100日(`TRAFFIC_KEEP_DAYS`)。保存先が止まっていれば送らず持ち越す(最大3日ぶん)。
+  Render無料枠はアクセスが15分無いとプロセスが止まるため、1時間ではなく60秒(取りこぼしは最大60秒ぶん)。
+- **レポート** `GET /api/growth/traffic?days=14`(1〜60): 保存先の値(HGETALL×日数・5分キャッシュ)+まだ送っていない増分(その場で足す=二重に数えない。積み上げ直後はキャッシュを捨てる)。
+  経路別合計・残った%・日別・**定着**(到着日 × 経路: size=その日の新規人数、d1/d3/d7=1日後/3日後/7日後に来た人数と割合、returnVisitDays7=7日以内の再訪の延べ人日。新規人数が無い到着日は割合を出さない)。
+  `summaryJa`(人が読める要約)・`definitionsJa`・`limitsJa`・`readMode`(store / store_down)・`readFailures`・`pendingUnflushed` を同梱。
+  **既定は公開**(件数だけで個人情報が無いため)。隠すには Render の環境変数 `GROWTH_REPORT_PUBLIC=0`(他の診断と同じ `?key=AUTO_COLLECT_SECRET` が必要になる)。
+- **管理ページ** `GET /growth`(noindex): 上のJSONを表で表示。鍵が必要な設定なら1回入力して端末に保存。
+
+### 限界(でっち上げない)
+localStorage を消した/別端末 = 新規。JSが動かない訪問者・ボットは数えない(ビーコンを送らない)。再起動直前の最大60秒ぶんの増分は失われうる(`pendingUnflushed` が未保存の件数)。保存先停止中は保存できず、復旧後にまとめて足す。
+
+### 使い方
+宣伝の投稿に付けるURL: `https://soccer-analysis-ai-proxy.onrender.com/?from=x`(Xの投稿) / `?from=youtube` / `?from=tiktok` / `?from=note` / `?from=line` など、印は自由(英数字・_・- で24文字まで)。
+見るところ: `https://soccer-analysis-ai-proxy.onrender.com/growth`
+
+### 検証(実測)
+新テスト `v95_traffic_test.js` **14/14**(差し替え保存先で実サーバーを叩く): ①経路名の正規化 ②ビーコン204・経路別カウント・保存先を触らない ③レポート合計/残った%/summaryJa
+④定着(昨日の新規10人→今日1人=d1 10%・新規人数の無い到着日は出さない) ⑤HINCRBYは増分だけ・EXPIREは日キー1回・間隔内は送らない ⑥積み上げ後に二重に数えない
+⑦保存先停止中は持ち越し・store_down 表示・復旧後に足す ⑧不正400/巨大413/GET405 ⑨経路40種類+other ⑩壊れた初回日はコホートに数えない・older
+⑪/growth ページ ⑫GROWTH_REPORT_PUBLIC=0 の鍵 ⑬画面側の実装と sw.js ⑭別プロセス: 最後のビーコン後にタイマーで積み上げ。
+本物のブラウザ(Playwright)で `?from=X` → `land(x, 新規)`・クリックで `engage`・同日2回目は新規でも再訪でもない到着、と実測。
+既存: 全53本合格・翻訳検査 17/17・起動スモーク合格。sw.js は v95。
+
+### v95 の環境変数(任意)
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `TRAFFIC_FLUSH_MS` | 60000 | 増分を保存先へ足す間隔(最後のビーコンからの遅延) |
+| `TRAFFIC_KEEP_DAYS` | 100 | 日ごとの集計を保存先に残す日数 |
+| `TRAFFIC_STORED_CACHE_MS` | 300000 | レポート用に保存先の値をキャッシュする時間 |
+| `GROWTH_REPORT_PUBLIC` | (公開) | `0` にすると `/api/growth/traffic` と `/growth` に `?key=AUTO_COLLECT_SECRET` が必要 |

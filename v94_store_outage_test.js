@@ -412,7 +412,8 @@ const get = (p) => new Promise((resolve, reject) => {
       assert.strictEqual((row.match(/", "/g) || []).length >= 2, true, "3言語そろっていない: " + key.slice(0, 30));
     }
     const sw = fs.readFileSync(SW_JS, "utf8");
-    assert.ok(/soccer-ai-shell-v94/.test(sw), "sw.js のキャッシュ名が v94 になっていない");
+    const swVer = Number((sw.match(/CACHE_NAME = "soccer-ai-shell-v(\d+)"/) || [])[1]);
+    assert.ok(Number.isFinite(swVer) && swVer >= 94, "sw.js のキャッシュ名が v94 以上になっていない: v" + swVer);
   });
 
   srvMod.server.close();

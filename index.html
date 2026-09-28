@@ -12672,6 +12672,75 @@ async function renderDigestCard() {
   if (sb) sb.addEventListener("click", () => shareDigestImage(dg));
 }
 
+// ============================================================================
+// v95(2026年9月28日): 「どこから何人・どれだけ残ったか」の計測(匿名・集計のみ)
+//   ・開いたとき(land)と、45秒以上いた/何か操作したとき(engage)に、小さなJSONを
+//     POST /api/visit へ送る。個人を特定する情報は送らない(端末の印はサーバーへ送らない)。
+//   ・「どこから」= URL の ?from=x のような印(宣伝の投稿に付ける)。無ければ参照元のドメイン、
+//     それも無ければ direct。
+//   ・「新規/再訪」はこの端末の localStorage(visitAttribution)で自分で判断して申告する。
+//     同じ日に何度開いても再訪は1回。日付は日本時間(サーバーの集計と同じ)。
+//   ・失敗しても画面には一切影響させない(すべて try/catch・応答は待たない)。
+// ============================================================================
+function trackVisitSource() {
+  try {
+    const url = new URL(location.href);
+    const fromParam = url.searchParams.get("from");
+    const refHost = (() => { try { return document.referrer ? new URL(document.referrer).hostname.toLowerCase() : ""; } catch (e) { return ""; } })();
+    const guessFromReferrer = (h) => {
+      if (!h) return "direct";
+      if (h === location.hostname) return "internal";
+      if (/(^|\.)(x\.com|twitter\.com|t\.co)$/.test(h)) return "x";
+      if (/(^|\.)(youtube\.com|youtu\.be)$/.test(h)) return "youtube";
+      if (/(^|\.)tiktok\.com$/.test(h)) return "tiktok";
+      if (/(^|\.)instagram\.com$/.test(h)) return "instagram";
+      if (/(^|\.)note\.com$/.test(h)) return "note";
+      if (/(^|\.)reddit\.com$/.test(h)) return "reddit";
+      if (/(^|\.)(discord\.com|discordapp\.com|discord\.gg)$/.test(h)) return "discord";
+      if (/(^|\.)(facebook\.com|fb\.com)$/.test(h)) return "facebook";
+      if (/(^|\.)(line\.me|lin\.ee)$/.test(h)) return "line";
+      if (/(^|\.)(google\.[a-z.]+|bing\.com|yahoo\.co\.jp|yahoo\.com|duckduckgo\.com)$/.test(h)) return "search";
+      return "referral";
+    };
+    const src = (fromParam && /^[a-z0-9_-]{1,24}$/i.test(fromParam)) ? fromParam.toLowerCase() : guessFromReferrer(refHost);
+    if (src === "internal") return; // 自分のサイト内の移動は数えない
+    const today = new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10); // 日本時間の日付(サーバーと同じ)
+    let rec = null; let storageOk = true;
+    try { rec = JSON.parse(localStorage.getItem("visitAttribution") || "null"); } catch (e) { storageOk = false; }
+    if (rec && (typeof rec !== "object" || !/^\d{4}-\d{2}-\d{2}$/.test(String(rec.first || "")))) rec = null;
+    const isNew = storageOk && !rec;
+    const alreadyToday = !!(rec && rec.lastDay === today);
+    const returning = storageOk && !isNew && !alreadyToday && rec.first !== today;
+    if (storageOk) {
+      const next = rec ? { ...rec } : { first: today, from: src };
+      next.lastDay = today; next.visits = (Number(next.visits) || 0) + 1;
+      try { localStorage.setItem("visitAttribution", JSON.stringify(next)); } catch (e) { /* 保存できなくても計測は続ける */ }
+      rec = next;
+    }
+    const base = { from: src, firstFrom: rec ? rec.from : null, firstDay: rec ? rec.first : null };
+    const send = (payload) => {
+      try {
+        const body = JSON.stringify(payload);
+        fetch(`${API_PROXY_BASE}/visit`, { method: "POST", headers: { "Content-Type": "application/json" }, body, keepalive: true }).catch(() => {});
+      } catch (e) { /* 計測は付加機能。失敗しても何もしない */ }
+    };
+    send({ type: "land", ...base, isNew, returning });
+    // 「残った」= 45秒以上画面にいた(見えている状態で)、または何かを操作した。1回の到着につき1度だけ。
+    let engaged = false;
+    const markEngaged = () => { if (engaged) return; engaged = true; send({ type: "engage", from: src }); };
+    const onInteract = () => { markEngaged(); document.removeEventListener("click", onInteract, true); document.removeEventListener("touchstart", onInteract, true); };
+    document.addEventListener("click", onInteract, true);
+    document.addEventListener("touchstart", onInteract, true);
+    let visibleMs = 0; let lastTick = Date.now();
+    const timer = setInterval(() => {
+      const now = Date.now();
+      if (document.visibilityState === "visible") visibleMs += now - lastTick;
+      lastTick = now;
+      if (visibleMs >= 45000) { clearInterval(timer); markEngaged(); }
+    }, 5000);
+  } catch (e) { /* 計測は付加機能。画面には影響させない */ }
+}
+
 renderMyClubCard();
 renderDigestCard();
 renderReflectionsCard();
@@ -12679,6 +12748,7 @@ renderSmarterCard();
 renderDailyDiff();
 renderDailyReportWidget();
 renderTodayPredictionsHero();
+trackVisitSource();
 // スカウト速報は「🔍 選手検索」画面の中にしか出ないカードなので、
 // そのタブを開いた最初の1回だけ読み込む(psInit の中から呼ぶ)。
 // ホームだけを見て終わる利用者には、この通信は一度も発生しない。

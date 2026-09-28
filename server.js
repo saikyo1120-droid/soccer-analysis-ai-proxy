@@ -2480,6 +2480,311 @@ async function handleAccuracyStatsCached() {
   return r;
 }
 
+// ============================================================================
+// v95(2026年9月28日)・利用者の指示「どこから何人・どれだけ残ったかを数える機能」
+// ----------------------------------------------------------------------------
+// 設計(方針⑥「質問した瞬間に重い処理をしない」・10万人スケール・保存先のコマンド節約):
+//   ・画面(index.html)が、開いたとき(land)と「残った」と分かったとき(engage=45秒以上いた、
+//     または何か操作した)に、小さな JSON を POST /api/visit へ送る(ビーコン)。
+//   ・「どこから」は URL の ?from=x / ?from=youtube のような印(無ければ referrer のドメインから
+//     推定、それも無ければ direct)。「新規/再訪」は端末側の localStorage に「初回の日と経路」を
+//     持たせ、端末が自分で申告する(サーバーは訪問者ごとの記録を**一切持たない**=匿名・集計のみ)。
+//   ・サーバーはプロセス内のカウンター(日 × 経路 × 種類)を増やすだけ(O(1))。1時間に1回、
+//     増えたぶんだけを HINCRBY でまとめて保存先に足す(0の項目は送らない・保存先が止まって
+//     いれば送らず持ち越す)。再起動で失うのは最大1時間ぶん(正直に開示)。
+//   ・「どれだけ残ったか」= 到着日(コホート)ごとの「翌日以降にまた来た人」。端末は
+//     初回の日と経路を毎回添えるので、サーバーは c:<初回日>|<初回経路> を今日の分として数える。
+//     同じ端末が1日に何度来ても1回(端末側で「今日はもう送った」を持つ)。
+//   ・限界(でっち上げない): localStorage を消した/別の端末 = 新規に数える。JS が動かない
+//     訪問者・ボットは数えない。時刻は日本時間の日付で切る(端末側も同じ計算)。
+// ============================================================================
+const TRAFFIC_SOURCE_RE = /^[a-z0-9_-]{1,24}$/;
+const TRAFFIC_MAX_SOURCES_PER_DAY = 40;      // 経路名の種類が増えすぎないよう、超えたら "other"
+const TRAFFIC_COHORT_MAX_AGE_DAYS = 60;      // 初回がこれより古い再訪は "older" にまとめる
+// 増分を保存先へ足す間隔。Render無料枠はアクセスが15分無いとプロセスが止まる(=メモリの増分が消える)ため、
+// 1時間ではなく60秒にする。1回の積み上げは「増えた項目数」ぶんのコマンド(小さいサイトなら2〜6件)。
+// 最後のビーコンのあと誰も来なくても、タイマーで60秒後に必ず1回積み上げる(取りこぼしを最小にする)。
+const TRAFFIC_FLUSH_MS = Number(process.env.TRAFFIC_FLUSH_MS) || 60 * 1000;
+const TRAFFIC_KEEP_DAYS = Number(process.env.TRAFFIC_KEEP_DAYS) || 100;
+const TRAFFIC_MAX_BODY_BYTES = 2048;
+const TRAFFIC_PENDING_MAX_DAYS = 3;
+const traffic = {
+  pending: new Map(),        // dayKey -> Map<field, delta>(まだ保存先に足していない増分)
+  knownDayKeys: new Set(),   // EXPIRE を付け終えた日キー
+  lastFlushAt: Date.now(), flushInFlight: false, flushFailures: 0, flushedCommands: 0,
+  flushTimer: null,          // 最後のビーコンから TRAFFIC_FLUSH_MS 後に1回積み上げるタイマー
+  accepted: 0, rejected: 0, lastAcceptedAt: null,
+};
+function scheduleTrafficFlush() {
+  if (traffic.flushTimer) return;
+  traffic.flushTimer = setTimeout(() => {
+    traffic.flushTimer = null;
+    runInBackgroundCtx(() => maybeFlushTraffic(false).catch(() => {}));
+  }, TRAFFIC_FLUSH_MS + 50);
+  if (typeof traffic.flushTimer.unref === "function") traffic.flushTimer.unref(); // プロセス終了を妨げない
+}
+const TRAFFIC_KEY = (day) => `growth:traffic:${day}`;
+function trafficNormalizeSource(v) {
+  const s = String(v == null ? "" : v).trim().toLowerCase();
+  if (!s) return "direct";
+  return TRAFFIC_SOURCE_RE.test(s) ? s : "other";
+}
+function trafficDayMap(day) {
+  let m = traffic.pending.get(day);
+  if (!m) {
+    m = new Map();
+    traffic.pending.set(day, m);
+    // 古い日の増分は最大3日ぶんまで(保存先が長く止まっているときにメモリを食い続けない。捨てた事実は flushFailures に残る)
+    while (traffic.pending.size > TRAFFIC_PENDING_MAX_DAYS) {
+      const oldest = [...traffic.pending.keys()].sort()[0];
+      traffic.pending.delete(oldest);
+      traffic.flushFailures++;
+    }
+  }
+  return m;
+}
+function trafficBump(day, field, n) {
+  const m = trafficDayMap(day);
+  m.set(field, (m.get(field) || 0) + (n || 1));
+}
+function trafficSourcesInDay(m) {
+  const set = new Set();
+  for (const f of m.keys()) { const mm = /^[lnre]:(.+)$/.exec(f); if (mm) set.add(mm[1]); }
+  return set;
+}
+/** ビーコン1件を集計に加える。戻り値は {ok, reason}。訪問者の情報は何も保存しない。 */
+function recordVisit(body) {
+  if (!body || typeof body !== "object") return { ok: false, reason: "invalid_body" };
+  const type = body.type === "land" ? "land" : body.type === "engage" ? "engage" : null;
+  if (!type) return { ok: false, reason: "invalid_type" };
+  const day = appDateKey();
+  const m = trafficDayMap(day);
+  let src = trafficNormalizeSource(body.from);
+  if (!trafficSourcesInDay(m).has(src) && trafficSourcesInDay(m).size >= TRAFFIC_MAX_SOURCES_PER_DAY) src = "other";
+  if (type === "engage") { trafficBump(day, `e:${src}`); traffic.accepted++; traffic.lastAcceptedAt = new Date().toISOString(); return { ok: true, src, type }; }
+  trafficBump(day, `l:${src}`);
+  if (body.isNew === true) {
+    trafficBump(day, `n:${src}`);
+  } else if (body.returning === true) {
+    trafficBump(day, `r:${src}`);
+    // コホート(到着日 × 初回経路)への再訪。初回日が読めない/未来/今日なら数えない(でっち上げない)
+    const firstDay = String(body.firstDay || "");
+    if (/^\d{4}-\d{2}-\d{2}$/.test(firstDay) && firstDay < day) {
+      const ageDays = Math.round((new Date(`${day}T00:00:00Z`).getTime() - new Date(`${firstDay}T00:00:00Z`).getTime()) / 86400000);
+      const cohortDay = Number.isFinite(ageDays) && ageDays <= TRAFFIC_COHORT_MAX_AGE_DAYS ? firstDay : "older";
+      const firstSrc = trafficNormalizeSource(body.firstFrom);
+      trafficBump(day, `c:${cohortDay}|${firstSrc}`);
+    }
+  }
+  traffic.accepted++;
+  traffic.lastAcceptedAt = new Date().toISOString();
+  return { ok: true, src, type };
+}
+/** 1時間に1回、増えたぶんだけを保存先へ足す(HINCRBY・まとめ送り)。失敗したぶんは持ち越す。 */
+async function maybeFlushTraffic(force) {
+  if (!UPSTASH_ENABLED || traffic.flushInFlight) return { sent: 0, skipped: "disabled_or_inflight" };
+  const now = Date.now();
+  if (!force && now - traffic.lastFlushAt < TRAFFIC_FLUSH_MS) return { sent: 0, skipped: "interval" };
+  if (storeIsDown()) return { sent: 0, skipped: "store_down" };
+  const cmds = []; const meta = [];
+  for (const [day, m] of traffic.pending) {
+    for (const [field, delta] of m) {
+      if (!delta) continue;
+      cmds.push(["HINCRBY", TRAFFIC_KEY(day), field, String(delta)]);
+      meta.push({ day, field, delta });
+    }
+    if (!traffic.knownDayKeys.has(day) && m.size) { cmds.push(["EXPIRE", TRAFFIC_KEY(day), String(TRAFFIC_KEEP_DAYS * 86400)]); meta.push({ day, expire: true }); }
+  }
+  traffic.lastFlushAt = now;
+  if (!cmds.length) return { sent: 0, skipped: "nothing" };
+  traffic.flushInFlight = true;
+  try {
+    const results = await upstashCmdBatch(cmds); // 失敗した要素は null で返る(1件ずつの経路でも同じ)
+    let sent = 0;
+    results.forEach((r, i) => {
+      const mt = meta[i];
+      if (mt.expire) { if (r !== null && r !== undefined) traffic.knownDayKeys.add(mt.day); return; }
+      if (r === null || r === undefined) return; // 失敗 → 増分を残す(次回に持ち越し)
+      const m = traffic.pending.get(mt.day);
+      if (m) { const left = (m.get(mt.field) || 0) - mt.delta; if (left > 0) m.set(mt.field, left); else m.delete(mt.field); }
+      sent++;
+    });
+    traffic.flushedCommands += sent;
+    if (sent < meta.filter((x) => !x.expire).length) traffic.flushFailures++;
+    for (const [day, m] of traffic.pending) if (!m.size) traffic.pending.delete(day);
+    // 保存先へ足したので、レポート用の「保存先の値」キャッシュは捨てる(足した直後に数字が減って見えないように)
+    if (sent) for (const k of [...cache.keys()]) if (String(k).startsWith("growth:traffic:stored:")) cache.delete(k);
+    return { sent };
+  } catch (e) {
+    traffic.flushFailures++;
+    return { sent: 0, error: String((e && e.message) || e).slice(0, 120) };
+  } finally {
+    traffic.flushInFlight = false;
+  }
+}
+function trafficParseHash(flat) {
+  const out = new Map();
+  if (Array.isArray(flat)) {
+    for (let i = 0; i + 1 < flat.length; i += 2) out.set(String(flat[i]), Number(flat[i + 1]) || 0);
+  } else if (flat && typeof flat === "object") {
+    for (const [k, v] of Object.entries(flat)) out.set(k, Number(v) || 0);
+  }
+  return out;
+}
+/** 直近N日の「どこから何人・どれだけ残ったか」(保存先の値 + まだ送っていない増分)。 */
+// 保存先の値(HGETALL×日数)は5分キャッシュする。未保存の増分(pending)は毎回その場で足すので、
+// 見えている数字は常に最新(キャッシュは保存先の往復を減らすためだけ)。
+const TRAFFIC_STORED_CACHE_MS = Number(process.env.TRAFFIC_STORED_CACHE_MS) || 5 * 60 * 1000;
+async function readTrafficStored(dayKeys) {
+  const ck = `growth:traffic:stored:${dayKeys[0]}:${dayKeys.length}`;
+  const hit = cacheGet(ck);
+  if (hit) return hit;
+  const stored = new Map(); let readMode = "none"; let readFailures = 0;
+  if (UPSTASH_ENABLED && !storeIsDown()) {
+    try {
+      const results = await upstashCmdBatch(dayKeys.map((d) => ["HGETALL", TRAFFIC_KEY(d)]));
+      results.forEach((r, i) => { if (r === null || r === undefined) readFailures++; stored.set(dayKeys[i], trafficParseHash(r)); });
+      readMode = "store";
+    } catch (e) { readFailures = dayKeys.length; readMode = "store"; }
+  } else if (UPSTASH_ENABLED) { readFailures = dayKeys.length; readMode = "store_down"; }
+  const out = { stored, readMode, readFailures, readAt: new Date().toISOString() };
+  // 読めなかった日があるときは短く(60秒)、全部読めたら5分
+  if (readMode === "store") cacheSet(ck, out, readFailures ? 60 * 1000 : TRAFFIC_STORED_CACHE_MS);
+  return out;
+}
+async function buildTrafficReport(days) {
+  const n = Math.max(1, Math.min(60, Number(days) || 14));
+  const today = appDateKey();
+  const base = new Date(`${today}T00:00:00Z`).getTime();
+  const dayKeys = []; for (let i = 0; i < n; i++) dayKeys.push(new Date(base - i * 86400000).toISOString().slice(0, 10));
+  const { stored, readMode, readFailures, readAt } = await readTrafficStored(dayKeys);
+  // 保存先の値に、まだ送っていない増分を足す(送った分は保存先に入っているので二重にならない)
+  const perDay = new Map();
+  for (const d of dayKeys) {
+    const m = new Map(stored.get(d) || []);
+    const pend = traffic.pending.get(d);
+    if (pend) for (const [f, v] of pend) m.set(f, (m.get(f) || 0) + v);
+    perDay.set(d, m);
+  }
+  const sourceTotals = new Map();
+  const daysOut = [];
+  for (const d of dayKeys) {
+    const m = perDay.get(d);
+    const bySource = {};
+    for (const [f, v] of m) {
+      const mm = /^([lnre]):(.+)$/.exec(f); if (!mm) continue;
+      const src = mm[2];
+      const row = bySource[src] || (bySource[src] = { landings: 0, newVisitors: 0, returning: 0, engaged: 0 });
+      const tot = sourceTotals.get(src) || { landings: 0, newVisitors: 0, returning: 0, engaged: 0 };
+      const key = mm[1] === "l" ? "landings" : mm[1] === "n" ? "newVisitors" : mm[1] === "r" ? "returning" : "engaged";
+      row[key] += v; tot[key] += v; sourceTotals.set(src, tot);
+    }
+    daysOut.push({ date: d, sources: bySource, landings: Object.values(bySource).reduce((a, r) => a + r.landings, 0) });
+  }
+  // 定着(コホート): 到着日Dの新規(経路S)のうち、D+1 / D+3 / D+7 に来た人と、7日以内の再訪の延べ人日
+  const retention = [];
+  for (const d of dayKeys) {
+    if (d === today) continue;
+    const mD = perDay.get(d);
+    const sizes = {};
+    for (const [f, v] of mD) { const mm = /^n:(.+)$/.exec(f); if (mm) sizes[mm[1]] = v; }
+    const dMs = new Date(`${d}T00:00:00Z`).getTime();
+    const dayPlus = (k) => new Date(dMs + k * 86400000).toISOString().slice(0, 10);
+    const returnsOn = (k, src) => { const m = perDay.get(dayPlus(k)); return m ? (m.get(`c:${d}|${src}`) || 0) : null; };
+    const rows = [];
+    for (const [src, size] of Object.entries(sizes)) {
+      const d1 = returnsOn(1, src), d3 = returnsOn(3, src), d7 = returnsOn(7, src);
+      let within7 = 0, within7Known = false;
+      for (let k = 1; k <= 7; k++) { const v = returnsOn(k, src); if (v !== null) { within7 += v; within7Known = true; } }
+      const pct = (x) => (x === null || !size) ? null : Math.round((x / size) * 1000) / 10;
+      rows.push({ source: src, size, d1, d1Pct: pct(d1), d3, d3Pct: pct(d3), d7, d7Pct: pct(d7), returnVisitDays7: within7Known ? within7 : null });
+    }
+    if (rows.length) retention.push({ cohortDate: d, rows });
+  }
+  const sources = [...sourceTotals.entries()].map(([source, t]) => ({
+    source, ...t,
+    engagedPct: t.landings ? Math.round((t.engaged / t.landings) * 1000) / 10 : null,
+  })).sort((a, b) => b.landings - a.landings);
+  const total = sources.reduce((a, s) => ({ landings: a.landings + s.landings, newVisitors: a.newVisitors + s.newVisitors, returning: a.returning + s.returning, engaged: a.engaged + s.engaged }), { landings: 0, newVisitors: 0, returning: 0, engaged: 0 });
+  const summaryJa = [];
+  summaryJa.push(`直近${n}日(〜${today}・日本時間): 到着${total.landings}回 / 新規${total.newVisitors}人 / 再訪${total.returning}回 / 残った(45秒以上か操作あり)${total.engaged}回${total.landings ? `(${Math.round((total.engaged / total.landings) * 1000) / 10}%)` : ""}`);
+  for (const s of sources.slice(0, 12)) {
+    summaryJa.push(`${s.source}: 到着${s.landings} / 新規${s.newVisitors} / 再訪${s.returning} / 残った${s.engaged}${s.engagedPct !== null ? `(${s.engagedPct}%)` : ""}`);
+  }
+  if (!sources.length) summaryJa.push("まだ計測データがありません(この機能を入れた後に開かれた画面から数え始めます)。");
+  return {
+    ok: true, generatedAt: new Date().toISOString(), days: n, today,
+    readMode, readFailures, storedReadAt: readAt,
+    total, sources, byDay: daysOut, retention,
+    pendingUnflushed: [...traffic.pending.values()].reduce((a, m) => a + [...m.values()].reduce((x, y) => x + y, 0), 0),
+    counters: { accepted: traffic.accepted, rejected: traffic.rejected, lastAcceptedAt: traffic.lastAcceptedAt, flushedCommands: traffic.flushedCommands, flushFailures: traffic.flushFailures, lastFlushAt: traffic.lastFlushAt ? new Date(traffic.lastFlushAt).toISOString() : null },
+    summaryJa,
+    definitionsJa: {
+      landings: "到着: 画面が開かれた回数(同じ人が2回開けば2)",
+      newVisitors: "新規: その端末で初めて開いた(localStorage に記録が無かった)",
+      returning: "再訪: 初回とは別の日にもう一度来た(1日に何度来ても1と数える)",
+      engaged: "残った: 45秒以上画面にいた、または何かを操作した(1回の到着につき最大1)",
+      retention: "定着: 到着日(コホート)ごとの新規人数に対して、1日後・3日後・7日後に来た人数と割合。returnVisitDays7 は7日以内の再訪の延べ人日",
+      source: "経路: URL の ?from=〜(英数字・_・- で24文字まで)。無ければ参照元ドメインから推定(x / youtube / tiktok / instagram / note / reddit / discord / search / referral)。何も無ければ direct",
+    },
+    limitsJa: [
+      "端末側の localStorage を消した/別の端末から来た場合は新規として数えます。",
+      "JavaScript が動かない訪問者・ボットは数えません(ビーコンを送らないため)。",
+      "サーバー再起動の直前1時間ぶんの増分は失われることがあります(pendingUnflushed が未保存の件数)。",
+      "保存先(Upstash)が止まっている間は保存できず、復旧後にまとめて足します。",
+    ],
+  };
+}
+// 管理用の一覧ページ(データは /api/growth/traffic から取る。公開設定は同じ)
+function growthPageHtml() {
+  return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>どこから何人・どれだけ残ったか</title>
+<style>
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;margin:16px;color:#1b2430;background:#f6f7f9}
+h1{font-size:1.15rem;margin:0 0 8px}h2{font-size:1rem;margin:18px 0 6px}
+table{border-collapse:collapse;width:100%;background:#fff;font-size:.9rem}th,td{border:1px solid #dfe3e8;padding:6px 8px;text-align:right}th:first-child,td:first-child{text-align:left}
+th{background:#eef1f5}.note{color:#5a6472;font-size:.85rem}.warn{color:#b3541e}.ok{color:#1e8449}
+input{padding:6px 8px;font-size:.95rem;width:min(100%,360px)}button{padding:6px 12px;font-size:.95rem}
+</style></head><body>
+<h1>📈 どこから何人・どれだけ残ったか</h1>
+<div class="note">日本時間の日付で集計。「残った」= 45秒以上いた、または何か操作した。数字は保存先の値+まだ保存していない増分(いま見えている値が最新)。</div>
+<div id="keyBox" style="display:none;margin:10px 0"><span class="note">このページは鍵で保護されています。Render の環境変数 AUTO_COLLECT_SECRET の値を入れてください(この端末に保存します)。</span><br><input id="keyInput" type="password" placeholder="AUTO_COLLECT_SECRET"> <button id="keyBtn" type="button">表示する</button></div>
+<div style="margin:10px 0"><label>期間: <select id="days"><option value="7">7日</option><option value="14" selected>14日</option><option value="30">30日</option><option value="60">60日</option></select></label> <button id="reload" type="button">更新</button> <span id="status" class="note"></span></div>
+<h2>経路ごとの合計</h2><div id="sources"></div>
+<h2>日ごとの到着</h2><div id="byDay"></div>
+<h2>定着(到着日ごと)</h2><div class="note">size=その日の新規人数。d1/d3/d7=1日後/3日後/7日後にまた来た人数(割合)。— は「その日がまだ来ていない」。</div><div id="retention"></div>
+<h2>この計測の限界</h2><ul id="limits" class="note"></ul>
+<script>
+(function(){
+  var esc=function(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});};
+  var key=null; try{key=localStorage.getItem("growthViewKey");}catch(e){}
+  function load(){
+    var days=document.getElementById("days").value; var st=document.getElementById("status"); st.textContent="読み込み中…";
+    var url="/api/growth/traffic?days="+encodeURIComponent(days)+(key?"&key="+encodeURIComponent(key):"");
+    fetch(url,{cache:"no-store"}).then(function(r){ if(r.status===403){document.getElementById("keyBox").style.display="block"; st.textContent="鍵が必要です。"; return null;} return r.json(); }).then(function(d){
+      if(!d) return; if(!d.ok){st.textContent="取得できませんでした"; return;}
+      st.textContent="更新: "+new Date(d.generatedAt).toLocaleString("ja-JP")+(d.readMode==="store_down"?"(保存先が停止中: いま動いているサーバーの増分だけ表示)":"")+(d.pendingUnflushed?"(未保存の増分 "+d.pendingUnflushed+"件を含む)":"");
+      var t='<table><tr><th>経路</th><th>到着</th><th>新規</th><th>再訪</th><th>残った</th><th>残った%</th></tr>';
+      t+='<tr><td><b>合計</b></td><td><b>'+d.total.landings+'</b></td><td><b>'+d.total.newVisitors+'</b></td><td><b>'+d.total.returning+'</b></td><td><b>'+d.total.engaged+'</b></td><td><b>'+(d.total.landings?Math.round(d.total.engaged/d.total.landings*1000)/10+"%":"—")+'</b></td></tr>';
+      d.sources.forEach(function(s){t+='<tr><td>'+esc(s.source)+'</td><td>'+s.landings+'</td><td>'+s.newVisitors+'</td><td>'+s.returning+'</td><td>'+s.engaged+'</td><td>'+(s.engagedPct===null?"—":s.engagedPct+"%")+'</td></tr>';});
+      t+='</table>'; if(!d.sources.length) t='<div class="note">まだ計測データがありません。</div>'; document.getElementById("sources").innerHTML=t;
+      var b='<table><tr><th>日付</th><th>到着</th><th>内訳(経路: 到着/新規/残った)</th></tr>';
+      d.byDay.forEach(function(x){ var parts=Object.keys(x.sources).sort(function(a,c){return x.sources[c].landings-x.sources[a].landings;}).map(function(k){var r=x.sources[k];return esc(k)+": "+r.landings+"/"+r.newVisitors+"/"+r.engaged;}); b+='<tr><td>'+esc(x.date)+'</td><td>'+x.landings+'</td><td style="text-align:left">'+(parts.join(" ・ ")||"—")+'</td></tr>'; });
+      b+='</table>'; document.getElementById("byDay").innerHTML=b;
+      var r='<table><tr><th>到着日</th><th>経路</th><th>size</th><th>d1</th><th>d3</th><th>d7</th><th>7日以内の再訪(延べ)</th></tr>';
+      var any=false; d.retention.forEach(function(c){ c.rows.forEach(function(row){ any=true; var f=function(v,p){return v===null?"—":v+(p===null?"":" ("+p+"%)");}; r+='<tr><td>'+esc(c.cohortDate)+'</td><td>'+esc(row.source)+'</td><td>'+row.size+'</td><td>'+f(row.d1,row.d1Pct)+'</td><td>'+f(row.d3,row.d3Pct)+'</td><td>'+f(row.d7,row.d7Pct)+'</td><td>'+(row.returnVisitDays7===null?"—":row.returnVisitDays7)+'</td></tr>'; }); });
+      r+='</table>'; if(!any) r='<div class="note">まだ定着を測れる到着日がありません(新規が来た翌日から表示されます)。</div>'; document.getElementById("retention").innerHTML=r;
+      document.getElementById("limits").innerHTML=(d.limitsJa||[]).map(function(x){return "<li>"+esc(x)+"</li>";}).join("");
+    }).catch(function(){ document.getElementById("status").textContent="取得できませんでした(サーバー起動待ちの可能性)。"; });
+  }
+  document.getElementById("reload").addEventListener("click",load);
+  document.getElementById("days").addEventListener("change",load);
+  document.getElementById("keyBtn").addEventListener("click",function(){ key=document.getElementById("keyInput").value.trim(); try{localStorage.setItem("growthViewKey",key);}catch(e){} document.getElementById("keyBox").style.display="none"; load(); });
+  load();
+})();
+</script></body></html>`;
+}
+
 // Leagues/competitions to hide from "today's real fixtures" even though
 // API-Football includes them in an unrestricted /fixtures?date=... response —
 // youth, reserve, and women's competitions clutter a fan-facing app whose
@@ -7360,6 +7665,55 @@ async function handleHttpRequest(req, res) {
         }));
         return;
       }
+      if (pathname === "/api/visit") {
+        // ---- v95: 流入の計測ビーコン(匿名・集計のみ。訪問者の情報は保存しない) ----
+        //   画面が「開いた(land)」「残った(engage)」を小さなJSONで知らせる。応答は 204。
+        //   外部APIも保存先も触らない(プロセス内のカウンターを増やすだけ=方針⑥)。
+        if (req.method !== "POST") {
+          res.writeHead(405, { "Content-Type": "application/json; charset=utf-8", "Allow": "POST" });
+          res.end(JSON.stringify({ ok: false, error: "POST only" }));
+          return;
+        }
+        const declared = Number(req.headers["content-length"]);
+        if (Number.isFinite(declared) && declared > TRAFFIC_MAX_BODY_BYTES) {
+          traffic.rejected++;
+          res.writeHead(413, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "body too large" }));
+          return;
+        }
+        let body = null;
+        try { body = await readJsonBody(req); } catch (e) { body = null; }
+        if (body && JSON.stringify(body).length > TRAFFIC_MAX_BODY_BYTES) body = null;
+        const r = recordVisit(body);
+        if (!r.ok) {
+          traffic.rejected++;
+          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: r.reason }));
+          return;
+        }
+        runInBackgroundCtx(() => maybeFlushTraffic(false).catch(() => {}));
+        scheduleTrafficFlush(); // 誰も来なくなっても60秒後に1回は積み上げる
+        res.writeHead(204, { "Cache-Control": "no-store" });
+        res.end();
+        return;
+      }
+      if (pathname === "/api/growth/traffic") {
+        // ---- v95: 「どこから何人・どれだけ残ったか」の集計(個人情報なし・件数のみ) ----
+        //   既定では公開(集計値だけなので)。隠したい場合は Render の環境変数
+        //   GROWTH_REPORT_PUBLIC=0 にすると、他の診断と同じ ?key=AUTO_COLLECT_SECRET が必要になる。
+        const requiredSecret = process.env.AUTO_COLLECT_SECRET || "";
+        if (process.env.GROWTH_REPORT_PUBLIC === "0" && requiredSecret && parsed.searchParams.get("key") !== requiredSecret) {
+          res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: "invalid or missing key" }));
+          return;
+        }
+        const daysReq = Math.max(1, Math.min(60, parseInt(parsed.searchParams.get("days") || "14", 10) || 14));
+        // 保存先の読み出し(HGETALL×日数)は buildTrafficReport 内で5分キャッシュ。未保存の増分は毎回その場で足す。
+        const report = await buildTrafficReport(daysReq);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+        res.end(JSON.stringify(report));
+        return;
+      }
       if (pathname === "/api/diag/skill-lane") {
         // ---- v93: Skill専用レーンの診断(本日の件数・制限回数・鍵の不一致回数) ----
         //   公開前の確認と公開後の見守り用。AUTO_COLLECT_SECRET が設定されていれば他の診断と同じ ?key= 保護。
@@ -9465,7 +9819,7 @@ async function handleHttpRequest(req, res) {
   //     明示的に許可する(既存の「拡張子での一括公開はしない」方針を維持)。
   //     中身はビルド時固定なので1時間キャッシュ+クライアント側の?v=で更新。
   if (req.method === "GET" && (seoPages.MATCH_PATH_RE.test(pathname)
-    || pathname === "/sitemap.xml" || pathname === "/robots.txt" || pathname === "/sw.js"
+    || pathname === "/sitemap.xml" || pathname === "/robots.txt" || pathname === "/sw.js" || pathname === "/growth"
     || /^\/i18n\.(en|zh|es)\.json$/.test(pathname))) {
     // /api/ と同じ1分あたりのレート制限を共有する(IDを走査してUpstash読み出しを
     // 浪費させる攻撃をキャッシュ+制限の二段で抑える)
@@ -9478,6 +9832,12 @@ async function handleHttpRequest(req, res) {
     const fwdProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
     const seoOrigin = `${fwdProto || "http"}://${req.headers.host || "localhost"}`;
     try {
+      if (pathname === "/growth") {
+        // v95: 「どこから何人・どれだけ残ったか」の管理用一覧(データは /api/growth/traffic。同じ公開設定)
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache", "X-Robots-Tag": "noindex" });
+        res.end(growthPageHtml());
+        return;
+      }
       if (pathname === "/sw.js") {
         const swPath = path.join(STATIC_ROOT, "sw.js");
         if (!fs.existsSync(swPath)) { res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" }); res.end("Not found"); return; }
@@ -9601,6 +9961,12 @@ module.exports = {
   __setTestHooks,
   // v93: Skill専用レーンの単体検証用(本番では誰も呼ばない)
   __skillLaneForTest: { skillLaneFor, heavyBudgetPrecheck, heavyBudgetExceeded, chargeHeavyBudget, heavyBudgetToday, rateLimited, SKILL_LANE_KEY },
+  // v95: 流入計測の検証用(本番では誰も呼ばない)
+  __trafficForTest: {
+    recordVisit, maybeFlushTraffic, buildTrafficReport, trafficNormalizeSource, growthPageHtml,
+    state: () => ({ pending: [...traffic.pending.entries()].map(([d, m]) => [d, Object.fromEntries(m)]), knownDayKeys: [...traffic.knownDayKeys], accepted: traffic.accepted, rejected: traffic.rejected, flushFailures: traffic.flushFailures, flushedCommands: traffic.flushedCommands, lastFlushAt: traffic.lastFlushAt }),
+    resetForTest: () => { traffic.pending.clear(); traffic.knownDayKeys.clear(); traffic.lastFlushAt = Date.now(); if (traffic.flushTimer) { clearTimeout(traffic.flushTimer); traffic.flushTimer = null; } traffic.flushInFlight = false; traffic.flushFailures = 0; traffic.flushedCommands = 0; traffic.accepted = 0; traffic.rejected = 0; traffic.lastAcceptedAt = null; for (const k of [...cache.keys()]) if (String(k).startsWith("growth:traffic:")) cache.delete(k); },
+  },
   // v94: 保存先の健全性・使用量・空回り防止の検証用(本番では誰も呼ばない)
   __storeForTest: {
     storeIsDown, storeStatusSnapshot, upstashUsageSnapshot, upstashMGetJSON, upstashGetJSONOrThrow,
