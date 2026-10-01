@@ -3866,6 +3866,90 @@
 </div>
 
 <script>
+// ============================================================================
+// v95→v96(2026年10月1日): 「どこから何人・どれだけ残ったか」の計測(匿名・集計のみ)
+//   v96で独立したスクリプトに分離: 本番で「開いたのに受信0」だったため、画面本体の長い
+//   スクリプトに依存せず、先頭近くで必ず動く形にした。
+//   ・開いたとき(land)と、45秒以上いた/何か操作したとき(engage)に、小さなJSONを
+//     POST /api/came-from へ送る(navigator.sendBeacon → 使えなければ fetch)。
+//   ・個人を特定する情報・端末の印は送らない。「新規/再訪」はこの端末の localStorage
+//     (visitAttribution)で端末が自分で判断して申告する。同じ日に何度開いても再訪は1回。
+//   ・日付は日本時間(サーバーの集計と同じ)。サイト内の移動(参照元が自分のドメイン)は数えない。
+//   ・ローカル(localhost/127.0.0.1/file:)で開いたときは送らない(開発中の確認で本番の集計を汚さない)。
+//   ・最後の送信結果を localStorage(visitBeaconLast)に残し、/growth の「届いているかの確認」で見られる。
+//   ・失敗しても画面には一切影響させない(すべて try/catch・応答は待たない)。
+// ============================================================================
+(function trackVisitSourceV96() {
+  try {
+    var host = String(location.hostname || "").toLowerCase();
+    if (!/^https?:$/.test(location.protocol) || host === "localhost" || host === "127.0.0.1" || host === "[::1]" || /\.local$/.test(host)) return;
+    var apiBase = location.origin + "/api";
+    var url = new URL(location.href);
+    var fromParam = url.searchParams.get("from");
+    var refHost = "";
+    try { refHost = document.referrer ? new URL(document.referrer).hostname.toLowerCase() : ""; } catch (e) { refHost = ""; }
+    var guess = function (h) {
+      if (!h) return "direct";
+      if (h === host) return "internal";
+      if (/(^|\.)(x\.com|twitter\.com|t\.co)$/.test(h)) return "x";
+      if (/(^|\.)(youtube\.com|youtu\.be)$/.test(h)) return "youtube";
+      if (/(^|\.)tiktok\.com$/.test(h)) return "tiktok";
+      if (/(^|\.)instagram\.com$/.test(h)) return "instagram";
+      if (/(^|\.)note\.com$/.test(h)) return "note";
+      if (/(^|\.)reddit\.com$/.test(h)) return "reddit";
+      if (/(^|\.)(discord\.com|discordapp\.com|discord\.gg)$/.test(h)) return "discord";
+      if (/(^|\.)(facebook\.com|fb\.com)$/.test(h)) return "facebook";
+      if (/(^|\.)(line\.me|lin\.ee)$/.test(h)) return "line";
+      if (/(^|\.)(google\.[a-z.]+|bing\.com|yahoo\.co\.jp|yahoo\.com|duckduckgo\.com)$/.test(h)) return "search";
+      return "referral";
+    };
+    var src = (fromParam && /^[a-z0-9_-]{1,24}$/i.test(fromParam)) ? fromParam.toLowerCase() : guess(refHost);
+    if (src === "internal") return;
+    var today = new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10);
+    var rec = null, storageOk = true;
+    try { rec = JSON.parse(localStorage.getItem("visitAttribution") || "null"); } catch (e) { storageOk = false; }
+    if (rec && (typeof rec !== "object" || !/^\d{4}-\d{2}-\d{2}$/.test(String(rec.first || "")))) rec = null;
+    var isNew = storageOk && !rec;
+    var alreadyToday = !!(rec && rec.lastDay === today);
+    var returning = storageOk && !isNew && !alreadyToday && rec.first !== today;
+    if (storageOk) {
+      var next = rec ? Object.assign({}, rec) : { first: today, from: src };
+      next.lastDay = today; next.visits = (Number(next.visits) || 0) + 1;
+      try { localStorage.setItem("visitAttribution", JSON.stringify(next)); } catch (e) { /* 保存できなくても計測は続ける */ }
+      rec = next;
+    }
+    var remember = function (o) { try { localStorage.setItem("visitBeaconLast", JSON.stringify(Object.assign({ at: new Date().toISOString() }, o))); } catch (e) { /* noop */ } };
+    var send = function (payload) {
+      try {
+        var body = JSON.stringify(payload);
+        var target = apiBase + "/came-from";
+        if (navigator.sendBeacon) {
+          // 同一オリジンなので application/json でもプリフライト無し。sendBeacon はページを閉じても届く
+          var queued = navigator.sendBeacon(target, new Blob([body], { type: "application/json" }));
+          if (queued) { remember({ type: payload.type, via: "sendBeacon", result: "queued" }); return; }
+        }
+        fetch(target, { method: "POST", headers: { "Content-Type": "application/json" }, body: body, keepalive: true })
+          .then(function (r) { remember({ type: payload.type, via: "fetch", result: r.ok ? "ok" : "http_error", status: r.status }); })
+          .catch(function (e) { remember({ type: payload.type, via: "fetch", result: "failed", error: String(e && e.message || e).slice(0, 80) }); });
+      } catch (e) { remember({ type: payload && payload.type, via: "none", result: "exception", error: String(e && e.message || e).slice(0, 80) }); }
+    };
+    send({ type: "land", from: src, firstFrom: rec ? rec.from : null, firstDay: rec ? rec.first : null, isNew: isNew, returning: returning });
+    var engaged = false;
+    var markEngaged = function () { if (engaged) return; engaged = true; send({ type: "engage", from: src }); };
+    var onInteract = function () { markEngaged(); document.removeEventListener("click", onInteract, true); document.removeEventListener("touchstart", onInteract, true); };
+    document.addEventListener("click", onInteract, true);
+    document.addEventListener("touchstart", onInteract, true);
+    var visibleMs = 0, lastTick = Date.now();
+    var timer = setInterval(function () {
+      var now = Date.now();
+      if (document.visibilityState === "visible") visibleMs += now - lastTick;
+      lastTick = now;
+      if (visibleMs >= 45000) { clearInterval(timer); markEngaged(); }
+    }, 5000);
+  } catch (e) { /* 計測は付加機能。画面には影響させない */ }
+})();
+</script>
+<script>
 /* ---------- Data ---------- */
 const GLOSSARY = [
   ["支配率(ポゼッション)", "自分のチームがボールを持っていた時間の割合。高いほど「ボールを握っていた」ことを意味しますが、それだけで勝敗が決まるわけではありません。"],
@@ -12672,75 +12756,6 @@ async function renderDigestCard() {
   if (sb) sb.addEventListener("click", () => shareDigestImage(dg));
 }
 
-// ============================================================================
-// v95(2026年9月28日): 「どこから何人・どれだけ残ったか」の計測(匿名・集計のみ)
-//   ・開いたとき(land)と、45秒以上いた/何か操作したとき(engage)に、小さなJSONを
-//     POST /api/visit へ送る。個人を特定する情報は送らない(端末の印はサーバーへ送らない)。
-//   ・「どこから」= URL の ?from=x のような印(宣伝の投稿に付ける)。無ければ参照元のドメイン、
-//     それも無ければ direct。
-//   ・「新規/再訪」はこの端末の localStorage(visitAttribution)で自分で判断して申告する。
-//     同じ日に何度開いても再訪は1回。日付は日本時間(サーバーの集計と同じ)。
-//   ・失敗しても画面には一切影響させない(すべて try/catch・応答は待たない)。
-// ============================================================================
-function trackVisitSource() {
-  try {
-    const url = new URL(location.href);
-    const fromParam = url.searchParams.get("from");
-    const refHost = (() => { try { return document.referrer ? new URL(document.referrer).hostname.toLowerCase() : ""; } catch (e) { return ""; } })();
-    const guessFromReferrer = (h) => {
-      if (!h) return "direct";
-      if (h === location.hostname) return "internal";
-      if (/(^|\.)(x\.com|twitter\.com|t\.co)$/.test(h)) return "x";
-      if (/(^|\.)(youtube\.com|youtu\.be)$/.test(h)) return "youtube";
-      if (/(^|\.)tiktok\.com$/.test(h)) return "tiktok";
-      if (/(^|\.)instagram\.com$/.test(h)) return "instagram";
-      if (/(^|\.)note\.com$/.test(h)) return "note";
-      if (/(^|\.)reddit\.com$/.test(h)) return "reddit";
-      if (/(^|\.)(discord\.com|discordapp\.com|discord\.gg)$/.test(h)) return "discord";
-      if (/(^|\.)(facebook\.com|fb\.com)$/.test(h)) return "facebook";
-      if (/(^|\.)(line\.me|lin\.ee)$/.test(h)) return "line";
-      if (/(^|\.)(google\.[a-z.]+|bing\.com|yahoo\.co\.jp|yahoo\.com|duckduckgo\.com)$/.test(h)) return "search";
-      return "referral";
-    };
-    const src = (fromParam && /^[a-z0-9_-]{1,24}$/i.test(fromParam)) ? fromParam.toLowerCase() : guessFromReferrer(refHost);
-    if (src === "internal") return; // 自分のサイト内の移動は数えない
-    const today = new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10); // 日本時間の日付(サーバーと同じ)
-    let rec = null; let storageOk = true;
-    try { rec = JSON.parse(localStorage.getItem("visitAttribution") || "null"); } catch (e) { storageOk = false; }
-    if (rec && (typeof rec !== "object" || !/^\d{4}-\d{2}-\d{2}$/.test(String(rec.first || "")))) rec = null;
-    const isNew = storageOk && !rec;
-    const alreadyToday = !!(rec && rec.lastDay === today);
-    const returning = storageOk && !isNew && !alreadyToday && rec.first !== today;
-    if (storageOk) {
-      const next = rec ? { ...rec } : { first: today, from: src };
-      next.lastDay = today; next.visits = (Number(next.visits) || 0) + 1;
-      try { localStorage.setItem("visitAttribution", JSON.stringify(next)); } catch (e) { /* 保存できなくても計測は続ける */ }
-      rec = next;
-    }
-    const base = { from: src, firstFrom: rec ? rec.from : null, firstDay: rec ? rec.first : null };
-    const send = (payload) => {
-      try {
-        const body = JSON.stringify(payload);
-        fetch(`${API_PROXY_BASE}/visit`, { method: "POST", headers: { "Content-Type": "application/json" }, body, keepalive: true }).catch(() => {});
-      } catch (e) { /* 計測は付加機能。失敗しても何もしない */ }
-    };
-    send({ type: "land", ...base, isNew, returning });
-    // 「残った」= 45秒以上画面にいた(見えている状態で)、または何かを操作した。1回の到着につき1度だけ。
-    let engaged = false;
-    const markEngaged = () => { if (engaged) return; engaged = true; send({ type: "engage", from: src }); };
-    const onInteract = () => { markEngaged(); document.removeEventListener("click", onInteract, true); document.removeEventListener("touchstart", onInteract, true); };
-    document.addEventListener("click", onInteract, true);
-    document.addEventListener("touchstart", onInteract, true);
-    let visibleMs = 0; let lastTick = Date.now();
-    const timer = setInterval(() => {
-      const now = Date.now();
-      if (document.visibilityState === "visible") visibleMs += now - lastTick;
-      lastTick = now;
-      if (visibleMs >= 45000) { clearInterval(timer); markEngaged(); }
-    }, 5000);
-  } catch (e) { /* 計測は付加機能。画面には影響させない */ }
-}
-
 renderMyClubCard();
 renderDigestCard();
 renderReflectionsCard();
@@ -12748,7 +12763,6 @@ renderSmarterCard();
 renderDailyDiff();
 renderDailyReportWidget();
 renderTodayPredictionsHero();
-trackVisitSource();
 // スカウト速報は「🔍 選手検索」画面の中にしか出ないカードなので、
 // そのタブを開いた最初の1回だけ読み込む(psInit の中から呼ぶ)。
 // ホームだけを見て終わる利用者には、この通信は一度も発生しない。

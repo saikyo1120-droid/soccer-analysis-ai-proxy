@@ -8754,3 +8754,41 @@ localStorage を消した/別端末 = 新規。JSが動かない訪問者・ボ�
 | `TRAFFIC_KEEP_DAYS` | 100 | 日ごとの集計を保存先に残す日数 |
 | `TRAFFIC_STORED_CACHE_MS` | 300000 | レポート用に保存先の値をキャッシュする時間 |
 | `GROWTH_REPORT_PUBLIC` | (公開) | `0` にすると `/api/growth/traffic` と `/growth` に `?key=AUTO_COLLECT_SECRET` が必要 |
+
+## 開発ログ・ラウンド77(2026年10月1日) — v96「ビーコンが本番で届かない」の切り分けと堅牢化
+
+### 見つかった問題(実測)
+v95 の流入計測を 9/28 07:56 UTC に配備後、利用者は 9/28 夕方以降にサイトを複数回開いているのに、
+サーバーの受理件数(`counters.accepted`)が 10/1 まで **0** のまま(同じプロセスが 9/28 から動き続けており、
+`selfHealSkippedForStore` は 2→21→39→50 と増えていた=再起動で消えたのではない)。
+つまり「開いたのにビーコンが届いていない/数えられていない」。
+
+原因の候補(どれかは v96 の受信内訳で特定する):
+1. 計測の呼び出しが、画面本体の長いスクリプト(約1万行)の**末尾**にあった → 手前の処理が止まると実行されない
+2. 共有の1分枠(1 IP あたり30回)に、画面の他の通信(1回の表示で十数回)と一緒に数えられ、
+   通信の最後に出るビーコンだけが 429 で弾かれる(とくに短時間に2回開いた場合)
+3. Safari のコンテンツブロッカー等が `/api/visit` を広告計測と見なして止めている
+
+### 修正
+- **計測を独立した小さな `<script>` に分離し、画面本体より前に置く**(`trackVisitSourceV96`)。本体のスクリプトに何が起きても動く。
+  `API_PROXY_BASE` に依存せず `location.origin + "/api"` を使う。**ローカル(localhost/127.0.0.1/file:)では送らない**
+  (開発中の確認で本番の集計を汚さない。以前は Playwright の確認が本番へ POST を試みていた=プロキシが遮断していただけ)。
+- 送信は `navigator.sendBeacon` → 使えなければ `fetch(keepalive)`。送り先は **`/api/came-from`**(`/api/visit` も古い画面のために残す)。
+- **ビーコンは共有の1分枠に数えない**。専用枠 `TRAFFIC_BEACON_PER_MINUTE`(既定12/分・IP別)で守る(1表示 = land+engage の2件)。
+- **受信側の内訳**を数える: `received / rateLimited / methodNotAllowed / tooLarge / badBody / lastReceivedAt`(プロセス起動以降)。
+  `/api/growth/traffic` の `counters.http` と `/api/health` の `trafficBeacons` に出す。
+  received=0 なら「ブラウザから届いていない」、received>0 で accepted=0 なら「届いたが弾いた/拒否した」と切り分けられる。
+- 端末側も最後の送信結果を `localStorage.visitBeaconLast`(type / via: sendBeacon|fetch / result / status)に残し、
+  `/growth` の「届いているかの確認」で、サーバー側の内訳と並べて見られる(開発者ツール不要)。
+- `.html` の配信に `Cache-Control: no-cache` を付ける(更新した画面が古いキャッシュに隠れないように。SW は元からネットワーク優先)。
+
+### 検証(実測)
+`v95_traffic_test.js` を v96 向けに更新し **17/17**(⑬ 独立スクリプト/sendBeacon/came-from/ローカル除外、⑮ 別名の送り先と受信内訳、
+⑯ 専用枠12件→13件目429・共有枠は無事、⑰ no-cache と /growth の確認欄)。本物のブラウザ(Playwright・非ローカルのホスト名で開く)で
+`?from=X` → `land(x,新規)` と クリックで `engage` が `/api/came-from` へ `sendBeacon` で送られ、`visitBeaconLast` に記録されることを実測。
+既存53本合格・翻訳検査 17/17・起動スモーク合格(12経路すべて200)。sw.js は v96。
+
+### 配備後の確認手順(利用者)
+新しいタブで `https://soccer-analysis-ai-proxy.onrender.com/?from=test` を開き、1分置いて `/growth` を見る。
+「届いているかの確認」に サーバー側の受信件数 と この端末の最後の送信結果 が出る。経路一覧に `test` が1件出れば計測は正常。
+出ない場合は、受信内訳のどこで止まっているかで原因が分かる(received=0 → ブラウザ側で送れていない / rateLimited>0 → 枠 / badBody>0 → 本文)。

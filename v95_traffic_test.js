@@ -266,22 +266,26 @@ const jst = (offsetDays) => new Date(Date.now() + 9 * 3600000 + (offsetDays || 0
     assert.strictEqual(r3.status, 200);
   });
 
-  await t("⑬ 画面(index.html): ビーコン送信・?from= と参照元の判定・端末側の新規/再訪判定・45秒/操作での engage / sw.js は v95以上", () => {
+  await t("⑬ 画面(index.html): 計測は独立スクリプト(v96)・sendBeacon→fetch・/api/came-from・?from= と参照元・端末側の新規/再訪・45秒/操作・ローカルでは送らない / sw.js は v96以上", () => {
     const html = fs.readFileSync(INDEX_HTML, "utf8");
-    assert.ok(html.includes("function trackVisitSource()"), "計測関数が無い");
-    assert.ok(html.includes("`${API_PROXY_BASE}/visit`"), "ビーコン先が /api/visit でない");
-    assert.ok(html.includes('url.searchParams.get("from")'), "?from= を読んでいない");
-    assert.ok(html.includes('localStorage.getItem("visitAttribution")'), "端末側の初回記録が無い");
-    assert.ok(html.includes('type: "land"') && html.includes('type: "engage"'));
-    assert.ok(html.includes("visibleMs >= 45000"), "45秒の判定が無い");
-    assert.ok(/trackVisitSource\(\);\s*$/m.test(html), "起動時に呼ばれていない");
-    assert.ok(html.includes('if (src === "internal") return;'), "サイト内の移動を除外していない");
-    const idx = html.indexOf("function trackVisitSource()");
-    const fnSrc = html.slice(idx, html.indexOf("\nrenderMyClubCard();", idx));
+    assert.ok(html.includes("(function trackVisitSourceV96()"), "v96の計測スクリプトが無い");
+    assert.strictEqual((html.match(/function trackVisitSource\(\)/g) || []).length, 0, "旧 trackVisitSource が残っている(二重送信)");
+    const idx = html.indexOf("(function trackVisitSourceV96()");
+    const mainIdx = html.indexOf("/* ---------- Data ---------- */");
+    assert.ok(idx > 0 && idx < mainIdx, "計測スクリプトが画面本体のスクリプトより前に無い");
+    const fnSrc = html.slice(idx, html.indexOf("</script>", idx));
+    assert.ok(fnSrc.includes('apiBase + "/came-from"'), "送り先が /api/came-from でない");
+    assert.ok(fnSrc.includes("navigator.sendBeacon(") && fnSrc.includes("keepalive: true"), "sendBeacon→fetch の順になっていない");
+    assert.ok(fnSrc.includes('url.searchParams.get("from")'), "?from= を読んでいない");
+    assert.ok(fnSrc.includes('localStorage.getItem("visitAttribution")') && fnSrc.includes('"visitBeaconLast"'), "端末側の記録が無い");
+    assert.ok(fnSrc.includes('type: "land"') && fnSrc.includes('type: "engage"'));
+    assert.ok(fnSrc.includes("visibleMs >= 45000"), "45秒の判定が無い");
+    assert.ok(fnSrc.includes('if (src === "internal") return;'), "サイト内の移動を除外していない");
+    assert.ok(/host === "localhost" \|\| host === "127\.0\.0\.1"/.test(fnSrc), "ローカルで送らない判定が無い");
     assert.ok(!/[ぁ-んァ-ン一-龥]/.test(fnSrc.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "")), "計測コードに表示用の日本語が入っている(翻訳対象になる)");
     const sw = fs.readFileSync(SW_JS, "utf8");
     const swVer = Number((sw.match(/CACHE_NAME = "soccer-ai-shell-v(\d+)"/) || [])[1]);
-    assert.ok(swVer >= 95, "sw.js が v95 以上でない: " + swVer);
+    assert.ok(swVer >= 96, "sw.js が v96 以上でない: " + swVer);
   });
 
   await t("⑭ 最後のビーコンのあと誰も来なくても、TRAFFIC_FLUSH_MS 後にタイマーで1回積み上げる(別プロセス・300ms設定)", async () => {
@@ -315,6 +319,45 @@ const jst = (offsetDays) => new Date(Date.now() + 9 * 3600000 + (offsetDays || 0
     assert.strictEqual(r.status, 204);
     assert.deepStrictEqual(r.flushed, { "l:x": 1, "n:x": 1 }, "タイマーで積み上がっていない: " + JSON.stringify(r));
     assert.strictEqual(r.hincrby, 2);
+  });
+
+  await t("⑮ v96: /api/came-from でも受理(204)・受信内訳 http.received/accepted が数えられる・/api/health にも出る", async () => {
+    T.resetForTest();
+    const r = await request("POST", "/api/came-from", { type: "land", from: "x", isNew: true });
+    assert.strictEqual(r.status, 204);
+    const rep = await request("GET", "/api/growth/traffic?days=3");
+    assert.strictEqual(rep.body.counters.http.received, 1, JSON.stringify(rep.body.counters));
+    assert.strictEqual(rep.body.counters.accepted, 1);
+    assert.ok(/再起動で0に戻ります/.test(rep.body.counters.noteJa));
+    const h = await request("GET", "/api/health");
+    assert.strictEqual(h.body.trafficBeacons.received, 1);
+    assert.strictEqual(h.body.trafficBeacons.accepted, 1);
+  });
+
+  await t("⑯ v96: ビーコンは共有の1分枠に数えず、専用枠(12/分)で守る。13件目は429で http.rateLimited が増える。共有枠の通常APIはその後も通る", async () => {
+    T.resetForTest();
+    let got429 = 0, got204 = 0;
+    for (let i = 0; i < 13; i++) {
+      const r = await request("POST", "/api/came-from", { type: "engage", from: "x" }, { "X-Forwarded-For": "203.0.113.7" });
+      if (r.status === 429) got429++; else if (r.status === 204) got204++;
+    }
+    assert.strictEqual(got204, 12, "専用枠12件が通っていない: " + got204);
+    assert.strictEqual(got429, 1, "13件目が429になっていない");
+    const rep = await request("GET", "/api/growth/traffic?days=3");
+    assert.strictEqual(rep.body.counters.http.received, 13);
+    assert.strictEqual(rep.body.counters.http.rateLimited, 1);
+    assert.strictEqual(rep.body.counters.accepted, 12);
+    // 同じIPの通常API(共有枠)は、ビーコン13件のあとでも通る(別の枠で数えているため)
+    const h = await request("GET", "/api/health", undefined, { "X-Forwarded-For": "203.0.113.7" });
+    assert.strictEqual(h.status, 200, "ビーコンが共有枠を食い潰している");
+  });
+
+  await t("⑰ v96: 画面(.html)は Cache-Control: no-cache で配る・/growth に「届いているかの確認」がある", async () => {
+    const r = await request("GET", "/index.html");
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.headers["cache-control"], "no-cache", "index.html に no-cache が付いていない: " + r.headers["cache-control"]);
+    const g = await request("GET", "/growth");
+    assert.ok(g.raw.includes("届いているかの確認") && g.raw.includes('"visitBeaconLast"') && g.raw.includes("counters.http"), "/growth に受信内訳の表示が無い");
   });
 
   srvMod.server.close();

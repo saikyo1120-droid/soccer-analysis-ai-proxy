@@ -2508,12 +2508,16 @@ const TRAFFIC_FLUSH_MS = Number(process.env.TRAFFIC_FLUSH_MS) || 60 * 1000;
 const TRAFFIC_KEEP_DAYS = Number(process.env.TRAFFIC_KEEP_DAYS) || 100;
 const TRAFFIC_MAX_BODY_BYTES = 2048;
 const TRAFFIC_PENDING_MAX_DAYS = 3;
+// v96: ビーコン専用の1分枠(IP別)。画面1回で land+engage の2件なので、12件/分で十分かつ乱射は防げる
+const TRAFFIC_BEACON_PER_MINUTE = Number(process.env.TRAFFIC_BEACON_PER_MINUTE) || 12;
 const traffic = {
   pending: new Map(),        // dayKey -> Map<field, delta>(まだ保存先に足していない増分)
   knownDayKeys: new Set(),   // EXPIRE を付け終えた日キー
   lastFlushAt: Date.now(), flushInFlight: false, flushFailures: 0, flushedCommands: 0,
   flushTimer: null,          // 最後のビーコンから TRAFFIC_FLUSH_MS 後に1回積み上げるタイマー
   accepted: 0, rejected: 0, lastAcceptedAt: null,
+  // v96: 「届いたか」を切り分けるための受信側の内訳(本番で受信0の原因を特定するため)
+  http: { received: 0, rateLimited: 0, methodNotAllowed: 0, tooLarge: 0, badBody: 0, lastReceivedAt: null },
 };
 function scheduleTrafficFlush() {
   if (traffic.flushTimer) return;
@@ -2717,7 +2721,14 @@ async function buildTrafficReport(days) {
     readMode, readFailures, storedReadAt: readAt,
     total, sources, byDay: daysOut, retention,
     pendingUnflushed: [...traffic.pending.values()].reduce((a, m) => a + [...m.values()].reduce((x, y) => x + y, 0), 0),
-    counters: { accepted: traffic.accepted, rejected: traffic.rejected, lastAcceptedAt: traffic.lastAcceptedAt, flushedCommands: traffic.flushedCommands, flushFailures: traffic.flushFailures, lastFlushAt: traffic.lastFlushAt ? new Date(traffic.lastFlushAt).toISOString() : null },
+    counters: {
+      accepted: traffic.accepted, rejected: traffic.rejected, lastAcceptedAt: traffic.lastAcceptedAt,
+      flushedCommands: traffic.flushedCommands, flushFailures: traffic.flushFailures, lastFlushAt: traffic.lastFlushAt ? new Date(traffic.lastFlushAt).toISOString() : null,
+      // v96: 受信側の内訳(このプロセスが起動してから)。received が0なら「ブラウザから届いていない」、
+      //   received>0 で accepted が0なら「届いたが弾かれた/拒否した」と切り分けられる。
+      http: { ...traffic.http },
+      noteJa: "counters はいま動いているサーバープロセスが起動してからの件数です(再起動で0に戻ります)。",
+    },
     summaryJa,
     definitionsJa: {
       landings: "到着: 画面が開かれた回数(同じ人が2回開けば2)",
@@ -2753,11 +2764,23 @@ input{padding:6px 8px;font-size:.95rem;width:min(100%,360px)}button{padding:6px 
 <h2>経路ごとの合計</h2><div id="sources"></div>
 <h2>日ごとの到着</h2><div id="byDay"></div>
 <h2>定着(到着日ごと)</h2><div class="note">size=その日の新規人数。d1/d3/d7=1日後/3日後/7日後にまた来た人数(割合)。— は「その日がまだ来ていない」。</div><div id="retention"></div>
+<h2>届いているかの確認(v96)</h2>
+<div id="diag" class="note"></div>
 <h2>この計測の限界</h2><ul id="limits" class="note"></ul>
 <script>
 (function(){
   var esc=function(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});};
   var key=null; try{key=localStorage.getItem("growthViewKey");}catch(e){}
+  // この端末(同じサイトなので localStorage を共有)が最後に送ったビーコンの結果と、初回の記録
+  function renderDiag(d){
+    var att=null, last=null; try{att=JSON.parse(localStorage.getItem("visitAttribution")||"null"); last=JSON.parse(localStorage.getItem("visitBeaconLast")||"null");}catch(e){}
+    var h=d&&d.counters&&d.counters.http? d.counters.http : null;
+    var lines=[];
+    if(h){ lines.push("サーバー側(いまのプロセス起動以降): 受信 "+h.received+" / 受理 "+(d.counters.accepted||0)+" / 専用枠で制限 "+h.rateLimited+" / 本文不正 "+h.badBody+" / 大きすぎ "+h.tooLarge+" / POST以外 "+h.methodNotAllowed+(h.lastReceivedAt?" / 最後の受信 "+new Date(h.lastReceivedAt).toLocaleString("ja-JP"):"")); }
+    lines.push(last? ("この端末の最後の送信: "+esc(last.type||"?")+" → "+esc(last.result||"?")+(last.status?" (HTTP "+last.status+")":"")+" / "+esc(last.via||"")+" / "+new Date(last.at).toLocaleString("ja-JP")) : "この端末からの送信記録はまだありません(トップページを新しく開くと記録されます)。");
+    lines.push(att? ("この端末の初回: "+esc(att.first)+" 経路 "+esc(att.from)+" / 来訪 "+(att.visits||0)+"回 / 最後に来た日 "+esc(att.lastDay||"-")) : "この端末の初回記録はまだありません。");
+    document.getElementById("diag").innerHTML=lines.map(function(x){return "<div>"+x+"</div>";}).join("");
+  }
   function load(){
     var days=document.getElementById("days").value; var st=document.getElementById("status"); st.textContent="読み込み中…";
     var url="/api/growth/traffic?days="+encodeURIComponent(days)+(key?"&key="+encodeURIComponent(key):"");
@@ -2775,7 +2798,8 @@ input{padding:6px 8px;font-size:.95rem;width:min(100%,360px)}button{padding:6px 
       var any=false; d.retention.forEach(function(c){ c.rows.forEach(function(row){ any=true; var f=function(v,p){return v===null?"—":v+(p===null?"":" ("+p+"%)");}; r+='<tr><td>'+esc(c.cohortDate)+'</td><td>'+esc(row.source)+'</td><td>'+row.size+'</td><td>'+f(row.d1,row.d1Pct)+'</td><td>'+f(row.d3,row.d3Pct)+'</td><td>'+f(row.d7,row.d7Pct)+'</td><td>'+(row.returnVisitDays7===null?"—":row.returnVisitDays7)+'</td></tr>'; }); });
       r+='</table>'; if(!any) r='<div class="note">まだ定着を測れる到着日がありません(新規が来た翌日から表示されます)。</div>'; document.getElementById("retention").innerHTML=r;
       document.getElementById("limits").innerHTML=(d.limitsJa||[]).map(function(x){return "<li>"+esc(x)+"</li>";}).join("");
-    }).catch(function(){ document.getElementById("status").textContent="取得できませんでした(サーバー起動待ちの可能性)。"; });
+      renderDiag(d);
+    }).catch(function(){ document.getElementById("status").textContent="取得できませんでした(サーバー起動待ちの可能性)。"; renderDiag(null); });
   }
   document.getElementById("reload").addEventListener("click",load);
   document.getElementById("days").addEventListener("change",load);
@@ -7508,6 +7532,8 @@ function serveStatic(req, res, pathname) {
       // ソース流出と同じ轍を踏まないための最低限のセキュリティヘッダ
       "X-Content-Type-Options": "nosniff",
       "Referrer-Policy": "strict-origin-when-cross-origin",
+      // v96: 画面(.html)は毎回サーバーに鮮度を確認させる(更新した画面が古いキャッシュに隠れないように)
+      ...(ext === ".html" ? { "Cache-Control": "no-cache" } : {}),
     });
     res.end(data);
   });
@@ -7610,7 +7636,20 @@ async function handleHttpRequest(req, res) {
     const heavyLimit = lane.dedicated ? SKILL_HEAVY_CALLS_PER_DAY : PER_IP_HEAVY_CALLS_PER_DAY;
     if (lane.dedicated) { const st = skillLaneStatsToday(); st.requests++; st.lastRequestAt = new Date().toISOString(); }
     res.setHeader("X-Skill-Lane", lane.dedicated ? "dedicated" : "shared"); // 動作確認用(鍵の値は出さない)
-    if (rateLimited(budgetKey, perMinuteLimit)) {
+    // ---- v96: 流入計測のビーコンは共有の1分枠に数えない ----
+    //   画面1回の表示で十数回のAPI通信が走るため、同じ枠で数えるとビーコン(通信の最後に出る)だけが
+    //   429で弾かれうる(本番で「開いたのに受信0」の候補)。専用の緩い枠(既定12回/分・IP別)で守る。
+    const isBeaconPath = pathname === "/api/visit" || pathname === "/api/came-from";
+    if (isBeaconPath) {
+      traffic.http.received++;
+      traffic.http.lastReceivedAt = new Date().toISOString();
+      if (rateLimited(`beacon|${ip}`, TRAFFIC_BEACON_PER_MINUTE)) {
+        traffic.http.rateLimited++;
+        res.writeHead(429, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: false, error: "too many beacons" }));
+        return;
+      }
+    } else if (rateLimited(budgetKey, perMinuteLimit)) {
       if (lane.dedicated) skillLaneStatsToday().limited++;
       res.writeHead(429, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ found: false, error: "レート制限に達しました。しばらく待ってから再試行してください。" }));
@@ -7662,31 +7701,36 @@ async function handleHttpRequest(req, res) {
           upstashUsage: { monthKey: usageNow.monthKey, monthEstimate: usageNow.monthEstimate, monthEstimateBasis: usageNow.monthEstimateBasis, monthlyLimit: usageNow.monthlyLimit, level: usageNow.level, noteJa: usageNow.noteJa },
           learningRunning: dailyLearningRunning,
           selfHealSkippedForStore: selfHealSkippedForStore.count,
+          trafficBeacons: { ...traffic.http, accepted: traffic.accepted }, // v96: ビーコンの受信内訳(プロセス起動以降)
         }));
         return;
       }
-      if (pathname === "/api/visit") {
+      if (pathname === "/api/visit" || pathname === "/api/came-from") {
         // ---- v95: 流入の計測ビーコン(匿名・集計のみ。訪問者の情報は保存しない) ----
         //   画面が「開いた(land)」「残った(engage)」を小さなJSONで知らせる。応答は 204。
         //   外部APIも保存先も触らない(プロセス内のカウンターを増やすだけ=方針⑥)。
+        //   v96: /api/came-from を正式な送り先にする(「visit」は広告計測と見なして止める
+        //   コンテンツブロッカーがあり得るため)。/api/visit は古い画面のために残す。
         if (req.method !== "POST") {
+          traffic.http.methodNotAllowed++;
           res.writeHead(405, { "Content-Type": "application/json; charset=utf-8", "Allow": "POST" });
           res.end(JSON.stringify({ ok: false, error: "POST only" }));
           return;
         }
         const declared = Number(req.headers["content-length"]);
         if (Number.isFinite(declared) && declared > TRAFFIC_MAX_BODY_BYTES) {
-          traffic.rejected++;
+          traffic.rejected++; traffic.http.tooLarge++;
           res.writeHead(413, { "Content-Type": "application/json; charset=utf-8" });
           res.end(JSON.stringify({ ok: false, error: "body too large" }));
           return;
         }
         let body = null;
         try { body = await readJsonBody(req); } catch (e) { body = null; }
+        if (typeof body === "string") { try { body = JSON.parse(body); } catch (e) { body = null; } } // sendBeacon が text/plain で送る場合に備える
         if (body && JSON.stringify(body).length > TRAFFIC_MAX_BODY_BYTES) body = null;
         const r = recordVisit(body);
         if (!r.ok) {
-          traffic.rejected++;
+          traffic.rejected++; traffic.http.badBody++;
           res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
           res.end(JSON.stringify({ ok: false, error: r.reason }));
           return;
@@ -9965,7 +10009,7 @@ module.exports = {
   __trafficForTest: {
     recordVisit, maybeFlushTraffic, buildTrafficReport, trafficNormalizeSource, growthPageHtml,
     state: () => ({ pending: [...traffic.pending.entries()].map(([d, m]) => [d, Object.fromEntries(m)]), knownDayKeys: [...traffic.knownDayKeys], accepted: traffic.accepted, rejected: traffic.rejected, flushFailures: traffic.flushFailures, flushedCommands: traffic.flushedCommands, lastFlushAt: traffic.lastFlushAt }),
-    resetForTest: () => { traffic.pending.clear(); traffic.knownDayKeys.clear(); traffic.lastFlushAt = Date.now(); if (traffic.flushTimer) { clearTimeout(traffic.flushTimer); traffic.flushTimer = null; } traffic.flushInFlight = false; traffic.flushFailures = 0; traffic.flushedCommands = 0; traffic.accepted = 0; traffic.rejected = 0; traffic.lastAcceptedAt = null; for (const k of [...cache.keys()]) if (String(k).startsWith("growth:traffic:")) cache.delete(k); },
+    resetForTest: () => { traffic.pending.clear(); traffic.knownDayKeys.clear(); traffic.lastFlushAt = Date.now(); if (traffic.flushTimer) { clearTimeout(traffic.flushTimer); traffic.flushTimer = null; } traffic.flushInFlight = false; traffic.flushFailures = 0; traffic.flushedCommands = 0; traffic.accepted = 0; traffic.rejected = 0; traffic.lastAcceptedAt = null; traffic.http = { received: 0, rateLimited: 0, methodNotAllowed: 0, tooLarge: 0, badBody: 0, lastReceivedAt: null }; for (const k of [...cache.keys()]) if (String(k).startsWith("growth:traffic:")) cache.delete(k); },
   },
   // v94: 保存先の健全性・使用量・空回り防止の検証用(本番では誰も呼ばない)
   __storeForTest: {
