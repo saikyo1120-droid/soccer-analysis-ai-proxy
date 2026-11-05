@@ -33,7 +33,7 @@
 const {
   CLUB_UNIVERSE, tierOf, clubsForCoreUpdate, clubsForSquadSync,
   clubsForXgUpdate, clubsForBasicInfo, UEFA_SNAPSHOT_NOTE_JA,
-  searchVariantsOf, pickBestTeamMatch,
+  searchVariantsOf, pickBestTeamMatch, dayNumberOf, // v98: 動的クラブの7日周期に使う
 } = require("./clubUniverse");
 const {
   computeGoalRateFeatures, computeFatigueFeature, computeHomeAwaySplit,
@@ -107,7 +107,15 @@ async function collectUniverse(deps, runAt, dateKey) {
   const priorityClubs = (deps.priorityClubs || [])
     .map((nameEn) => CLUB_UNIVERSE.find((c) => c.nameEn.toLowerCase() === String(nameEn).toLowerCase()))
     .filter(Boolean);
+  // ---- v98: 動的クラブ(「見た試合のクラブは翌日までに取り込む」) ----
+  //   deps.dynamicClubs = { due: [今日更新するクラブ], all: [採用済み全クラブ] }
+  //   due は新規採用(isNew)→最後の収集が古い順。固定名簿の後ろに付ける(tier C=最低優先。
+  //   予算が尽きれば正直に見送り、見送った数を stats.dynamic に残す)。
+  const dynamicDue = (deps.dynamicClubs && Array.isArray(deps.dynamicClubs.due)) ? deps.dynamicClubs.due.filter((c) => c && c.apiTeamId && c.nameEn) : [];
+  const dynamicAll = (deps.dynamicClubs && Array.isArray(deps.dynamicClubs.all)) ? deps.dynamicClubs.all : [];
+  const dynamicNew = dynamicDue.filter((c) => c.isNew);
   const stats = {
+    dynamic: { adoptedTotal: dynamicAll.length, dueToday: dynamicDue.length, newToday: dynamicNew.length, coreUpdated: 0, squadsUpdated: 0, bulkFetched: 0, skipped: 0, names: dynamicDue.slice(0, 10).map((c) => c.nameEn) },
     coreClubsPlanned: 0, coreClubsUpdated: 0,
     squadsPlanned: 0, squadsUpdated: 0,
     playersUpdated: 0, playersPlanned: 0,
@@ -239,6 +247,12 @@ async function collectUniverse(deps, runAt, dateKey) {
       teamResolveMemo.set(club.nameEn, hit);
       return hit;
     }
+    // v98: 動的クラブは試合一覧が返した teamId をそのまま使う(名前検索をしない=誤照合しない・予算0)
+    if (club.dynamic && Number.isFinite(Number(club.apiTeamId))) {
+      const hit = { teamId: Number(club.apiTeamId), dossier };
+      teamResolveMemo.set(club.nameEn, hit);
+      return hit;
+    }
 
     // 否定キャッシュ(直近7日以内に全候補で照合できなかったクラブは再試行しない)
     const failKey = `kb:club:resolvefail:${club.nameEn}`;
@@ -309,8 +323,8 @@ async function collectUniverse(deps, runAt, dateKey) {
 
   function metaOf(club, teamId, at) {
     return {
-      nameJa: club.nameJa, teamId, uefaRankSnapshot: club.rank,
-      tier: tierOf(club), computedAt: at.toISOString(),
+      nameJa: club.nameJa, teamId, uefaRankSnapshot: club.dynamic ? null : club.rank,
+      tier: club.dynamic ? "C" : tierOf(club), computedAt: at.toISOString(), // v98: 動的クラブは tier C
     };
   }
 
@@ -326,6 +340,7 @@ async function collectUniverse(deps, runAt, dateKey) {
       const bp = priorityClubs.includes(b) ? 0 : 1;
       return ap - bp || a.rank - b.rank;
     }),
+    ...dynamicDue, // v98: 動的クラブは固定名簿の後(予算が尽きたら見送る)
   ];
   stats.coreClubsPlanned = coreClubs.length;
   // 順位表はリーグ単位でまとめて取るため、クラブ→リーグIDをここで集める
@@ -340,6 +355,24 @@ async function collectUniverse(deps, runAt, dateKey) {
       // 「エラーが原因で件数が少ない」という誤った表示につながっていた)。
       if (!teamId) continue;
       const meta = metaOf(club, teamId, runAt);
+      if (club.dynamic) {
+        stats.dynamic.coreUpdated++;
+        // 新規採用の動的クラブは基本情報(本拠地・創設年・ロゴ)を1回だけ取得する(/teams?id=)
+        if (club.isNew && canSpend(1)) {
+          try {
+            const t = await callApiFootball("/teams", { id: teamId });
+            const row = (t.response || [])[0];
+            if (row && row.team) {
+              await clubDossier.updateSection(club.nameEn, "basic", {
+                founded: row.team.founded ?? null, countryEn: row.team.country ?? null,
+                venueName: (row.venue && row.venue.name) || null, venueCity: (row.venue && row.venue.city) || null,
+                venueCapacity: (row.venue && row.venue.capacity) || null, logo: row.team.logo || null,
+                dynamicReasonJa: club.reasonJa || null,
+              }, meta);
+            }
+          } catch (e) { noteWarning(stats, `dynamic_basic_failed:${club.nameEn}`, e); }
+        }
+      }
 
       // --- 直近試合 → フォーム・得点傾向・過密日程・ホームアウェイ ---
       let fixtures = [];
@@ -527,7 +560,11 @@ async function collectUniverse(deps, runAt, dateKey) {
   // ============================================================
   // ③ 選手名簿(7日で全クラブ一巡)
   // ============================================================
-  const squadClubs = alreadyRanToday ? [] : clubsForSquadSync(dateKey);
+  const squadClubs = alreadyRanToday ? [] : [
+    ...clubsForSquadSync(dateKey),
+    // v98: 動的クラブは新規採用の日と、その後は7日周期で名簿を更新する
+    ...dynamicDue.filter((c) => c.isNew || (c.rank % 7) === (dayNumberOf(dateKey) % 7)),
+  ];
   stats.squadsPlanned = squadClubs.length;
   for (const club of squadClubs) {
     if (!canSpend(1)) { skip("squad", `予算残量が安全ラインを下回ったため、${club.nameJa}以降の名簿更新を見送りました。`); break; }
@@ -561,6 +598,7 @@ async function collectUniverse(deps, runAt, dateKey) {
         }
       }
       stats.squadsUpdated++;
+      if (club.dynamic) stats.dynamic.squadsUpdated++;
     } catch (e) { stats.errors.push(`universe_squad_failed:${club.nameEn}:${e.code || e.message}`); }
   }
 
@@ -581,7 +619,11 @@ async function collectUniverse(deps, runAt, dateKey) {
   stats.bulkClubsFetched = 0;
   stats.bulkPlayersFetched = 0;
   stats.bulkRequests = 0;
-  const bulkClubs = alreadyRanToday ? [] : CLUB_UNIVERSE.slice(0, Math.max(1, BULK_CLUB_LIMIT));
+  const bulkClubs = alreadyRanToday ? [] : [
+    ...CLUB_UNIVERSE.slice(0, Math.max(1, BULK_CLUB_LIMIT)),
+    // v98: 動的クラブの選手成績は新規採用の日に全員ぶん、その後は7日周期で取り直す
+    ...dynamicDue.filter((c) => c.isNew || (c.rank % 7) === (dayNumberOf(dateKey) % 7)),
+  ];
   stats.bulkClubsPlanned = bulkClubs.length;
   for (const club of bulkClubs) {
     if (!canSpend(2)) {
@@ -659,6 +701,7 @@ async function collectUniverse(deps, runAt, dateKey) {
       }
       if (fetchedForClub > 0) {
         stats.bulkClubsFetched++;
+        if (club.dynamic) stats.dynamic.bulkFetched++; // v98
         stats.bulkPlayersFetched += fetchedForClub;
       }
       // 「黙って減らさない」: 途中で打ち切ったクラブは必ず理由を残す
@@ -1372,6 +1415,35 @@ async function collectUniverse(deps, runAt, dateKey) {
       }
     } catch (e) { noteWarning(stats, "universe_run_marker_failed", e); } // 記録できなくても収集自体は完了している(v92: 痕跡は残す)
   }
+
+  // ---- v98: teamId→クラブの対応表を保存(試合カードの照合用。1 SET) + 動的クラブの収集日を記録 ----
+  try {
+    const clubsForMap = [];
+    for (const c of CLUB_UNIVERSE) {
+      const m = teamResolveMemo.get(c.nameEn);
+      const tid = m && m.teamId ? m.teamId : (m && m.dossier && m.dossier.teamId) || null;
+      if (tid) clubsForMap.push({ teamId: Number(tid), nameEn: c.nameEn, nameJa: c.nameJa, tier: tierOf(c), dynamic: false, leagueId: c.leagueId || null });
+    }
+    // 今日解決しなかった固定クラブは、前回の表から引き継ぐ(表が日ごとに欠けないように)
+    if (deps.upstashGetJSON) {
+      const prev = await deps.upstashGetJSON("kb:universe:teammap").catch(() => null);
+      const have = new Set(clubsForMap.map((c) => c.nameEn));
+      for (const e of (prev && Array.isArray(prev.clubs)) ? prev.clubs : []) {
+        if (e && !e.dynamic && e.nameEn && !have.has(e.nameEn) && CLUB_UNIVERSE.some((c) => c.nameEn === e.nameEn)) clubsForMap.push(e);
+      }
+    }
+    for (const c of dynamicAll) {
+      if (Number.isFinite(Number(c.apiTeamId))) clubsForMap.push({ teamId: Number(c.apiTeamId), nameEn: c.nameEn, nameJa: c.nameJa || c.nameEn, tier: "C", dynamic: true, leagueId: c.leagueId || null });
+    }
+    if (deps.upstashSetJSON && clubsForMap.length) {
+      await deps.upstashSetJSON("kb:universe:teammap", { at: runAt.toISOString(), count: clubsForMap.length, clubs: clubsForMap });
+      stats.teamMapSaved = clubsForMap.length;
+    }
+    if (deps.dynamicUniverse && typeof deps.dynamicUniverse.markCollected === "function" && dynamicDue.length) {
+      await deps.dynamicUniverse.markCollected(dynamicDue.map((c) => c.apiTeamId), dateKey);
+    }
+    stats.dynamic.skipped = dynamicDue.filter((c) => !teamResolveMemo.has(c.nameEn)).length;
+  } catch (e) { noteWarning(stats, "universe_teammap_failed", e); }
 
   return stats;
 

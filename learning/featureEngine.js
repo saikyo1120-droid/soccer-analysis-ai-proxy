@@ -28,7 +28,7 @@
  *     日次ジョブ/オンデマンドのどちらからでも同じ結果になることを保証できる。
  */
 const { computeHomeAwaySplit } = require("./features");
-const { computeMatchFeatures, computeFeatureAvailability } = require("./predictionModel");
+const { computeMatchFeatures, computeFeatureAvailability, missingFeaturesOf } = require("./predictionModel");
 
 /**
  * 片側チームの「予測モデルへ渡す文脈」を組み立てる共通関数。
@@ -101,6 +101,8 @@ function buildTeamContext(src) {
     ratingExpGoals: Number.isFinite(s.ratingExpGoals) ? s.ratingExpGoals : null,
     // v57: クラブElo(clubelo.com)。取れなければnull(=特徴量0で影響なし)
     clubElo: Number.isFinite(s.clubElo) ? s.clubElo : null,
+    // v98: 主力選手(出場時間上位)の今季平均評価点(選手索引の実測。無ければnull=特徴量0で影響なし)
+    squadRating: Number.isFinite(s.squadRating) ? s.squadRating : null,
   };
 }
 
@@ -124,7 +126,9 @@ function buildMatchFeatures(homeSrc, awaySrc, h2h, market) {
   // 「順位データが取れず0を入れてしまっていた」といった**古い特徴量の
   // でっち上げを誰も検知できなかった**。10項目すべてを検査する。
   const supplied = computeFeatureAvailability(homeCtx, awayCtx, h2h, market);
-  return { features, homeCtx, awayCtx, supplied };
+  // v98: 使えなかった特徴量の一覧(予想レコードへ保存 → 外れ理由・翌日の優先取得・画面の「未取得」表示)
+  const missingFeatures = missingFeaturesOf(supplied);
+  return { features, homeCtx, awayCtx, supplied, missingFeatures };
 }
 
 module.exports = { buildTeamContext, buildMatchFeatures };

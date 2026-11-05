@@ -102,6 +102,7 @@ const {
   computeFeatureEffectiveness, buildAblationCandidates, mostLikelyScoreline,
   classifyFixtureOfficial,
   computeMatchProbabilitiesRaw, // v97: 判定に使った最終確率(finalProbs)の記録用
+  FEATURE_LABELS_JA, // v98: 学習計画の「データ不足」内訳の表示名
   // v62: 学習した大会かどうかの判定は下の learnedComp を使う(requireは末尾にまとめる)
 } = require("./predictionModel");
 // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ ----
@@ -158,6 +159,8 @@ const { DEFAULT_BACKFILL_LEAGUES } = require("./historicalBackfill");
 const { computePredictionShift } = require("./predictionShift");
 // ⑩ AIが自分で「次に何を学ぶか」を決める
 const { buildLearningAgenda, priorityClubsOf, saveAgenda, loadLatestAgenda } = require("./learningAgenda");
+// v98: 動的クラブ宇宙(見た試合・データが欠けた試合のクラブを翌日までに取り込む)
+const { createDynamicUniverse } = require("./dynamicUniverse");
 // ⑤ データの信頼度(出所×鮮度)。信頼度の高いデータほど強く学習する
 const { sampleWeightOf, buildFeatureTrust } = require("./trustEngine");
 
@@ -853,6 +856,8 @@ async function runDailyLearning(deps) {
   let hypothesesDiscarded = 0; // Hypothesis Engine: 検証の結果、外れて破棄した状態仮説の件数
   const roiAggToday = emptyRoiDaily(); // 精度証明ラウンド⑤: 本日のROI集計(オッズつきの答え合わせ)
   let reflectionsSaved = 0; // Layer4: 当たり/外れ問わず「振り返り」を保存した件数
+  const dataMissingTeams = []; // v98: 外れた試合でデータが欠けていたチーム(翌日の優先取得候補)
+  let dynamicUniverseToday = null; // v98: 動的クラブ宇宙の今日の採用結果(成長ログへ開示)
   let profilesGenerated = 0; // Layer2: 新しく生成した固定知識(クラブプロフィール)の件数
   let aiViewsChanged = 0; // Layer3: 前日から見解が変わったクラブの件数
   let aiViewsUnchanged = 0;
@@ -1336,6 +1341,14 @@ async function runDailyLearning(deps) {
       // 根拠に機械的に分類する(LLM不使用・でっち上げ防止)。
       const failureReasons = record.correct ? [] : classifyFailureReasons(record, record.weightsSnapshot);
       record.failureReasons = failureReasons;
+      // v98: 外れた試合でデータが欠けていたチームは、翌日の収集で優先的に取りに行く候補にする
+      if (!record.correct && Array.isArray(record.missingFeatures) && record.missingFeatures.length) {
+        for (const side of ["home", "away"]) {
+          const tid = record[`${side}TeamId`];
+          const nameEn = record[`${side}TeamEn`];
+          if (Number.isFinite(tid) && nameEn) dataMissingTeams.push({ teamId: tid, nameEn, leagueId: record.leagueId || null, league: record.league || null });
+        }
+      }
       // 2026年8月・完全自動Learning Cycle ⑧: 当たった時も「なぜ当たったのか」を
       // 分析する(従来は外れた時しか言語化していなかった)。失敗分析と完全に
       // 対称な条件でのみ判定し、決め手が無ければ正直にそう返す。
@@ -1629,6 +1642,7 @@ async function runDailyLearning(deps) {
   // ---- v57「クラブElo」: 日次一覧を1日1回だけ取得(保存を再利用) ----
   //   取れない日は7日以内の保存で継続(staleDaysを開示)。それも無ければ特徴量0。
   let clubEloDailyRows = [], clubEloByNormMap = null, clubEloMeta = null, clubEloUsedToday = 0;
+  let squadRatingUsedToday = 0; // v98: 両チームの主力評価点が揃った予想の数(特徴量⑤の検証材料)
   try {
     // v73: fetchFnの注入を外し、clubElo内蔵のNode標準トランスポート(https.request)を使う。
     //   接続タイムアウトを自由に制御でき、失敗時に生のエラーコード+所要msが試行ごとに残る。
@@ -1925,9 +1939,21 @@ async function runDailyLearning(deps) {
       const homeClubElo = eloOfName(fx.teams && fx.teams.home && fx.teams.home.name);
       const awayClubElo = eloOfName(fx.teams && fx.teams.away && fx.teams.away.name);
       if (Number.isFinite(homeClubElo) && Number.isFinite(awayClubElo)) clubEloUsedToday++;
+      // v98: 主力選手の平均評価点(選手索引の実測。信頼できる母数が無ければ null=特徴量0)
+      //   外部APIは呼ばない(プロセス内の索引を引くだけ)。
+      let homeSquadRating = null, awaySquadRating = null;
+      if (typeof deps.squadRatingOf === "function") {
+        try {
+          [homeSquadRating, awaySquadRating] = await Promise.all([
+            deps.squadRatingOf(homeTeamId, fx.teams && fx.teams.home && fx.teams.home.name),
+            deps.squadRatingOf(awayTeamId, fx.teams && fx.teams.away && fx.teams.away.name),
+          ]);
+        } catch (e) { homeSquadRating = null; awaySquadRating = null; }
+        if (Number.isFinite(homeSquadRating) && Number.isFinite(awaySquadRating)) squadRatingUsedToday++;
+      }
       const built = buildMatchFeatures(
-        { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXg, topScorer: homeTop, ratingExpGoals: ratingEg ? ratingEg.home : null, clubElo: homeClubElo },
-        { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXg, topScorer: awayTop, ratingExpGoals: ratingEg ? ratingEg.away : null, clubElo: awayClubElo },
+        { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXg, topScorer: homeTop, ratingExpGoals: ratingEg ? ratingEg.home : null, clubElo: homeClubElo, squadRating: homeSquadRating },
+        { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXg, topScorer: awayTop, ratingExpGoals: ratingEg ? ratingEg.away : null, clubElo: awayClubElo, squadRating: awaySquadRating },
         h2h,
         marketImplied // v47: 市場オッズを特徴量 marketEdge として渡す(無ければ0)
       );
@@ -2051,6 +2077,14 @@ async function runDailyLearning(deps) {
         homeLambda, awayLambda, features, weightsSnapshot: weights, factorImportance: importance,
         // v97: 判定に実際に使った最終確率(採点・表示・較正はこれを優先する。source=model/market_blend/second_opinion_blend)
         finalProbs,
+        // ---- v98: 予想時に「どのデータが使えて、どれが欠けていたか」を記録する ----
+        //   missingFeatures は外れ理由(data_missing)・翌日の優先取得・画面の「未取得」表示に使う。
+        //   teamId は欠けたデータのチームを翌日の収集で特定するため(名前の推測を避ける)。
+        homeTeamId: Number.isFinite(homeTeamId) ? homeTeamId : null,
+        awayTeamId: Number.isFinite(awayTeamId) ? awayTeamId : null,
+        supplied: built.supplied,
+        missingFeatures: built.missingFeatures,
+        squadRatings: { home: Number.isFinite(homeSquadRating) ? homeSquadRating : null, away: Number.isFinite(awaySquadRating) ? awaySquadRating : null },
         // v63: 期待得点が現実的な範囲(0.2〜4.0)の外へ出たか。出た試合は
         //   モデルが表現できる範囲の外なので、画面で正直に断る材料として残す。
         lambdaClamped: modelOut.lambdaClamped === true,
@@ -2213,11 +2247,49 @@ async function runDailyLearning(deps) {
         };
       }
     } catch (e) { warn("agenda_apply_failed", e); } // 計画が無ければ通常の輪番のみ(v92: 痕跡は残す)
+    // ---- v98: 動的クラブ宇宙 ----
+    //   ①外れた試合でデータが欠けていたチームを候補に記録(優先度最高)
+    //   ②候補から今日の採用を決める(1日 UNIVERSE_DYNAMIC_PER_DAY・総数 UNIVERSE_DYNAMIC_MAX)
+    //   ③採用済みのうち「新規」と「直近3日に試合があった」クラブを今日の収集対象へ
+    let dynamicClubs = null;
+    const dynamicUniverse = deps.dynamicUniverse || createDynamicUniverse({ upstashEnabled, upstashCmd });
+    try {
+      // 固定名簿の teamId(調査ファイルに保存済み)は候補・採用から除外する
+      const staticIds = new Set();
+      try {
+        const dr = await clubDossier.getDossiers(CLUB_UNIVERSE.map((c) => c.nameEn));
+        for (const d of dr.byName.values()) if (d && Number.isFinite(Number(d.teamId))) staticIds.add(Number(d.teamId));
+      } catch (e) { warn("dynamic_static_ids_failed", e); }
+      const staticNames = new Set(CLUB_UNIVERSE.map((c) => c.nameEn.toLowerCase()));
+      const isStaticTeam = (id, name) => staticIds.has(Number(id)) || staticNames.has(String(name || "").toLowerCase());
+      if (dataMissingTeams.length) {
+        const r = await dynamicUniverse.recordSeen(dataMissingTeams, { source: "data_missing", nowMs: runAt.getTime(), isStaticTeam });
+        if (r && r.ok === false) warn("dynamic_record_missing_failed", new Error(r.reasonJa || "unknown"));
+      }
+      const perDay = Number.isFinite(selfTuneConfig.dynamicClubsPerDay) ? selfTuneConfig.dynamicClubsPerDay : undefined;
+      const adopt = await dynamicUniverse.adoptForToday({ dateKey, nowMs: runAt.getTime(), isStaticTeam, perDay });
+      for (const w of (adopt && adopt.warnings) || []) warn(`dynamic:${w}`); // 候補の掃除などの失敗は痕跡を残す
+      if (adopt.ok) {
+        const objs = dynamicUniverse.clubObjectsFor(adopt.adoptedAll, { dateKey, perDay, newlyAdoptedIds: new Set(adopt.adoptedNow.map((a) => a.teamId)) });
+        dynamicClubs = { due: objs.due, all: objs.all };
+        dynamicUniverseToday = {
+          ok: true,
+          candidates: adopt.candidates, adoptedToday: adopt.adoptedNow.map((a) => ({ teamId: a.teamId, nameEn: a.nameEn, reasonJa: a.reasonJa })),
+          adoptedTotal: adopt.adoptedAll.length, dueToday: objs.due.length, skippedByCap: objs.skippedByCap,
+          prunedSeen: adopt.prunedSeen, retired: adopt.retired, dataMissingTeams: dataMissingTeams.length,
+          perDay: perDay ?? dynamicUniverse.DEFAULT_PER_DAY,
+        };
+      } else {
+        dynamicUniverseToday = { ok: false, reasonJa: adopt.reasonJa || "動的クラブの採用を決められませんでした。" };
+        warn("dynamic_adopt_failed", new Error(adopt.reasonJa || "unknown"));
+      }
+    } catch (e) { warn("dynamic_universe_failed", e); }
     universeStats = await collectUniverse({
       callApiFootball, apiBudget, clubDossier, knowledgeStore,
       knowledgeGraph, thoughtTimeline, computeFormScore,
       recordLearned: saveWithImportance,
       priorityClubs,
+      dynamicClubs, dynamicUniverse, // v98
       // 自己改善ループ③: AIが調整した収集設定(xG周期・選手詳細上限)を反映
       tune: { xgRotationDays: selfTuneConfig.xgRotationDays, playerDetailCap: selfTuneConfig.playerDetailCap },
       // 第8次監査: 同日再実行ガード(kb:universe:ran:<date>)の読み書きに使う
@@ -2735,7 +2807,7 @@ async function runDailyLearning(deps) {
     // 実測(どのクラブで外しているか・何が原因で外れているか)から優先順位つきの
     // 学習計画を作り、保存する。明日の収集(上の③-b)がこれを読んで実行する。
     try {
-      agendaToday = buildLearningAgenda(recentForFailures, topFailureReasonsRecent, { nowIso: runAt.toISOString() });
+      agendaToday = buildLearningAgenda(recentForFailures, topFailureReasonsRecent, { nowIso: runAt.toISOString(), featureLabelsJa: FEATURE_LABELS_JA }); // v98: データ不足の内訳に日本語名を使う
       await saveAgenda({ upstashEnabled, upstashSetJSON }, dateKey, agendaToday);
     } catch (e) { errors.push(`agenda_build_failed:${e.message}`); }
   } catch (e) { warn("failure_summary_failed", e); } // v92: 痕跡は残す
@@ -2951,7 +3023,14 @@ async function runDailyLearning(deps) {
       agendaClubsApplied: universeStats.agendaClubsApplied || [],
       // 本番エラー調査: 名前を照合できず収集できなかったクラブ(正直に開示)
       unresolvedClubs: universeStats.unresolvedClubs || [],
+      // v98: 動的クラブ(見た試合のクラブ)の収集実績
+      dynamic: universeStats.dynamic || null,
+      teamMapSaved: universeStats.teamMapSaved ?? null,
     } : null,
+    // v98: 動的クラブ宇宙の今日の採用(候補数・採用・上限)。固定名簿の外のクラブがどれだけ増えたか
+    dynamicUniverse: dynamicUniverseToday,
+    // v98: 主力評価点(squadRatingDiff)が両チームぶん揃って予想に使えた件数(特徴量⑤の検証材料)
+    squadRatingUsedToday,
     // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ ----
     // ご指示⑨: 今日答え合わせして市場別に採点できた件数(詳細は learn:accuracy:<date>)
     accuracyScoredToday: resolvedScoredToday.length,

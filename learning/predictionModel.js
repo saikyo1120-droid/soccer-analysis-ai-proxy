@@ -56,6 +56,12 @@ const EXTENDED_DEFAULT_WEIGHTS = {
   // clubelo.com(無料の独立系Eloレーティング)の差。自前のDixon-Coles地力とは
   // 独立な「第二の意見」。既定値0 = 取得前・未学習では予測に一切影響しない。
   clubEloSensitivity: 0,
+  // ---- 主力選手の評価(2026年11月5日・v98「選手の質」) ----
+  // 毎晩の収集で貯めた選手の実測(API-Footballのシーズン平均評価点)から、
+  // 出場時間上位14人の平均評価点の差を特徴量にする。既定値0 = 採用前は予測に
+  // 一切影響しない。毎日の重み学習(ホールドアウト検証つき)が改善を実測した
+  // ときだけ重みが付く(人手では決めない)。
+  squadRatingSensitivity: 0,
   // ---- 市場オッズ(2026年8月18日・v47「予測モデルの根本強化」) ----
   // ブックメーカーのオッズから計算した「市場が見るホーム優位度」。
   // ブックメーカーの的中率(実測53〜55%)は現状の自前モデルより高いため、
@@ -122,6 +128,7 @@ const FEATURE_WEIGHT_MAP = {
   marketEdge: "marketSensitivity",
   ratingLambdaDiff: "ratingSensitivity",
   clubEloDiff: "clubEloSensitivity", // v57: クラブElo(外部レーティング)の差
+  squadRatingDiff: "squadRatingSensitivity", // v98: 主力選手の平均評価点(実測)の差
 };
 
 const FEATURE_LABELS_JA = {
@@ -138,6 +145,7 @@ const FEATURE_LABELS_JA = {
   marketEdge: "市場オッズ(ブックメーカーの評価)",
   ratingLambdaDiff: "チームの地力(長期レーティング)",
   clubEloDiff: "クラブElo(独立の外部レーティング)",
+  squadRatingDiff: "主力選手の評価点(今季の実測平均)", // v98
 };
 
 /**
@@ -196,7 +204,16 @@ function computeFeatureAvailability(homeCtx, awayCtx, h2h, market) {
     marketEdge: !!(market && Number.isFinite(market.homePct) && Number.isFinite(market.awayPct)),
     ratingLambdaDiff: both(h.ratingExpGoals, a.ratingExpGoals),
     clubEloDiff: both(h.clubElo, a.clubElo),
+    squadRatingDiff: both(h.squadRating, a.squadRating), // v98
   };
+}
+
+// v98: 特徴量の可否(computeFeatureAvailability)から「使えなかった特徴量」の一覧を作る。
+//   予想レコードに missingFeatures として残し、外れ理由(data_missing)・翌日の優先取得・
+//   画面の「未取得: …」表示に使う。市場オッズ(marketEdge)は試合単位の外部データなので含める。
+function missingFeaturesOf(supplied) {
+  if (!supplied || typeof supplied !== "object") return [];
+  return Object.keys(FEATURE_WEIGHT_MAP).filter((k) => supplied[k] === false);
 }
 
 function computeMatchFeatures(homeCtx, awayCtx, h2h, market) {
@@ -249,6 +266,11 @@ function computeMatchFeatures(homeCtx, awayCtx, h2h, market) {
     //   どちらかのEloが無ければ0(=影響しない。推測で埋めない)。v57。
     clubEloDiff: (Number.isFinite(h.clubElo) && Number.isFinite(a.clubElo))
       ? Math.max(-1.5, Math.min(1.5, (h.clubElo - a.clubElo) / 400))
+      : 0,
+    // squadRatingDiff: 主力選手(出場時間上位14人)の今季平均評価点の差(v98)。
+    //   評価点は 6.0〜8.0 付近に集まるため差は概ね ±0.6。どちらかに実測が無ければ0(推測で埋めない)。
+    squadRatingDiff: (Number.isFinite(h.squadRating) && Number.isFinite(a.squadRating))
+      ? Math.max(-1.5, Math.min(1.5, h.squadRating - a.squadRating))
       : 0,
     // ---- 和の特徴量(λの独立化。2026年8月) ----
     // 「どちらが強いか」ではなく「どれだけ点が入る試合か」を表す。
@@ -718,6 +740,7 @@ const LEARNABLE_KEYS = [
   "marketSensitivity", // 市場オッズ(v47)。特徴量が全件0のデータでは勾配0=動かない
   "ratingSensitivity", "ratingSumSensitivity", // チームの地力(v50)
   "clubEloSensitivity", // クラブElo(v57)。特徴量が全件0のデータでは勾配0=動かない
+  "squadRatingSensitivity", // 主力選手の評価点(v98)。特徴量が全件0のデータでは勾配0=動かない
   // λの独立化(和の重み)と Dixon-Coles の低スコア補正も学習対象にする
   "attackSumSensitivity", "concededSumSensitivity", "fatigueSumSensitivity", "xgSumSensitivity",
   "rho",
@@ -923,6 +946,9 @@ function buildLearningSummary(historyEntries, limit) {
 // 原因をでっち上げない)。
 const FAILURE_REASON_LABELS_JA = {
   home_bonus_overweighted: "ホーム補正が強すぎた",
+  data_missing: "予想時にデータが足りなかった", // v98
+  squadRatingDiff_overweighted: "主力選手の評価点を重視しすぎた",
+  squadRatingDiff_underweighted: "主力選手の評価点を軽視した",
   formDiff_overweighted: "直近フォームを重視しすぎた",
   formDiff_underweighted: "直近フォームを軽視した",
   goalRateDiff_overweighted: "得点力・失点率を重視しすぎた",
@@ -996,6 +1022,21 @@ function classifyFailureReasons(record, weightsUsed) {
     }
   }
 
+  // ---- v98: 予想時に欠けていたデータを「外れ理由」として正式に扱う ----
+  //   missingFeatures(v98以降のレコードに保存)に1つでも特徴量があれば、
+  //   「データが足りなかった」を理由に加える。翌日の学習計画(learningAgenda)が
+  //   この理由を集計し、欠けていたチームのデータ取得を優先する。
+  const missing = Array.isArray(record.missingFeatures) ? record.missingFeatures.filter((k) => FEATURE_LABELS_JA[k]) : [];
+  if (missing.length) {
+    const labels = missing.map((k) => FEATURE_LABELS_JA[k]);
+    reasons.push({
+      id: "data_missing",
+      labelJa: FAILURE_REASON_LABELS_JA.data_missing,
+      missingFeatures: missing.slice(),
+      detail: `${labels.join("・")}のデータが予想時に取得できておらず、これらを考慮せずに予想していました(欠けていたデータは翌日の収集で優先的に取りに行きます)。`,
+    });
+  }
+
   if (!reasons.length) {
     reasons.push({
       id: "unmodeled_factors",
@@ -1004,7 +1045,10 @@ function classifyFailureReasons(record, weightsUsed) {
     });
   }
 
-  return reasons.slice(0, 3);
+  // v98: 「データ不足」は上位3件の枠とは別に必ず残す(翌日の取得計画の材料になるため)
+  const primary = reasons.filter((r) => r.id !== "data_missing").slice(0, 3);
+  const dataMissing = reasons.find((r) => r.id === "data_missing");
+  return dataMissing ? [...primary, dataMissing] : primary;
 }
 
 // ---- 2026年8月・優先順位③「Failure Learningを本格化してください」 ----
@@ -1434,6 +1478,7 @@ function applyMarketBlend(homeLambda, awayLambda, rho, marketImplied, w) {
 }
 
 module.exports = {
+  missingFeaturesOf, // v98
   EXTENDED_DEFAULT_WEIGHTS,
   FEATURE_WEIGHT_MAP,
   FEATURE_SUM_WEIGHT_MAP,

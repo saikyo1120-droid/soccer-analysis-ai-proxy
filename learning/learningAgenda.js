@@ -76,6 +76,8 @@ function buildLearningAgenda(resolvedRecords, topFailureReasons, opts) {
     injuryDiff_underweighted: { targetJa: "怪我情報の反映", actionJa: "怪我人情報の更新頻度を維持し、負傷者数の差の学習データを厚くします。" },
     coach_change_ignored: { targetJa: "監督交代の追跡", actionJa: "監督交代が検出されたクラブを翌日の優先更新に含めます。" },
     home_bonus_overweighted: { targetJa: "ホーム補正の見直し", actionJa: "次回の重み学習でホーム基礎値の近傍探索を継続します(自動)。" },
+    // v98: 予想時にデータが欠けていた(外れ理由として正式に扱う)
+    data_missing: { targetJa: "データ不足の解消", actionJa: "欠けていたチームを動的クラブの候補として記録し、翌日の収集で優先的に取得します(固定名簿の外のクラブも取り込みます)。" },
   };
   for (const fr of (topFailureReasons || []).slice(0, 3)) {
     if (!fr || !fr.id || fr.count < 2) continue; // 1回だけの外れで方針は変えない
@@ -86,6 +88,30 @@ function buildLearningAgenda(resolvedRecords, topFailureReasons, opts) {
       targetJa: (map && map.targetJa) || fr.labelJa,
       reasonJa: `直近の外れた予測のうち${fr.count}件で「${fr.labelJa}」が原因と分析されたため。`,
       actionJa: (map && map.actionJa) || "次回の重み学習(毎日実行)で該当特徴量の重みが再評価されます。",
+    });
+  }
+
+  // ---- ②-b v98: どのデータが欠けて外れたかの内訳(missingFeatures の実測集計) ----
+  const missCounts = new Map();
+  let missedWithMissing = 0;
+  for (const r of records) {
+    if (r.correct) continue;
+    const mf = Array.isArray(r.missingFeatures) ? r.missingFeatures
+      : (Array.isArray(r.failureReasons) ? ((r.failureReasons.find((x) => x && x.id === "data_missing") || {}).missingFeatures || []) : []);
+    if (!mf.length) continue;
+    missedWithMissing++;
+    for (const k of mf) missCounts.set(k, (missCounts.get(k) || 0) + 1);
+  }
+  if (missedWithMissing >= 2 && !items.some((it) => it.kind === "theme" && it.targetEn === "data_missing")) {
+    const top = [...missCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
+      .map(([k, n]) => `${(opts && opts.featureLabelsJa && opts.featureLabelsJa[k]) || k}(${n}件)`);
+    items.push({
+      kind: "data",
+      targetEn: "data_missing",
+      targetJa: "データ不足の解消",
+      reasonJa: `直近の外れた予測のうち${missedWithMissing}件は、予想時にデータが欠けていました(内訳: ${top.join("・")})。`,
+      actionJa: "欠けていたチームを動的クラブの候補として記録し、翌日の収集で優先的に取得します。",
+      missingFeatureCounts: Object.fromEntries(missCounts),
     });
   }
 
