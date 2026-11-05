@@ -101,7 +101,10 @@ async function callOnce(model, { systemPrompt, userPrompt, maxTokens, timeoutMs 
   const block = Array.isArray(json.content) ? json.content.find((b) => b.type === "text") : null;
   const text = block ? block.text : "";
   if (!text) {
-    const err = new Error("Anthropic APIから空の応答が返されました");
+    // v98.1: 本番で毎日数クラブに起きている EMPTY_RESPONSE の原因が追えるよう、
+    //   停止理由(stop_reason)と返ってきたブロックの種類をエラー文に残す(本文・鍵は含めない)。
+    const types = Array.isArray(json.content) ? json.content.map((b) => b && b.type).filter(Boolean).join(",") : "none";
+    const err = new Error(`Anthropic APIから空の応答が返されました(stop_reason=${json.stop_reason || "?"}, blocks=${types || "empty"})`);
     err.code = "EMPTY_RESPONSE";
     throw err;
   }
