@@ -485,7 +485,7 @@ function mockStore(opts) {
     assert.ok(html.includes("const discussInFlightKeys = new Set();") && html.includes("runDiscussFlowInner("), "考察の二重送信防止が無い");
     assert.ok((html.match(/e\.isComposing/g) || []).length >= 3, "IME変換中の Enter 対策が3箇所に無い");
     assert.ok(html.includes("function scheduleDegradedRetry(key, fn)") && (html.match(/scheduleDegradedRetry\(/g) || []).length >= 5, "読めなかった表示の自動読み直しが無い");
-    assert.ok(html.includes('fetch("/i18n." + appLang + ".json?v=97"'), "言語パックの版が上がっていない");
+    assert.ok(/fetch\("\/i18n\." \+ appLang \+ "\.json\?v=(9[7-9]|[1-9]\d{2,})"/.test(html), "言語パックの版が上がっていない(v97以上)");
     assert.ok(!html.includes("good ゲーム"), "日英混在の誤字が残っている");
     assert.ok(html.includes("if (!wrap) return;\n  // v97(全体監査): カードを描いたのに枠が非表示"), "選手カードの枠を表示する修正が無い");
     assert.ok(html.includes("取得できません") && html.includes("前の質問にAIが答えている途中です"), "新しい文言の辞書項目が無い");

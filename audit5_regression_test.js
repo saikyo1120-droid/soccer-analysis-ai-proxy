@@ -115,8 +115,9 @@ test("両方そろっている場合は、これまで通り正しく差が計�
   // 2026-09-02監査での更新: audit5以後にv47(市場エッジ)・v50(レーティング)・
   // v57(クラブElo)が正当追加された。全特徴の「供給できた」申告を検証するため、
   // 追加分の入力も与える(与えなければfalse=正直な申告、はそれ自体正しい挙動)。
-  const home = { formScore: 2, avgGoalsFor: 2, avgGoalsAgainst: 0.5, pointsPerGame: 2.2, matchesLast7Days: 1, injuryCount: 1, suspensionCount: 0, homeVenueWinRate: 0.8, xgNet: 0.9, topScorerGoals: 15, ratingExpGoals: 1.8, clubElo: 1900 };
-  const away = { formScore: -1, avgGoalsFor: 1, avgGoalsAgainst: 1.5, pointsPerGame: 1.0, matchesLast7Days: 3, injuryCount: 4, suspensionCount: 2, awayVenueWinRate: 0.2, xgNet: -0.4, topScorerGoals: 5, ratingExpGoals: 1.2, clubElo: 1700 };
+  // v98: 主力選手の評価点(squadRating)も正当追加されたため入力に加える
+  const home = { formScore: 2, avgGoalsFor: 2, avgGoalsAgainst: 0.5, pointsPerGame: 2.2, matchesLast7Days: 1, injuryCount: 1, suspensionCount: 0, homeVenueWinRate: 0.8, xgNet: 0.9, topScorerGoals: 15, ratingExpGoals: 1.8, clubElo: 1900, squadRating: 7.2 };
+  const away = { formScore: -1, avgGoalsFor: 1, avgGoalsAgainst: 1.5, pointsPerGame: 1.0, matchesLast7Days: 3, injuryCount: 4, suspensionCount: 2, awayVenueWinRate: 0.2, xgNet: -0.4, topScorerGoals: 5, ratingExpGoals: 1.2, clubElo: 1700, squadRating: 6.8 };
   const f = computeMatchFeatures(home, away, { homeSideWins: 3, awaySideWins: 1 });
   assert.strictEqual(f.formDiff, 3);
   assert.strictEqual(Math.round(f.goalRateDiff * 100) / 100, 2);

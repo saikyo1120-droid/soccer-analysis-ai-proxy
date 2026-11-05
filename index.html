@@ -735,7 +735,7 @@
     if (appLang === "ja" || langPackRequested) return;
     langPackRequested = true;
     try {
-      fetch("/i18n." + appLang + ".json?v=97", { cache: "force-cache" }) // v97: 版を上げてキャッシュを更新
+      fetch("/i18n." + appLang + ".json?v=98", { cache: "force-cache" }) // v98: 版を上げてキャッシュを更新
         .then(function (r) { return r && r.ok ? r.json() : null; })
         .then(function (j) {
           if (!j || typeof j !== "object") return;
@@ -3489,6 +3489,57 @@
     ["検証済みの自社予測の件数は、保存先から読み出せなかったため表示できません(更新の判断に必要な件数: ⦿件)。", "The number of verified predictions can't be shown because it couldn't be read from storage (needed for an update decision: $1).", "已验证的自家预测数量无法从存储读取,因此不显示(更新判断所需数量: $1场)。", "El número de predicciones verificadas no se puede mostrar porque no pudo leerse del almacenamiento (necesarias para decidir una actualización: $1)."],
   ];
   for (var rp4 = 0; rp4 < RAWP4.length; rp4++) P.push([pat(RAWP4[rp4][0]), RAWP4[rp4][1], RAWP4[rp4][2], RAWP4[rp4][3]]);
+  /* ==== v98(2026年11月・利用者の指摘): 試合カードの選手データをサーバーの知識へ・根拠(使えた/欠けたデータ)の表示 ==== */
+  add({
+    "追跡対象外のクラブのため、選手データはありません(このカードが開かれたので取り込み候補に登録しました。翌日以降の夜間収集で自動的に取得します)。":
+      ["This club isn't tracked yet, so there's no player data (opening this card queued it for pickup — the nightly collection will fetch it from tomorrow).",
+       "该俱乐部尚未纳入追踪,因此没有球员数据(打开此卡片后已登记为收录候选,夜间收集将从明天起自动获取)。",
+       "Este club aún no está en seguimiento, así que no hay datos de jugadores (al abrir esta tarjeta quedó en cola; la recogida nocturna lo traerá a partir de mañana)."],
+    "このクラブはまだ取り込み中です(選手成績は翌日以降の夜間収集で揃います)。":
+      ["This club is still being imported (player stats will be complete after the next nightly collection).",
+       "该俱乐部仍在收录中(球员成绩将在下次夜间收集后补齐)。",
+       "Este club todavía se está importando (las estadísticas de jugadores se completarán tras la próxima recogida nocturna)."],
+    "評価点のある主力が少ないため、優劣の比較はしません。":
+      ["Too few core players have a rating, so no side is judged stronger.",
+       "有评分的主力太少,因此不作强弱比较。",
+       "Hay muy pocos titulares con valoración, así que no se juzga qué lado es más fuerte."],
+    "両クラブの主力の平均評価点は拮抗しています。":
+      ["Both clubs' core-player average ratings are level.",
+       "两队主力的平均评分势均力敌。",
+       "Las valoraciones medias de los titulares de ambos clubes están igualadas."],
+    "保存先から選手データを読み出せませんでした(1分ほど待って開き直してください)。":
+      ["Player data couldn't be read from storage (please reopen in about a minute).",
+       "无法从存储读取球员数据(请约1分钟后重新打开)。",
+       "No se pudieron leer los datos de jugadores del almacenamiento (vuelve a abrir en un minuto)."],
+    "この試合はAI自身の予想対象外です(学習している大会ではないため)。表示している勝率は API-Football の予想です。":
+      ["This match is outside the AI's own predictions (it isn't a competition the AI learns). The win probabilities shown are API-Football's prediction.",
+       "本场比赛不在AI自身的预测范围内(不是AI学习的赛事)。显示的胜率是API-Football的预测。",
+       "Este partido queda fuera de las predicciones propias de la IA (no es una competición que aprenda). Las probabilidades mostradas son la predicción de API-Football."],
+    "AIの展開予想(実測データ)": ["AI match outlook (measured data)", "AI比赛展望(实测数据)", "Previsión de la IA (datos medidos)"],
+    "主力の平均評価点": ["core-player average rating", "主力平均评分", "valoración media de titulares"],
+    "注目選手(今季の実測)": ["Key players (this season, measured)", "焦点球员(本赛季实测)", "Jugadores clave (esta temporada, medido)"],
+    "怪我・出場停止": ["Injuries / suspensions", "伤病・停赛", "Lesiones / sanciones"],
+    "監督・布陣": ["Coach / formation", "主教练・阵型", "Entrenador / formación"],
+    "直近5試合": ["Last 5 matches", "最近5场", "Últimos 5 partidos"],
+    "選手データの鮮度": ["Data freshness", "数据新鲜度", "Actualidad de los datos"],
+    "クラブ情報": ["club info", "俱乐部信息", "info del club"],
+    "(見た試合から取り込んだクラブ)": ["(club imported from a viewed match)", "(从浏览过的比赛中收录的俱乐部)", "(club importado de un partido visto)"],
+    "使えたデータ": ["Data used", "可用数据", "Datos usados"],
+    "未取得のため考慮していないデータ": ["Not fetched, so not considered", "未获取因而未考虑的数据", "No obtenidos, por lo que no se consideran"],
+    "(旧い記録のため、欠けていたデータの有無は分かりません)": ["(older record: whether any data was missing is unknown)", "(较早的记录:无法得知是否缺少数据)", "(registro antiguo: no se sabe si faltaron datos)"],
+    "主力選手の評価点(今季の実測平均)": ["Core-player rating (this season's measured average)", "主力球员评分(本赛季实测平均)", "Valoración de titulares (media medida de esta temporada)"],
+    "予想時にデータが足りなかった": ["Data was missing at prediction time", "预测时数据不足", "Faltaban datos al predecir"],
+    "主力選手の評価点を重視しすぎた": ["Over-weighted core-player ratings", "过度重视主力球员评分", "Sobreponderó la valoración de titulares"],
+    "主力選手の評価点を軽視した": ["Under-weighted core-player ratings", "轻视了主力球员评分", "Infraponderó la valoración de titulares"],
+    "データ不足の解消": ["Fix missing data", "弥补数据不足", "Resolver datos faltantes"],
+    "人": ["", "人", ""],
+  });
+  var RAWP5 = [
+    ["主力の平均評価点では⦿がやや上(差⦿)", "By core-player average rating, $1 is slightly ahead (gap $2)", "按主力平均评分,$1略占上风(差$2)", "Por valoración media de titulares, $1 va ligeramente por delante (diferencia $2)"],
+    ["(評価点のある主力 ⦿人/索引 ⦿人)", "($1 rated core players / $2 indexed)", "(有评分主力$1人/索引$2人)", "($1 titulares con valoración / $2 indexados)"],
+    ["⦿のデータが予想時に取得できておらず、これらを考慮せずに予想していました(欠けていたデータは翌日の収集で優先的に取りに行きます)。", "$1 data wasn't available at prediction time, so it wasn't considered (missing data is fetched with priority in the next collection).", "预测时未能获取$1的数据,因此未予考虑(缺失的数据将在下次收集中优先获取)。", "Los datos de $1 no estaban disponibles al predecir, así que no se consideraron (los datos faltantes se obtienen con prioridad en la siguiente recogida)."],
+  ];
+  for (var rp5 = 0; rp5 < RAWP5.length; rp5++) P.push([pat(RAWP5[rp5][0]), RAWP5[rp5][1], RAWP5[rp5][2], RAWP5[rp5][3]]);
   /* ==== 辞書ここまで ==== */
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
   else boot();
@@ -8355,6 +8406,9 @@ function buildMostImportantFactorBanner(analysis) {
 // data when either side happens to be a club we've registered. Deliberately an
 // exact-match table (not substring matching) to avoid false positives like
 // "Inter Miami" matching a lookup meant for "Inter" (Milan).
+// v98: 試合前プレビューはこの表を使わなくなった(サーバーの知識 analysis.knowledge を使う。
+//   11クラブだけの手書き表が「登録選手データがない」を量産していた根本原因)。
+//   表と2つの関数は、将来の互換のために残すが、画面のどこからも呼ばれていない。
 const REAL_FIXTURE_CLUB_EN_TO_JA = {
   "bayern münchen": "バイエルン・ミュンヘン", "fc bayern münchen": "バイエルン・ミュンヘン", "bayern munich": "バイエルン・ミュンヘン",
   "arsenal": "アーセナルFC",
@@ -8468,68 +8522,126 @@ function build90MinStoryHtml(f, homeP, awayP, level) {
     </div>`;
 }
 
+// ---- v98(2026年11月5日・利用者の指摘「登録選手データがない試合が多い」) ----
+//   試合前プレビューの選手データは、画面内の手書き名簿(11クラブ・107人)ではなく、
+//   サーバーの知識(クラブ宇宙172+見た試合から取り込んだ動的クラブ)= analysis.knowledge を描く。
+//   数値はすべて API-Football の今季実測(評価点・得点・出場時間)。架空の能力値は使わない。
+//   追跡対象外のクラブは正直にそう書き、裏で取り込み候補に登録される(翌日以降の夜間収集)。
+const KNOWLEDGE_POS_SHORT = { Goalkeeper: "GK", Defender: "DF", Midfielder: "MF", Attacker: "FW" };
+function knowledgeShortDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? "" : d.toLocaleString("ja-JP", { month: "numeric", day: "numeric" });
+}
+function knowledgeKeyPlayersHtml(players) {
+  if (!players || !players.length) return "";
+  return players.map((p) => {
+    const pos = KNOWLEDGE_POS_SHORT[p.position] || "";
+    const ga = [];
+    if (p.goals) ga.push(`⚽×${Number(p.goals)}`);
+    if (p.assists) ga.push(`👟×${Number(p.assists)}`);
+    const injured = p.injured ? ` <span style="color:#c0392b;">🩹</span>` : "";
+    return `<div class="real-fixture-row" style="padding:4px 0;">
+      <div>${escapeHtml(p.name)}${pos ? ` <span class="value-note" style="opacity:.8;">(${pos})</span>` : ""} ${ga.join(" ")}${injured}</div>
+      <div style="font-weight:700; color:${ratingBadgeColor(p.rating)};">${Number.isFinite(p.rating) ? p.rating.toFixed(2) : "-"} <span class="value-note" style="font-weight:400; opacity:.8;">${Number(p.minutes || 0).toLocaleString("en-US")}<span>分</span></span></div>
+    </div>`;
+  }).join("");
+}
+function knowledgeRecentFormHtml(form) {
+  const rr = form && Array.isArray(form.recentResults) ? form.recentResults : [];
+  if (!rr.length) return "";
+  const marks = rr.map((r) => {
+    const gf = Number(r.goalsFor), ga = Number(r.goalsAgainst);
+    if (!Number.isFinite(gf) || !Number.isFinite(ga)) return "?";
+    return gf > ga ? "○" : gf < ga ? "●" : "△";
+  });
+  const detail = rr.map((r) => `${r.homeAway === "H" ? "H" : "A"} ${Number.isFinite(Number(r.goalsFor)) ? r.goalsFor : "?"}-${Number.isFinite(Number(r.goalsAgainst)) ? r.goalsAgainst : "?"} ${escapeHtml(r.opponent || "")}`).join(" / ");
+  return `<div class="value-note" style="margin-top:2px;"><span>直近5試合</span>: ${marks.join("")} <span style="opacity:.8;">(${detail})</span></div>`;
+}
+function buildKnowledgeSideHtml(teamName, side) {
+  const name = escapeHtml(teamName || "");
+  if (!side) return `<div style="flex:1; min-width:220px;"><strong>${name}</strong><p class="value-note" style="margin:4px 0 0;"><span>取得できません</span></p></div>`;
+  if (side.tracked === false) {
+    return `<div style="flex:1; min-width:220px;"><strong>${name}</strong>
+      <p class="value-note" style="margin:4px 0 0;">追跡対象外のクラブのため、選手データはありません(このカードが開かれたので取り込み候補に登録しました。翌日以降の夜間収集で自動的に取得します)。</p></div>`;
+  }
+  const sq = side.squad || null;
+  const d = side.dossier || null;
+  const parts = [];
+  if (sq && sq.reliable) {
+    parts.push(`<div class="value-note" style="margin-top:2px;"><span>主力の平均評価点</span>: <strong>${sq.avgRating.toFixed(2)}</strong> <span style="opacity:.8;">(評価点のある主力 ${sq.ratedCount}人/索引 ${sq.playersIndexed}人)</span></div>`);
+  } else if (sq && sq.playersIndexed > 0) {
+    parts.push(`<div class="value-note" style="margin-top:2px;">評価点のある主力が少ないため、優劣の比較はしません。 <span style="opacity:.8;">(評価点のある主力 ${sq.ratedCount}人/索引 ${sq.playersIndexed}人)</span></div>`);
+  } else {
+    parts.push(`<div class="value-note" style="margin-top:2px;">このクラブはまだ取り込み中です(選手成績は翌日以降の夜間収集で揃います)。</div>`);
+  }
+  if (sq && sq.keyPlayers && sq.keyPlayers.length) {
+    parts.push(`<div class="value-note" style="margin-top:4px;"><span>注目選手(今季の実測)</span></div>${knowledgeKeyPlayersHtml(sq.keyPlayers)}`);
+  }
+  if (d && d.injuries && Number.isFinite(d.injuries.count)) {
+    const names = [...(d.injuries.players || []), ...(d.injuries.suspended || [])].map(escapeHtml);
+    parts.push(`<div class="value-note" style="margin-top:2px;"><span>怪我・出場停止</span>: ${d.injuries.count}<span>人</span>${names.length ? ` <span style="opacity:.8;">(${names.join("・")})</span>` : ""}</div>`);
+  }
+  if (d && d.coach && (d.coach.name || d.coach.formation)) {
+    parts.push(`<div class="value-note" style="margin-top:2px;"><span>監督・布陣</span>: ${escapeHtml(d.coach.name || "-")}${d.coach.formation ? ` (${escapeHtml(d.coach.formation)})` : ""}</div>`);
+  }
+  if (d && d.form) parts.push(knowledgeRecentFormHtml(d.form));
+  const fresh = [];
+  if (sq && sq.indexBuiltAt) fresh.push(`<span>選手成績</span> ${knowledgeShortDate(sq.indexBuiltAt)}`);
+  if (d && d.updatedAt) fresh.push(`<span>クラブ情報</span> ${knowledgeShortDate(d.updatedAt)}`);
+  if (fresh.length) parts.push(`<div class="value-note" style="margin-top:2px; opacity:.8;">🕓 <span>選手データの鮮度</span>: ${fresh.join("・")}</div>`);
+  return `<div style="flex:1; min-width:220px;"><strong>${name}</strong>${side.dynamic ? ` <span class="value-note" style="opacity:.8;"><span>(見た試合から取り込んだクラブ)</span></span>` : ""}${parts.join("")}</div>`;
+}
 function buildUpcomingPreviewHtml(analysis, level) {
   const f = analysis.fixture;
-  const homeJa = mapEnglishClubToRegistered(f.home.name);
-  const awayJa = mapEnglishClubToRegistered(f.away.name);
-  const homeP = registeredPlayersForClubJa(homeJa);
-  const awayP = registeredPlayersForClubJa(awayJa);
+  const k = analysis.knowledge || null;
+  const kh = k ? k.home : null;
+  const ka = k ? k.away : null;
   const dt = new Date(f.date);
   const timeStr = isNaN(dt.getTime()) ? "" : dt.toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
 
-  let predictionHtml = "";
-  if (homeP.length && awayP.length) {
-    const homeOverall = teamAvg(homeP, "overall"), awayOverall = teamAvg(awayP, "overall");
-    const diff = homeOverall - awayOverall;
-    const confidence = Math.round(50 + Math.min(38, Math.abs(diff) * 2.6));
-    const favored = diff >= 0 ? f.home.name : f.away.name;
-    const barPct = 50 + diff * 3;
-    // ---- 2026年8月・第三者監査が発見した「母数を隠した平均値」の是正 ----
-    //   ここは登録済み選手だけの平均を比べている。実際には
-    //   アーセナル38人 vs マンチェスター・シティ1人 のような比較が起こり、
-    //   それでも「シティの方が有利そうです」と断言し、確信度%まで出していた。
-    //   母数を必ず開示し、母数が少ない/偏っている場合は勝ち負けを断言しない。
-    const nHome = homeP.length, nAway = awayP.length;
-    const thinSample = nHome < 5 || nAway < 5 || Math.max(nHome, nAway) >= Math.min(nHome, nAway) * 3;
-    const sampleNoteJa = `(この比較の母数: ${escapeHtml(f.home.name)} ${nHome}人 / ${escapeHtml(f.away.name)} ${nAway}人の登録選手のみ${thinSample ? "。母数が少ない、または左右で大きく偏っているため、クラブ全体の強さを表す数値ではありません" : ""})`;
-    const leadText = thinSample ? {
-      beginner: `🤖 登録されている選手の数が両チームで大きく違うため、どちらが有利かはこのデータからは判断できません。${sampleNoteJa}`,
-      standard: `🤖 <strong>AIの展開予想:</strong> 登録選手データの母数が不足または偏っているため、優劣の判定は行いません。下記の注目選手は、登録がある範囲での情報です。${sampleNoteJa}`,
-      expert: `🤖 <strong>AIの展開予想:</strong> 登録選手の総合能力値平均は${escapeHtml(f.home.name)} ${homeOverall.toFixed(1)} 対 ${escapeHtml(f.away.name)} ${awayOverall.toFixed(1)} ですが、母数が偏っているため優劣の推定には使えません。${sampleNoteJa}`,
-    }[level] || "" : {
-      beginner: `🤖 AIの予想では「${escapeHtml(favored)}」の方が少し有利そうです！下の注目選手たちの活躍がポイントになりそうです。${sampleNoteJa}`,
-      standard: `🤖 <strong>AIの展開予想:</strong> 登録選手データの平均値では${escapeHtml(favored)}がやや優勢と分析されます(AI確信度 ${confidence}%)。${sampleNoteJa}`,
-      expert: `🤖 <strong>AIの展開予想:</strong> 登録選手の総合能力値平均は${escapeHtml(f.home.name)} ${homeOverall.toFixed(1)} 対 ${escapeHtml(f.away.name)} ${awayOverall.toFixed(1)}(差分${Math.abs(diff).toFixed(1)}、AI確信度${confidence}%)。${sampleNoteJa}`,
-    }[level] || "";
-    predictionHtml = `
-      <p class="value-note">${leadText}</p>
-      ${thinSample ? "" : strengthBarHtml("AI優勢度", barPct, f.home.name, f.away.name)}
-      <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:8px;">
-        <div style="flex:1; min-width:220px;"><strong>${escapeHtml(f.home.name)} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(homeP, 3)}</div></div>
-        <div style="flex:1; min-width:220px;"><strong>${escapeHtml(f.away.name)} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(awayP, 3)}</div></div>
-      </div>
-      ${build90MinStoryHtml(f, homeP, awayP, level)}`;
-  } else if (homeP.length || awayP.length) {
-    const side = homeP.length ? f.home.name : f.away.name;
-    const otherSide = homeP.length ? f.away.name : f.home.name;
-    const players = homeP.length ? homeP : awayP;
-    predictionHtml = `
-      <p class="value-note">🤖 <strong>AIの展開予想:</strong> ${escapeHtml(side)}には登録選手データがあるため、そちらの注目選手を中心にプレビューします(${escapeHtml(otherSide)}は現時点で未登録のクラブのため、選手個別の分析はまだ提供できません)。</p>
-      <div style="margin-top:6px;"><strong>${escapeHtml(side)} の注目選手</strong><div style="margin-top:6px;">${keyPlayersHtml(players, 3)}</div></div>
-      ${build90MinStoryHtml(f, homeP, awayP, level)}`;
-  } else {
-    predictionHtml = `<p class="value-note">🤖 <strong>AIの展開予想:</strong> 現時点では${escapeHtml(f.home.name)}・${escapeHtml(f.away.name)}どちらも登録選手データがないため、選手個別の予想は提供できません(実際の試合結果や選手データが揃い次第、対応クラブを拡大予定です)。試合が終了すると、実データに基づいた選手評価と振り返りをこの場所で見られます。</p>`;
+  // ---- 両クラブの「主力の平均評価点」の比較(母数が信頼できるときだけ。拮抗なら断定しない) ----
+  let leadHtml = "";
+  const hs = kh && kh.squad && kh.squad.reliable ? kh.squad : null;
+  const as = ka && ka.squad && ka.squad.reliable ? ka.squad : null;
+  if (hs && as) {
+    const diff = hs.avgRating - as.avgRating;
+    if (Math.abs(diff) >= 0.15) {
+      const favored = diff > 0 ? f.home.name : f.away.name;
+      leadHtml = `<p class="value-note">🤖 <strong><span>AIの展開予想(実測データ)</span>:</strong> 主力の平均評価点では${escapeHtml(favored)}がやや上(差${Math.abs(diff).toFixed(2)})</p>
+        ${strengthBarHtml("主力の平均評価点", 50 + Math.max(-30, Math.min(30, diff * 60)), hs.avgRating.toFixed(2), as.avgRating.toFixed(2))}`;
+    } else {
+      leadHtml = `<p class="value-note">🤖 <strong><span>AIの展開予想(実測データ)</span>:</strong> 両クラブの主力の平均評価点は拮抗しています。</p>`;
+    }
+  } else if (k && (kh || ka)) {
+    leadHtml = `<p class="value-note">🤖 <strong><span>AIの展開予想(実測データ)</span>:</strong> 評価点のある主力が少ないため、優劣の比較はしません。</p>`;
+  } else if (k && k.readFailed) {
+    leadHtml = `<p class="value-note">🤖 <strong><span>AIの展開予想(実測データ)</span>:</strong> <span>保存先から選手データを読み出せませんでした(1分ほど待って開き直してください)。</span></p>`;
   }
+  const sidesHtml = `
+      <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:8px;">
+        ${buildKnowledgeSideHtml(f.home.name, kh)}
+        ${buildKnowledgeSideHtml(f.away.name, ka)}
+      </div>`;
 
   // UI/UX統一ラウンド: ホームと同じ「AIの予想(勝敗・勝率バー・根拠)」を
   // 詳細画面でも最初に表示する(AI自身の予測モデルの保存値。通信ゼロの同期参照)。
-  const ownPred = predsByFixtureId.get(String(f.id));
+  // v98: 根拠(使えた/欠けたデータ)はサーバーの ownBasis を優先して表示する。
+  let ownPred = predsByFixtureId.get(String(f.id)) || null;
+  if (ownPred && analysis.ownBasis && !ownPred.basis) ownPred = { ...ownPred, basis: analysis.ownBasis };
+  let noOwnHtml = "";
+  if (!ownPred) {
+    const ap = analysis.aiPrediction;
+    const pct = ap && Number.isFinite(Number(ap.homePct)) ? ` <span style="opacity:.85;">(API-Football: ${escapeHtml(f.home.name)} ${Number(ap.homePct)}% / <span>引き分け</span> ${Number(ap.drawPct)}% / ${escapeHtml(f.away.name)} ${Number(ap.awayPct)}%)</span>` : "";
+    noOwnHtml = `<p class="value-note" style="margin:8px 0;">ℹ️ <span>この試合はAI自身の予想対象外です(学習している大会ではないため)。表示している勝率は API-Football の予想です。</span>${pct}</p>`;
+  }
   return `
     <div class="card">
       <h2>🔮 試合前プレビュー: ${escapeHtml(f.home.name)} vs ${escapeHtml(f.away.name)}</h2>
       <p class="value-note">${escapeHtml(f.league || "")}${timeStr ? " ・ キックオフ " + timeStr : ""}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}</p>
-      ${ownPred ? predictionSummaryBlockHtml(ownPred, "🤖 AIの予想") : ""}
-      ${predictionHtml}
+      ${ownPred ? predictionSummaryBlockHtml(ownPred, "🤖 AIの予想") : noOwnHtml}
+      ${leadHtml}
+      ${sidesHtml}
       <p class="value-note" style="margin-top:8px;">※これはAIによる展開予想であり、実際の試合結果を保証するものではありません。</p>
     </div>`;
 }
@@ -11222,6 +11334,25 @@ function predResultBadgeHtml(p) {
     : `<span style="color:var(--series-2); font-weight:bold; margin-left:6px;">❌ 外れ</span>`;
 }
 // 成長可視化ラウンド⑤: 判断根拠のスコア行(この予測に実際に影響した要素と影響度)
+// ---- v98: 根拠の透明化「使えたデータ/未取得のため考慮していないデータ」 ----
+//   サーバーの basis(予想時の supplied から実測)を表示する。旧い記録(supplied なし)は
+//   使えたデータだけ出し、欠けの有無は断定しない(でっち上げ禁止)。
+function predBasisLineHtml(p) {
+  const b = p && p.basis;
+  if (!b) return "";
+  const tr = (label) => (typeof window !== "undefined" && window.t ? window.t(label) : label);
+  const used = Array.isArray(b.used) ? b.used.map((u) => tr(u.labelJa || u)) : [];
+  const missing = Array.isArray(b.missing) ? b.missing.map((u) => tr(u.labelJa || u)) : null;
+  const parts = [];
+  if (used.length) parts.push(`<span>使えたデータ</span>: ${used.map(escapeHtml).join("・")}`);
+  if (missing && missing.length) parts.push(`<span>未取得のため考慮していないデータ</span>: ${missing.map(escapeHtml).join("・")}`);
+  else if (missing && !missing.length && used.length) parts.push(`<span>未取得のため考慮していないデータ</span>: <span>なし</span>`);
+  else if (b.basisKind === "legacy") parts.push(`<span>(旧い記録のため、欠けていたデータの有無は分かりません)</span>`);
+  const sr = b.squadRatings;
+  if (sr && Number.isFinite(Number(sr.home)) && Number.isFinite(Number(sr.away))) parts.push(`<span>主力の平均評価点</span>: ${Number(sr.home).toFixed(2)} vs ${Number(sr.away).toFixed(2)}`);
+  if (!parts.length) return "";
+  return `<div class="value-note" style="margin-top:2px;">📦 ${parts.join(" ／ ")}</div>`;
+}
 function predFactorsLineHtml(p) {
   if (!p.factors || !p.factors.length) return "";
   const parts = p.factors.map((f) => `${escapeHtml(typeof window !== "undefined" && window.t ? window.t(f.labelJa) : f.labelJa)}${"★".repeat(Math.max(1, Math.min(5, Number(f.stars) || 1)))}`);
@@ -11249,7 +11380,7 @@ function predictionSummaryBlockHtml(p, titleJa) {
       <div>${escapeHtml(titleJa || "🤖 AIの予想")}: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predResultBadgeHtml(p)}</div>
       ${predBarHtml(p)}
       <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-      ${predUnlearnedLineHtml(p)}${predConfidenceLineHtml(p)}${predFactorsLineHtml(p)}${similarLine}${marketLine}${blendLine}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
+      ${predUnlearnedLineHtml(p)}${predConfidenceLineHtml(p)}${predFactorsLineHtml(p)}${predBasisLineHtml(p)}${similarLine}${marketLine}${blendLine}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
     </div>`;
 }
 // ---- 2026年8月18日・v50「市場ブレンド」の開示 ----
@@ -11734,7 +11865,7 @@ async function renderTodayPredictionsHero(reuseCached) {
         ${duelMyPickLineHtml(p)}
         ${predBarHtml(p)}
         <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-        ${predUnlearnedLineHtml(p)}${predConfidenceLineHtml(p)}${predFactorsLineHtml(p)}${similarLine}${marketLine}${predBlendLineHtml(p)}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
+        ${predUnlearnedLineHtml(p)}${predConfidenceLineHtml(p)}${predFactorsLineHtml(p)}${predBasisLineHtml(p)}${similarLine}${marketLine}${predBlendLineHtml(p)}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
         <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;"><button class="ghost-btn pred-share-btn" type="button" data-share-idx="${todayPredShareItems.indexOf(p)}" style="padding:5px 12px; font-size:12px;">📸 画像でシェア</button>${
           /* v77(集客①): 検索エンジンにも載る試合個別ページへの導線(共有用URLにもなる) */
           Number.isFinite(Number(p.fixtureId)) ? `<a class="ghost-btn" href="/match/${Number(p.fixtureId)}" style="padding:5px 12px; font-size:12px; text-decoration:none; display:inline-block;">🔗 この試合のページ</a>` : ""}</div>

@@ -111,6 +111,7 @@ const {
   // v59: スコアシナリオ上位5件と派生指標(同じスコア分布から取り出す)
   topScorelinesFrom, derivedMatchMetrics,
 } = require("./learning/predictionModel");
+const predictionModel = require("./learning/predictionModel"); // v98: 特徴量の日本語名(根拠の表示)
 // v59「どんな対戦でも1行で分析」: クラブ名の解決と分析の組み立て(外部通信なし)
 const matchupLib = require("./learning/matchupAnalysis");
 // v62: 学習した大会 / していない大会 の判定(的中率を同じ条件どうしで比べるため)
@@ -520,13 +521,21 @@ function upstashUsageSnapshot() {
   };
 }
 // 1時間に1回、まだ積み上げていない分を保存先へ加算する(保存先が止まっていれば送らない)
-async function maybeFlushUpstashUsage() {
+// v98: 本番実測(11/5)で、再デプロイが続くと「起動から1時間未満のプロセスが数えた分」
+//   (約5,000コマンド)が積み上げ前に消え、月間推定が実際より小さくなっていた。
+//   ①未積み上げが UPSTASH_USAGE_FLUSH_MAX(既定2,000)を超えたら時間を待たずに積み上げる
+//   ②プロセス終了(SIGTERM/beforeExit)時に必ず積み上げる(flushUpstashUsageOnExit)
+const UPSTASH_USAGE_FLUSH_MAX = Math.max(100, Number(process.env.UPSTASH_USAGE_FLUSH_MAX) || 2000);
+async function maybeFlushUpstashUsage(opts) {
+  const force = !!(opts && opts.force);
   if (!UPSTASH_ENABLED || upstashUsage.flushInFlight) return;
   const now = Date.now();
-  if (now - upstashUsage.lastFlushAt < UPSTASH_USAGE_FLUSH_MS) return;
+  const dueByTime = now - upstashUsage.lastFlushAt >= UPSTASH_USAGE_FLUSH_MS;
+  const dueBySize = upstashUsage.unflushed >= UPSTASH_USAGE_FLUSH_MAX;
+  if (!force && !dueByTime && !dueBySize) return;
   if (storeIsDown()) return;
   const n = upstashUsage.unflushed;
-  if (n <= 0) { upstashUsage.lastFlushAt = now; return; }
+  if (n <= 0) { if (dueByTime) upstashUsage.lastFlushAt = now; return; }
   upstashUsage.flushInFlight = true;
   try {
     const key = `ops:upstash:usage:${upstashUsage.monthKey}`;
@@ -543,6 +552,18 @@ async function maybeFlushUpstashUsage() {
   } finally {
     upstashUsage.flushInFlight = false;
   }
+}
+// v98: プロセス終了時の積み上げ(再デプロイで数えた分が消えないように)。
+//   終了を遅らせないよう最長 UPSTASH_USAGE_EXIT_FLUSH_MS(既定2.5秒)で打ち切る。
+const UPSTASH_USAGE_EXIT_FLUSH_MS = Math.max(500, Number(process.env.UPSTASH_USAGE_EXIT_FLUSH_MS) || 2500);
+async function flushUpstashUsageOnExit() {
+  if (!UPSTASH_ENABLED || upstashUsage.unflushed <= 0) return false;
+  let timer = null;
+  const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve("timeout"), UPSTASH_USAGE_EXIT_FLUSH_MS); });
+  try {
+    const r = await Promise.race([maybeFlushUpstashUsage({ force: true }).then(() => "done"), timeout]);
+    return r === "done";
+  } catch (e) { return false; } finally { if (timer) clearTimeout(timer); }
 }
 // 起動時に、保存先に積み上げ済みの今月合計を1回だけ読む(再起動で推定がゼロに戻らないように)
 let upstashUsageBootLoaded = false;
@@ -1413,10 +1434,11 @@ async function flushBudgetOnExit() {
     if (ok !== false) budgetWritesPending = 0;
   }
 }
-process.on("beforeExit", () => { flushBudgetOnExit(); });
+// v98: 使用量カウンター(upstashUsage)も終了時に積み上げる(再デプロイで消えていた分の根治)
+process.on("beforeExit", () => { flushBudgetOnExit(); flushUpstashUsageOnExit(); });
 for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, async () => {
-    await flushBudgetOnExit();
+    await Promise.all([flushBudgetOnExit(), flushUpstashUsageOnExit()]);
     process.exit(0); // 既定動作を上書きした以上、自分で確実に終了する
   });
 }
@@ -3006,9 +3028,11 @@ async function handleFixturesToday(query, opts) {
         status: f.fixture.status ? f.fixture.status.short : null,
         venue: f.fixture.venue ? f.fixture.venue.name : null,
         league: f.league ? f.league.name : null,
+        leagueId: (f.league && Number.isFinite(Number(f.league.id))) ? Number(f.league.id) : null, // v98
         country: f.league ? f.league.country : null,
-        home: { name: f.teams.home.name, logo: f.teams.home.logo, winner: f.teams.home.winner },
-        away: { name: f.teams.away.name, logo: f.teams.away.logo, winner: f.teams.away.winner },
+        // v98: teamId を添える(試合カードの知識照合・動的クラブの候補記録に使う。名前の推測をしない)
+        home: { id: f.teams.home.id ?? null, name: f.teams.home.name, logo: f.teams.home.logo, winner: f.teams.home.winner },
+        away: { id: f.teams.away.id ?? null, name: f.teams.away.name, logo: f.teams.away.logo, winner: f.teams.away.winner },
         score: f.goals ? { home: f.goals.home, away: f.goals.away } : null,
       }));
     // 利用者目線ラウンドで発見した欠陥の修正:
@@ -3039,6 +3063,23 @@ async function handleFixturesToday(query, opts) {
       }
     }
 
+    // ---- v98: 「見た試合のクラブは翌日までに取り込む」の候補記録 ----
+    //   表示される試合(最大80)と、AIが予想している大会(学習対象12大会)の全試合のチームを
+    //   候補として記録する(まとめ書き1回・外部APIは呼ばない)。固定名簿のクラブは除外される。
+    //   取り込み(収集)そのものは毎晩の学習が行う(方針⑥)。
+    runInBackgroundCtx(async () => {
+      try {
+        const learnedIds = learnedComp.LEARNED_LEAGUE_IDS;
+        const seenTeams = [];
+        const pushTeam = (f, side) => {
+          const t = f && f[side];
+          if (t && Number.isFinite(Number(t.id)) && t.name) seenTeams.push({ teamId: Number(t.id), nameEn: t.name, leagueId: f.leagueId, league: f.league, country: f.country });
+        };
+        for (const f of fixtures) { pushTeam(f, "home"); pushTeam(f, "away"); }
+        for (const f of mapped) { if (f.leagueId && learnedIds.has(f.leagueId)) { pushTeam(f, "home"); pushTeam(f, "away"); } }
+        await dynamicUniverse.recordSeen(seenTeams, { source: "fixtures", learnedLeagueIds: learnedIds, isStaticTeam: (id, name) => isStaticUniverseTeam(id, name) });
+      } catch (e) { /* 候補の記録はベストエフォート(表示には影響しない) */ }
+    });
     const payload = {
       found: true, source: "API-Football", date: today, fetchedAt: new Date().toISOString(), fixtures,
       // 正直な開示: この日に実際に存在した試合数と、表示枠(80)の都合で省略した件数
@@ -3119,6 +3160,38 @@ function buildScenarioFields(record) {
   };
 }
 
+// ---- v98: 予想の「根拠」をレコードから組み立てる(画面の全カードで同じ形を使う) ----
+//   factors: 効いた要素の上位(★)/ used: 実データが両チームぶん揃って使えた要素 /
+//   missing: 揃わず「使わなかった」要素(v98以降の記録は supplied から。旧記録は featureTrust から推定)
+function buildPredictionBasis(record) {
+  if (!record) return null;
+  const labels = predictionModel.FEATURE_LABELS_JA || {};
+  const factors = (Array.isArray(record.factorImportance) ? record.factorImportance : [])
+    .filter((f) => f && f.stars > 0)
+    .sort((a, b) => (b.stars || 0) - (a.stars || 0))
+    .slice(0, 3)
+    .map((f) => ({ key: f.key || null, labelJa: f.labelJa || labels[f.key] || f.key, stars: f.stars }));
+  let used = null, missing = null, basisKind = "unknown";
+  if (record.supplied && typeof record.supplied === "object") {
+    used = Object.keys(record.supplied).filter((k) => record.supplied[k] === true && labels[k]).map((k) => ({ key: k, labelJa: labels[k] }));
+    missing = Object.keys(record.supplied).filter((k) => record.supplied[k] === false && labels[k]).map((k) => ({ key: k, labelJa: labels[k] }));
+    basisKind = "measured";
+  } else if (Array.isArray(record.featureTrust) && record.featureTrust.length) {
+    const kindToLabel = { form: "直近フォーム", injuries: "怪我人", standings: "順位・勝点", xg: "xG(期待得点)の質", odds: "市場オッズ(ブックメーカーの評価)" };
+    used = record.featureTrust.map((t) => t && kindToLabel[t.kind]).filter(Boolean).map((l) => ({ key: null, labelJa: l }));
+    missing = null; // 旧記録では「欠けていた」を断定できない(推測で埋めない)
+    basisKind = "legacy";
+  }
+  return {
+    factors, used, missing, basisKind,
+    weightsVersion: Number.isFinite(record.weightsVersion) ? record.weightsVersion : null,
+    loggedAt: record.loggedAt || null,
+    squadRatings: record.squadRatings || null,
+    predictedWinner: record.predictedWinner || null,
+    learnedCompetition: learnedComp.isLearnedRecord(record),
+  };
+}
+
 function buildTodayPredictionEntry(fixture, record, calibrationMap) {
   if (!fixture || !record) return null;
   // v97(全体監査): 画面の勝率は「判定に実際に使った最終確率」(record.finalProbs。市場混合・
@@ -3195,6 +3268,8 @@ function buildTodayPredictionEntry(fixture, record, calibrationMap) {
     oddsSource: record.oddsSource || null,
     // v62: この大会をAIが学習しているか。していない大会は画面で1行だけ正直に断る。
     learnedCompetition: learnedComp.isLearnedRecord(record),
+    // v98: 根拠(効いた要素・使えたデータ・欠けたデータ)。全カードで表示する
+    basis: buildPredictionBasis(record),
     // v57「直前情報」: スタメン確定・直前オッズによる参考判定(朝の予想は不変)
     preKick: record.preKick ? {
       at: record.preKick.at || null,
@@ -3510,11 +3585,47 @@ async function handleFixtureAnalysis(query) {
         status: statusShort,
         venue: entry.fixture.venue ? entry.fixture.venue.name : null,
         league: entry.league ? entry.league.name : null,
-        home: { name: entry.teams.home.name, logo: entry.teams.home.logo },
-        away: { name: entry.teams.away.name, logo: entry.teams.away.logo },
+        leagueId: (entry.league && Number.isFinite(Number(entry.league.id))) ? Number(entry.league.id) : null, // v98
+        home: { id: entry.teams.home.id ?? null, name: entry.teams.home.name, logo: entry.teams.home.logo },
+        away: { id: entry.teams.away.id ?? null, name: entry.teams.away.name, logo: entry.teams.away.logo },
         score: entry.goals ? { home: entry.goals.home, away: entry.goals.away } : null,
       },
     };
+    // ---- v98: サーバーの知識(クラブ宇宙172+動的クラブ)で試合カードの選手データを組み立てる ----
+    //   画面内の手書き名簿(11クラブ)をやめ、両チームの調査ファイル(MGET 1回)と選手索引
+    //   (プロセス内)から「主力の実測」「怪我」「監督・布陣」「直近5試合」を返す。
+    //   外部APIは呼ばない(方針⑥)。追跡対象外のクラブは tracked:false で正直に返し、
+    //   候補(view)として記録して翌日以降の夜間収集で取り込む。
+    let knowledge = null;
+    try {
+      knowledge = await teamKnowledge.knowledgeForFixture(
+        { id: entry.teams.home.id, name: entry.teams.home.name },
+        { id: entry.teams.away.id, name: entry.teams.away.name }
+      );
+    } catch (e) { knowledge = { home: null, away: null, readFailed: true, error: String((e && e.message) || e).slice(0, 80) }; }
+    runInBackgroundCtx(async () => {
+      try {
+        const untracked = [];
+        for (const side of ["home", "away"]) {
+          const k = knowledge && knowledge[side];
+          const t = entry.teams[side];
+          if (k && k.tracked === false && t && Number.isFinite(Number(t.id)) && t.name) {
+            untracked.push({ teamId: Number(t.id), nameEn: t.name, leagueId: base.fixture.leagueId, league: base.fixture.league, country: entry.league ? entry.league.country : null });
+          }
+        }
+        if (untracked.length) await dynamicUniverse.recordSeen(untracked, { source: "view", learnedLeagueIds: learnedComp.LEARNED_LEAGUE_IDS, isStaticTeam: (tid, name) => isStaticUniverseTeam(tid, name) });
+      } catch (e) { /* ベストエフォート */ }
+    });
+    // v98: この試合にAI自身の予想があれば、その根拠(効いた要素・使えたデータ・欠けたデータ)を添える
+    let ownBasis = null;
+    if (UPSTASH_ENABLED) {
+      try {
+        const rec = await upstashGetJSON(`learn:ownpred:${entry.fixture.id}`);
+        if (rec) ownBasis = buildPredictionBasis(rec);
+      } catch (e) { ownBasis = null; }
+    }
+    base.knowledge = knowledge;
+    base.ownBasis = ownBasis;
 
     if (!FINISHED_STATUSES.has(statusShort) && !LIVE_STATUSES.has(statusShort)) {
       // Not started yet (also covers postponed/cancelled/etc.) — no real
@@ -4507,6 +4618,8 @@ async function runDailyLearningThenQA(deps) {
   //   学習記録は1日1回しか変わらないのでキャッシュは長くてよいが、変わった瞬間だけは
   //   次のアクセスで新しい記録を見せる(「学習したのに画面が古い」を作らない)。
   for (const k of Array.from(cache.keys())) if (k.startsWith("learn:")) cache.delete(k);
+  // v98: 学習で動的クラブ・teamId対応表が変わるので、試合カード用の照合表も次回に作り直す
+  try { teamKnowledge.invalidate(); } catch (e) { /* noop */ }
   try {
     const qa = await runAutoQANow({ repairRounds: 2 });
     console.log("[autoQA] after learning", JSON.stringify({
@@ -4836,6 +4949,34 @@ const { collectClubPlayersBatch } = require("./learning/universeCollector");
 const playerSearchDeps = {
   upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
 };
+// ---- v98(2026年11月5日・利用者の指摘「登録選手データがない試合が多い」) ----
+//   動的クラブ宇宙(見た試合のクラブを翌日までに取り込む)と、試合カード用のチーム知識
+//   (teamId→クラブの照合・選手索引からの主力実測・調査ファイルの要約)。
+//   どちらも「利用者の操作の瞬間に外部APIを呼ばない」(方針⑥)。
+const { createDynamicUniverse } = require("./learning/dynamicUniverse");
+const dynamicUniverse = createDynamicUniverse({ upstashEnabled: UPSTASH_ENABLED, upstashCmd: (cmd) => upstashCmd(cmd) });
+const { createTeamKnowledge } = require("./knowledge/teamKnowledge");
+// 選手索引(配列の行)をオブジェクトへ展開したものを、索引の読み込み時刻ごとに1回だけ作って使い回す
+const playerObjectsCache = { loadedAt: -1, players: [] };
+function getPlayerObjectsForKnowledge() {
+  const st = playerIndexState;
+  if (!st || !Array.isArray(st.rows) || !st.rows.length) return { players: [], builtAt: null };
+  if (playerObjectsCache.loadedAt !== st.loadedAt) {
+    playerObjectsCache.players = st.rows.map((r) => { try { return playerSearch.fromIndexRow(r); } catch (e) { return null; } }).filter(Boolean);
+    playerObjectsCache.loadedAt = st.loadedAt;
+  }
+  return { players: playerObjectsCache.players, builtAt: (st.meta && st.meta.builtAt) || null };
+}
+const teamKnowledge = createTeamKnowledge({
+  CLUB_UNIVERSE, clubDossier, dynamicUniverse,
+  getPlayerRows: getPlayerObjectsForKnowledge,
+  upstashEnabled: UPSTASH_ENABLED, upstashCmd: (cmd) => upstashCmd(cmd), upstashGetJSON: (key) => upstashGetJSON(key),
+});
+// 固定名簿のチームか(候補記録から除外するため)。照合表が未構築なら裏で作り始め、名前で判定する
+function isStaticUniverseTeam(teamId, name) {
+  try { teamKnowledge.ensureMap(false).catch(() => {}); } catch (e) { /* noop */ }
+  return teamKnowledge.isStaticTeamSync(teamId, name);
+}
 
 // ============================================================================
 // 2026年8月7日・「データはあるのに検索できない」の構造的な対処
@@ -5223,6 +5364,11 @@ const learningDeps = {
   appDateKey,
   // 優先順位⑲/⑳: 知識グラフと、考えの変化の時系列
   knowledgeGraph, thoughtTimeline,
+  // ---- v98 ----
+  // 主力選手の平均評価点(特徴量 squadRatingDiff)。プロセス内の選手索引だけを引く(外部APIなし)
+  squadRatingOf: (teamId, nameHint) => teamKnowledge.squadRatingForFeature(teamId, nameHint),
+  // 動的クラブ宇宙(候補の記録・今日の採用・収集日の記録)
+  dynamicUniverse,
 };
 
 // ---- Stage E: Knowledge Engine / Memory Engine / Knowledge Graph への依存注入 ----
@@ -5732,8 +5878,17 @@ async function handleMatchAnalysis(query, clientIp) {
     // リーグ別の値を使う)。
     ratingEgAnalysis = expGoalsFromRatings(ratingsData, homeTeamId, awayTeamId);
   } catch (e) { /* レーティングは付加情報。無くても分析は返す */ }
-  const homeSrcRaw = { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXgInfo, topScorer: homeTopScorerInfo, ratingExpGoals: ratingEgAnalysis ? ratingEgAnalysis.home : null };
-  const awaySrcRaw = { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXgInfo, topScorer: awayTopScorerInfo, ratingExpGoals: ratingEgAnalysis ? ratingEgAnalysis.away : null };
+  // v98: 主力選手の平均評価点(選手索引の実測)。日次学習と同じ入口(featureEngine)へ渡す
+  //   =「同じ特徴量を二重管理しない」原則。索引に信頼できる母数が無ければ null(特徴量0)。
+  let homeSquadRatingA = null, awaySquadRatingA = null;
+  try {
+    [homeSquadRatingA, awaySquadRatingA] = await Promise.all([
+      teamKnowledge.squadRatingForFeature(homeTeamId, home.nameEn),
+      teamKnowledge.squadRatingForFeature(awayTeamId, away.nameEn),
+    ]);
+  } catch (e) { homeSquadRatingA = null; awaySquadRatingA = null; }
+  const homeSrcRaw = { teamId: homeTeamId, form: homeForm, injuries: homeInjuries, standings: homeStandings, xg: homeXgInfo, topScorer: homeTopScorerInfo, ratingExpGoals: ratingEgAnalysis ? ratingEgAnalysis.home : null, squadRating: homeSquadRatingA };
+  const awaySrcRaw = { teamId: awayTeamId, form: awayForm, injuries: awayInjuries, standings: awayStandings, xg: awayXgInfo, topScorer: awayTopScorerInfo, ratingExpGoals: ratingEgAnalysis ? ratingEgAnalysis.away : null, squadRating: awaySquadRatingA };
   const [homeSrc, awaySrc] = await Promise.all([
     dossierFill(home, home.nameJa, homeSrcRaw),
     dossierFill(away, away.nameJa, awaySrcRaw),
@@ -6097,6 +6252,8 @@ function learningHealthLiveFields() {
     store: storeStatusSnapshot(),
     upstashUsage: upstashUsageSnapshot(),
     selfHeal: { skippedForStore: selfHealSkippedForStore.count, lastSkipAt: selfHealSkippedForStore.lastAt ? new Date(selfHealSkippedForStore.lastAt).toISOString() : null, lastSkipReason: selfHealSkippedForStore.lastReason, learningRunningNow: dailyLearningRunning },
+    // v98: 試合カード用の teamId→クラブ照合表(固定/動的クラブ数・作成時刻・出所)
+    teamKnowledge: teamKnowledge.snapshot(),
     apiPlan: getApiPlanInfo(),
   };
 }
@@ -10317,10 +10474,26 @@ module.exports = {
     cacheGet, cacheSet, clearCache: () => cache.clear(), cacheKeys: () => [...cache.keys()],
     releaseDailyRunLock, getOrLogPrediction,
   },
+  // v98: 試合カードの知識・動的クラブ宇宙・根拠表示の検証用(本番では誰も呼ばない)
+  __v98ForTest: {
+    teamKnowledge, dynamicUniverse, buildPredictionBasis, handleFixtureAnalysis, handleFixturesToday,
+    isStaticUniverseTeam, getPlayerObjectsForKnowledge,
+    // 選手索引の行を直接差し込む(索引の読み込み経路を通さずに主力実測を検証する)
+    setPlayerIndexRowsForTest: (rows, meta) => {
+      playerIndexState.rows = Array.isArray(rows) ? rows : [];
+      playerIndexState.meta = meta || { builtAt: new Date().toISOString() };
+      playerIndexState.loadedAt = Date.now();
+      playerIndexState.available = playerIndexState.rows.length > 0;
+    },
+    learningDeps,
+  },
   // v94: 保存先の健全性・使用量・空回り防止の検証用(本番では誰も呼ばない)
   __storeForTest: {
     storeIsDown, storeStatusSnapshot, upstashUsageSnapshot, upstashMGetJSON, upstashGetJSONOrThrow,
     tryAcquireDailyRunLock, maybeSelfHealDailyLearning, maybeWatchLineups, maybeFlushUpstashUsage,
+    // v98: 終了時の積み上げ・件数しきい値
+    flushUpstashUsageOnExit, UPSTASH_USAGE_FLUSH_MAX, usageUnflushed: () => upstashUsage.unflushed,
+    noteCommandsForTest: (n) => { for (let i = 0; i < n; i++) countUpstashCommand(["GET", "test"], "single"); },
     isQuotaExceededMessage,
     selfHealSkipped: () => ({ ...selfHealSkippedForStore }),
     isLearningRunning: () => dailyLearningRunning,

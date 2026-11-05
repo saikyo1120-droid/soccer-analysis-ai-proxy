@@ -292,7 +292,7 @@ test("★欠陥77: AI考察の全体/個人どちらの上限でも、もう片�
   //   同じ「個人枠を先に消費し、全体枠が尽きていたら個人枠を返金する」順序に統一。
   //   これで全体・個人どちらの上限でも、もう片方の枠を無駄に消費しない。
   const maStart = SERVER.indexOf("async function handleMatchAnalysis");
-  const maBlock = SERVER.slice(maStart, maStart + 24000);
+  const maBlock = SERVER.slice(maStart, maStart + 32000); // v98: 主力評価点の供給(squadRating)が増えて関数が長くなった
   const ipIdx = maBlock.indexOf("if (typeof generateLLM === \"function\" && tryConsumeLlmBudgetForIp(clientIp))");
   const globalIdx = maBlock.indexOf("if (await tryConsumeLlmBudget())");
   assert.ok(ipIdx !== -1 && globalIdx !== -1 && ipIdx < globalIdx,
