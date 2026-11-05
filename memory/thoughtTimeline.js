@@ -61,7 +61,15 @@ function createThoughtTimeline({ upstashEnabled, upstashCmd, upstashGetJSON, ups
     }
     if (!KINDS.includes(event.kind)) return { saved: false, reason: "INVALID_KIND" };
 
-    const list = await read(subjectKey);
+    // v97(全体監査): 既存の記録を読めなかったときは重複判定ができないので書かない
+    //   (旧実装は失敗→[]→「初めての出来事」として毎回追記し、同じ文が積み上がっていた)。
+    let list;
+    try {
+      const raw = (await upstashCmd(["LRANGE", keyFor(subjectKey), "0", "-1"])) || [];
+      list = raw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
+    } catch (e) {
+      return { saved: false, reason: "READ_FAILED" };
+    }
     // 監査で発見した欠陥の修正:
     //   直前の1件としか比べていなかったため、「予測→結果→学び」を毎回書くと
     //   学びの文が常に「結果」の後ろに来て、**同じ定型文が毎日積み上がって**

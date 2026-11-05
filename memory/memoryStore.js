@@ -45,11 +45,23 @@ function createMemoryStore({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
       return { saved: false, changed: false, reason: "INVALID_ITEM" };
     }
 
-    const previous = await getLastConclusion(subjectKey);
+    // ---- v97(全体監査): 「読めなかった」を「初めての結論」と取り違えない ----
+    //   upstashGetJSON は失敗を null に潰すため、保存先が一瞬でも失敗すると前の結論を
+    //   「無かった」ことにして revision 1 で上書きし、履歴への退避も変化理由の記録も飛ばし、
+    //   累計カウンターまで増やしていた(「AIは昨日こう考えていた」が消える)。
+    //   読めなかったときは保存を見送る(次回の実行で改めて比較する)。
+    let previous = null;
+    try {
+      const rawPrev = await upstashCmd(["GET", `memory:current:${subjectKey}`]);
+      previous = rawPrev === null || rawPrev === undefined ? null : (typeof rawPrev === "object" ? rawPrev : JSON.parse(rawPrev));
+    } catch (e) {
+      return { saved: false, changed: false, reason: "LOOKUP_FAILED" };
+    }
 
     if (!previous) {
       const record = { ...conclusion, subjectKey, revision: 1 };
-      await upstashSetJSON(`memory:current:${subjectKey}`, record);
+      const okInit = await upstashSetJSON(`memory:current:${subjectKey}`, record);
+      if (okInit === false) return { saved: false, changed: false, reason: "WRITE_FAILED" };
       await upstashCmd(["INCR", "memory:totalConclusionsSavedCounter"]).catch(() => {});
       return { saved: true, changed: true, reason: "INITIAL", revision: 1 };
     }
