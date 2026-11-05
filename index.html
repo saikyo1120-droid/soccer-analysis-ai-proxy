@@ -735,7 +735,7 @@
     if (appLang === "ja" || langPackRequested) return;
     langPackRequested = true;
     try {
-      fetch("/i18n." + appLang + ".json?v=82", { cache: "force-cache" })
+      fetch("/i18n." + appLang + ".json?v=97", { cache: "force-cache" }) // v97: 版を上げてキャッシュを更新
         .then(function (r) { return r && r.ok ? r.json() : null; })
         .then(function (j) {
           if (!j || typeof j !== "object") return;
@@ -2568,7 +2568,7 @@
     "選手の索引がまだ作られていないため、評価の変化を測れません。": ["The player index hasn't been built yet, so rating changes can't be measured.", "球员索引尚未生成,无法测量评价变化。", "El índice de jugadores no existe aún, así que no pueden medirse cambios de nota."],
     "選手の索引がまだ作られていません。": ["The player index hasn't been built yet.", "球员索引尚未生成。", "El índice de jugadores aún no se ha creado."],
     "選手の記録が2回以上更新されると、その差分から検知が始まります。": ["Once a player's record updates twice or more, detection starts from the diffs.", "球员记录更新2次以上后,将根据差分开始检测。", "Cuando el registro de un jugador se actualiza 2+ veces, la detección empieza con las diferencias."],
-    "選手の評価点はほぼ互角で、僅差の good ゲームでした。": ["Player ratings were nearly level — a fine-margins, well-played game.", "球员评分几乎持平,是一场毫厘之差的好比赛。", "Las notas quedaron casi igualadas: un buen partido decidido por detalles."],
+    "選手の評価点はほぼ互角で、僅差の好ゲームでした。": ["Player ratings were nearly level — a fine-margins, well-played game.", "球员评分几乎持平,是一场毫厘之差的好比赛。", "Las notas quedaron casi igualadas: un buen partido decidido por detalles."],
     "選手プロフィール": ["Player profile", "球员档案", "Perfil del jugador"],
     "選手・クラブ情報の追加収集": ["Additional player/club data collection", "球员与俱乐部信息的追加收集", "Recogida adicional de datos de jugadores y clubes"],
     "選手成績": ["Player stats", "球员成绩", "Estadísticas del jugador"],
@@ -3432,6 +3432,63 @@
     ["⦿ vs ⦿", "$1 vs $2", "$1 vs $2", "$1 vs $2"],
   ];
   for (var rp3 = 0; rp3 < RAWP3.length; rp3++) P.push([pat(RAWP3[rp3][0]), RAWP3[rp3][1], RAWP3[rp3][2], RAWP3[rp3][3]]);
+  /* ==== v97(2026年10月・全体監査): 「読めなかった」系の正直な表示・待ち時間・二重送信の文言 ==== */
+  add({
+    "前の質問にAIが答えている途中です。回答が出てから、もう一度送ってください。":
+      ["The AI is still answering your previous question. Please send again once the reply appears.",
+       "AI仍在回答上一个问题。等回答出现后再发送一次。",
+       "La IA todavía está respondiendo a tu pregunta anterior. Vuelve a enviarla cuando aparezca la respuesta."],
+    "分析に時間がかかりすぎたため、いったん中断しました(実データの取得とAIの文章生成が混み合っている可能性があります)。もう一度お試しください。":
+      ["The analysis took too long and was interrupted (fetching real data and generating the AI text may be congested). Please try again.",
+       "分析耗时过长,已暂时中断(获取实际数据和生成AI文本可能较为拥挤)。请再试一次。",
+       "El análisis tardó demasiado y se interrumpió (la obtención de datos reales y la generación del texto de IA pueden estar saturadas). Inténtalo de nuevo."],
+    "アクセスが集中しています。少し待ってからもう一度お試しください。":
+      ["Access is busy right now. Please wait a moment and try again.",
+       "当前访问较为集中。请稍后再试。",
+       "Hay mucho tráfico ahora mismo. Espera un momento e inténtalo de nuevo."],
+    "本日の試合一覧を取得できませんでした(サーバー起動待ちの可能性があります。しばらくして再読み込みしてください)。":
+      ["Couldn't load today's fixture list (the server may still be waking up — please reload in a moment).",
+       "无法获取今天的赛程列表(服务器可能仍在启动中,请稍后重新加载)。",
+       "No se pudo cargar la lista de partidos de hoy (el servidor puede estar despertando; recarga en un momento)."],
+    "アクセスが集中しているため、本日の試合一覧を一時的に取得できませんでした(少し待って再読み込みしてください)。":
+      ["Today's fixture list is temporarily unavailable due to heavy traffic (please wait a moment and reload).",
+       "由于访问集中,暂时无法获取今天的赛程列表(请稍后重新加载)。",
+       "La lista de partidos de hoy no está disponible temporalmente por el alto tráfico (espera un momento y recarga)."],
+    "保存先(Upstash)から予想を読み出せなかったため、本日のAI予想を表示できません(予想が無いのではなく、読めなかった状態です)。1分ほど待って再読み込みしてください。":
+      ["Today's AI predictions can't be shown because they couldn't be read from storage (Upstash) — they exist, they just couldn't be read. Please reload in about a minute.",
+       "由于无法从存储(Upstash)读取预测,暂时无法显示今天的AI预测(并非没有预测,而是读取失败)。请约1分钟后重新加载。",
+       "No se pueden mostrar las predicciones de hoy porque no pudieron leerse del almacenamiento (Upstash): existen, pero no se pudieron leer. Recarga en un minuto."],
+    "本日ぶんの予想はありませんでした。AIが予想している「次の試合」は、保存先(Upstash)から読み出せなかったため表示できません(1分ほど待って再読み込みしてください)。":
+      ["There were no predictions for today. The AI's predictions for upcoming matches couldn't be read from storage (Upstash) — please reload in about a minute.",
+       "今天没有预测。AI对“下一场比赛”的预测无法从存储(Upstash)读取(请约1分钟后重新加载)。",
+       "No había predicciones para hoy. Las predicciones de la IA para los próximos partidos no pudieron leerse del almacenamiento (Upstash); recarga en un minuto."],
+    "保存先(Upstash)から地力レーティングを読み出せませんでした(レーティングが無いという意味ではありません)。1分ほど待って再読み込みしてください。":
+      ["The strength ratings couldn't be read from storage (Upstash) — this doesn't mean there are none. Please reload in about a minute.",
+       "无法从存储(Upstash)读取实力评分(并不表示没有评分)。请约1分钟后重新加载。",
+       "No se pudieron leer las valoraciones de fuerza del almacenamiento (Upstash); no significa que no existan. Recarga en un minuto."],
+    "保存先(Upstash)からダイジェストを読み出せませんでした(ダイジェストが無いという意味ではありません)。1分ほど待って再読み込みしてください。":
+      ["The digest couldn't be read from storage (Upstash) — this doesn't mean there is none. Please reload in about a minute.",
+       "无法从存储(Upstash)读取摘要(并不表示没有摘要)。请约1分钟后重新加载。",
+       "No se pudo leer el resumen del almacenamiento (Upstash); no significa que no exista. Recarga en un minuto."],
+    "保存先(Upstash)から自動QAの結果を読み出せませんでした(QAが走っていないという意味ではありません)。1分ほど待って再読み込みしてください。":
+      ["The automatic QA result couldn't be read from storage (Upstash) — this doesn't mean QA hasn't run. Please reload in about a minute.",
+       "无法从存储(Upstash)读取自动QA结果(并不表示QA未运行)。请约1分钟后重新加载。",
+       "No se pudo leer el resultado del QA automático del almacenamiento (Upstash); no significa que no se haya ejecutado. Recarga en un minuto."],
+    "保存先(Upstash)からスカウト速報を読み出せませんでした(変化が無かったという意味ではありません)。":
+      ["The scouting feed couldn't be read from storage (Upstash) — this doesn't mean nothing changed.",
+       "无法从存储(Upstash)读取球探快讯(并不表示没有变化)。",
+       "No se pudo leer el feed de ojeo del almacenamiento (Upstash); no significa que no haya cambios."],
+    "一部の累計は保存先から読み出せなかったため表示していません。":
+      ["Some totals aren't shown because they couldn't be read from storage.",
+       "部分累计因无法从存储读取而未显示。",
+       "Algunos totales no se muestran porque no pudieron leerse del almacenamiento."],
+    "取得できません": ["unavailable", "无法获取", "no disponible"],
+    "(スコア不明)": ["(score unknown)", "(比分未知)", "(marcador desconocido)"],
+  });
+  var RAWP4 = [
+    ["検証済みの自社予測の件数は、保存先から読み出せなかったため表示できません(更新の判断に必要な件数: ⦿件)。", "The number of verified predictions can't be shown because it couldn't be read from storage (needed for an update decision: $1).", "已验证的自家预测数量无法从存储读取,因此不显示(更新判断所需数量: $1场)。", "El número de predicciones verificadas no se puede mostrar porque no pudo leerse del almacenamiento (necesarias para decidir una actualización: $1)."],
+  ];
+  for (var rp4 = 0; rp4 < RAWP4.length; rp4++) P.push([pat(RAWP4[rp4][0]), RAWP4[rp4][1], RAWP4[rp4][2], RAWP4[rp4][3]]);
   /* ==== 辞書ここまで ==== */
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
   else boot();
@@ -7033,14 +7090,35 @@ const API_PROXY_BASE = "https://soccer-analysis-ai-proxy.onrender.com/api";
 // fetchOptions (省略可) は fetch() にそのまま渡す追加オプション。POSTでJSONを
 // 送りたい呼び出し元(例: /api/predict-match)は { method: "POST", body: ... ,
 // headers: {...} } を渡す。既存の呼び出し元(引数2つ)は今まで通りGETとして動作する。
-async function fetchJsonWithTimeout(url, timeoutMs, fetchOptions) {
+async function fetchJsonWithTimeout(url, timeoutMs, fetchOptions, _retried) {
+  const ms = timeoutMs || 4000;
   const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
-  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs || 4000) : null;
+  const timer = controller ? setTimeout(() => controller.abort(), ms) : null;
   try {
     const opts = Object.assign({}, fetchOptions || {}, controller ? { signal: controller.signal } : {});
     const res = await fetch(url, opts);
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    if (!res.ok) {
+      // v97: 呼び出し側が原因(429=混雑・503=一時停止 等)を見分けられるよう、状態と本文を添える
+      const err = new Error("HTTP " + res.status);
+      err.httpStatus = res.status;
+      try { err.body = await res.json(); } catch (e) { /* 本文がJSONでない */ }
+      throw err;
+    }
     return await res.json();
+  } catch (e) {
+    // ---- v97(全体監査): 「温まっている」と思っていたサーバーが再び休止していた場合の救済 ----
+    //   Render無料プランは15分アクセスが無いと休止する。タブを開いたまま時間が経つと、
+    //   backendConfirmedWarm=true のまま短い待ち時間(6秒)で呼び、起床待ち(〜60秒)に間に合わず
+    //   全カードが「取得できませんでした」になっていた。短い待ち時間で中断(AbortError)したときは
+    //   「休止中」と見なし直し、GETに限って起床待ちの長い待ち時間で1回だけやり直す
+    //   (POST=考察・対決登録などは二重実行を避けるためやり直さない)。
+    const aborted = !!(e && e.name === "AbortError");
+    const isGet = !fetchOptions || !fetchOptions.method || String(fetchOptions.method).toUpperCase() === "GET";
+    if (aborted && !_retried && isGet && backendConfirmedWarm && ms < COLD_START_TIMEOUT_MS) {
+      backendConfirmedWarm = false;
+      return fetchJsonWithTimeout(url, COLD_START_TIMEOUT_MS, fetchOptions, true);
+    }
+    throw e;
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -7070,12 +7148,29 @@ async function fetchRealPlayerSeasonStats(player) {
   } catch (e) { return null; } // proxy not running / no key / player not found / timeout — all treated the same: fall back to simulation
 }
 
+// v97(全体監査): 「取得に失敗した」と「本日は試合が無い/取れなかった理由がある」を区別して返す。
+//   旧実装はどちらも null にしていたため、画面はカードを黙って隠すしかなく、利用者には
+//   「今日は試合が無いのか・サーバーが落ちているのか」が分からなかった。
+//   戻り値: { status: "ok"|"empty"|"failed", data, reasonJa }
+let lastFixturesFetchStatus = null;
+let lastFixturesFetchReasonJa = null;
 async function fetchRealFixturesToday() {
   try {
     const data = await fetchJsonWithTimeout(`${API_PROXY_BASE}/fixtures/today`, backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
     backendConfirmedWarm = true;
-    return (data && data.found && data.fixtures && data.fixtures.length) ? data : null;
-  } catch (e) { return null; }
+    if (data && data.found && data.fixtures && data.fixtures.length) { lastFixturesFetchStatus = "ok"; return data; }
+    lastFixturesFetchStatus = (data && data.found === false && data.reason && data.reason !== "no_fixtures") ? "failed" : "empty";
+    if (lastFixturesFetchStatus === "failed") {
+      lastFixturesFetchReasonJa = (data && (data.noteJa || data.messageJa || data.error)) || null;
+    }
+    return null;
+  } catch (e) {
+    lastFixturesFetchStatus = "failed";
+    lastFixturesFetchReasonJa = (e && e.httpStatus === 429)
+      ? "アクセスが集中しているため、本日の試合一覧を一時的に取得できませんでした(少し待って再読み込みしてください)。"
+      : null;
+    return null;
+  }
 }
 
 // "本物の記録" のAI予測正答率を取得する。バックエンド(server/server.js)がUpstash
@@ -7105,15 +7200,25 @@ async function fetchGrowthLog() {
 // スコアまで表示する)。裏側は server/server.js の /api/match-analysis で、
 // Prediction Engine v2(実データの特徴量 + 学習済みの重み + ポワソン分布)に
 // よる本物の計算。プロキシ未接続/APIキー未設定の場合はその旨を正直に表示する。
+// v97(全体監査): マッチ分析はサーバー側で最大11回の外部API取得+AIの文章生成を行うため、
+//   温まっていても6秒では終わらないことがある(以前は6秒で中断→「接続できませんでした」と
+//   事実と違う表示)。専用の待ち時間(45秒)にし、中断・混雑(429)・接続失敗を言い分ける。
+const MATCH_ANALYSIS_TIMEOUT_MS = 45000;
 async function fetchMatchAnalysis(homeJa, awayJa) {
   try {
     const homeEn = CLUB_JA_TO_EN[homeJa] || homeJa;
     const awayEn = CLUB_JA_TO_EN[awayJa] || awayJa;
     const url = `${API_PROXY_BASE}/match-analysis?home=${encodeURIComponent(homeEn)}&away=${encodeURIComponent(awayEn)}${(window.appLang && window.appLang !== "ja") ? `&lang=${window.appLang}` : ""}`;
-    const data = await fetchJsonWithTimeout(url, backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
+    const data = await fetchJsonWithTimeout(url, backendConfirmedWarm ? MATCH_ANALYSIS_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
     backendConfirmedWarm = true;
     return data || null;
   } catch (e) {
+    if (e && e.name === "AbortError") {
+      return { ok: false, reason: "timeout", message: "分析に時間がかかりすぎたため、いったん中断しました(実データの取得とAIの文章生成が混み合っている可能性があります)。もう一度お試しください。" };
+    }
+    if (e && e.httpStatus === 429) {
+      return { ok: false, reason: "rate_limited", message: (e.body && (e.body.messageJa || e.body.error)) || "アクセスが集中しています。少し待ってからもう一度お試しください。" };
+    }
     return { ok: false, reason: "network_error", message: "分析サーバーに接続できませんでした(実データ連携サーバーが休止中の場合、初回は最大1分ほどかかることがあります。もう一度お試しください)。" };
   }
 }
@@ -7371,6 +7476,11 @@ async function renderExternalPanel(player) {
 
 function renderPlayerCard(player, level) {
   const wrap = document.getElementById("playerCardWrap");
+  if (!wrap) return;
+  // v97(全体監査): カードを描いたのに枠が非表示(display:none)のままになる経路があった
+  //   (ヒーローチャットの「AとBを比較して」: 「下の選手カードの比較欄に表示しています」と
+  //    答えながら、カード枠は隠れたままだった)。描いた以上は必ず見えるようにする。
+  wrap.style.display = "";
   trackRecentPlayer(player);
   // preserve the "もっと見る" expand/collapse state across re-renders (e.g. when the
   // 超入門/標準/戦術 level switch triggers a re-render of the same open card) so the
@@ -7754,7 +7864,8 @@ function wirePlayerExtras(player) {
   const chatSendBtn = document.getElementById("chatSendBtn");
   const chatInput = document.getElementById("chatInput");
   if (chatSendBtn) chatSendBtn.addEventListener("click", () => sendChatMessage(player));
-  if (chatInput) chatInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendChatMessage(player); });
+  // v97: 日本語入力の変換確定の Enter(isComposing / keyCode 229)で送信しない(変換途中の文が飛ぶ不具合)
+  if (chatInput) chatInput.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing && e.keyCode !== 229) sendChatMessage(player); });
   const cardWrapEl = document.getElementById("playerCardWrap");
   (cardWrapEl || document).querySelectorAll(".chat-suggest-btn").forEach(btn => {
     btn.addEventListener("click", () => sendChatMessage(player, btn.dataset.q));
@@ -8129,7 +8240,18 @@ async function renderRealFixturesIfAvailable() {
   const listEl = document.getElementById("realFixturesList");
   if (!cardEl || !listEl) return;
   const data = await fetchRealFixturesToday();
-  if (!data) { cardEl.style.display = "none"; return; }
+  if (!data) {
+    // v97: 失敗(接続・サーバー側の取得失敗)は黙って隠さず、1行で正直に伝える。試合が無い日は従来どおり隠す。
+    if (lastFixturesFetchStatus === "failed") {
+      listEl.innerHTML = `<p class="value-note">${escapeHtml(lastFixturesFetchReasonJa || "本日の試合一覧を取得できませんでした(サーバー起動待ちの可能性があります。しばらくして再読み込みしてください)。")}</p>`;
+      cardEl.style.display = "block";
+      const noteEl0 = document.getElementById("fixturesContextNote");
+      if (noteEl0) noteEl0.style.display = "none";
+    } else {
+      cardEl.style.display = "none";
+    }
+    return;
+  }
 
   lastFixturesToday = data.fixtures;
   renderFixturesListInto(listEl, lastFixturesToday);
@@ -8498,7 +8620,7 @@ function buildDecisivePointsText(analysis, level) {
     if (level === "beginner") {
       parts.push(gap >= 0.3
         ? `選手の出来を表す評価点でも${homeAvg > awayAvg ? f.home.name : f.away.name}の方が良かったので、実力どおりの結果と言えそうです。`
-        : `選手の評価点はほぼ互角で、僅差の good ゲームでした。`);
+        : `選手の評価点はほぼ互角で、僅差の好ゲームでした。`);
     } else if (level === "expert") {
       parts.push(gap >= 0.3
         ? `出場選手の平均レーティングは${f.home.name} ${homeAvg.toFixed(2)} 対 ${f.away.name} ${awayAvg.toFixed(2)}(差${gap.toFixed(2)})で、内容面でも${homeAvg > awayAvg ? f.home.name : f.away.name}が上回った。`
@@ -8513,12 +8635,14 @@ function buildDecisivePointsText(analysis, level) {
   redCardEvents.forEach(e => parts.push(level === "beginner"
     ? `${e.minute}分に${e.team}の${e.player}が退場になったのも大きなポイントでした。`
     : `${e.minute}分の${e.team}・${e.player}の退場が試合の流れに影響したと考えられます。`));
-  if (analysis.motmHome && analysis.motmAway) {
-    const motm = analysis.motmHome.rating >= analysis.motmAway.rating ? analysis.motmHome : analysis.motmAway;
-    const motmTeam = analysis.motmHome.rating >= analysis.motmAway.rating ? f.home.name : f.away.name;
+  // v97: 評価点が無い(null)MOTM候補で「評価null」と表示しない。両方に数値の評価がある試合だけ比べる。
+  const motmRatingOf = (m) => (m && Number.isFinite(Number(m.rating)) ? Number(m.rating) : null);
+  if (analysis.motmHome && analysis.motmAway && motmRatingOf(analysis.motmHome) !== null && motmRatingOf(analysis.motmAway) !== null) {
+    const motm = motmRatingOf(analysis.motmHome) >= motmRatingOf(analysis.motmAway) ? analysis.motmHome : analysis.motmAway;
+    const motmTeam = motmRatingOf(analysis.motmHome) >= motmRatingOf(analysis.motmAway) ? f.home.name : f.away.name;
     parts.push(level === "beginner"
-      ? `一番活躍したのは${motmTeam}の${motm.name}選手でした(評価${motm.rating})。`
-      : `この試合のマン・オブ・ザ・マッチ候補は${motmTeam}の${motm.name}(評価${motm.rating})です。`);
+      ? `一番活躍したのは${motmTeam}の${motm.name}選手でした(評価${motmRatingOf(motm)})。`
+      : `この試合のマン・オブ・ザ・マッチ候補は${motmTeam}の${motm.name}(評価${motmRatingOf(motm)})です。`);
   }
   // 利用者目線ラウンド: 選手評価もイベントも無い試合では、スコア以外の分析材料が
   // 存在しない。理由を正直に添える(推測で「勝敗を分けた要因」を作らないため)。
@@ -8593,7 +8717,7 @@ function buildFinishedAnalysisHtml(analysis, level) {
   }
   return `
     <div class="card">
-      <h2>📝 試合後の振り返り: ${escapeHtml(f.home.name)} ${escapeHtml(String(f.score.home))} - ${escapeHtml(String(f.score.away))} ${escapeHtml(f.away.name)}</h2>
+      <h2>📝 試合後の振り返り: ${escapeHtml(f.home.name)} ${(f.score && f.score.home !== null && f.score.home !== undefined) ? `${escapeHtml(String(f.score.home))} - ${escapeHtml(String(f.score.away))}` : "(スコア不明)"} ${escapeHtml(f.away.name)}</h2>
       <p class="value-note">${escapeHtml(f.league || "")}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}(API-Footballの実データに基づく、試合終了後の振り返りです)</p>
       ${verdictHtml}
       <p class="value-note"><strong>🤖 何が勝敗を分けたか:</strong> ${escapeHtml(buildDecisivePointsText(analysis, level))}</p>
@@ -8678,19 +8802,25 @@ async function renderFixtureAnalysisInline(btn) {
   // ご指示どおり「AIが今回最も重要だと判断した要因」を、結論より先に表示する。
   slot.innerHTML = buildMostImportantFactorBanner(analysis) + bodyHtml;
   slot.dataset.loaded = "1";
+  if (slot.id) slotAnalysisCache.set(slot.id, analysis);
+  // v97(全体監査): 取得中に利用者が「閉じる」を押していた(二度押し)場合、閉じた試合を
+  //   「いま表示中の試合」として記憶しない(レベル切替が閉じた試合のカードを書き換える不具合)。
+  if (slot.style.display === "none") return;
   lastRealFixtureAnalysis = analysis;
   lastRealFixtureAnalysisSlotId = slot.id || null;
-  if (slot.id) slotAnalysisCache.set(slot.id, analysis);
   if (analysis.fixture && analysis.fixture.home && analysis.fixture.away) {
     trackRecentMatch("real:" + fixtureId, `${analysis.fixture.home.name} vs ${analysis.fixture.away.name}`);
   }
 }
 
+let __realFixtureAnalysisToken = 0; // v97: 連打・別試合への切替で、古い応答が新しい表示を上書きしないための番号
 async function renderRealFixtureAnalysis(fixtureId) {
   const wrapEl = document.getElementById("realFixtureAnalysisWrap");
   if (!wrapEl) return;
+  const myToken = ++__realFixtureAnalysisToken;
   wrapEl.innerHTML = `<div class="card"><p class="value-note">🔄 実データを取得中です…(サーバーが休止していた場合、初回は最大1分ほどかかることがあります)</p></div>`;
   const analysis = await fetchRealFixtureAnalysis(fixtureId);
+  if (myToken !== __realFixtureAnalysisToken) return; // より新しい要求が出ている(この結果は捨てる)
   if (!analysis) { wrapEl.innerHTML = `<div class="card"><p class="value-note">この試合の詳細データを取得できませんでした。時間をおいて再度お試しください。</p></div>`; lastRealFixtureAnalysis = null; lastRealFixtureAnalysisSlotId = null; return; }
   lastRealFixtureAnalysis = analysis;
   lastRealFixtureAnalysisSlotId = null; // この入口は #realFixtureAnalysisWrap に描く
@@ -9691,7 +9821,26 @@ function renderDiscussReplyHtml(resp) {
 // hero chat・選手個別チャット共通の議論モードフロー。
 // pushFn: 新しいメッセージオブジェクトを履歴配列に積む関数
 // renderFn: 履歴を再描画する関数
+// v97(全体監査): 同じ画面で考察が進行中のあいだは、新しい送信を受け付けない。
+//   旧実装は Enter の連打・ボタンの二度押しでそのまま2本目の考察リクエストを送っていた
+//   (利用者の1日10回のAI考察枠を1回の質問で2回ぶん消費し、回答も二重に並ぶ)。
+const discussInFlightKeys = new Set();
 async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn, forcedPlayerName, surfaceKey) {
+  const inflightKey = surfaceKey || ((contextPlayer && contextPlayer.name) ? `card:${contextPlayer.name}` : "hero");
+  if (discussInFlightKeys.has(inflightKey)) {
+    const waitMsg = "前の質問にAIが答えている途中です。回答が出てから、もう一度送ってください。";
+    pushFn({ role: "ai", text: `<p class="value-note">⏳ ${escapeHtml((typeof window !== "undefined" && window.t) ? window.t(waitMsg) : waitMsg)}</p>`, extras: "" });
+    renderFn();
+    return;
+  }
+  discussInFlightKeys.add(inflightKey);
+  try {
+    await runDiscussFlowInner(q, dLevel, contextPlayer, pushFn, renderFn, forcedPlayerName, surfaceKey);
+  } finally {
+    discussInFlightKeys.delete(inflightKey);
+  }
+}
+async function runDiscussFlowInner(q, dLevel, contextPlayer, pushFn, renderFn, forcedPlayerName, surfaceKey) {
   let { subject, playerHint, resolvedPlayer } = buildDiscussSubject(q, contextPlayer, forcedPlayerName);
   // ---- v79(案5): 文脈記憶の読み出し ----
   //   記憶は「画面」単位(ヒーローチャット=hero / 選手カードごと=card:◯◯)。
@@ -10019,6 +10168,7 @@ document.getElementById("heroChatBtn").addEventListener("click", () => {
   input.value = "";
 });
 document.getElementById("heroChatInput").addEventListener("keydown", (e) => {
+  if (e.isComposing || e.keyCode === 229) return; // v97: 日本語入力の変換確定の Enter では送らない
   if (e.key === "Enter") { heroAskAI(e.target.value); e.target.value = ""; }
 });
 // AI対話パートナーの「深掘り質問」チップ(hero chat側) — #heroChatMessages自体は
@@ -10417,8 +10567,15 @@ function buildLearningSummarySection(log) {
   }
   // まだ一度も採用された変更が無い場合: 架空の「学習しました」は出さず、
   // 今どこまで進んでいるか(検証済み件数/必要件数)を正直に見せる。
-  const resolved = log.totalOwnPredictionsResolvedSoFar ?? 0;
   const need = log.minResolvedForRecalibration ?? 10;
+  // v97: 読めなかった(null)ときは「0件」と断定しない
+  if (!Number.isFinite(log.totalOwnPredictionsResolvedSoFar)) {
+    return `
+    <p class="value-note" style="margin:10px 0 4px;">🔧 Prediction Engineの重み更新: まだ1回もありません。</p>
+    <div class="value-note" style="margin:2px 0 2px 8px;">検証済みの自社予測の件数は、保存先から読み出せなかったため表示できません(更新の判断に必要な件数: ${need}件)。</div>
+  `;
+  }
+  const resolved = log.totalOwnPredictionsResolvedSoFar;
   const remain = Math.max(0, need - resolved);
   return `
     <p class="value-note" style="margin:10px 0 4px;">🔧 Prediction Engineの重み更新: まだ1回もありません。</p>
@@ -10427,6 +10584,19 @@ function buildLearningSummarySection(log) {
   `;
 }
 
+// ---- v97(全体監査): 「読めなかった」表示の自動読み直し ----
+//   画面の文言は「復旧すると自動的に表示が戻ります」と約束していたが、実際には再読み込みしないと
+//   戻らなかった。読めなかった表示を出した部品は、65秒後に最大5回まで自動で読み直す
+//   (サーバー側の失敗キャッシュは60秒なので、それより少し後に読む)。
+const degradedRetryCounts = {};
+function scheduleDegradedRetry(key, fn) {
+  const n = degradedRetryCounts[key] || 0;
+  if (n >= 5) return;
+  degradedRetryCounts[key] = n + 1;
+  const timer = setTimeout(() => { try { fn(); } catch (e) { /* 次回の読み直しに任せる */ } }, 65 * 1000);
+  // Node(テスト環境)ではこのタイマーがプロセスの終了を妨げるため unref する(ブラウザでは数値なので何もしない)
+  if (timer && typeof timer.unref === "function") timer.unref();
+}
 async function renderGrowthLogWidget() {
   const summaryEl = document.getElementById("growthLogSummary");
   const detailsEl = document.getElementById("growthLogDetails");
@@ -10455,6 +10625,7 @@ async function renderGrowthLogWidget() {
       : "保存先(Upstash)に接続できないため、いまは学習の記録を読み出せません。学習が止まったという意味ではありません。復旧すると自動的に表示が戻ります。";
     summaryEl.innerHTML = `🧠 <strong>昨日学んだこと</strong>: <span class="value-note">${msg}</span>`;
     if (detailsEl) detailsEl.innerHTML = "";
+    scheduleDegradedRetry("growthLog", () => renderGrowthLogWidget()); // v97: 「復旧すると自動的に戻る」を実際に行う
     return;
   }
   if (!log.ranYet) {
@@ -10735,14 +10906,16 @@ function classifyLearnErrors(list, serverClassification) {
     const failureReasonsHtml = topReasons.length
       ? `<div class="value-note" style="margin:4px 0;">❌ 直近よく外れる理由: ${topReasons.map((r) => `${escapeHtml(r.labelJa)}(${r.count}件)`).join("・")}</div>`
       : `<div class="value-note" style="margin:4px 0;">❌ 直近よく外れる理由: まだ十分な検証データがありません。</div>`;
-    const totals = log.engineTotals || { knowledgeItemsTotal: 0, memoryConclusionsTotal: 0, predictionsTotal: 0 };
+    const totals = log.engineTotals || { knowledgeItemsTotal: null, memoryConclusionsTotal: null, predictionsTotal: null };
+    // v97: 読めなかった値(null)は「0件」ではなく「取得できません」と出す(でっち上げ禁止)
+    const totalCell = (v) => (Number.isFinite(v) ? `<strong>${v}</strong>件` : `<span style="opacity:.8;">取得できません</span>`);
     const engineTotalsHtml = `
       <div class="value-note" style="margin:8px 0 2px; display:flex; gap:14px; flex-wrap:wrap;">
-        <span>🧠 Knowledge累計: <strong>${totals.knowledgeItemsTotal}</strong>件</span>
-        <span>⚽ Prediction累計: <strong>${totals.predictionsTotal}</strong>件</span>
-        <span>💭 Memory累計: <strong>${totals.memoryConclusionsTotal}</strong>件</span>
+        <span>🧠 Knowledge累計: ${totalCell(totals.knowledgeItemsTotal)}</span>
+        <span>⚽ Prediction累計: ${totalCell(totals.predictionsTotal)}</span>
+        <span>💭 Memory累計: ${totalCell(totals.memoryConclusionsTotal)}</span>
       </div>
-      <div class="value-note" style="opacity:.75;">※累計は保存された時点でカウントする「これまでの学習活動量」の目安です(知識の失効等では減りません)。</div>
+      <div class="value-note" style="opacity:.75;">※累計は保存された時点でカウントする「これまでの学習活動量」の目安です(知識の失効等では減りません)。${log.countersReadFailed ? "一部の累計は保存先から読み出せなかったため表示していません。" : ""}</div>
     `;
     // 2026年8月・ご要望②(Knowledge Engineの毎日成長): 監督交代・補強はフォーム系
     // (factsToday)とは別経路で保存されるため、別枠(otherFactsToday)で表示する。
@@ -10905,6 +11078,12 @@ function fetchTodayPredictionsShared() {
         const data = await fetchJsonWithTimeout(`${API_PROXY_BASE}/predictions/today`, backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
         if (data && data.found && Array.isArray(data.predictions)) {
           data.predictions.forEach((p) => predsByFixtureId.set(String(p.fixtureId), p));
+        }
+        // v97: サーバーが「読めなかった」(readFailed)を返した結果は共有キャッシュに固定しない
+        //   (60秒後に読み直せるように)。ヒーローカードは注記を出したうえで自動で読み直す。
+        if (data && (data.readFailed || data.upcomingReadFailed)) {
+          __todayPredictionsPromise = null;
+          scheduleDegradedRetry("predictionsToday", () => { todayPredCachedData = null; renderTodayPredictionsHero(false); });
         }
         return data;
       } catch (e) {
@@ -11526,7 +11705,13 @@ async function renderTodayPredictionsHero(reuseCached) {
   const rowHtml = (p) => {
     const homeName = escapeHtml((p.home && p.home.name) || "ホーム");
     const awayName = escapeHtml((p.away && p.away.name) || "アウェイ");
-    const kickoffStr = p.kickoff ? new Date(p.kickoff).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "";
+    // v97: 「次の試合」(今日ではない日)は日付も添える。時刻だけだと「今夜23:00」と誤読される。
+    const kickoffStr = p.kickoff ? (() => {
+      const d = new Date(p.kickoff);
+      const t = d.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" });
+      const sameDay = d.toLocaleDateString("ja-JP") === new Date().toLocaleDateString("ja-JP");
+      return sameDay ? t : `${d.toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" })} ${t}`;
+    })() : "";
     // ---- v53「AIと予想対決」: 未開始の試合は、自分の予想を選ぶまでAIの予想を伏せる ----
     //   (スキップでいつでも見られる。対決OFFなら従来どおり)
     if (duelModeOn() && String(p.status || "") === "NS" && !p.resolved && p.predictedWinner && !duelGetPicks()[p.fixtureId]) {
@@ -11660,7 +11845,7 @@ async function renderTodayPredictionsHero(reuseCached) {
   if (duelJoinSubmitBtn) duelJoinSubmitBtn.addEventListener("click", () => {
     const inp = document.getElementById("duelNickInput");
     const nick = inp ? inp.value.trim() : "";
-    if (!nick) { if (inp) inp.placeholder = "ニックネームを入れてください"; return; }
+    if (!nick) { if (inp) inp.placeholder = window.t("ニックネームを入れてください"); return; } // v97: 多言語表示で日本語が漏れないように
     if (duelLbJoin(nick)) {
       duelLastRegisterNote = "🏆 参加登録しました。ここから先のピックが自動でランキングに登録されます。";
     } else {
@@ -11706,11 +11891,13 @@ async function renderDailyReportWidget() {
       : "保存先(Upstash)に接続できないため、いまはダッシュボードの数字を読み出せません(0件という意味ではありません)。復旧すると自動的に表示が戻ります。";
     summaryEl.innerHTML = `<span class="value-note">📊 ${msg}</span>`;
     if (detailsEl) detailsEl.innerHTML = "";
+    scheduleDegradedRetry("dailyReport", () => renderDailyReportWidget()); // v97: 約束どおり自動で読み直す
     return;
   }
   const degradedLine = data.degraded
     ? `<div class="value-note" style="margin-top:4px; color:var(--warn, #b3541e);">⚠️ 保存先から一部の記録を読み出せなかったため、この表示の一部は不完全です(60秒後に読み直します)。</div>`
     : "";
+  if (data.degraded) scheduleDegradedRetry("dailyReportDegraded", () => renderDailyReportWidget()); // v97: 「60秒後に読み直します」を実際に行う
   const u = data.updates || {};
   const p = data.predictions || {};
   const api = data.apiUsage || {};
@@ -12705,7 +12892,7 @@ async function shareDigestImage(dg) {
     const blob = await (await fetch(dataUrl)).blob();
     const file = new File([blob], "ai_weekly_digest.png", { type: "image/png" });
     if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
-      await navigator.share({ files: [file], title: "今週のAIダイジェスト" });
+      await navigator.share({ files: [file], title: window.t("今週のAIダイジェスト") }); // v97
       return;
     }
     const a = document.createElement("a");
@@ -12882,6 +13069,7 @@ function psWireCombo(inputId, listId, field, onPick) {
   });
 
   input.addEventListener("keydown", (e) => {
+    if (e.isComposing || e.keyCode === 229) return; // v97: 日本語入力の変換確定の Enter/矢印では動かさない
     if (e.key === "ArrowDown") { e.preventDefault(); move(1); }
     else if (e.key === "ArrowUp") { e.preventDefault(); move(-1); }
     else if (e.key === "Enter") {
@@ -12940,6 +13128,9 @@ async function psLoadFacets() {
   } catch (e) { data = null; }
   if (!data || !data.ok) {
     if (lead) lead.textContent = "サーバーに接続できないため、選手データを読み込めませんでした。時間をおいて再度お試しください。";
+    // v97: 起動直後の失敗(サーバー起床待ち)で選手検索が再読み込みまで使えないままになっていた。
+    //   自動で読み直す(65秒後・最大5回)。
+    scheduleDegradedRetry("psFacets", () => psLoadFacets());
     return null;
   }
   psState.facets = data;

@@ -95,6 +95,7 @@ function createMockRedis() {
   async function upstashCmd(cmd) {
     const [op, ...args] = cmd;
     if (op === "GET") return store.has(args[0]) ? store.get(args[0]) : null;
+    if (op === "MGET") return args.map((k) => (store.has(k) ? store.get(k) : null)); // v97: 本番と同じく複数キーをまとめて読めるようにする
     if (op === "SET") { const [key, value, flag] = args; if (flag === "NX" && store.has(key)) return null; store.set(key, value); return "OK"; }
     if (op === "INCR") { const cur = parseInt(store.get(args[0]), 10) || 0; store.set(args[0], String(cur + 1)); return cur + 1; }
     if (op === "RPUSH") { const [key, val] = args; const l = store.get(key) || []; l.push(val); store.set(key, l); return l.length; }
@@ -131,7 +132,7 @@ function makeFlatFixtureList(teamId, n, dateBase) {
       homeLambda: 1.6, awayLambda: 1.1,
       features: { formDiff: 0, goalRateDiff: 0, injuryDiff: 0, standingsDiff: 0, headToHeadDiff: 3, fatigueDiff: 0 },
       weightsSnapshot, factorImportance: [],
-      kickoff: new Date().toISOString(), loggedAt: new Date().toISOString(),
+      kickoff: "2025-01-01T12:00:00Z" /* v97: 答え合わせ対象はキックオフ+2時間を過ぎている必要がある(実際の試合と同じ) */, loggedAt: new Date().toISOString(),
       resolved: false, actualWinner: null, correct: null, resolvedAt: null,
       originTeamEn, stateHypothesis: `${REGISTERED_TEAMS[0].nameJa}が優位という仮説(過去対戦重視・テスト用)`,
     });
@@ -185,7 +186,7 @@ function makeFlatFixtureList(teamId, n, dateBase) {
       homeFormScore: 3, awayFormScore: -3, predictedWinner: "home",
       features: { formDiff: 6, goalRateDiff: 0, injuryDiff: 0, standingsDiff: 0, headToHeadDiff: 0, fatigueDiff: 0 },
       weightsSnapshot: EXTENDED_DEFAULT_WEIGHTS, factorImportance: [],
-      kickoff: new Date().toISOString(), loggedAt: new Date().toISOString(),
+      kickoff: "2025-01-01T12:00:00Z" /* v97: 答え合わせ対象はキックオフ+2時間を過ぎている必要がある(実際の試合と同じ) */, loggedAt: new Date().toISOString(),
       resolved: false, actualWinner: null, correct: null, resolvedAt: null,
       originTeamEn, stateHypothesis: `${REGISTERED_TEAMS[0].nameJa}が優位という仮説(的中予定)`,
     });

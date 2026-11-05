@@ -274,9 +274,14 @@ test("★欠陥F: テストランナーが async の失敗を本当に検出で�
     "await 無しの t.fn() 呼び出しが残っている");
 });
 
-test("★欠陥D: 予算の書き戻し間隔が短く、終了時の取りこぼし対策がある", () => {
+test("★欠陥D: 予算の書き戻しは件数または時間で必ず行われ、終了時の取りこぼし対策がある", () => {
   const src = fs.readFileSync(path.join(ROOT, "server", "server.js"), "utf8");
-  assert.ok(/budgetWritesPending >= 2/.test(src), "書き戻し間隔が長すぎる(消費の記録が失われる)");
+  // v97(全体監査): 「2件ごと」は Upstash コマンドを API呼び出し1件につき約1つ消費して
+  // 無料枠枯渇の一因になったため、「25件ごと or 60秒経過」へ変更。正確さはヘッダー
+  // (x-ratelimit-requests-remaining)による毎回の合わせ直しと終了時の書き戻しで守る。
+  assert.ok(/budgetWritesPending >= BUDGET_FLUSH_EVERY/.test(src), "件数による書き戻し条件が無い");
+  assert.ok(/lastBudgetFlushAt\) >= BUDGET_FLUSH_INTERVAL_MS/.test(src), "時間による書き戻し条件が無い(長時間の未書き戻しが起きる)");
+  assert.ok(/reconcileFromRemaining/.test(src), "本家ヘッダーによる合わせ直しが無い(書き戻し間隔を伸ばす前提が崩れる)");
   assert.ok(src.includes('process.on("beforeExit"'), "プロセス終了時の書き戻しが必要");
   // 第3次監査の指摘: SIGTERM/SIGINTを握ると既定の終了動作を上書きするため、
   // 書き戻し後に必ず自分で終了させること(Renderの再デプロイが固まらないように)

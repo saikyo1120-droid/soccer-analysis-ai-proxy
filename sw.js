@@ -6,7 +6,7 @@
  *   ・/api/ へのリクエストは一切触らない(鮮度・予算計測・レート制限をそのまま保つ)。
  *   ・POST等のGET以外・別オリジンも触らない。
  */
-const CACHE_NAME = "soccer-ai-shell-v96"; // v96: 画面更新(流入計測ビーコンの独立化・送り先変更)に合わせて更新
+const CACHE_NAME = "soccer-ai-shell-v97"; // v97: 画面更新(全体監査の修正)に合わせて更新
 const SHELL = ["/", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"];
 
 self.addEventListener("install", (event) => {
@@ -41,7 +41,11 @@ self.addEventListener("fetch", (event) => {
       // キャッシュ制御に任せる(端末に古いページを残さない)。
       if (fresh && fresh.ok && (url.pathname === "/" || SHELL.indexOf(url.pathname) !== -1)) {
         const cache = await caches.open(CACHE_NAME);
-        cache.put(req, fresh.clone()).catch(() => {});
+        // v97: トップページは「/?from=x」のような検索文字列つきで開かれることが多い(流入計測)。
+        //   そのままの URL で保存すると、オフライン時の代替(caches.match("/"))に一致しない。
+        //   トップページはパス名「/」で保存する(他のシェル資産は従来どおり)。
+        const putKey = url.pathname === "/" ? new Request("/") : req;
+        cache.put(putKey, fresh.clone()).catch(() => {});
       }
       return fresh;
     } catch (err) {

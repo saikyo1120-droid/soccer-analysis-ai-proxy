@@ -53,7 +53,7 @@ async function resolveOneFixture(mock, { fixtureId, originTeamEn, homeTeamEn, aw
     fixtureId, homeTeamEn, awayTeamEn, homeFormScore: 0, awayFormScore: 0, predictedWinner,
     features: features || { formDiff: 0, goalRateDiff: 0, injuryDiff: 0, standingsDiff: 0, headToHeadDiff: 0, fatigueDiff: 0 },
     weightsSnapshot: weightsSnapshot || EXTENDED_DEFAULT_WEIGHTS, factorImportance: [],
-    kickoff: new Date().toISOString(), loggedAt: new Date().toISOString(),
+    kickoff: "2025-01-01T12:00:00Z" /* v97: 答え合わせ対象はキックオフ+2時間を過ぎている必要がある(実際の試合と同じ) */, loggedAt: new Date().toISOString(),
     resolved: false, actualWinner: null, correct: null, resolvedAt: null,
     originTeamEn, stateHypothesis: `${originTeamEn}のテスト用仮説`,
   });

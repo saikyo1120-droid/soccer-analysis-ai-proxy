@@ -251,6 +251,7 @@ const get = (p) => new Promise((resolve, reject) => {
   });
 
   await t("⑭ 復旧後: /api/growth-log は通常表示(ranYet:true)、/api/learning/progress は「記録なし」を正しく区別", async () => {
+    srvMod.__clearCacheForTest("learn:growth-log"); // v97: 停止中の劣化応答は60秒キャッシュされる(復旧直後の検証なので捨てる)
     const r = await get("/api/growth-log");
     assert.strictEqual(r.body.readFailed, undefined);
     assert.strictEqual(r.body.ranYet, true, JSON.stringify(r.body).slice(0, 200));

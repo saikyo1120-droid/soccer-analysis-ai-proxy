@@ -8792,3 +8792,95 @@ v95 の流入計測を 9/28 07:56 UTC に配備後、利用者は 9/28 夕方以
 新しいタブで `https://soccer-analysis-ai-proxy.onrender.com/?from=test` を開き、1分置いて `/growth` を見る。
 「届いているかの確認」に サーバー側の受信件数 と この端末の最後の送信結果 が出る。経路一覧に `test` が1件出れば計測は正常。
 出ない場合は、受信内訳のどこで止まっているかで原因が分かる(received=0 → ブラウザ側で送れていない / rateLimited>0 → 枠 / badBody>0 → 本文)。
+
+## 開発ログ・ラウンド78(2026年10月20日) — v97「全体監査(隅々まで)の修正」(利用者の依頼「他にバグや不具合がないか隅々まで確認して、あればすみやかに修正。改善案も提案」)
+
+### 監査の範囲と方法
+10/1〜10/2 に、サーバー(`server.js`・`learning/`・`knowledge/`・`memory/`・`rag/`・`reasoning/`・`discuss/`・`llm/`)と
+画面(`index.html`・`sw.js`)の**全ファイルを4領域に分けて並列で静的監査**し、本番の実測(Upstash の消費・API 使用量・
+応答)と突き合わせた。見つかった約80件を「データが消える/二重になる」「本番の費用(Upstash・API・LLM)」「予想の採点と表示の食い違い」
+「10万人スケールでの保護」「画面の不具合」に分類し、**すべて根本原因で修正**した(対症療法の分岐追加はしない)。
+納品が 10/20 になったのは、10/3〜10/19 に開発側の会話が休止していたため(本番は無停止で稼働・学習を継続)。
+
+### A. 保存先(Upstash)の消費を、精度を落とさずに減らす(方針③「無駄だけを削る」)
+本番実測: 10/1 時点 16,440 → 10/20 時点 543,999 コマンド(**約2.8万/日**。無料枠50万/月を19日で超過)。消費の大口は次の3つだった。
+1. **API 予算の書き戻しが API 呼び出し 2回につき1回**で、さらに毎回 `EXPIRE` も送っていた(= API 1回 ≒ Upstash 1コマンド。1日3,000〜4,000)。
+   → `learning/apiBudget.js`: 書き戻しは **25回ごと or 60秒ごと**(`API_BUDGET_FLUSH_EVERY` / `API_BUDGET_FLUSH_INTERVAL_MS`)+終了時に必ず flush。
+   `EXPIRE` は**カウンターを自分が作った時(INCRBY の結果が増分と一致)か、その日のプロセス初回だけ**。`summary()` に `flushCount` / `unflushed` を出す。
+   予算の上限判定はプロセス内の実数で行うため、書き戻し間隔を空けても**上限超過の危険は増えない**(落ちた場合に失うのは最大25件分の記録のみ)。
+2. **「今日の予想」(`/api/predictions/today`)が、予想1件ごとに GET**(最大80件+校正マップ)。画面を開くたびに約80コマンド。
+   → **MGET 1回**に集約(`upstashMGetJSONStrict`)。今後の試合(upcoming)も MGET。
+3. **成長ログ(`/api/growth-log`)がキャッシュ無し**で、開くたびに5キーを個別 GET。`/api/learning/metrics` と `/api/learning/health` も同様。
+   → `learning/storeRead.js`(新規)の `readManyJSON` で **MGET 1回**+**5分キャッシュ**(読めなかった時は60秒)。
+   `health` はキャッシュ本体に `servedFromCache:true` と、生きた値(`learningRunningNow` 等)を毎回上書きする `learningHealthLiveFields()`。
+   **学習が完走した直後に `learn:` 系のキャッシュを全部消す**ので、「学習したのに画面が古い」は起きない。
+その他: 日次差分・ランキング・クラブ要約の保留予想・対決リーダーボード・知識グラフの辺・知識ストアのハッシュ読みも MGET 化。
+MGET が使えない保存先(テスト用のモック等)では自動で1件ずつ読む方式へ戻る(`readMode: "per-key"`)。
+
+### B. 「読めなかった ≠ 無かった」— データが消える/二重になる経路の根治
+`upstashGetJSON` は失敗を null に飲み込むため、保存先が一時的に読めないと「無い」と誤認して**上書き・二重作成・消去**が起きる経路が多数あった。
+読む→直す→書く(read-merge-write)の全箇所を、**失敗を例外として扱う厳格読み(`upstashGetJSONOrThrow` / `upstashMGetJSONStrict` / `getDossierStrict` 等)**に替え、
+読めなかった時は「書かない・消さない・後回し」にした。
+- 予想の作成(`getOrLogPrediction`): 既存予想が読めなければ**作らない**(同じ試合の二重予想を防ぐ)。
+- 日次学習の答え合わせ(`learning/dailyJob.js`): 保留一覧が読めなければその回は打ち切り、部分的にしか読めなければ null の分は飛ばす。
+  結果の保存に失敗したら **LREM(保留からの除去)をしない**で解決ロックを外し、翌日に再挑戦(`prediction_resolve_save_failed:` を記録)。
+  重みは1回だけ読み、読めなければ調整・市場ブレンド・API-Football ブレンドを**見送る**(`weights_unreadable`)。
+  チーム名辞書・成長ログ統合・直前オッズ観測の累積・自己調整設定(`self_tune_config_not_saved:`)・xG 収集・精度の日次保存(`accuracy_save_failed:`)も同様。
+- 日次ロックの解放(`releaseDailyRunLock`): 自分のロックか確認できなければ外さない(`released:false`)。
+- 知識(`knowledge/clubDossier.js` / `knowledgeStore.js` / `knowledgeGraph.js`): 選手の保存は既存を読めた時だけ統合、索引・類似度索引は読めなければ作り直さない。
+- 記憶(`memory/memoryStore.js` `LOOKUP_FAILED` / `WRITE_FAILED`、`memory/thoughtTimeline.js` `READ_FAILED`)、自己改善(`learning/selfImprovement.js` の
+  `configsFromFailedRead` → 読めなかった設定で上書きしない)、対決リーダーボード(処理できた分だけ `HDEL`、残りは `deferred`)。
+- 画面向け API(ランキング・ダイジェスト・クラブ要約・対決・QA・スカウト・日次差分・`/match/<id>`・sitemap): 読めなかった時に
+  **「空」を5分キャッシュしていた**のをやめ、`readFailed:true` を**60秒だけ**キャッシュ(`/match/<id>` は代替HTML+`Cache-Control: no-store`+`Retry-After: 60`)。
+- 日次スナップショット(`buildDailySnapshot`): 索引やカウンターが部分的にしか読めない時は `incomplete` にして**保存しない**(翌日の差分が「減った」に化けない)。
+
+### C. 予想の採点・表示・校正の食い違い
+- **最終確率(`finalProbs`)を予想レコードに保存**。市場ブレンド/第二意見ブレンド後の確率で予想しているのに、採点・画面・校正は**ブレンド前の確率**を
+  使っていた(自信の数字と的中率の対応が崩れる)。`learning/accuracyTracker.js` の `oneX2ProbsOf(record)` / `confidenceOnPickOf(record)` に一本化し、
+  自信 = **予想した結果の確率**(最大確率ではない)。採点結果に `confidenceBasis` / `probsSource` を残す。
+- **キックオフ+2時間より前の保留予想は答え合わせの API を呼ばない**(`pendingSkippedNotFinished`)。終わっていない試合に毎回 API を使っていた。
+- 過去データの取り込み(`learning/historicalBackfill.js`): 延長・PK 決着(AET/PEN)は **90分のスコア**(`score.fulltime`)で 1X2 を学習(`finishedStatus` を保存)。
+- 男子専用の徹底: 2軍パターン(`RESERVE_TEAM_PATTERNS`)拡張、女子大会の判定(`WOMENS_COMP_RE`)に kvinde / vrouwen / kobiet / naisten を追加。
+- 負傷者の特徴量(`learning/features.js` `computeInjuryCountFeature`): **過去10日〜今後7日の窓**で数える(以前は古い記録まで数えていた)。
+  会話側の負傷要約(`rag/knowledgeSource.js`)も同じ基準。
+- 根拠プール(`reasoning/evidencePool.js`)の同文重複を除去。多段推論(`discuss/multiStep.js`)の「実際2-1」表記と選手名の表示。
+- 知識グラフの辺の寿命を180日に(観測のたびに延長)。選手検索の æ/œ/ð/þ 正規化(`knowledge/playerSearch.js` / `clubDossier.js`)。
+
+### D. 10万人スケールの保護と費用(方針⑥)
+- **重い API の1日予算が「処理中」を数えていなかった** → 同時に来た要求で上限を突き抜けられた。`heavyInflight` で処理中も数え、終わったら解放。
+- **軽い API と重い API の1分枠を分離**: 画面を1回開くと十数回の軽い通信が出るため、共有枠(30/分)を軽い通信が食い潰し、肝心の分析が 429 になっていた。
+  `LIGHT_API_PATHS`(health・今日の予想・精度・反省・成長ログ・学習系・QA・差分・ランキング・知識の検索/選手・対決・クラブ要約・今日の試合・流入)は
+  **`LIGHT_RATE_LIMIT_PER_MINUTE`(既定90/分、`RATE_LIMIT_PER_MINUTE` を上げた環境ではその3倍)**。429 には `Retry-After: 30` と `rateLimited:true`。Skill 専用レーンは不変。
+- **1人の1日上限エラー(`IP_DAILY_LIMIT`)を共有キャッシュに入れていた** → 1人が上限に達すると、同じ選手・試合を見る**全員**に上限エラーが返った。
+  `cacheSetUnlessPerClient` で個人の上限エラーは共有キャッシュへ入れない(選手成績・今日の試合・監督検索・試合分析)。
+- **LLM 予算の返金**: 生成に失敗した呼び出しも予算を消費していた → `refundLlmBudget()`(個人・全体とも DECR)。
+  クラブ/選手プロフィールのその場生成が**予算の外**だった → `generateLLMMetered` で同じ予算の中に入れる。
+- The Odds API 呼び出しに**時間制限(既定15秒・`ODDS_API_TIMEOUT_MS`)**と、エラー文からのキー秘匿。Anthropic 側もキー秘匿。
+- 不正な URL / Host ヘッダーで 500 を返していた → 400 `{ok:false,error:"bad request"}`。
+
+### E. 画面(`index.html` / `sw.js`)
+- **起きたばかりのサーバーへの最初の通信(6秒)が切れたら、GET に限り1回だけ60秒で待ち直す**(Render の無料枠は寝ているため「接続できません」が出やすかった)。
+  試合分析は 45秒(`MATCH_ANALYSIS_TIMEOUT_MS`)。
+- 今日の試合が取れなかった時に**理由**を出す(`lastFixturesFetchReasonJa`)。
+- **日本語入力の変換中 Enter で送信されない**(`isComposing` / keyCode 229 をチャット2か所と選手検索で判定)。
+- 同じ質問の**二重送信を防ぐ**(`discussInFlightKeys`)。保存先が一時停止中の表示は **65秒おき・最大5回**だけ再取得(`scheduleDegradedRetry`)。
+- 「好ゲーム」の訳抜け、MOTM の評価が無い時の表示、終了試合でスコアが無い時の「(スコア不明)」、選手カードの再表示、今日以外の試合の日付前置き、
+  試合分析の隠れ枠の取り違え(`__realFixtureAnalysisToken`)、エンジン合計の「取得できません」、答え合わせ件数が読めない時の文言、共有タイトルの翻訳。
+  v97 の新しい文言は 13 件 × 3 言語を辞書に追加(`RAWP4`)。
+- `sw.js` は v97。トップページは `?from=` 付きで開いてもオフライン代替が一致するよう、保存キーを `/` に正規化。
+
+### 検証(実測)
+- 新規 `v97_audit_fixes_test.js` **39/39**(A: 予算書き戻し・MGET 集約・キャッシュ、B: 厳格読みの各経路、C: finalProbs/採点/AET・PEN/負傷窓、D: 処理中計上・軽重レーン・個人エラー非共有・LLM 返金、E: 画面と sw)。
+- 既存テストはサーバー側 29 本・画面側 38 本がすべて合格(`v92` / `v93` / `v94` / `v95` / `budget_and_feature_audit` はこの版の仕様に合わせて更新。
+  モック8本に MGET を追加)。起動スモーク 12 経路すべて 200。翻訳検査(Playwright)17/17。負荷テスト合格。
+- 本番 10/20 01:22 UTC 実測(v97 配備前): 直近30日 公式 62.9%(450件)/ `accuracy.readMode: mget` / `degraded:false` / `silentFailures 0` /
+  Upstash 月間推定 543,999(保存先は正常応答)。v97 の削減効果は配備後に `/api/health` の `upstashUsage.monthCommandsThisProcess` の1日あたりの伸びで測る。
+
+### 環境変数(すべて任意・未設定なら既定値)
+`API_BUDGET_FLUSH_EVERY`(既定25)/ `API_BUDGET_FLUSH_INTERVAL_MS`(既定60000)/ `LIGHT_RATE_LIMIT_PER_MINUTE`(既定90)/ `ODDS_API_TIMEOUT_MS`(既定15000)
+
+### 配備後の確認手順(利用者)
+1. `https://soccer-analysis-ai-proxy.onrender.com/api/health` に `upstashUsage.monthCommandsThisProcess` が出て、翌日見たときの増え方が 1万/日を大きく下回る。
+2. `/api/predictions/today` に `readFailed` が出ない(読めている)こと、`/api/learning/daily-report` が `degraded:false` のままであること。
+3. 画面で日本語を変換中に Enter を押しても送信されない。`/?from=test` を開いて `/growth` の受信内訳を見る(v96 の確認と同じ)。
+4. GitHub の `llm/providers/server.js`(2026-08-06 の古い複製・未使用・315KB)は削除してよい(本体の `server.js` とは別物。残っていても動作に影響はない)。

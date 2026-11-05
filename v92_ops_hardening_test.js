@@ -194,7 +194,7 @@ function seedClubs(m, n) {
     assert.ok(dj.includes("warnings: mergeWarningSummaries(previous.warnings, current.warnings),"), "同日再実行の合算が無い");
     assert.ok(dj.includes("for (const w of universeStats.warnings) warn(`universe:${w}`);"), "収集側の warnings が合流していない");
     for (const call of [
-      "loadTuneConfig({ upstashEnabled, upstashGetJSON, noteWarning: warn })",
+      "loadTuneConfig({ upstashEnabled, upstashGetJSON, upstashCmd, noteWarning: warn })", // v97: upstashCmd 追加(失敗の区別)
       "clubEloLookup, xgLookup, noteWarning: warn }",
       "processAnswerability({ ...intelDeps, upstashCmd, noteWarning: warn }",
       "appendHistory({ upstashEnabled, upstashCmd, noteWarning: warn }",
@@ -306,7 +306,8 @@ function seedClubs(m, n) {
     const dj = fs.readFileSync(path.join(__dirname, "learning", "dailyJob.js"), "utf8");
     const decl = dj.indexOf("const lineupWatchScored = { n: 0, morningSum: 0, preKickSum: 0 };");
     const use = dj.indexOf("lineupWatchScored.n++;");
-    const loop = dj.indexOf('for (const fixtureIdStr of pendingIds) {');
+    // v97: 答え合わせループは index 付き(MGET まとめ読み)の for へ変わった
+    const loop = dj.indexOf('for (let pIdx = 0; pIdx < pendingIds.length; pIdx++) {');
     assert.ok(decl > 0 && use > 0 && loop > 0, "対象の行が見つからない");
     assert.ok(decl < loop && loop < use, `宣言(${decl})が答え合わせループ(${loop})より前に無い`);
     assert.strictEqual((dj.match(/const lineupWatchScored = /g) || []).length, 1, "宣言が二重になっている");

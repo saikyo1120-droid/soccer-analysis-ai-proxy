@@ -54,7 +54,9 @@ const KEY = "test-skill-key-0123456789abcdef";
 
 (async () => {
   // ---------------- 鍵あり・診断保護ありのサーバー ----------------
-  const A = await bootServer(8907, { SKILL_API_KEY: KEY, SKILL_RATE_LIMIT_PER_MINUTE: "6", AUTO_COLLECT_SECRET: "diag-secret" });
+  // v97: /api/health は「軽い読み出し」の別枠(既定90回/分)になったため、この検証では軽い枠も3回に絞る
+  //   (レーンの仕組み=鍵の有無で枠が分かれること、を確認するテスト。しきい値そのものは対象外)。
+  const A = await bootServer(8907, { SKILL_API_KEY: KEY, SKILL_RATE_LIMIT_PER_MINUTE: "6", LIGHT_RATE_LIMIT_PER_MINUTE: "3", AUTO_COLLECT_SECRET: "diag-secret" });
   try {
     await t("① 鍵なし: 従来どおりIPの枠(3回まで・4回目は429・レーン表示は shared)", async () => {
       // 起床確認で1回使っているので、残り2回が通り、その次が429
@@ -118,10 +120,15 @@ const KEY = "test-skill-key-0123456789abcdef";
   try {
     await t("④ 鍵未設定: ヘッダーは無視され従来のIP枠(4回目429)。/api/health の skillLane は off・診断も無効を明示", async () => {
       const h = { "X-Skill-Key": KEY };
-      const r1 = await get(8909, "/api/health", h); const r2 = await get(8909, "/api/health", h); const r3 = await get(8909, "/api/health", h);
+      const r1 = await get(8909, "/api/health", h);
       assert.strictEqual(r1.status, 200); assert.strictEqual(JSON.parse(r1.body).skillLane, "off");
       assert.strictEqual(r1.headers["x-skill-lane"], "shared");
-      assert.strictEqual(r2.status, 200); assert.strictEqual(r3.status, 429, "未設定環境で従来の枠が効いていない");
+      // v97: /api/health は「軽い読み出し」の緩い枠(別バケツ)になったため、従来のIP枠(3回/分)の
+      //   確認は重い処理の経路(/api/matchup。APIキー無しでも200を返す)で行う。
+      const r2 = await get(8909, "/api/matchup?q=x", h); const r3 = await get(8909, "/api/matchup?q=x", h);
+      const r4 = await get(8909, "/api/matchup?q=x", h); const r5 = await get(8909, "/api/matchup?q=x", h);
+      assert.strictEqual(r2.status, 200); assert.strictEqual(r3.status, 200); assert.strictEqual(r4.status, 200);
+      assert.strictEqual(r5.status, 429, "未設定環境で従来の枠が効いていない");
     });
   } finally { C.srv.kill("SIGKILL"); }
 

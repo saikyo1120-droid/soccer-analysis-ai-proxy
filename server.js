@@ -78,7 +78,7 @@ const { recordPredictionEvaluation, buildComparisonForResponse } = require("./me
 const { getMetricsTrend } = require("./learning/dailyMetrics");
 // 2026年8月・「本当に毎日賢くなるAI」フェーズ(ご指示②⑨⑩):
 // 予測精度の毎日測定・学習計画・信頼度の説明をダッシュボードへ返す
-const { getAccuracyTrend, computeMarketProbs } = require("./learning/accuracyTracker");
+const { getAccuracyTrend, computeMarketProbs, oneX2ProbsOf } = require("./learning/accuracyTracker"); // v97: oneX2ProbsOf(最終確率の優先)
 // 2026年8月・精度証明ラウンド②: 較正(実測のズレ)に基づく表示勝率の自動補正
 const { applyCalibration } = require("./learning/calibrationCorrection");
 // 自己改善ループ⑤: 「この1か月でAIが何を改善してきたか」の履歴読み出し
@@ -283,6 +283,19 @@ function cacheSet(key, data, ttlMs) {
 //   別の選手の質問に対して返る**ことが起こりうる。各部品を符号化して連結する。
 function cacheKeyOf(prefix, parts) {
   return prefix + ":" + (parts || []).map((v) => encodeURIComponent(String(v ?? ""))).join("|");
+}
+
+// ---- v97(全体監査): 「ある利用者だけの失敗」を全員向けキャッシュに入れない ----
+//   IP_DAILY_LIMIT(1端末あたりの重い処理の上限)はその利用者だけの状態なのに、以前は
+//   他の失敗と同じく {found:false, reason:"IP_DAILY_LIMIT"} を共有キーに5分キャッシュしていた。
+//   上限に達した人が1回検索すると、同じ選手・試合を見た**全員**が5分間「見つかりません
+//   (上限)」になる。利用者固有の失敗はキャッシュせず、その人にだけ返す。
+function isPerClientError(e) {
+  return !!(e && e.code === "IP_DAILY_LIMIT");
+}
+function cacheSetUnlessPerClient(key, payload, ttlMs, e) {
+  if (isPerClientError(e)) return;
+  cacheSet(key, payload, ttlMs);
 }
 
 // 2026年8月・本番調査で発見された不具合の修正(GitHub Actionsの手動実行が
@@ -598,6 +611,36 @@ async function upstashMGetJSON(keys) {
   for (const k of list) values.push(await upstashGetJSON(k));
   return { readMode: "per-key", values };
 }
+// v97(全体監査): 「読めなかった」を握り潰さない複数キー読み出し。
+//   upstashMGetJSON は失敗時に1件ずつの GET へ落とし、それも失敗すると null を返すため、
+//   呼び出し側は「保存先が落ちている」のか「本当に無い」のかを区別できなかった
+//   (トップページの各カードが停止中に「予想はありません」「データなし」と断定して
+//   5〜30分キャッシュしていた)。こちらは失敗をそのまま投げるので、呼び出し側で
+//   readFailed を立てて短いキャッシュ(60秒)にできる。
+//   ・最大100キーずつに分けて MGET(1回のリクエストが大きくなりすぎないように)
+//   ・戻り値は keys と同じ長さの配列(無かった要素は null)
+async function upstashMGetJSONStrict(keys, { chunk = 100 } = {}) {
+  const list = (keys || []).filter(Boolean);
+  if (!list.length) return [];
+  if (storeIsDown()) {
+    const err = new Error("STORE_UNAVAILABLE");
+    err.code = "STORE_UNAVAILABLE";
+    throw err;
+  }
+  const out = [];
+  const parse = (v) => { if (v === null || v === undefined) return null; if (typeof v === "object") return v; try { return JSON.parse(v); } catch (e) { return null; } };
+  for (let i = 0; i < list.length; i += chunk) {
+    const part = list.slice(i, i + chunk);
+    const raw = await upstashCmd(["MGET", ...part]); // 失敗はそのまま投げる(呼び出し側で readFailed)
+    if (!Array.isArray(raw) || raw.length !== part.length) {
+      // MGET に対応しない保存先(テストのフック等): 1件ずつ GET(こちらも失敗は投げる)
+      for (const k of part) out.push(parse(await upstashCmd(["GET", k])));
+      continue;
+    }
+    for (const v of raw) out.push(parse(v));
+  }
+  return out;
+}
 // ============================================================================
 // 2026年8月8日・「正答率の更新が遅い」の実測と対処
 // ----------------------------------------------------------------------------
@@ -792,6 +835,22 @@ const rateBuckets = new Map();
 const RATE_BUCKETS_MAX = 5000;
 // 上限は環境変数で調整できるようにする(既定30。検証用に一時的に緩めたい場合に使う)
 const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE) || 30;
+// ---- v97(全体監査): 「軽い読み出し」と「重い処理」で1分あたりの枠を分ける ----
+//   ホーム画面は1回の表示で約15〜18本の API を呼ぶ(すべてサーバー側キャッシュ/保存先の読み出しで、
+//   利用者の操作で API-Football を呼ぶものではない)。従来は全部が同じ「1IP=1分30回」の枠だったため、
+//   1分以内に2回開き直す・タブを2つ開く・家族で同じ回線、といった普通の使い方で後半の呼び出しが
+//   429 になり、カードが「取得できませんでした」に化けていた(重い処理の保護という本来の目的と無関係)。
+//   軽い読み出し専用の枠(既定90回/分・IP別)を設け、重い処理(考察・分析・選手検索等)は従来どおり30回/分。
+const LIGHT_RATE_LIMIT_PER_MINUTE = Number(process.env.LIGHT_RATE_LIMIT_PER_MINUTE) || Math.max(90, RATE_LIMIT_PER_MINUTE * 3); // 既定90(RATE_LIMIT_PER_MINUTE を大きくした環境ではその3倍)
+const LIGHT_API_PATHS = new Set([
+  "/api/health", "/api/predictions/today", "/api/accuracy-stats", "/api/reflections", "/api/growth-log",
+  "/api/learning/daily-report", "/api/learning/metrics", "/api/learning/health", "/api/learning/progress",
+  "/api/qa/latest", "/api/daily-diff", "/api/digest/latest", "/api/ratings/rankings", "/api/knowledge/scouting",
+  "/api/knowledge/coverage", "/api/duel/leaderboard", "/api/duel/results", "/api/duel/pick", "/api/club/summary",
+  "/api/players/highlights", "/api/players/recommend", "/api/players/suggest", "/api/knowledge/player-facets",
+  "/api/knowledge/players", "/api/knowledge/club-players", "/api/knowledge/player", "/api/fixtures/today",
+  "/api/growth/traffic",
+]);
 
 // ---- v93(2026年9月24日): 正規のSkill呼び出し(Capafy等)のための「専用の枠」 ----
 //   Capafy の Run Online は利用者全員が同じ出口IPを共有する可能性が高い。上の「1IP=1分30回」
@@ -1185,7 +1244,11 @@ async function releaseDailyRunLock(opts) {
   const force = !!(opts && opts.force);
   try {
     if (!force) {
-      const cur = await upstashCmd(["GET", key]).catch(() => null);
+      // v97: 持ち主の確認に失敗したら外さない(旧実装は失敗→null→「空いている」と見なして
+      //   別プロセスのロックを DEL していた=二重学習の穴)。寿命で自動的に消える。
+      let cur;
+      try { cur = await upstashCmd(["GET", key]); }
+      catch (e) { return { released: false, reasonJa: "ロックの持ち主を確認できなかったため、外しませんでした(寿命で自動的に消えます)。" }; }
       if (cur && dailyRunLockToken && String(cur) !== String(dailyRunLockToken)) {
         // 別のプロセスが持っているロックなので触らない
         return { released: false, reasonJa: "このロックは別の実行が持っているため、外しませんでした。" };
@@ -1313,16 +1376,30 @@ async function getApiBudget() {
 // プロセス終了時にも必ず書き戻す。
 let budgetWritesPending = 0;
 let lastFlushedBudget = null;
+// v97(全体監査): 書き戻しの間隔。
+//   以前は「API呼び出し2件ごと」に書き戻していたため、日次学習(1日約3,000〜3,400件の
+//   API呼び出し)だけで Upstash コマンドを約3,000/日消費していた(9月の無料枠枯渇の一因)。
+//   消費の正確さは別の仕組みで守られている:
+//     ・API-Football の全応答ヘッダー x-ratelimit-requests-remaining で毎回「本家の残数」に
+//       合わせ直す(reconcileFromRemaining。過小報告は次の1件で必ず補正される)
+//     ・プロセス終了(SIGTERM/beforeExit)時に必ず書き戻す(flushBudgetOnExit)
+//   そのため「25件ごと、または前回の書き戻しから60秒経過」で十分であり、
+//   Upstash コマンドは API呼び出し1件あたり約1 → 約0.04〜0.08 に減る。
+const BUDGET_FLUSH_EVERY = Math.max(1, Number(process.env.API_BUDGET_FLUSH_EVERY) || 25);
+const BUDGET_FLUSH_INTERVAL_MS = Math.max(1000, Number(process.env.API_BUDGET_FLUSH_INTERVAL_MS) || 60_000);
+let lastBudgetFlushAt = Date.now();
 async function maybeFlushBudget(budget) {
   lastFlushedBudget = budget;
   budgetWritesPending++;
-  if (budgetWritesPending >= 2) {
+  const due = budgetWritesPending >= BUDGET_FLUSH_EVERY
+    || (Date.now() - lastBudgetFlushAt) >= BUDGET_FLUSH_INTERVAL_MS;
+  if (due) {
     // 第5次監査の修正: これまでは flush() を呼ぶ前に未書き戻し件数を0へ
     // リセットしていたため、**Upstashが一時的に落ちて書き戻しに失敗しても
     // 「書き戻し済み」扱いになり、終了時の再書き戻しも行われなかった**。
     // 成功したときだけリセットする。
     const ok = await budget.flush().catch(() => false);
-    if (ok !== false) budgetWritesPending = 0;
+    if (ok !== false) { budgetWritesPending = 0; lastBudgetFlushAt = Date.now(); }
   }
 }
 // プロセス終了時の取りこぼし防止。
@@ -1923,7 +2000,7 @@ async function handlePlayerSeasonStats(query) {
     return { status: 200, body: payload };
   } catch (e) {
     const payload = { found: false, reason: e.code || "error", error: e.message };
-    cacheSet(cacheKey, payload, 5 * 60 * 1000);
+    cacheSetUnlessPerClient(cacheKey, payload, 5 * 60 * 1000, e); // v97: 利用者固有の上限エラーは共有キャッシュに入れない
     return { status: 200, body: payload };
   }
 }
@@ -1949,9 +2026,17 @@ function outcomeFromScore(homeGoals, awayGoals) {
 // 架空の値を作らずnullを返し、その試合は正答率の集計対象にしない。
 async function getOrLogPrediction(fixtureId, meta, opts) {
   const key = `pred:${fixtureId}`;
-  const existing = await upstashGetJSON(key);
-  if (existing) return existing;
   if (!UPSTASH_ENABLED) return null;
+  // v97(全体監査): 「読めなかった」を「未記録」と取り違えない。旧実装は upstashGetJSON(失敗→null)
+  //   だったため、保存先が一瞬でも失敗すると既存の記録(答え合わせ済みのものも)を新しい記録で
+  //   **上書き**し(resolved:false に戻る→二重に答え合わせされる)、API も1回無駄に消費していた。
+  let existing = null;
+  try {
+    existing = await upstashGetJSONOrThrow(key);
+  } catch (e) {
+    return null; // 読めない間は記録しない(次の自動収集で改めて)
+  }
+  if (existing) return existing;
   try {
     // 第8次監査(Medium)の修正: cron(auto-collect)からの呼び出しはjobCallとして計上する
     const data = await callApiFootball("/predictions", { fixture: fixtureId }, { jobCall: !!(opts && opts.jobCall) });
@@ -2112,18 +2197,28 @@ async function resolvePrediction(fixtureId, homeGoals, awayGoals, opts) {
    学習ジョブとは切り離してある)。
    ============================================================================ */
 async function buildDailySnapshot() {
+  // v97(全体監査): 読めなかった値を 0 として「今日のスナップショット」に固定保存しない。
+  //   旧実装は失敗→null→0 で保存し(その日は二度と作り直されない)、翌日の「昨日との比較」が
+  //   「検索できる選手が3,000人減った」のような嘘になっていた。1つでも読めなかったら
+  //   incomplete:true を返し、呼び出し側は保存せず短いキャッシュで返す。
   const idx = await loadPlayerIndex(false).catch(() => null);
   const rows = (idx && idx.rows) || [];
+  const indexIncomplete = !idx || idx.partial === true;
   const C = playerSearch.COL;
+  let countersFailed = false;
   const [totalRaw, resolvedRaw, correctRaw, knowledgeRaw] = await Promise.all([
-    upstashCmd(["GET", "pred:total"]).catch(() => null),
-    upstashCmd(["GET", "pred:resolved"]).catch(() => null),
-    upstashCmd(["GET", "pred:correct"]).catch(() => null),
-    upstashCmd(["GET", "learn:knowledge:total"]).catch(() => null),
+    upstashCmd(["GET", "pred:total"]).catch(() => { countersFailed = true; return null; }),
+    upstashCmd(["GET", "pred:resolved"]).catch(() => { countersFailed = true; return null; }),
+    upstashCmd(["GET", "pred:correct"]).catch(() => { countersFailed = true; return null; }),
+    upstashCmd(["GET", "learn:knowledge:total"]).catch(() => { countersFailed = true; return null; }),
   ]);
   const resolved = parseInt(resolvedRaw, 10) || 0;
   const correct = parseInt(correctRaw, 10) || 0;
   return {
+    incomplete: indexIncomplete || countersFailed,
+    incompleteReasonJa: (indexIncomplete || countersFailed)
+      ? `${indexIncomplete ? "選手索引を完全に読み出せませんでした" : ""}${indexIncomplete && countersFailed ? "・" : ""}${countersFailed ? "予測の累計を読み出せませんでした" : ""}(この結果は保存せず、1分後に読み直します)`
+      : null,
     at: new Date().toISOString(),
     dateKey: appDateKey(),
     playerIndexCount: rows.length,
@@ -2151,14 +2246,28 @@ async function handleDailyDiff() {
   const snapKey = (k) => `kb:daily:snapshot:${k}`;
 
   // ---- 今日のスナップショット(無ければ作って保存する) ----
-  let today = await upstashGetJSON(snapKey(todayKey)).catch(() => null);
+  // v97: 今日・昨日のスナップショットは MGET 1回で読み、「読めなかった」を区別する
+  //   (読めなかったのに「今日の分が無い」と見なして作り直し・上書きしない)。
+  let today = null, yesterday = null;
+  try {
+    const snaps = await upstashMGetJSONStrict([snapKey(todayKey), snapKey(yKey)]);
+    today = snaps[0]; yesterday = snaps[1];
+  } catch (e) {
+    const body = { ok: true, available: false, readFailed: true, generatedAt: new Date().toISOString(), reasonJa: "保存先(Upstash)から昨日との比較用の記録を読み出せませんでした(記録が無いという意味ではありません)。1分ほど待って再読み込みしてください。" };
+    cacheSet("daily:diff", body, 60 * 1000);
+    return { status: 200, body };
+  }
   const freshlyCreated = !today;
+  let snapshotIncomplete = false;
   if (!today) {
     today = await buildDailySnapshot();
-    await upstashSetJSON(snapKey(todayKey), today).catch(() => {});
-    await upstashCmd(["EXPIRE", snapKey(todayKey), String(30 * 86400)]).catch(() => {});
+    if (today.incomplete) {
+      snapshotIncomplete = true; // 保存しない(読めなかった値を今日の確定値にしない)
+    } else {
+      await upstashSetJSON(snapKey(todayKey), today).catch(() => {});
+      await upstashCmd(["EXPIRE", snapKey(todayKey), String(30 * 86400)]).catch(() => {});
+    }
   }
-  const yesterday = await upstashGetJSON(snapKey(yKey)).catch(() => null);
 
   const idx = await loadPlayerIndex(false).catch(() => null);
   const rows = (idx && idx.rows) || [];
@@ -2336,14 +2445,17 @@ async function handleDailyDiff() {
     date: todayKey, comparedWith: yesterday ? yKey : null,
     firstDayJa: yesterday ? null
       : "昨日のスナップショットがまだ無いため、今回は「今日の状態」だけを表示しています。明日から本当の差分が出ます。",
-    snapshotCreatedNow: freshlyCreated,
-    verdictJa,
+    snapshotCreatedNow: freshlyCreated && !snapshotIncomplete,
+    // v97: 読めなかった値を含むスナップショットは保存していない(翌日の差分を嘘にしないため)
+    snapshotIncomplete,
+    snapshotIncompleteReasonJa: snapshotIncomplete ? (today.incompleteReasonJa || null) : null,
+    verdictJa: snapshotIncomplete ? `${verdictJa}(※今日の状態の一部を読み出せなかったため、数字は不完全です)` : verdictJa,
     evidenceCount: evidence.length,
     predictions, playerIndex: playerIndexDiff, playerForm, clubChanges, aiViews, model, learningRun,
     honestyJa: "ここに出しているのは、すべて実測値の差分です。件数だけの指標(Knowledge件数・Memory件数など)は、利用者が確かめられないためこの欄には出していません。",
     generatedAt: new Date().toISOString(),
   };
-  cacheSet("daily:diff", body, 5 * 60 * 1000);
+  cacheSet("daily:diff", body, snapshotIncomplete ? 60 * 1000 : 5 * 60 * 1000);
   return { status: 200, body };
 }
 
@@ -2940,7 +3052,7 @@ async function handleFixturesToday(query, opts) {
     return { status: 200, body: payload };
   } catch (e) {
     const payload = { found: false, reason: e.code || "error", error: e.message };
-    cacheSet(cacheKey, payload, 5 * 60 * 1000);
+    cacheSetUnlessPerClient(cacheKey, payload, 5 * 60 * 1000, e); // v97: 利用者固有の上限エラーは共有キャッシュに入れない
     return { status: 200, body: payload };
   }
 }
@@ -3009,8 +3121,10 @@ function buildScenarioFields(record) {
 
 function buildTodayPredictionEntry(fixture, record, calibrationMap) {
   if (!fixture || !record) return null;
-  const probs = (Number.isFinite(record.homeLambda) && Number.isFinite(record.awayLambda))
-    ? computeMarketProbs(record.homeLambda, record.awayLambda) : null;
+  // v97(全体監査): 画面の勝率は「判定に実際に使った最終確率」(record.finalProbs。市場混合・
+  //   2つ目の意見を含む)を優先する。以前は λ だけから計算し直していたため、混合で判定した
+  //   試合では表示の勝率と判定の根拠が食い違っていた。旧記録(finalProbs 無し)は従来どおり λ から。
+  const probs = oneX2ProbsOf(record);
   const pct = (v) => Math.round(v * 100);
   const topFactor = Array.isArray(record.factorImportance) && record.factorImportance.length
     ? (record.factorImportance.find((f) => f && f.stars > 0) || record.factorImportance[0]) : null;
@@ -3144,16 +3258,36 @@ async function handlePredictionsToday() {
   const fixtures = fx.fixtures || [];
   let predictions = [];
   let calibrationMap = null;
+  // v97(全体監査): 読めなかった(保存先停止・通信失敗)ことを「予想が無い」に潰さない。
+  //   旧実装は1試合1 GET(最大80回)+失敗時 null だったため、9月の Upstash 停止中は
+  //   「本日の試合の中にAIが予想を保存している試合はまだありません」と断定して
+  //   5分キャッシュしていた。読めなかったときは readFailed を立て、60秒だけキャッシュする。
+  let readFailed = false;
   if (UPSTASH_ENABLED && fixtures.length) {
-    // Redisの読み取りのみ(1試合1コマンド+較正マップ1コマンド・上限60・結果は5分キャッシュ)
-    calibrationMap = await upstashGetJSON("learn:calibration:map").catch(() => null);
     // 監査での指摘: 一覧は最大80件返るのに予想の照合は先頭60件だけだったため、
     // 夜の試合が61番目以降に来た日は「本日は対象試合がない」と誤って断定していた。
-    // 表示上限と揃える(読み取りは5分キャッシュの内側なので実害のあるコスト増は無い)。
+    // 表示上限と揃える。v97: 80回の GET → 較正マップ込みで MGET 1〜2回(往復・コマンド数の削減)。
     const target = fixtures.slice(0, 80);
-    const records = await Promise.all(target.map((f) => upstashGetJSON(`learn:ownpred:${f.id}`).catch(() => null)));
-    predictions = target.map((f, i) => buildTodayPredictionEntry(f, records[i], calibrationMap)).filter(Boolean);
-    predictions.sort((a, b) => new Date(a.kickoff || 0) - new Date(b.kickoff || 0));
+    try {
+      const values = await upstashMGetJSONStrict(["learn:calibration:map", ...target.map((f) => `learn:ownpred:${f.id}`)]);
+      calibrationMap = values[0] || null;
+      const records = values.slice(1);
+      predictions = target.map((f, i) => buildTodayPredictionEntry(f, records[i], calibrationMap)).filter(Boolean);
+      predictions.sort((a, b) => new Date(a.kickoff || 0) - new Date(b.kickoff || 0));
+    } catch (e) {
+      readFailed = true;
+    }
+  }
+  if (readFailed) {
+    const payload = {
+      found: true, date: fx.date, generatedAt: new Date().toISOString(),
+      totalFixturesToday: fixtures.length,
+      predictions: [], upcomingPredictions: [], bestPick: null, calibrationAvailable: false,
+      readFailed: true,
+      noteJa: "保存先(Upstash)から予想を読み出せなかったため、本日のAI予想を表示できません(予想が無いのではなく、読めなかった状態です)。1分ほど待って再読み込みしてください。",
+    };
+    cacheSet(cacheKey, payload, 60 * 1000);
+    return { status: 200, body: payload };
   }
   // ---- 2026年8月・利用者からの指摘への対応: 「今日のAI予想が空」問題 ----
   //   予想はAIが追跡しているクラブの「次の試合」に対して作られるため、その試合が
@@ -3164,19 +3298,26 @@ async function handlePredictionsToday() {
   //   すでに保存済みの予想をそのまま出すだけ)。
   //   コスト: 今日ぶんが空のときだけ、保留リストの読み出し+最大40件のGET。
   let upcomingPredictions = [];
+  let upcomingReadFailed = false;
   if (!predictions.length && UPSTASH_ENABLED) {
     try {
-      // calibrationMapは上で取得済みの場合がある(未取得のときだけ読む)
-      if (!fixtures.length) calibrationMap = await upstashGetJSON("learn:calibration:map").catch(() => null);
-      const pendingIds = (await upstashCmd(["LRANGE", "learn:ownpred:pending", "-40", "-1"]).catch(() => [])) || [];
-      const recs = await Promise.all(pendingIds.map((id) => upstashGetJSON(`learn:ownpred:${id}`).catch(() => null)));
+      const pendingIds = (await upstashCmd(["LRANGE", "learn:ownpred:pending", "-40", "-1"])) || [];
+      // v97: 40回の GET → MGET 1回。calibrationMapは上で取得済みの場合がある(未取得のときだけ読む)
+      const keys = pendingIds.map((id) => `learn:ownpred:${id}`);
+      const values = await upstashMGetJSONStrict(fixtures.length ? keys : ["learn:calibration:map", ...keys]);
+      let recs = values;
+      if (!fixtures.length) { calibrationMap = values[0] || null; recs = values.slice(1); }
       upcomingPredictions = selectUpcomingPredictionRecords(recs, Date.now())
         .map((r) => buildTodayPredictionEntry({
           id: r.fixtureId, date: r.kickoff, status: "NS", league: r.league || null,
           home: { name: r.homeTeamEn }, away: { name: r.awayTeamEn }, score: null,
         }, r, calibrationMap))
         .filter(Boolean);
-    } catch (e) { /* 付加情報。失敗しても本日ぶんの表示は返す */ }
+    } catch (e) {
+      // 付加情報。失敗しても本日ぶんの表示は返すが、v97: 「読めなかった」は痕跡を残し、
+      // 「次の試合も無い」と5分間断定しないよう短いキャッシュにする(下の cacheSet 参照)。
+      upcomingReadFailed = true;
+    }
   }
 
   // ---- 精度証明ラウンド③: 今日のベスト予想 ----
@@ -3220,7 +3361,11 @@ async function handlePredictionsToday() {
           ? `本日の試合${fixtures.length}件の中に、AIが予想を保存している試合はまだありません。AIは追跡172クラブ(欧州上位100+J1・5大リーグ全部)+登録クラブを日替わりの順番で回り、毎朝の学習で1回あたり最大${OWN_PREDICT_LOG_CAP_DISPLAY}件の予想を新しく作ります。そのため「今日はまだ順番が回っていない」ことがあります。オフシーズン中は対象試合そのものが少ないのも正常です。`
           : "本日は対象となる試合がありません。シーズン中は毎朝の学習で、ここにAI予想が並びます。")),
   };
-  cacheSet(cacheKey, payload, 5 * 60 * 1000);
+  if (!predictions.length && upcomingReadFailed) {
+    payload.upcomingReadFailed = true;
+    payload.noteJa = "本日ぶんの予想はありませんでした。AIが予想している「次の試合」は、保存先(Upstash)から読み出せなかったため表示できません(1分ほど待って再読み込みしてください)。";
+  }
+  cacheSet(cacheKey, payload, upcomingReadFailed ? 60 * 1000 : 5 * 60 * 1000);
   return { status: 200, body: payload };
 }
 
@@ -3310,7 +3455,7 @@ async function handleCoachSearch(query) {
     return { status: 200, body: payload };
   } catch (e) {
     const payload = { found: false, reason: e.code || "error", error: e.message, coaches: [] };
-    cacheSet(cacheKey, payload, 5 * 60 * 1000);
+    cacheSetUnlessPerClient(cacheKey, payload, 5 * 60 * 1000, e); // v97
     return { status: 200, body: payload };
   }
 }
@@ -3529,7 +3674,7 @@ async function handleFixtureAnalysis(query) {
     return { status: 200, body: payload };
   } catch (e) {
     const payload = { found: false, reason: e.code || "error", error: e.message };
-    cacheSet(cacheKey, payload, 5 * 60 * 1000);
+    cacheSetUnlessPerClient(cacheKey, payload, 5 * 60 * 1000, e); // v97: 利用者固有の上限エラーは共有キャッシュに入れない
     return { status: 200, body: payload };
   }
 }
@@ -3581,9 +3726,17 @@ function heavyBudgetToday() {
   return heavyIpDailyBudget.counts;
 }
 // 外部APIを1回使ったことを、いま処理中のリクエストに記録する(利用者の呼び出しのみ)
+// ---- v97(全体監査): 処理中(未課金)の回数も上限判定に含める ----
+//   課金は「応答を返し終わってから」なので、同じ端末が同時に多数のリクエストを投げると、
+//   どれもまだ課金されておらず全部が上限判定を通り抜けていた(30回/分 × 最大11回 = 1分で
+//   300回超の契約枠消費が可能)。処理中の回数を端末ごとに持ち、判定ではこれも足す。
+const heavyInflight = new Map(); // 端末キー -> 処理中(未課金)の外部API回数
 function noteHeavyApiCall() {
   const store = heavyCtx.getStore();
-  if (store && !store.jobOnly) store.apiCalls++;
+  if (store && !store.jobOnly) {
+    store.apiCalls++;
+    if (store.ip) heavyInflight.set(store.ip, (heavyInflight.get(store.ip) || 0) + 1);
+  }
 }
 // どのエンドポイントが実際に外部APIを使ったかは、決め打ちの表ではなく **実測で覚える**。
 // (表を手で維持すると必ず古くなる。実測なら、後から足した画面も自動で対象になる)
@@ -3600,14 +3753,15 @@ function heavyLimitMessageJa(limit) {
 function heavyBudgetExceeded(ip, limit) {
   const counts = heavyBudgetToday();
   const cap = (Number.isFinite(limit) && limit > 0) ? limit : PER_IP_HEAVY_CALLS_PER_DAY; // v93
-  return (counts.get(ip || "unknown") || 0) >= cap;
+  const key = ip || "unknown";
+  return (counts.get(key) || 0) + (heavyInflight.get(key) || 0) >= cap; // v97: 処理中の回数も含める
 }
 // 受付時の判定: すでに本日の上限に達していて、かつ **実際に外部APIを使う画面** のときだけ断る。
 // 前払いはしないので、入力エラーやキャッシュ命中では1回も引かれない。
 // 軽い画面(/api/health など)は巻き添えで止めない。
 function heavyBudgetPrecheck(ip, pathname, limit) {
   const counts = heavyBudgetToday();
-  const used = counts.get(ip || "unknown") || 0;
+  const used = (counts.get(ip || "unknown") || 0) + (heavyInflight.get(ip || "unknown") || 0); // v97: 処理中も含める
   const cap = (Number.isFinite(limit) && limit > 0) ? limit : PER_IP_HEAVY_CALLS_PER_DAY; // v93: レーン別の上限
   if (used >= cap && isObservedHeavyPath(pathname)) {
     return {
@@ -3628,6 +3782,11 @@ function runInBackgroundCtx(fn) {
 // 応答を返し終わってから、実際に使った回数だけ引く
 const HEAVY_BUDGET_MAX_IPS = 20000; // このファイルの他の表(rateBuckets等)と同じ考え方の上限
 function chargeHeavyBudget(ip, calls, pathname) {
+  // v97: 処理中として数えていたぶんを解放してから、確定した使用量として足す
+  if (ip && calls > 0) {
+    const left = (heavyInflight.get(ip) || 0) - calls;
+    if (left <= 0) heavyInflight.delete(ip); else heavyInflight.set(ip, left);
+  }
   if (!calls || calls <= 0) return;
   const counts = heavyBudgetToday();
   const key = ip || "unknown";
@@ -4077,7 +4236,7 @@ async function maybeWatchLineups() {
         if (oddsApiLib.isEnabled(process.env) && Number.isFinite(lgId) && oddsApiLib.SPORT_KEYS[lgId]) {
           if (!consensusCache.has(lgId)) {
             const r = await oddsApiLib.fetchLeagueConsensus(
-              { fetchFn: (u) => fetch(u), upstashCmd, env: process.env }, lgId, nowMs);
+              { fetchFn: (u, o) => fetch(u, o), upstashCmd, env: process.env }, lgId, nowMs); // v97: タイムアウト用の signal を通す
             consensusCache.set(lgId, r && r.ok ? r.events : null);
           }
           const events = consensusCache.get(lgId);
@@ -4344,6 +4503,10 @@ async function runDailyLearningThenQA(deps) {
     stopKeepAwake();
     throw e;
   }
+  // v97: 学習が終わった直後に、ホーム画面の学習系キャッシュ(5分)を捨てる。
+  //   学習記録は1日1回しか変わらないのでキャッシュは長くてよいが、変わった瞬間だけは
+  //   次のアクセスで新しい記録を見せる(「学習したのに画面が古い」を作らない)。
+  for (const k of Array.from(cache.keys())) if (k.startsWith("learn:")) cache.delete(k);
   try {
     const qa = await runAutoQANow({ repairRounds: 2 });
     console.log("[autoQA] after learning", JSON.stringify({
@@ -5181,11 +5344,28 @@ async function runAutoQANow(opts) {
 // (これまでは毎日学習エンジンの登録11クラブ限定だった。RAG経路にも同じ
 // エンジンを共有することで、"主要リーグ全クラブ・全選手"に対応する現実的な
 // 方法として、質問されたクラブ・選手から知識が蓄積されていく設計にする)。
+// v97(全体監査): 質問時のオンデマンド生成(クラブ/選手プロフィール)も、サイト全体の1日LLM予算を
+//   必ず通す。以前は予算の外で呼ばれており、新しい選手・クラブが質問されるたびに「数えていない」
+//   LLM呼び出しが1回増えていた(実費の天井が守られない)。予算が無い日は生成を見送る
+//   (エンジン側はベストエフォートなので、回答自体は実成績だけで返る)。失敗時は返金する。
+async function generateLLMMetered(args) {
+  if (!(await tryConsumeLlmBudget())) {
+    const err = new Error("本日のサイト全体のAI利用予算が上限のため、プロフィールの生成を見送りました");
+    err.code = "LLM_BUDGET";
+    throw err;
+  }
+  try {
+    return await generateLLM(args);
+  } catch (e) {
+    await refundLlmBudget().catch(() => {});
+    throw e;
+  }
+}
 const clubProfileEngine = createClubProfileEngine({
-  generateLLM, knowledgeStore, setRelation: relationshipIndex.setRelation,
+  generateLLM: generateLLMMetered, knowledgeStore, setRelation: relationshipIndex.setRelation,
 });
 const playerProfileEngine = createPlayerProfileEngine({
-  generateLLM, knowledgeStore, setRelation: relationshipIndex.setRelation,
+  generateLLM: generateLLMMetered, knowledgeStore, setRelation: relationshipIndex.setRelation,
   // 選手は登録クラブのような固定リストが無い(オンデマンドで増えていく)ため、
   // 「累計で何人の選手について知識を持つようになったか」を/api/debug-statusで
   // 可視化できるよう、軽量なカウンターだけ別途記録する。
@@ -5772,6 +5952,9 @@ async function handleMatchAnalysis(query, clientIp) {
     } catch (e) {
       console.error("[match-analysis] generateLLM failed, falling back to deterministic narrative:", e.code || "(no code)", "-", e.message);
       // フォールバック(上で既に決定論的な文章をセット済み)のまま続行する。
+      // v97: AIの文章は得られなかったので、消費した個人・全体の1回ぶんを返す(discussと同じ扱い)
+      refundLlmBudgetForIp(clientIp);
+      await refundLlmBudget().catch(() => {});
     }
    } else {
      // 全体枠が尽きていた: LLMを呼べないので、直前に消費した per-IP の1枠を返金する
@@ -5904,9 +6087,32 @@ async function handleMatchAnalysis(query, clientIp) {
  * このエンドポイントは一般利用者にも見せる前提です(AIの健全性を隠さない方針)が、
  * debug-statusのような内部件数の詳細までは返しません。
  */
+// v97(全体監査): 健康診断の結果を5分キャッシュする(読めなかった結果は60秒)。
+//   1回の診断で成長ログ(MGET 1)+実行履歴(MGET 1)+重み履歴(LRANGE 1)+指標7日(MGET 1)+
+//   正答率(キャッシュ共有)を読む。学習記録は1日1回しか変わらないため、アクセスのたびに
+//   読み直す必要はない。プロセス内の生の値(保存先の状態・使用量・実行中フラグ)は
+//   キャッシュから返すときも毎回その時点の値に差し替える(古い状態を見せない)。
+function learningHealthLiveFields() {
+  return {
+    store: storeStatusSnapshot(),
+    upstashUsage: upstashUsageSnapshot(),
+    selfHeal: { skippedForStore: selfHealSkippedForStore.count, lastSkipAt: selfHealSkippedForStore.lastAt ? new Date(selfHealSkippedForStore.lastAt).toISOString() : null, lastSkipReason: selfHealSkippedForStore.lastReason, learningRunningNow: dailyLearningRunning },
+    apiPlan: getApiPlanInfo(),
+  };
+}
 async function handleLearningHealth(searchParams) {
-  const generatedAt = new Date().toISOString();
   const days = Math.max(1, Math.min(60, parseInt((searchParams && searchParams.get("days")) || "14", 10) || 14));
+  const lhKey = `learn:health|${days}|${appDateKey()}`;
+  const lhCached = cacheGet(lhKey);
+  if (lhCached) {
+    return { status: 200, body: { ...lhCached, ...learningHealthLiveFields(), servedFromCache: true } };
+  }
+  const built = await buildLearningHealth(days);
+  cacheSet(lhKey, built.body, built.degraded ? 60 * 1000 : 5 * 60 * 1000);
+  return { status: 200, body: built.body };
+}
+async function buildLearningHealth(days) {
+  const generatedAt = new Date().toISOString();
   // v94: 例外時も「未実行(ranYet:false)」ではなく「読めなかった」として扱う
   const growthLog = await getGrowthLog(learningDeps).catch((e) => ({ ranYet: null, readFailed: true, storeError: String((e && e.message) || e).slice(0, 160) }));
   const todayDateKey = appDateKey();
@@ -5979,21 +6185,19 @@ async function handleLearningHealth(searchParams) {
           : "すべての構成要素が正常に動作しています。";
 
   return {
-    status: 200,
+    degraded: storeDownNow || !!(runHistory && runHistory.storeDown) || !!(growthLog && growthLog.countersReadFailed),
     body: {
       ok: true, generatedAt, overall, overallMessageJa,
       // v94: 保存先の健全性・使用量・空回り防止の実測(プロセス内の値)
-      store: storeNow,
-      upstashUsage: upstashUsageSnapshot(),
-      selfHeal: { skippedForStore: selfHealSkippedForStore.count, lastSkipAt: selfHealSkippedForStore.lastAt ? new Date(selfHealSkippedForStore.lastAt).toISOString() : null, lastSkipReason: selfHealSkippedForStore.lastReason, learningRunningNow: dailyLearningRunning },
+      ...learningHealthLiveFields(),
       zeroKnowledge, zeroVerification, engines, runHistory,
       // 2026年8月: 「昨日より賢くなったか」を数値の差分で示す(⑧のご要望)。
       growthComparison: metricsTrend ? metricsTrend.comparison : null,
       metricsAvailable: !!(metricsTrend && metricsTrend.available),
       apiBudget: growthLog.apiBudget || null,
-      // 2026年8月・優先順位⑪: 現在の契約プランの自動判定結果。
+      // 2026年8月・優先順位⑪: 現在の契約プランの自動判定結果(apiPlan)は
+      // learningHealthLiveFields() で毎回その時点の値を入れる。
       // 「Proに加入したはずだが本当に反映されているか」をこの画面だけで確認できる。
-      apiPlan: getApiPlanInfo(),
       // 2026年8月: 「Renderの環境変数をちゃんと設定できたのか」を、
       // Renderの管理画面を開かなくてもこの画面だけで確認できるようにする。
       // 環境変数は一度設定すれば再デプロイしても保持されるため、設定作業は1回だけ。
@@ -6372,6 +6576,20 @@ function refundLlmBudgetForIp(ip) {
   const key = ip || "unknown";
   const current = llmIpDailyBudget.counts.get(key) || 0;
   if (current > 0) llmIpDailyBudget.counts.set(key, current - 1);
+}
+// v97(全体監査): AI呼び出しが失敗して回答を返せなかったとき、サイト全体の1日予算も返す。
+//   以前は失敗(タイムアウト・提供元の5xx/429・キー不正)でも消費したままで、障害の日に
+//   「回答ゼロなのに予算だけ尽きる」状態になり得た。永続側(Upstash)は DECR で戻す(ベストエフォート)。
+async function refundLlmBudget() {
+  const today = appDateKey();
+  if (llmDailyBudget.day !== today) return;
+  if (llmDailyBudget.count > 0) llmDailyBudget.count -= 1;
+  if (UPSTASH_ENABLED) {
+    try {
+      const n = await upstashCmd(["DECR", `llm:budget:${today}`]);
+      if (Number(n) < 0) await upstashCmd(["SET", `llm:budget:${today}`, "0", "EX", "172800"]).catch(() => {});
+    } catch (e) { /* 永続側へ戻せなくても、メモリ側は戻っている */ }
+  }
 }
 
 function formatClubFacts(knowledge, needs) {
@@ -7176,7 +7394,9 @@ async function handleDiscuss(body, clientIp) {
         if (exec.addedFacts.length) facts.push(...exec.addedFacts);
         multiStepMeta = {
           enabled: true, ran: true,
-          plannedActions: msPlan.actions.map((a) => ({ type: a.type, clubJa: a.club.nameJa })),
+          // v97: player_stats 行動には club が無い(playerName だけ)。旧コードは a.club.nameJa で
+          //   TypeError になり、選手比較の多段思考が成功していても応答全体が500になっていた。
+          plannedActions: msPlan.actions.map((a) => ({ type: a.type, clubJa: a.club ? a.club.nameJa : (a.playerName || null) })),
           focusJa: msPlan.focusJa,
           executed: exec.executed,
           extraFacts: exec.addedFacts.length,
@@ -7281,6 +7501,11 @@ async function handleDiscuss(body, clientIp) {
     // 続いても原因(APIキー不正・クレジット不足・レート制限・モデル名不正 等)を
     // 特定する手段がなかった。Renderの「Logs」タブで実際の原因が読めるようにする。
     console.error("[discuss] generateLLM failed:", e.code || "(no code)", "-", e.message);
+    // v97: 回答を返せなかったので、この利用者の1回ぶんとサイト全体の1回ぶんを返す
+    //   (利用者の責任ではない失敗で残り回数が減るのは不公平。多段思考ぶんの計画呼び出しは
+    //    実際に実行されているので返さない)。
+    refundLlmBudgetForIp(clientIp);
+    await refundLlmBudget().catch(() => {});
     // v85: 原因ごとに正直な日本語メッセージを出し分ける(画面を見るだけで原因が
     // 分かるように)。Renderの「Logs」タブにも従来どおり原因を残す。
     const httpStatus = e && e.httpStatus;
@@ -7616,7 +7841,20 @@ async function handleHttpRequest(req, res) {
     const perfPath = String(req.url || "").split("?")[0].split("/").slice(0, 3).join("/") || "/";
     res.on("finish", () => { try { recordPerf(perfPath, Date.now() - perfT0); } catch (e) { /* 計測は本処理を妨げない */ } });
   }
-  const parsed = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  // v97(全体監査): 壊れた Host ヘッダー・不正な URL は 500(内部エラー扱い・スタックをログへ)ではなく
+  //   400 で静かに返す(利用者側の入力の問題。ログも1行の警告に留める)。
+  let parsed;
+  try {
+    parsed = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  } catch (e) {
+    try {
+      parsed = new URL(req.url, "http://localhost"); // Host だけが壊れている場合は補って続行
+    } catch (e2) {
+      res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ ok: false, error: "bad request" }));
+      return;
+    }
+  }
   const pathname = parsed.pathname;
 
   if (pathname.startsWith("/api/")) {
@@ -7649,11 +7887,18 @@ async function handleHttpRequest(req, res) {
         res.end(JSON.stringify({ ok: false, error: "too many beacons" }));
         return;
       }
-    } else if (rateLimited(budgetKey, perMinuteLimit)) {
-      if (lane.dedicated) skillLaneStatsToday().limited++;
-      res.writeHead(429, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify({ found: false, error: "レート制限に達しました。しばらく待ってから再試行してください。" }));
-      return;
+    } else {
+      // v97: 軽い読み出しは専用の緩い枠(IP別)。Skill専用レーンは従来どおり1本で数える。
+      const isLightPath = !lane.dedicated && LIGHT_API_PATHS.has(pathname);
+      const limited = isLightPath
+        ? rateLimited(`light|${budgetKey}`, LIGHT_RATE_LIMIT_PER_MINUTE)
+        : rateLimited(budgetKey, perMinuteLimit);
+      if (limited) {
+        if (lane.dedicated) skillLaneStatsToday().limited++;
+        res.writeHead(429, { "Content-Type": "application/json; charset=utf-8", "Retry-After": "30" });
+        res.end(JSON.stringify({ found: false, error: "レート制限に達しました。しばらく待ってから再試行してください。", rateLimited: true }));
+        return;
+      }
     }
     // 外部APIを多く消費する利用者を、1日の実測回数で制限する。
     // 前払いではないので、入力エラーやキャッシュ命中(外部API 0回)では1回も引かれない。
@@ -7921,14 +8166,20 @@ async function handleHttpRequest(req, res) {
           return;
         }
         let rkBody;
+        let rkReadFailed = false; // v97: 「読めなかった」を「まだ無い」と言わない・長くキャッシュしない
         if (!UPSTASH_ENABLED) {
           rkBody = { ok: true, available: false, reasonJa: "保存先(Upstash)が未設定のため、レーティングはまだありません。" };
         } else {
-          const ratings = await upstashGetJSON(RATINGS_KEY).catch(() => null);
-          if (!ratings || !ratings.available || !ratings.byTeam) {
+          let ratings = null, prev = null;
+          try {
+            const vals = await upstashMGetJSONStrict([RATINGS_KEY, "learn:ratings:ranks:prev"]); // v97: 2 GET → MGET 1回
+            ratings = vals[0]; prev = vals[1];
+          } catch (e) { rkReadFailed = true; }
+          if (rkReadFailed) {
+            rkBody = { ok: true, available: false, readFailed: true, reasonJa: "保存先(Upstash)から地力レーティングを読み出せませんでした(レーティングが無いという意味ではありません)。1分ほど待って再読み込みしてください。" };
+          } else if (!ratings || !ratings.available || !ratings.byTeam) {
             rkBody = { ok: true, available: false, reasonJa: "地力レーティングは、次の朝の学習(15大会×5シーズンの実試合からの初回学習)のあとに公開されます。でっち上げの暫定値は出しません。" };
           } else {
-            const prev = await upstashGetJSON("learn:ratings:ranks:prev").catch(() => null);
             const prevRanks = (prev && prev.ranks) || {};
             const jaByEnLc = new Map(CLUB_UNIVERSE.map((c) => [c.nameEn.toLowerCase(), c.nameJa]));
             // v55: レーティング本体に名前が無い(または一部欠けている)場合、
@@ -8005,8 +8256,8 @@ async function handleHttpRequest(req, res) {
             };
           }
         }
-        // v55: 名前の自動取得中は3分キャッシュ(数分で名前つきに切り替わる)。通常は30分。
-        cacheSet("ratings:rankings:public", rkBody, (rkBody && rkBody.available && /自動取得/.test(rkBody.noteJa || "")) ? 3 * 60 * 1000 : 30 * 60 * 1000);
+        // v55: 名前の自動取得中は3分キャッシュ(数分で名前つきに切り替わる)。通常は30分。v97: 読めなかった結果は60秒。
+        cacheSet("ratings:rankings:public", rkBody, rkReadFailed ? 60 * 1000 : (rkBody && rkBody.available && /自動取得/.test(rkBody.noteJa || "")) ? 3 * 60 * 1000 : 30 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=300" });
         res.end(JSON.stringify(rkBody));
         return;
@@ -8023,7 +8274,8 @@ async function handleHttpRequest(req, res) {
               const z = (await upstashCmd(["ZREVRANGE", duelLb.LB_ALLTIME_KEY, "0", "19", "WITHSCORES"])) || [];
               const rows = [];
               for (let i = 0; i + 1 < z.length; i += 2) rows.push({ playerId: z[i], wins: Number(z[i + 1]) });
-              const players = await Promise.all(rows.map((r) => upstashGetJSON(`${duelLb.PLAYER_KEY_PREFIX}${r.playerId}`).catch(() => null)));
+              // v97: 上位20人の記録を1件ずつ GET → MGET 1回(失敗はそのまま catch へ=「一時的に失敗」として60秒キャッシュ)
+              const players = rows.length ? await upstashMGetJSONStrict(rows.map((r) => `${duelLb.PLAYER_KEY_PREFIX}${r.playerId}`)) : [];
               const total = await upstashCmd(["ZCARD", duelLb.LB_ALLTIME_KEY]).catch(() => null);
               top = {
                 available: true,
@@ -8116,12 +8368,16 @@ async function handleHttpRequest(req, res) {
         if (!UPSTASH_ENABLED) {
           dBody = { ok: true, available: false, reasonJa: "保存先(Upstash)が未設定のため、ダイジェストはまだありません。" };
         } else {
-          const dig = await upstashGetJSON("learn:digest:latest").catch(() => null);
-          dBody = dig
-            ? { ok: true, available: true, digest: dig }
-            : { ok: true, available: false, reasonJa: "最初のダイジェストは、次の毎朝の学習のあとに自動生成されます(直前の1週間分)。以降は毎週月曜に新しい週のぶんへ更新されます。" };
+          // v97: 「読めなかった」を「まだ無い」と言わない・10分キャッシュしない
+          let dig = null, digReadFailed = false;
+          try { dig = await upstashGetJSONOrThrow("learn:digest:latest"); } catch (e) { digReadFailed = true; }
+          dBody = digReadFailed
+            ? { ok: true, available: false, readFailed: true, reasonJa: "保存先(Upstash)からダイジェストを読み出せませんでした(ダイジェストが無いという意味ではありません)。1分ほど待って再読み込みしてください。" }
+            : dig
+              ? { ok: true, available: true, digest: dig }
+              : { ok: true, available: false, reasonJa: "最初のダイジェストは、次の毎朝の学習のあとに自動生成されます(直前の1週間分)。以降は毎週月曜に新しい週のぶんへ更新されます。" };
         }
-        cacheSet("digest:latest:public", dBody, 10 * 60 * 1000);
+        cacheSet("digest:latest:public", dBody, dBody.readFailed ? 60 * 1000 : 10 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
         res.end(JSON.stringify(dBody));
         return;
@@ -8146,6 +8402,7 @@ async function handleHttpRequest(req, res) {
           return;
         }
         let csBody;
+        let pendingRecsReadFailed = false; // v97
         if (!UPSTASH_ENABLED) {
           csBody = { ok: true, clubEn: club.nameEn, clubJa: club.nameJa, available: false, reasonJa: "保存先(Upstash)が未設定のため、このクラブの記録はまだありません。" };
         } else {
@@ -8160,12 +8417,15 @@ async function handleHttpRequest(req, res) {
             let pendingRecs = cacheGet("clubsummary:pendingrecs");
             if (pendingRecs === undefined) {
               const pendingIds = (await upstashCmd(["LRANGE", "learn:ownpred:pending", "-40", "-1"]).catch(() => [])) || [];
-              const got = await Promise.all(pendingIds.map((id) => upstashGetJSON(`learn:ownpred:${id}`).catch(() => null)));
+              // v97: 40件の GET → MGET 1回(読めなかった場合は空のまま・この結果は下で短くキャッシュ)
+              let got = [];
+              try { got = pendingIds.length ? await upstashMGetJSONStrict(pendingIds.map((id) => `learn:ownpred:${id}`)) : []; }
+              catch (e) { got = []; pendingRecsReadFailed = true; }
               pendingRecs = got.filter(Boolean);
               // v49: 保留中の予測は日次学習でしか増えないため、30分キャッシュで十分。
               // (10分だと最悪 40GET×144回/日=5,760コマンドとUpstash無料枠1万/日の
               //  半分を食い得た。30分なら最悪1,920コマンドで安全圏。方針⑥にも適合)
-              cacheSet("clubsummary:pendingrecs", pendingRecs, 30 * 60 * 1000);
+              cacheSet("clubsummary:pendingrecs", pendingRecs, pendingRecsReadFailed ? 60 * 1000 : 30 * 60 * 1000);
             }
             const nameLc = club.nameEn.toLowerCase();
             // 第9次監査(v49)の修正: 記録のチーム名は「予測対象クラブ側=このアプリの
@@ -8240,14 +8500,16 @@ async function handleHttpRequest(req, res) {
                 noteJa: mine.length ? null : "このクラブの答え合わせ済み予測はまだありません(予測対象に入り次第、ここに実測が並びます)。",
               },
               nextPrediction,
+              // v97: 保留中の予測を読めなかった(次の予測が「無い」のではなく「読めなかった」)
+              nextPredictionReadFailed: pendingRecsReadFailed,
               condition,
             };
           } catch (e) {
             csBody = { ok: true, clubEn: club.nameEn, clubJa: club.nameJa, available: false, reasonJa: "記録の読み出しに一時的に失敗しました。しばらくして再度お試しください。" };
           }
         }
-        // v49: 一時的な読み出し失敗を10分も固定表示しない(失敗時だけ2分で再挑戦)
-        cacheSet(csCacheKey, csBody, (csBody && csBody.available === false && UPSTASH_ENABLED) ? 2 * 60 * 1000 : 10 * 60 * 1000);
+        // v49: 一時的な読み出し失敗を10分も固定表示しない(失敗時だけ2分で再挑戦)。v97: 一部読めなかった結果は60秒。
+        cacheSet(csCacheKey, csBody, pendingRecsReadFailed ? 60 * 1000 : (csBody && csBody.available === false && UPSTASH_ENABLED) ? 2 * 60 * 1000 : 10 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=120" });
         res.end(JSON.stringify(csBody));
         return;
@@ -8433,8 +8695,13 @@ async function handleHttpRequest(req, res) {
           res.end(JSON.stringify(qaCached));
           return;
         }
-        const rep = await upstashGetJSON("qa:report:latest").catch(() => null);
-        const publicBody = rep ? buildPublicQaReport(rep) : {
+        // v97: 「読めなかった」を「まだ1度も走っていません」と断定しない
+        let rep = null, qaReadFailed = false;
+        try { rep = UPSTASH_ENABLED ? await upstashGetJSONOrThrow("qa:report:latest") : null; } catch (e) { qaReadFailed = true; }
+        const publicBody = rep ? buildPublicQaReport(rep) : qaReadFailed ? {
+          ok: false, available: false, readFailed: true,
+          reasonJa: "保存先(Upstash)から自動QAの結果を読み出せませんでした(QAが走っていないという意味ではありません)。1分ほど待って再読み込みしてください。",
+        } : {
           ok: false, available: false,
           reasonJa: "自動QAはまだ1度も走っていません(毎日の学習が完走した直後に自動で走ります)。",
         };
@@ -9545,7 +9812,8 @@ async function handleHttpRequest(req, res) {
           },
           notComputedJa: "「怪我からの復帰」は、API-Footballの負傷者リストからの消失で判定できますが、離脱の開始日が提供されないため復帰かどうかを断定できません。断定できない項目は出していません。",
         };
-        cacheSet("kb:scouting", body, 5 * 60 * 1000);
+        if (feed.readFailed) body.readFailed = true;
+        cacheSet("kb:scouting", body, feed.readFailed ? 60 * 1000 : 5 * 60 * 1000); // v97: 読めなかった結果は60秒
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(body));
         return;
@@ -9554,6 +9822,15 @@ async function handleHttpRequest(req, res) {
         // ホーム画面の「昨日学んだこと」ウィジェット用。Upstash未設定・未実行の
         // 場合も、架空の数字を返さず正直な状態を返す(既存のhandleAccuracyStats
         // と同じ方針)。
+        // v97(全体監査): ホーム画面を開くたびに保存先を読んでいた(キャッシュ無し。
+        //   成長ログ本体+指標3日分で1アクセス約8コマンド)。学習記録は1日1回しか変わらないため
+        //   5分キャッシュする(読めなかった結果は60秒)。/api/learning/daily-report と同じ方針。
+        const glCached = cacheGet("learn:growth-log");
+        if (glCached) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify(glCached));
+          return;
+        }
         // v94: 例外時も「未実行」ではなく「読めなかった」として返す
         const result = await getGrowthLog(learningDeps)
           .catch((e) => ({ configured: UPSTASH_ENABLED, ranYet: null, readFailed: true, storeError: String((e && e.message) || e).slice(0, 160), message: "保存先(Upstash)から学習の記録を読み出せませんでした。学習が実行されていないという意味ではありません。" }));
@@ -9573,6 +9850,7 @@ async function handleHttpRequest(req, res) {
           result.growthComparison = trend ? trend.comparison : null;
         } catch (e) { /* 診断は付加情報なので、失敗しても本体は返す */ }
         result.store = storeStatusSnapshot(); // v94: 画面が「読めない理由」を出せるように
+        cacheSet("learn:growth-log", result, (result.readFailed || result.countersReadFailed) ? 60 * 1000 : 5 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(result));
         return;
@@ -9583,10 +9861,21 @@ async function handleHttpRequest(req, res) {
         // Weight Update / Learning Time を日ごとに記録したものを、前日との差分つきで返す。
         const days = Math.max(2, Math.min(60, parseInt(parsed.searchParams.get("days") || "14", 10) || 14));
         const todayDateKey = appDateKey();
+        // v97(全体監査): 読み出し結果を5分キャッシュ(読めなかった結果は60秒)。
+        //   指標は1日1回しか増えないのに、アクセスのたびに最大60日ぶんを読んでいた。
+        const mtKey = `learn:metrics|${days}|${todayDateKey}`;
+        const mtCached = cacheGet(mtKey);
+        if (mtCached) {
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify(mtCached));
+          return;
+        }
         const trend = await getMetricsTrend(learningDeps, days, todayDateKey)
-          .catch((e) => ({ available: false, reasonJa: `指標の読み出しに失敗しました(${e.message})。`, days: [] }));
+          .catch((e) => ({ available: false, readFailed: true, reasonJa: `指標の読み出しに失敗しました(${e.message})。`, days: [] }));
+        const mtBody = { ok: true, generatedAt: new Date().toISOString(), ...trend };
+        cacheSet(mtKey, mtBody, trend.readFailed ? 60 * 1000 : 5 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-        res.end(JSON.stringify({ ok: true, generatedAt: new Date().toISOString(), ...trend }));
+        res.end(JSON.stringify(mtBody));
         return;
       }
       if (pathname === "/api/learning/daily-report") {
@@ -9908,9 +10197,11 @@ async function handleHttpRequest(req, res) {
         const smKey = cacheKeyOf("seo-sitemap", [seoOrigin]);
         let xml = cacheGet(smKey);
         if (xml === undefined) {
-          xml = UPSTASH_ENABLED ? await seoPages.buildSitemapXml({ upstashCmd }, seoOrigin)
-            : await seoPages.buildSitemapXml({ upstashCmd: async () => [] }, seoOrigin);
-          cacheSet(smKey, xml, 60 * 60 * 1000);
+          const built = UPSTASH_ENABLED ? await seoPages.buildSitemap({ upstashCmd }, seoOrigin)
+            : await seoPages.buildSitemap({ upstashCmd: async () => [] }, seoOrigin);
+          xml = built.xml;
+          // v97: 索引を読めなかった(トップページだけの)サイトマップを1時間キャッシュしない(60秒)
+          cacheSet(smKey, xml, built.readFailed ? 60 * 1000 : 60 * 60 * 1000);
         }
         res.writeHead(200, { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "public, max-age=3600" });
         res.end(xml);
@@ -9923,11 +10214,16 @@ async function handleHttpRequest(req, res) {
       let page = cacheGet(pageKey);
       if (page === undefined) {
         page = UPSTASH_ENABLED
-          ? await seoPages.renderMatchPage({ upstashGetJSON }, fixtureIdStr, seoOrigin)
+          ? await seoPages.renderMatchPage({ upstashGetJSON, upstashCmd }, fixtureIdStr, seoOrigin)
           : { status: 404, html: seoPages.renderNotFoundHtml(fixtureIdStr, seoOrigin) };
-        cacheSet(pageKey, page, 10 * 60 * 1000);
+        // v97: 読めなかった(503)結果は10分キャッシュしない(60秒だけ)。検索エンジンにも保存させない。
+        cacheSet(pageKey, page, page.readFailed ? 60 * 1000 : 10 * 60 * 1000);
       }
-      res.writeHead(page.status, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=600" });
+      res.writeHead(page.status, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": page.readFailed ? "no-store" : "public, max-age=600",
+        ...(page.readFailed ? { "Retry-After": "60" } : {}),
+      });
       res.end(page.html);
       return;
     } catch (e) {
@@ -10010,6 +10306,16 @@ module.exports = {
     recordVisit, maybeFlushTraffic, buildTrafficReport, trafficNormalizeSource, growthPageHtml,
     state: () => ({ pending: [...traffic.pending.entries()].map(([d, m]) => [d, Object.fromEntries(m)]), knownDayKeys: [...traffic.knownDayKeys], accepted: traffic.accepted, rejected: traffic.rejected, flushFailures: traffic.flushFailures, flushedCommands: traffic.flushedCommands, lastFlushAt: traffic.lastFlushAt }),
     resetForTest: () => { traffic.pending.clear(); traffic.knownDayKeys.clear(); traffic.lastFlushAt = Date.now(); if (traffic.flushTimer) { clearTimeout(traffic.flushTimer); traffic.flushTimer = null; } traffic.flushInFlight = false; traffic.flushFailures = 0; traffic.flushedCommands = 0; traffic.accepted = 0; traffic.rejected = 0; traffic.lastAcceptedAt = null; traffic.http = { received: 0, rateLimited: 0, methodNotAllowed: 0, tooLarge: 0, badBody: 0, lastReceivedAt: null }; for (const k of [...cache.keys()]) if (String(k).startsWith("growth:traffic:")) cache.delete(k); },
+  },
+  // v97: 全体監査の修正の検証用(本番では誰も呼ばない)
+  __v97ForTest: {
+    cacheSetUnlessPerClient, isPerClientError, LIGHT_API_PATHS, LIGHT_RATE_LIMIT_PER_MINUTE,
+    BUDGET_FLUSH_EVERY, BUDGET_FLUSH_INTERVAL_MS, maybeFlushBudget,
+    heavyInflight, noteHeavyApiCall, heavyCtx, heavyBudgetExceeded, chargeHeavyBudget,
+    refundLlmBudget, tryConsumeLlmBudget, llmBudgetState: () => ({ ...llmDailyBudget }),
+    upstashMGetJSONStrict, handlePredictionsToday, handleDailyDiff, buildTodayPredictionEntry,
+    cacheGet, cacheSet, clearCache: () => cache.clear(), cacheKeys: () => [...cache.keys()],
+    releaseDailyRunLock, getOrLogPrediction,
   },
   // v94: 保存先の健全性・使用量・空回り防止の検証用(本番では誰も呼ばない)
   __storeForTest: {

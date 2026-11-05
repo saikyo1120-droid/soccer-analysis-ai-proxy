@@ -15,6 +15,7 @@ function createMockRedis() {
   async function upstashCmd(cmd) {
     const [op, ...args] = cmd;
     if (op === "GET") return store.has(args[0]) ? store.get(args[0]) : null;
+    if (op === "MGET") return args.map((k) => (store.has(k) ? store.get(k) : null)); // v97: 本番と同じく複数キーをまとめて読めるようにする
     if (op === "SET") { store.set(args[0], args[1]); return "OK"; }
     if (op === "RPUSH") { const [k, v] = args; const l = store.get(k) || []; l.push(v); store.set(k, l); return l.length; }
     if (op === "LRANGE") { const [k, s, e] = args; const l = store.get(k) || []; let start = parseInt(s, 10), end = parseInt(e, 10); if (start < 0) start = Math.max(0, l.length + start); if (end < 0) end = l.length + end; return l.slice(start, end + 1); }
