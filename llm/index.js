@@ -18,6 +18,8 @@ const PROVIDERS = {
   local: () => require("./providers/local"),
 };
 
+const EMPTY_RESPONSE_RETRY_DELAY_MS = Math.max(0, Number(process.env.LLM_EMPTY_RETRY_DELAY_MS) || 1500); // v98.1
+
 function currentProviderName() {
   return String(process.env.LLM_PROVIDER || "anthropic").trim().toLowerCase();
 }
@@ -64,10 +66,22 @@ async function generateLLM({ systemPrompt, userPrompt, maxTokens, tier, timeoutM
     const heavyModel = provider.resolveModel("heavy");
     if (lightModel && lightModel !== heavyModel) timeoutFallbackModel = lightModel;
   }
-  const out = await provider.generate({
+  const req = {
     systemPrompt: systemPrompt || "", userPrompt: userPrompt || "", maxTokens: maxTokens || 700, tier: usedTier,
     timeoutMs, truncateRetry, timeoutFallbackModel, timeoutFallbackTimeoutMs, timeoutFallbackMaxTokens,
-  });
+  };
+  // v98.1: 空の応答(EMPTY_RESPONSE)は一過性のことが多い(本番実測: 毎日172クラブ中2〜5件)。
+  //   1回だけ 1.5秒おいて再試行し、それでも空なら元のエラー(停止理由つき)をそのまま投げる。
+  //   他のエラー(HTTP・時間切れ・JSON不正)は従来どおり再試行しない(プロバイダー側の方針を変えない)。
+  let out;
+  try {
+    out = await provider.generate(req);
+  } catch (e) {
+    if (!(e && e.code === "EMPTY_RESPONSE")) throw e;
+    await new Promise((r) => setTimeout(r, EMPTY_RESPONSE_RETRY_DELAY_MS));
+    out = await provider.generate(req);
+    if (out && typeof out === "object") out.retriedAfterEmpty = true;
+  }
   // v51: プロバイダーは従来どおり文字列を返してもよいし、{text, model, fallbackFrom}を
   // 返してもよい(予備モデルで答えた場合、実際に使ったモデルを正直に開示するため)。
   const isObj = out && typeof out === "object";
@@ -75,7 +89,7 @@ async function generateLLM({ systemPrompt, userPrompt, maxTokens, tier, timeoutM
   const model = (isObj && out.model)
     ? out.model
     : (typeof provider.resolveModel === "function" ? provider.resolveModel(usedTier) : null);
-  return { text, provider: name, tier: usedTier, model, modelFallbackFrom: (isObj && out.fallbackFrom) || null, truncated: !!(isObj && out.truncated) };
+  return { text, provider: name, tier: usedTier, model, modelFallbackFrom: (isObj && out.fallbackFrom) || null, truncated: !!(isObj && out.truncated), retriedAfterEmpty: !!(isObj && out.retriedAfterEmpty) };
 }
 
 module.exports = { generateLLM, currentProviderName, resolveTier, PROVIDERS };
