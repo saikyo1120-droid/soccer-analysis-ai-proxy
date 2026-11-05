@@ -38,6 +38,7 @@ const UNAVAILABLE_FIELDS_JA = {
   managerQuotes: "監督のコメント・会見内容はAPI-Footballでは提供されていません。",
 };
 
+const { readManyJSON } = require("../learning/storeRead"); // v97: 複数キーのまとめ読み(MGET)・失敗の区別
 const DIFF_LIST_CAP = 20; // 1クラブに保持する「最近の変化」の上限
 const SCOUT_FEED_KEEP = 300; // スカウト用フィード(新規/移籍/若手/フォーム急変)の保持件数
 // v92: 網羅率の一覧で1回のMGETにまとめるクラブ数(1応答を大きくしすぎない)
@@ -52,6 +53,7 @@ function normalizeForSearch(s) {
   return String(s || "")
     .normalize("NFD").replace(/[̀-ͯ]/g, "") // 濁点・アクセントを除去
     .replace(/[øØ]/g, "o").replace(/[đĐ]/g, "d").replace(/[łŁ]/g, "l").replace(/[ßẞ]/g, "ss")
+    .replace(/[æÆ]/g, "ae").replace(/[œŒ]/g, "oe").replace(/[ðÐ]/g, "d").replace(/[þÞ]/g, "th") // v97: NFDで分解されない合字(Kjær/Sørloth等の検索漏れ対策)
     .toLowerCase()
     .replace(/[^a-z0-9 ]/g, " ")
     .replace(/\s+/g, " ")
@@ -68,6 +70,21 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
   async function getDossier(nameEn) {
     if (!upstashEnabled || !nameEn) return null;
     return (await upstashGetJSON(keyFor(nameEn)).catch(() => null)) || null;
+  }
+  // v97(全体監査): 「読めなかった」を区別する読み出し(更新=読んで差分を足して書く、で使う)。
+  //   upstashGetJSON は失敗を null に潰すため、保存先が一瞬でも失敗すると「新規クラブ」と
+  //   見なして**空の調査ファイルを上書き保存**し、他のセクション(スタメン・成績・監督…)が
+  //   丸ごと消えていた(次に巡回が回るまで数日間、そのクラブの知識が空になる)。
+  async function getDossierStrict(nameEn) {
+    if (!upstashEnabled || !nameEn) return { ok: true, dossier: null };
+    if (typeof upstashCmd !== "function") return { ok: true, dossier: await getDossier(nameEn) };
+    try {
+      const raw = await upstashCmd(["GET", keyFor(nameEn)]);
+      if (raw === null || raw === undefined) return { ok: true, dossier: null };
+      return { ok: true, dossier: typeof raw === "object" ? raw : JSON.parse(raw) };
+    } catch (e) {
+      return { ok: false, dossier: null, error: String((e && e.message) || e).slice(0, 120) };
+    }
   }
 
   /**
@@ -87,7 +104,9 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
     const m = meta || {};
     const now = m.computedAt || new Date().toISOString();
 
-    let dossier = await getDossier(nameEn);
+    const read = await getDossierStrict(nameEn);
+    if (!read.ok) return { saved: false, changesJa: [], readFailed: true, reasonJa: `保存先から既存の調査ファイルを読み出せなかったため、上書きを避けて更新を見送りました(${read.error})` };
+    let dossier = read.dossier;
     const isNew = !dossier;
     if (!dossier) {
       dossier = {
@@ -214,7 +233,20 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
   async function savePlayer(player) {
     if (!upstashEnabled || !player || !player.id) return { saved: false };
     const key = `kb:player:${player.id}`;
-    const existing = await upstashGetJSON(key).catch(() => null);
+    // v97(全体監査): 読めなかったのに「新規選手」と見なして上書きすると、前日までの成績・
+    //   国籍・身長が消え(下のコメントの欠陥と同じ結果)、スカウトフィードに偽の「新規登録」が
+    //   積まれ、kb:player:count も二重に増える。読めなかったときは保存を見送る。
+    let existing = null;
+    if (typeof upstashCmd === "function") {
+      try {
+        const rawP = await upstashCmd(["GET", key]);
+        existing = rawP === null || rawP === undefined ? null : (typeof rawP === "object" ? rawP : JSON.parse(rawP));
+      } catch (e) {
+        return { saved: false, readFailed: true, isNew: null, events: [], reasonJa: `保存先から既存の選手記録を読み出せなかったため、上書きを避けて保存を見送りました(${String((e && e.message) || e).slice(0, 80)})` };
+      }
+    } else {
+      existing = await upstashGetJSON(key).catch(() => null);
+    }
     // ---- 2026年8月の検証で判明した既存の欠陥 ----
     // ここは常に「渡された内容でキーごと上書き」していた。名簿同期のように
     // 基本情報だけを渡す呼び出しが、前日に取得した成績・国籍・身長を
@@ -345,7 +377,10 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
   async function getScoutFeed(limit) {
     if (!upstashEnabled) return { available: false, reasonJa: "保存先(Upstash)が未設定です。", items: [] };
     const n = Math.max(1, Math.min(SCOUT_FEED_KEEP, Number(limit) || 40));
-    const raw = (await upstashCmd(["LRANGE", "kb:player:scoutfeed", "0", String(n - 1)]).catch(() => [])) || [];
+    // v97: 「読めなかった」を「変化なし(0件)」と言わない
+    let raw;
+    try { raw = (await upstashCmd(["LRANGE", "kb:player:scoutfeed", "0", String(n - 1)])) || []; }
+    catch (e) { return { available: false, readFailed: true, items: [], reasonJa: "保存先(Upstash)からスカウト速報を読み出せませんでした(変化が無かったという意味ではありません)。" }; }
     const items = raw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
     return { available: true, items };
   }
@@ -359,6 +394,21 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
     if (!upstashEnabled) return {};
     return (await upstashGetJSON("kb:player:statsIndex").catch(() => null)) || {};
   }
+  // v97: 「読めなかった」を区別する版。{ ok:false } のとき呼び出し側は索引を上書き保存しない
+  //   (読めなかった→{}→今日ぶんだけの索引で上書き、で数千人ぶんの索引が消える欠陥の対策)。
+  async function readIndexStrict(key) {
+    if (!upstashEnabled) return { ok: true, index: {} };
+    if (typeof upstashCmd !== "function") return { ok: true, index: (await upstashGetJSON(key).catch(() => null)) || {} };
+    try {
+      const raw = await upstashCmd(["GET", key]);
+      if (raw === null || raw === undefined) return { ok: true, index: {} };
+      return { ok: true, index: (typeof raw === "object" ? raw : JSON.parse(raw)) || {} };
+    } catch (e) {
+      return { ok: false, index: null, error: String((e && e.message) || e).slice(0, 120) };
+    }
+  }
+  async function getStatsIndexStrict() { return readIndexStrict("kb:player:statsIndex"); }
+  async function getSearchIndexStrict() { return readIndexStrict("kb:player:searchIndex"); }
   async function saveStatsIndex(index) {
     if (!upstashEnabled || !index) return false;
     return (await upstashSetJSON("kb:player:statsIndex", index)) !== false;
@@ -397,6 +447,18 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
     }
     out.readMode = perKeyChunks === 0 ? "mget" : (mgetChunks === 0 ? "per-key" : "mixed");
     return out;
+  }
+
+  // v97(全体監査): 複数クラブの調査ファイルをまとめて読む(1クラブ1 GET → 100件ずつ MGET)。
+  //   「読めなかった」を区別して返す(日次収集が選手索引を作り直すときに、読めなかった
+  //   クラブを「名簿なし」と見なして索引から落とさないため)。
+  async function getDossiers(nameEns) {
+    const names = (nameEns || []).filter(Boolean);
+    if (!upstashEnabled || !names.length) return { byName: new Map(), readFailed: false, partial: false };
+    const r = await readManyJSON({ upstashCmd, upstashGetJSON }, names.map((n) => keyFor(n)));
+    const byName = new Map();
+    names.forEach((n, i) => { if (r.values[i]) byName.set(n, r.values[i]); });
+    return { byName, readFailed: !!r.readFailed, partial: !!r.partial, readMode: r.readMode };
   }
 
   async function getCoverageSummary() {
@@ -441,8 +503,9 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
   }
 
   return {
-    getDossier, updateSection, savePlayer, getPlayer, getStatsIndex, saveStatsIndex, getCoverageSummary, slugOf,
+    getDossier, getDossiers, updateSection, savePlayer, getPlayer, getStatsIndex, saveStatsIndex, getCoverageSummary, slugOf,
     getSearchIndex, saveSearchIndex, searchPlayers, getScoutFeed,
+    getStatsIndexStrict, getSearchIndexStrict, // v97: 「読めなかった」を区別する版(更新で使う)
   };
 }
 

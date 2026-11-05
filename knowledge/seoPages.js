@@ -19,7 +19,7 @@
 "use strict";
 
 const { CLUB_UNIVERSE } = require("../learning/clubUniverse");
-const { computeMarketProbs } = require("../learning/accuracyTracker");
+const { oneX2ProbsOf } = require("../learning/accuracyTracker"); // v97: 判定に使った最終確率を優先(無ければλから)
 const { scorelineOutcome } = require("../learning/predictionModel");
 
 const MATCH_PATH_RE = /^\/match\/(\d{1,12})$/;
@@ -86,12 +86,17 @@ async function recordMatchIndexEntry(deps, record) {
 
 // ---- sitemap.xml ----
 async function buildSitemapXml(deps, origin) {
+  return (await buildSitemap(deps, origin)).xml;
+}
+// v97: 読めなかった事実も返す版(呼び出し側は失敗結果を長くキャッシュしない)
+async function buildSitemap(deps, origin) {
   const base = String(origin || "").replace(/\/+$/, "");
   const urls = [`  <url><loc>${esc(base)}/</loc><changefreq>daily</changefreq></url>`];
   let rows = [];
+  let readFailed = false;
   try {
     rows = (await deps.upstashCmd(["LRANGE", INDEX_KEY, "0", "-1"])) || [];
-  } catch (e) { rows = []; }
+  } catch (e) { rows = []; readFailed = true; } // v97: 読めなかった事実を呼び出し側へ返す(1時間キャッシュしないため)
   const seen = new Set();
   const items = [];
   for (const raw of rows) {
@@ -108,7 +113,8 @@ async function buildSitemapXml(deps, origin) {
       ? `<lastmod>${it.kickoff.slice(0, 10)}</lastmod>` : "";
     urls.push(`  <url><loc>${esc(base)}/match/${esc(it.id)}</loc>${lastmod}</url>`);
   }
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls.join("\n")}\n</urlset>\n`;
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls.join("\n")}\n</urlset>\n`;
+  return { xml, readFailed, urlCount: urls.length };
 }
 
 // ---- robots.txt ----
@@ -126,9 +132,8 @@ function renderMatchPageHtml(record, origin) {
   const kickoffJa = fmtKickoffJa(record.kickoff);
   const resolved = record.resolved === true;
 
-  // 勝率(保存済みλから導く既存モデルの分布。新しい推定はしない)
-  const probs = (Number.isFinite(record.homeLambda) && Number.isFinite(record.awayLambda))
-    ? computeMarketProbs(record.homeLambda, record.awayLambda) : null;
+  // 勝率(判定に実際に使った最終確率。v97より前の記録は保存済みλから導く既存モデルの分布。新しい推定はしない)
+  const probs = oneX2ProbsOf(record);
   const pct = (x) => Math.round(Number(x) * 100);
 
   const predLabel = outcomeLabelJa(record.predictedWinner, home, away);
@@ -266,20 +271,54 @@ function renderNotFoundHtml(fixtureId, origin) {
 }
 
 // ルート用の入口: レコードを読み、ページか404を返す
+// v97(全体監査): 「読めなかった」(保存先の障害)と「無い」を区別する。旧実装は失敗も 404 で
+//   返し、しかもその 404 が10分キャッシュ+ CDN(max-age=600)に乗るため、保存先が一時的に
+//   落ちた時間帯に検索エンジンへ「存在しないページ」と伝えてしまっていた(索引から外される
+//   恐れ)。読めなかったときは 503 + Cache-Control: no-store(呼び出し側で設定)にする。
 async function renderMatchPage(deps, fixtureId, origin) {
   let record = null;
   try {
-    record = await deps.upstashGetJSON(`learn:ownpred:${fixtureId}`);
-  } catch (e) { record = null; }
+    if (typeof deps.upstashCmd === "function") {
+      const raw = await deps.upstashCmd(["GET", `learn:ownpred:${fixtureId}`]);
+      record = raw === null || raw === undefined ? null : (typeof raw === "object" ? raw : JSON.parse(raw));
+    } else {
+      record = await deps.upstashGetJSON(`learn:ownpred:${fixtureId}`);
+    }
+  } catch (e) {
+    return { status: 503, readFailed: true, html: renderUnavailableHtml(fixtureId, origin) };
+  }
   if (!record || !record.fixtureId) {
     return { status: 404, html: renderNotFoundHtml(fixtureId, origin) };
   }
   return { status: 200, html: renderMatchPageHtml(record, origin) };
 }
 
+// 保存先が読めなかったときの一時ページ(検索エンジンには「一時的に利用できない」と伝える)
+function renderUnavailableHtml(fixtureId, origin) {
+  const base = String(origin || "").replace(/\/+$/, "");
+  return `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>一時的に表示できません | サッカー分析AI</title>
+<style>body{font-family:system-ui,sans-serif;margin:0;background:#f6f7f9;color:#1b1f24}main{max-width:720px;margin:40px auto;padding:0 16px}h1{font-size:20px}.cta{display:inline-block;margin-top:16px;padding:10px 16px;border-radius:8px;background:#1b5e20;color:#fff;text-decoration:none}</style>
+</head>
+<body>
+<main>
+  <h1>この試合のページは一時的に表示できません</h1>
+  <p>予想の保存先に接続できなかったため、試合ID(${esc(String(fixtureId))})の予想を読み出せませんでした。予想が無いという意味ではありません。1分ほど待って再読み込みしてください。</p>
+  <a class="cta" href="${esc(base)}/">⚽ 今日のAI予想を見る</a>
+</main>
+</body>
+</html>
+`;
+}
+
 module.exports = {
   MATCH_PATH_RE, INDEX_KEY, INDEX_CAP, SITEMAP_URL_CAP,
-  recordMatchIndexEntry, buildSitemapXml, robotsTxt,
-  renderMatchPage, renderMatchPageHtml, renderNotFoundHtml,
+  recordMatchIndexEntry, buildSitemapXml, buildSitemap, robotsTxt,
+  renderMatchPage, renderMatchPageHtml, renderNotFoundHtml, renderUnavailableHtml,
   jaNameOf,
 };

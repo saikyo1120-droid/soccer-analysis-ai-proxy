@@ -106,6 +106,7 @@ function normalizeForSearch(s) {
   return String(s || "")
     .normalize("NFD").replace(/[̀-ͯ]/g, "")
     .replace(/[øØ]/g, "o").replace(/[đĐ]/g, "d").replace(/[łŁ]/g, "l").replace(/[ßẞ]/g, "ss")
+    .replace(/[æÆ]/g, "ae").replace(/[œŒ]/g, "oe").replace(/[ðÐ]/g, "d").replace(/[þÞ]/g, "th") // v97: NFDで分解されない合字(Kjær/Sørloth等の検索漏れ対策)
     .toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
 }
 

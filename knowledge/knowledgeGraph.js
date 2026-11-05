@@ -44,6 +44,8 @@
  */
 
 const DEFAULT_MAX_DEPTH = 3;
+const { readManyJSON } = require("../learning/storeRead"); // v97: 複数キーのまとめ読み
+const EDGE_TTL_SEC = 180 * 86400; // v97: 辺の本体の寿命(観測のたびに延長)
 const DEFAULT_MAX_EDGES_PER_NODE = 20;
 const DEFAULT_MAX_VISITED = 60;
 const EDGE_LIST_CAP = 60; // 1ノードあたりに保持する辺の上限(古いものから捨てる)
@@ -155,6 +157,11 @@ function createKnowledgeGraph({ upstashEnabled, upstashCmd, upstashGetJSON, upst
       lastSeenAt: new Date().toISOString(),
     };
     await upstashSetJSON(`kg:edge:${key}`, record);
+    // v97(全体監査): 辺の本体に寿命(180日・観測のたびに延長)を付ける。索引(kg:out/kg:in)は
+    //   上限60件で古いものから押し出されるが、本体は削除経路が無く、どこからも辿れない
+    //   「孤児キー」として無限に増えていた(knowledge:item で直した問題と同じ構造)。
+    //   毎日観測される関係は寿命が延び続け、観測されなくなった関係だけが自然に消える。
+    await upstashCmd(["EXPIRE", `kg:edge:${key}`, String(EDGE_TTL_SEC)]).catch(() => {});
     await upsertNode(e.fromType, e.fromId, { labelJa: e.fromLabelJa });
     await upsertNode(e.toType, e.toId, { labelJa: e.toLabelJa });
 
@@ -189,28 +196,26 @@ function createKnowledgeGraph({ upstashEnabled, upstashCmd, upstashGetJSON, upst
     } catch (e) { return 0; }
   }
 
+  // v97: 辺の本体をまとめて読む(MGET。対応しない保存先では1件ずつ)。読めなかったものは載せない。
+  async function readEdgeBodies(keys) {
+    const list = (keys || []).filter(Boolean);
+    if (!list.length) return [];
+    const r = await readManyJSON({ upstashCmd, upstashGetJSON }, list.map((k) => `kg:edge:${k}`));
+    return r.values.filter(Boolean);
+  }
+
   /** そのノードから出ている辺(1対多に対応) */
   async function getOutEdges(type, id, limit = DEFAULT_MAX_EDGES_PER_NODE) {
     if (!upstashEnabled || !type || !id) return [];
     const keys = (await upstashCmd(["LRANGE", `kg:out:${type}:${id}`, String(-limit), "-1"]).catch(() => [])) || [];
-    const out = [];
-    for (const k of keys) {
-      const rec = await upstashGetJSON(`kg:edge:${k}`).catch(() => null);
-      if (rec) out.push(rec);
-    }
-    return out;
+    return readEdgeBodies(keys); // v97: 1件ずつ GET → MGET
   }
 
   /** そのノードへ入ってきている辺(逆探索。既存実装ではできなかったこと) */
   async function getInEdges(type, id, limit = DEFAULT_MAX_EDGES_PER_NODE) {
     if (!upstashEnabled || !type || !id) return [];
     const keys = (await upstashCmd(["LRANGE", `kg:in:${type}:${id}`, String(-limit), "-1"]).catch(() => [])) || [];
-    const out = [];
-    for (const k of keys) {
-      const rec = await upstashGetJSON(`kg:edge:${k}`).catch(() => null);
-      if (rec) out.push(rec);
-    }
-    return out;
+    return readEdgeBodies(keys); // v97: 1件ずつ GET → MGET
   }
 
   /**

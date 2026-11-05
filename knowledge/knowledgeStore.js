@@ -50,6 +50,7 @@
  * 残るが、RAG・推論には使われなくなる)。
  */
 const crypto = require("crypto");
+const { readManyJSON } = require("../learning/storeRead"); // v97: 複数キーのまとめ読み(MGET)
 
 const DEFAULT_EXPIRY_DAYS = { fact: 14, analysis: 30, opinion: 7, profile: 60, reflection: 90 };
 const MAX_ITEMS_PER_TEAM = 80;
@@ -208,18 +209,33 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
     return { saved: true, hash };
   }
 
+  // v97(全体監査): 知識本体をハッシュ一覧からまとめて読む。
+  //   以前は1件ずつ GET していた(1クラブ最大200件 → 質問1回・日次巡回1クラブごとに最大200コマンド)。
+  //   MGET で100件ずつにまとめる(往復・コマンド数の削減)。MGET に対応しない保存先
+  //   (テストのモック等)では従来どおり1件ずつ読む。
+  //   戻り値: { items, readFailed } — readFailed は「保存先が読めなかった」印
+  //   (「知識が無い」と区別するため。呼び出し側はそのまま開示できる)。
+  async function readItemsByHashes(hashes) {
+    const list = (hashes || []).filter(Boolean);
+    if (!list.length) return { items: [], readFailed: false };
+    const r = await readManyJSON({ upstashCmd, upstashGetJSON }, list.map((h) => `knowledge:item:${h}`));
+    // 一部だけ読めなかった(partial)場合も、件数を誤って少なく見せないよう readFailed 扱いにする
+    if (r.readFailed || r.partial) return { items: [], readFailed: true };
+    return { items: r.values.filter(Boolean), readFailed: false };
+  }
+
   // teamEn/leagueEnどちらの名前空間でも共通で使う内部ヘルパー(重複を避けるため
   // getActiveKnowledge/getActiveKnowledgeForLeagueの両方から呼ばれる)。
   async function getActiveKnowledgeByEntity(entity, nowMs) {
     const empty = { facts: [], analyses: [], opinions: [], profiles: [], reflections: [], totalStored: 0, totalActive: 0 };
     if (!upstashEnabled || !entity) return empty;
     const now = nowMs || Date.now();
-    const hashes = (await upstashCmd(["LRANGE", `knowledge:byTeam:${entity}`, "0", "-1"]).catch(() => [])) || [];
-    const items = [];
-    for (const h of hashes) {
-      const record = await upstashGetJSON(`knowledge:item:${h}`);
-      if (record) items.push(record);
-    }
+    let hashes = [];
+    let listReadFailed = false;
+    try { hashes = (await upstashCmd(["LRANGE", `knowledge:byTeam:${entity}`, "0", "-1"])) || []; }
+    catch (e) { listReadFailed = true; }
+    const { items, readFailed } = listReadFailed ? { items: [], readFailed: true } : await readItemsByHashes(hashes);
+    if (readFailed) return { ...empty, readFailed: true };
     const active = items.filter((i) => !isExpired(i, now));
     // 使用回数の記録(メモリ加算のみ=応答速度に影響しない。日次ジョブで保存)
     for (const i of active) {
@@ -255,12 +271,12 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
     const empty = { newItems: [], updatedItems: [], staleCount: 0 };
     if (!upstashEnabled || !entity || !dateKey) return empty;
     const now = nowMs || Date.now();
-    const hashes = (await upstashCmd(["LRANGE", `knowledge:byTeam:${entity}`, "0", "-1"]).catch(() => [])) || [];
-    const items = [];
-    for (const h of hashes) {
-      const record = await upstashGetJSON(`knowledge:item:${h}`);
-      if (record) items.push(record);
-    }
+    let hashes = [];
+    let listReadFailed = false;
+    try { hashes = (await upstashCmd(["LRANGE", `knowledge:byTeam:${entity}`, "0", "-1"])) || []; }
+    catch (e) { listReadFailed = true; }
+    const { items, readFailed } = listReadFailed ? { items: [], readFailed: true } : await readItemsByHashes(hashes);
+    if (readFailed) return { ...empty, readFailed: true }; // v97: 読めなかった日を「新規0件」と断定しない
     // 第8次監査(Medium)の修正: dateKeyは日本時間基準(dailyJobのappDateKey)なのに、
     // firstSeenAt/lastSeenAt(UTCのISO文字列)をUTCのまま日付切り出しして比較していた。
     // 日次実行はUTC19時(=日本時間の朝4時)のため、その実行で保存した知識のUTC日付は
@@ -325,9 +341,12 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
     if (!upstashEnabled) return [];
     const stored = (await upstashGetJSON(USAGE_KEY).catch(() => null)) || {};
     const top = Object.entries(stored).sort((a, b) => b[1] - a[1]).slice(0, limit || 5);
+    // v97: 上位N件の本体を MGET 1回で読む(対応しない保存先では1件ずつ)
+    const { items } = await readItemsByHashes(top.map(([hash]) => hash));
+    const byHash = new Map(items.map((it) => [it.hash, it]));
     const out = [];
     for (const [hash, count] of top) {
-      const item = await upstashGetJSON(`knowledge:item:${hash}`).catch(() => null);
+      const item = byHash.get(hash);
       if (item) out.push({ usageCount: count, statement: item.statement, teamJa: item.teamJa || null, type: item.type });
     }
     return out;
