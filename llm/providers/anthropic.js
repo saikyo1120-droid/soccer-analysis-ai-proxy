@@ -86,7 +86,11 @@ async function callOnce(model, { systemPrompt, userPrompt, maxTokens, timeoutMs 
     }),
   }, timeoutMs || ANTHROPIC_TIMEOUT_MS);
   if (!res.ok) {
-    const bodyText = await res.text().catch(() => "");
+    let bodyText = await res.text().catch(() => "");
+    // v97(全体監査・防御的措置): 応答本文に万一キー文字列が含まれても、エラー文(ログ・
+    //   診断JSONへ流れる)に残さない。通常の Anthropic エラー本文にキーは含まれないが、
+    //   秘密情報は「含まれないはず」ではなく「含まれても漏れない」形にしておく。
+    if (ANTHROPIC_API_KEY && ANTHROPIC_API_KEY.length >= 8) bodyText = bodyText.split(ANTHROPIC_API_KEY).join("[redacted]");
     const err = new Error(`Anthropic API HTTP ${res.status}: ${bodyText.slice(0, 300)}`);
     err.code = "HTTP_ERROR";
     err.httpStatus = res.status;
