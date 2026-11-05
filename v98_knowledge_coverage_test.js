@@ -234,6 +234,43 @@ function mockStore() {
     delete process.env.UNIVERSE_BULK_CLUB_LIMIT;
   });
 
+  // ================= v98.1: LLM の空応答(EMPTY_RESPONSE) =================
+  await t("L1 generateLLM: 空応答(EMPTY_RESPONSE)は1回だけ再試行して成功を返し、他のエラーは再試行しない", async () => {
+    process.env.LLM_EMPTY_RETRY_DELAY_MS = "0";
+    const LLM = require("./llm/index.js");
+    let calls = 0;
+    LLM.PROVIDERS.fakeempty = () => ({ generate: async () => { calls++; if (calls === 1) { const e = new Error("empty"); e.code = "EMPTY_RESPONSE"; throw e; } return { text: "ok-after-retry" }; }, resolveModel: () => "fake-model" });
+    const prevProvider = process.env.LLM_PROVIDER;
+    process.env.LLM_PROVIDER = "fakeempty";
+    const r = await LLM.generateLLM({ systemPrompt: "s", userPrompt: "u", maxTokens: 10 });
+    assert.strictEqual(r.text, "ok-after-retry"); assert.strictEqual(calls, 2); assert.strictEqual(r.retriedAfterEmpty, true);
+    let calls2 = 0;
+    LLM.PROVIDERS.fakeempty2 = () => ({ generate: async () => { calls2++; const e = new Error("still empty(stop_reason=end_turn, blocks=empty)"); e.code = "EMPTY_RESPONSE"; throw e; }, resolveModel: () => "fake" });
+    process.env.LLM_PROVIDER = "fakeempty2";
+    await assert.rejects(() => LLM.generateLLM({ systemPrompt: "s", userPrompt: "u" }), (e) => e.code === "EMPTY_RESPONSE" && /stop_reason/.test(e.message));
+    assert.strictEqual(calls2, 2, "2回目も空なら諦める(無限に再試行しない)");
+    let calls3 = 0;
+    LLM.PROVIDERS.fakehttp = () => ({ generate: async () => { calls3++; const e = new Error("HTTP 500"); e.code = "HTTP_ERROR"; throw e; }, resolveModel: () => "fake" });
+    process.env.LLM_PROVIDER = "fakehttp";
+    await assert.rejects(() => LLM.generateLLM({ systemPrompt: "s", userPrompt: "u" }), (e) => e.code === "HTTP_ERROR");
+    assert.strictEqual(calls3, 1, "HTTPエラーは再試行しない");
+    if (prevProvider === undefined) delete process.env.LLM_PROVIDER; else process.env.LLM_PROVIDER = prevProvider;
+  });
+  await t("L2 anthropic provider: 空応答のエラー文に停止理由とブロック種別が残る(原因が追える)", async () => {
+    const realFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, json: async () => ({ content: [{ type: "tool_use" }], stop_reason: "end_turn" }) });
+    try {
+      // 鍵はモジュール読み込み時に読まれるため、この検査だけ別の鍵付きで読み直す
+      const modPath = require.resolve("./llm/providers/anthropic.js");
+      const prevKey = process.env.ANTHROPIC_API_KEY; process.env.ANTHROPIC_API_KEY = "sk-test-dummy-key";
+      delete require.cache[modPath];
+      const prov = require(modPath);
+      await assert.rejects(() => prov.generate({ systemPrompt: "s", userPrompt: "u", maxTokens: 10, truncateRetry: false }), (e) => e.code === "EMPTY_RESPONSE" && /stop_reason=end_turn/.test(e.message) && /blocks=tool_use/.test(e.message) && !/sk-test-dummy-key/.test(e.message));
+      delete require.cache[modPath];
+      if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prevKey;
+    } finally { global.fetch = realFetch; }
+  });
+
   // ================= ① チーム知識(主力の実測・照合) =================
   const TK = require("./knowledge/teamKnowledge");
   await t("H1 squadStrengthFromPlayers: 出場時間上位14人の平均評価点・母数・注目選手・怪我人(実測のみ)", () => {
@@ -248,6 +285,9 @@ function mockStore() {
     assert.deepStrictEqual(s.injuredIndexed, ["P2"]);
     const thin = TK.squadStrengthFromPlayers(players.slice(0, 5));
     assert.strictEqual(thin.reliable, false, "評価点のある主力が7人未満なら比較しない");
+    // v98.1: 注目選手は270分(フル3試合)以上の選手から選ぶ(2試合ぶんの評価点は偶然に左右される)
+    const few = TK.squadStrengthFromPlayers([{ name: "TwoGames", minutes: 180, rating: 9.0 }, { name: "Regular", minutes: 900, rating: 7.0 }]);
+    assert.deepStrictEqual(few.keyPlayers.map((p) => p.name), ["Regular"]);
   });
   await t("H2 knowledgeForFixture: teamId で照合し、追跡クラブは選手実測+調査ファイル(MGET 1回)、対象外は tracked:false", async () => {
     const m = mockStore();
@@ -506,6 +546,11 @@ function mockStore() {
     const legacy = api.predBasisLineHtml({ basis: { factors: [], used: [{ labelJa: "直近フォーム" }], missing: null, basisKind: "legacy" } });
     assert.ok(legacy.includes("旧い記録のため") && !legacy.includes("未取得のため"), legacy);
     assert.strictEqual(api.predBasisLineHtml({}), "");
+  });
+  await t("U2c index.html: 試合前プレビューの見出し行「キックオフ」は辞書で訳せる形(span)になっている", () => {
+    assert.ok(html.includes("` ・ <span>キックオフ</span> ${timeStr}`"), "キックオフが span で囲まれていない");
+    const dictPart = html.slice(0, html.indexOf("/* ==== 辞書ここまで ==== */"));
+    assert.ok(/"キックオフ":\s*\[/.test(dictPart), "辞書に「キックオフ」が無い");
   });
   await t("U3 sw.js は v98・index.html は ?v=98", () => {
     const sw = fs.readFileSync(SW_JS, "utf8");

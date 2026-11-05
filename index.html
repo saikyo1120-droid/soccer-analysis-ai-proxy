@@ -3533,6 +3533,7 @@
     "主力選手の評価点を軽視した": ["Under-weighted core-player ratings", "轻视了主力球员评分", "Infraponderó la valoración de titulares"],
     "データ不足の解消": ["Fix missing data", "弥补数据不足", "Resolver datos faltantes"],
     "人": ["", "人", ""],
+    "キックオフ": ["Kick-off", "开球", "Inicio"],
   });
   var RAWP5 = [
     ["主力の平均評価点では⦿がやや上(差⦿)", "By core-player average rating, $1 is slightly ahead (gap $2)", "按主力平均评分,$1略占上风(差$2)", "Por valoración media de titulares, $1 va ligeramente por delante (diferencia $2)"],
@@ -8638,7 +8639,7 @@ function buildUpcomingPreviewHtml(analysis, level) {
   return `
     <div class="card">
       <h2>🔮 試合前プレビュー: ${escapeHtml(f.home.name)} vs ${escapeHtml(f.away.name)}</h2>
-      <p class="value-note">${escapeHtml(f.league || "")}${timeStr ? " ・ キックオフ " + timeStr : ""}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}</p>
+      <p class="value-note">${escapeHtml(f.league || "")}${timeStr ? ` ・ <span>キックオフ</span> ${timeStr}` : ""}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}</p>
       ${ownPred ? predictionSummaryBlockHtml(ownPred, "🤖 AIの予想") : noOwnHtml}
       ${leadHtml}
       ${sidesHtml}
