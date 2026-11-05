@@ -39,10 +39,20 @@ function summarizeRecentForm(fixtures, teamId) {
     .sort((a, b) => new Date(b.date) - new Date(a.date));
 }
 
-function summarizeInjuries(rawList, maxCount) {
+// v97(全体監査): /injuries はシーズン全体(試合ごとの欠場記録)を返すため、何か月も前に復帰した
+//   選手が「負傷者」として考察の根拠に混ざっていた。基準時刻の前後(過去10日〜未来7日)の
+//   記録だけを「現在の負傷・出場停止」とみなす(features.js の computeInjuryCountFeature と同じ窓)。
+//   日付を持たない応答は従来どおり全件(消しすぎない)。
+function summarizeInjuries(rawList, maxCount, refMs) {
   const seen = new Set();
   const items = [];
-  const sorted = (rawList || []).slice().sort((a, b) => new Date((b.fixture && b.fixture.date) || 0) - new Date((a.fixture && a.fixture.date) || 0));
+  const ref = Number.isFinite(refMs) ? refMs : Date.now();
+  const all = (rawList || []).slice();
+  const dated = all.filter((r) => r && r.fixture && r.fixture.date && Number.isFinite(new Date(r.fixture.date).getTime()));
+  const windowed = dated.length
+    ? dated.filter((r) => { const t = new Date(r.fixture.date).getTime(); return t >= ref - 10 * 86400000 && t <= ref + 7 * 86400000; })
+    : all;
+  const sorted = windowed.sort((a, b) => new Date((b.fixture && b.fixture.date) || 0) - new Date((a.fixture && a.fixture.date) || 0));
   for (const r of sorted) {
     const name = r.player && r.player.name;
     if (!name || seen.has(name)) continue;
