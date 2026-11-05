@@ -268,7 +268,16 @@ function eloForTeamName(eloByNorm, rows, teamName) {
 async function backfillHistory(deps, teams, sinceMs, runAt) {
   const { fetchFn, upstashCmd, upstashGetJSON, upstashSetJSON } = deps;
   if (!upstashSetJSON || !upstashCmd) return { ran: false, reasonJa: "保存先(Upstash)が未設定のため見送りました。" };
-  const existing = await upstashGetJSON(HIST_KEY).catch(() => null);
+  // v97(全体監査): 「一度きり」の判定に使う既存履歴は、読めなかった日に「無い」と見なすと
+  //   約190クラブぶんの再取得(数分・外部サイトへの負荷)と既存履歴の上書きが起きる。
+  //   失敗を区別して読み、読めなかった日は見送る。
+  let existing = null;
+  try {
+    const rawH = await upstashCmd(["GET", HIST_KEY]);
+    existing = rawH === null || rawH === undefined ? null : (typeof rawH === "object" ? rawH : JSON.parse(rawH));
+  } catch (e) {
+    return { ran: false, reasonJa: `保存済みのElo履歴を読み出せなかったため、再取得・上書きを避けて見送りました(${String((e && e.message) || e).slice(0, 80)})。` };
+  }
   if (existing && existing.byTeamId && Object.keys(existing.byTeamId).length > 0) {
     return { ran: false, alreadyDone: true, teams: Object.keys(existing.byTeamId).length, reasonJa: "取得済みのため再取得しません(一度きりの設計)。" };
   }

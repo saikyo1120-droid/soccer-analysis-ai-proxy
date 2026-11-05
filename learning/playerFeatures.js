@@ -60,7 +60,8 @@ function toNum(v) {
  *   ・判定できない(リーグ名が無い等)エントリーは男子扱い=従来どおり(消しすぎない)
  */
 // femin(仏feminine)・fémin(アクセント付き)・femmin(伊femminile)・femen(西femenino)をすべて拾う
-const WOMENS_COMP_RE = /\bwomen'?s?\b|\bfrauen\b|f[ée]min|femmin|femen|\bwsl\b|\bnwsl\b|\bladies\b|\bdames\b|damallsvenskan|toppserien|kvinne|女子|レディース/i;
+// v97: 蘭(vrouwen)・波(kobiet)・丁(kvinde。ノルウェー語 kvinne と別綴り)・芬(naisten)を追加
+const WOMENS_COMP_RE = /\bwomen'?s?\b|\bfrauen\b|f[ée]min|femmin|femen|\bwsl\b|\bnwsl\b|\bladies\b|\bdames\b|damallsvenskan|toppserien|kvinne|kvinde|vrouwen|kobiet|naisten|女子|レディース/i;
 const WOMENS_TEAM_SUFFIX_RE = /(\s|\()W\)?$/;
 function isWomensStatEntry(st) {
   const lg = String((st && st.league && st.league.name) || "");

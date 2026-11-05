@@ -51,25 +51,42 @@ function defaultTuneConfig() {
 }
 
 async function loadTuneConfig(deps) {
-  const { upstashEnabled, upstashGetJSON } = deps || {};
+  const { upstashEnabled, upstashGetJSON, upstashCmd } = deps || {};
   const cfg = defaultTuneConfig();
   if (!upstashEnabled) return cfg;
   try {
-    const stored = await upstashGetJSON(TUNE_CONFIG_KEY);
+    // v97(全体監査): upstashCmd があれば失敗を区別して読む。upstashGetJSON は失敗を null に潰すため、
+    //   保存先が一瞬でも失敗すると「既定値」で動き、その日の終わりに saveTuneConfig が既定値で
+    //   上書き保存して、AIが自分で調整してきた値(と評価待ちの記録)を消していた。
+    //   読めなかった日は既定値で動くが readFailed を立て、保存側で上書きを拒む。
+    let stored = null;
+    if (typeof upstashCmd === "function") {
+      const raw = await upstashCmd(["GET", TUNE_CONFIG_KEY]);
+      stored = raw === null || raw === undefined ? null : (typeof raw === "object" ? raw : JSON.parse(raw));
+    } else {
+      stored = await upstashGetJSON(TUNE_CONFIG_KEY);
+    }
     if (stored && typeof stored === "object") {
       for (const name of Object.keys(TUNABLE_KNOBS)) {
         if (Number.isFinite(stored[name])) cfg[name] = clampKnob(name, stored[name]);
       }
       if (Array.isArray(stored.pendingEvaluations)) cfg.pendingEvaluations = stored.pendingEvaluations;
     }
-  } catch (e) { noteVia(deps, "tune_config_read_failed", e); } // 読めなければ既定値(安全側。v92: 痕跡は残す=自己調整値が既定に戻った事実を隠さない)
+  } catch (e) {
+    configsFromFailedRead.add(cfg); // 保存側で上書きを拒むための印(設定値そのものは既定値のまま=挙動は不変)
+    noteVia(deps, "tune_config_read_failed", e); // 読めなければ既定値(安全側。v92: 痕跡は残す=自己調整値が既定に戻った事実を隠さない)
+  }
   return cfg;
 }
+// v97: 読み出しに失敗して既定値になった設定オブジェクトの印(値には手を加えないので deepEqual は不変)
+const configsFromFailedRead = new WeakSet();
+function tuneConfigReadFailed(cfg) { return !!(cfg && typeof cfg === "object" && configsFromFailedRead.has(cfg)); }
 
 async function saveTuneConfig(deps, cfg) {
   const { upstashEnabled, upstashSetJSON } = deps || {};
   if (!upstashEnabled || !cfg) return false;
-  try { await upstashSetJSON(TUNE_CONFIG_KEY, cfg); return true; } catch (e) { return false; }
+  if (tuneConfigReadFailed(cfg)) return false; // v97: 読めなかった日の既定値で、保存済みの自己調整値を上書きしない
+  try { const ok = await upstashSetJSON(TUNE_CONFIG_KEY, cfg); return ok !== false; } catch (e) { return false; }
 }
 
 async function appendHistory(deps, events) {
@@ -365,4 +382,5 @@ module.exports = {
   clampKnob, defaultTuneConfig, loadTuneConfig, saveTuneConfig, appendHistory,
   buildSelfDiagnosis, buildImprovementProposals, applyProposals, evaluateDueChanges,
   getSelfImprovementHistory,
+  tuneConfigReadFailed, // v97
 };

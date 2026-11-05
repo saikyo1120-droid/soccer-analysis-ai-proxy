@@ -155,8 +155,20 @@ async function collectUniverse(deps, runAt, dateKey) {
   const womensKnown = new Map();   // 保存済み: id -> {name, evidenceJa, at}
   const womensCleared = new Set(); // 今日、男子の成績が観測された= 記憶から外す
   const noteMensConfirmed = (id) => { if (womensKnown.has(Number(id))) womensCleared.add(Number(id)); };
+  // v97(全体監査): 記憶を「読めなかった」のに空と見なして上書き保存すると、過去に判定した
+  //   最大2,000人の除外記憶が今日ぶんだけに縮む(翌日から女子選手の混入が再発する)。
+  //   読めなかった日は当日の判定だけ効かせ、記憶の保存を見送る。
+  let womensMemoryReadFailed = false;
   try {
-    const savedWomens = deps.upstashGetJSON ? await deps.upstashGetJSON(WOMENS_KNOWN_KEY).catch(() => null) : null;
+    let savedWomens = null;
+    if (typeof deps.upstashCmd === "function") {
+      try {
+        const rawW = await deps.upstashCmd(["GET", WOMENS_KNOWN_KEY]);
+        savedWomens = rawW === null || rawW === undefined ? null : (typeof rawW === "object" ? rawW : JSON.parse(rawW));
+      } catch (e) { womensMemoryReadFailed = true; throw e; }
+    } else {
+      savedWomens = deps.upstashGetJSON ? await deps.upstashGetJSON(WOMENS_KNOWN_KEY).catch(() => null) : null;
+    }
     for (const [id, v] of Object.entries((savedWomens && savedWomens.ids) || {})) {
       if (Number.isFinite(Number(id))) womensKnown.set(Number(id), v || {});
     }
@@ -791,8 +803,19 @@ async function collectUniverse(deps, runAt, dateKey) {
     // 名簿(squad)は既に全クラブぶんこのループで読んでいるので、
     // **追加のAPI呼び出しもRedis読み出しも一切増えない**。
     const searchIndex = {};
+    // v97(全体監査): 172クラブを1件ずつ GET → MGET でまとめ読み。読めなかったクラブがあるときは
+    //   索引を**作り直さない**(読めなかったクラブの選手が「名簿なし」扱いで索引から消え、
+    //   選手検索から数百人が一斉に消える欠陥の対策。前日の索引を残す)。
+    const dossiersRead = (typeof clubDossier.getDossiers === "function")
+      ? await clubDossier.getDossiers(CLUB_UNIVERSE.map((c) => c.nameEn))
+      : null;
+    let indexReadIncomplete = false;
+    if (dossiersRead && (dossiersRead.readFailed || dossiersRead.partial)) {
+      indexReadIncomplete = true;
+      stats.errors.push(`universe_player_index_skipped_read_failed:${dossiersRead.readFailed ? "all" : "partial"}:調査ファイルを読み切れなかったため、選手索引の作り直しを見送りました(前日の索引をそのまま使います)`);
+    }
     for (const club of CLUB_UNIVERSE) {
-      const d = await clubDossier.getDossier(club.nameEn);
+      const d = dossiersRead ? (dossiersRead.byName.get(club.nameEn) || null) : await clubDossier.getDossier(club.nameEn);
       const squad = d && d.sections && d.sections.squad && d.sections.squad.players;
       if (!squad) continue;
       squadByClub.set(club.nameEn, { club, players: squad });
@@ -808,7 +831,7 @@ async function collectUniverse(deps, runAt, dateKey) {
       }
     }
     stats.playersIndexed = Object.keys(searchIndex).length;
-    if (stats.playersIndexed > 0) {
+    if (stats.playersIndexed > 0 && !indexReadIncomplete) {
       const savedIdx = await clubDossier.saveSearchIndex(searchIndex);
       if (!savedIdx) stats.errors.push("universe_player_index_save_failed");
     }
@@ -817,12 +840,33 @@ async function collectUniverse(deps, runAt, dateKey) {
     // 従来は「更新の古い順」を知るためだけに候補全員(数千人)の記録を
     // 1件ずつ読んでいた(1日数千Redisコマンド。選手3万人規模では無料枠を
     // 単独で超過)。playerId→statsUpdatedAtの索引1キー(読み1回・書き1回)に変更。
-    const statsIndex = await clubDossier.getStatsIndex();
+    // v97: 「読めなかった」を区別する。読めなかった日は {} で始めず、索引の保存も見送る
+    //   (読めなかった→{}→今日ぶんだけで上書き、で数千人ぶんの更新時刻が消え、
+    //    翌日以降「全員が最古」として同じ選手から取り直す欠陥の対策)。
+    let statsIndex = {};
+    let statsIndexWritable = true;
+    if (typeof clubDossier.getStatsIndexStrict === "function") {
+      const sRead = await clubDossier.getStatsIndexStrict();
+      if (sRead.ok) statsIndex = sRead.index || {};
+      else { statsIndexWritable = false; stats.errors.push(`universe_stats_index_read_failed:${sRead.error || "store"}:更新時刻の索引を読めなかったため、本日は索引を更新しません`); }
+    } else {
+      statsIndex = await clubDossier.getStatsIndex();
+    }
     // 連続して取得できなかった選手の記録(毎日同じ失敗を繰り返さないため)
     // このファイルは保存先を deps 経由で受け取る(直接の変数は存在しない)。
     // 無い環境でも動くように、必ず存在確認してから使う。
-    const playerFailCounts = (deps.upstashGetJSON
-      ? (await deps.upstashGetJSON(PLAYER_FAIL_KEY).catch(() => null)) : null) || {};
+    // v97: 読めなかった日は {} で始めず(今日ぶんだけで上書きすると「N日間見送る」記憶が消え、
+    //   取得できない選手への無駄な再試行が翌日から復活する)、保存も見送る。
+    let playerFailCounts = {};
+    let playerFailWritable = true;
+    if (typeof deps.upstashCmd === "function") {
+      try {
+        const rawF = await deps.upstashCmd(["GET", PLAYER_FAIL_KEY]);
+        playerFailCounts = (rawF === null || rawF === undefined) ? {} : ((typeof rawF === "object" ? rawF : JSON.parse(rawF)) || {});
+      } catch (e) { playerFailWritable = false; noteWarning(stats, "player_fail_memory_read_failed", e); }
+    } else {
+      playerFailCounts = (deps.upstashGetJSON ? (await deps.upstashGetJSON(PLAYER_FAIL_KEY).catch(() => null)) : null) || {};
+    }
     let playerFailDirty = false;
     const nowMsForSkip = runAt.getTime();
     const isSkipped = (playerId) => {
@@ -963,8 +1007,8 @@ async function collectUniverse(deps, runAt, dateKey) {
         done++;
       }
     }
-    if (indexDirty) await clubDossier.saveStatsIndex(statsIndex);
-    if (playerFailDirty && deps.upstashSetJSON) await deps.upstashSetJSON(PLAYER_FAIL_KEY, playerFailCounts).catch(() => {});
+    if (indexDirty && statsIndexWritable) await clubDossier.saveStatsIndex(statsIndex);
+    if (playerFailDirty && playerFailWritable && deps.upstashSetJSON) await deps.upstashSetJSON(PLAYER_FAIL_KEY, playerFailCounts).catch(() => {});
   } catch (e) { stats.errors.push(`universe_players_failed:${e.message}`); }
 
   // ============================================================
@@ -992,6 +1036,16 @@ async function collectUniverse(deps, runAt, dateKey) {
     } else {
       const todayKey = playerSearch.dateKeyNum(runAt.toISOString());
       const prevLoaded = await playerSearch.loadIndex(psDeps);
+      // ---- v97(全体監査): 前回の索引を完全に読めなかった日は、索引を作り直さない ----
+      //   「今日どの情報源にも現れなかった選手は前回の行を持ち越す」設計のため、前回の索引が
+      //   部分的にしか読めない(ブロック欠落)と、読めなかったブロックの選手が持ち越されず
+      //   索引から消える。saveIndex の「半分未満への縮小は拒む」門番は 50〜100% の縮小を
+      //   通してしまうので、ここで止める(前日の索引をそのまま使う。目次が無い=初回は除く)。
+      if (prevLoaded.partial && prevLoaded.meta) {
+        stats.playerIndex = { built: false, skippedPartialRead: true, reasonJa: `前回の選手索引を完全に読み出せなかったため(${prevLoaded.reasonJa || "ブロック欠落"})、今日は索引を作り直さず前回の索引をそのまま使います。` };
+        stats.errors.push("universe_player_rich_index_skipped_partial_read");
+        throw Object.assign(new Error("INDEX_PREV_PARTIAL"), { skipIndexBuild: true });
+      }
       const prevMap = new Map();
       for (const r of prevLoaded.rows) prevMap.set(Number(r[playerSearch.COL.id]), r);
       const isFirstBuild = prevMap.size === 0;
@@ -1086,7 +1140,7 @@ async function collectUniverse(deps, runAt, dateKey) {
       //   保存するのは「女子大会の成績しか無い」と実際に観測した選手だけ。推測では書かない。
       //   男子成績が観測できた選手(womensCleared)は記憶から外して復帰させる。
       try {
-        if (deps.upstashSetJSON) {
+        if (deps.upstashSetJSON && !womensMemoryReadFailed) {
           const mergedIds = {};
           for (const [id, v] of womensKnown) if (!womensCleared.has(id)) mergedIds[id] = v;
           for (const [id, v] of womensExcluded) mergedIds[id] = { ...v, at: runAt.toISOString() };
@@ -1257,8 +1311,10 @@ async function collectUniverse(deps, runAt, dateKey) {
       if (!saveRes.saved) stats.errors.push("universe_player_rich_index_save_failed");
     }
   } catch (e) {
-    stats.errors.push(`universe_player_index_failed:${e.message}`);
-    stats.playerIndex = { built: false, reasonJa: `索引の作成中にエラーが発生しました: ${e.message}` };
+    if (!(e && e.skipIndexBuild)) { // v97: 前回索引の不完全読みによる見送りは上で記録済み
+      stats.errors.push(`universe_player_index_failed:${e.message}`);
+      stats.playerIndex = { built: false, reasonJa: `索引の作成中にエラーが発生しました: ${e.message}` };
+    }
   }
 
   // ============================================================
@@ -1553,6 +1609,14 @@ async function collectClubPlayersBatch(deps, opts) {
     upstashGetJSON, upstashSetJSON, upstashCmd,
   };
   const prevLoaded = await playerSearch.loadIndex(psDeps);
+  // v97(全体監査): 前回の索引を完全に読めなかった日は、索引へのマージ保存を見送る
+  //   (読めなかったブロックの選手が「今回取得しなかった選手」として持ち越されず消えるため)。
+  //   取得した選手記録の保存(下)は索引と独立なので続ける。
+  if (prevLoaded.partial && prevLoaded.meta) {
+    stats.ok = false;
+    stats.indexSkippedPartialRead = true;
+    stats.reasonJa = `前回の選手索引を完全に読み出せなかったため(${prevLoaded.reasonJa || "ブロック欠落"})、索引への上書き保存を見送りました(前回の索引をそのまま使います)。`;
+  }
   const prevMap = new Map();
   for (const r of (prevLoaded.rows || [])) prevMap.set(Number(r[playerSearch.COL.id]), r);
   const grid = (await playerSearch.loadGrid(psDeps).catch(() => null)) || {};
@@ -1568,11 +1632,13 @@ async function collectClubPlayersBatch(deps, opts) {
     if (seen.has(id)) continue;
     rows.push(prevRow);   // 今回取得しなかった選手を消さない
   }
-  const saveRes = await playerSearch.saveIndex(psDeps, rows, {
-    builtAt: runAt.toISOString(),
-    collectedBatch: true,
-    sources: { clubsFetched: stats.clubsFetched, playersFetched: stats.playersFetched },
-  });
+  const saveRes = stats.indexSkippedPartialRead
+    ? { saved: false, reasonJa: stats.reasonJa }
+    : await playerSearch.saveIndex(psDeps, rows, {
+      builtAt: runAt.toISOString(),
+      collectedBatch: true,
+      sources: { clubsFetched: stats.clubsFetched, playersFetched: stats.playersFetched },
+    });
   stats.ok = saveRes.saved === true;
   stats.indexCount = rows.length;
   stats.indexClubs = new Set(rows.map((r) => r[playerSearch.COL.teamEn]).filter(Boolean)).size;
@@ -1582,18 +1648,28 @@ async function collectClubPlayersBatch(deps, opts) {
   // ---- 選手記録も保存する(上限つき。次回の作り直しの材料になる) ----
   if (recordSaveCap > 0) {
     let saved = 0;
-    const statsIndex = await clubDossier.getStatsIndex().catch(() => ({}));
+    // v97: 更新時刻の索引は「読めなかった」を区別し、読めなかった日は上書き保存しない
+    let statsIndex = {};
+    let statsIndexWritable = true;
+    if (typeof clubDossier.getStatsIndexStrict === "function") {
+      const sRead = await clubDossier.getStatsIndexStrict();
+      if (sRead.ok) statsIndex = sRead.index || {};
+      else { statsIndexWritable = false; noteWarning(stats, "stats_index_read_failed", new Error(sRead.error || "store")); }
+    } else {
+      statsIndex = await clubDossier.getStatsIndex().catch(() => ({}));
+    }
     for (const [id, rec] of collected) {
       if (saved >= recordSaveCap) break;
       if (!rec.stats) continue;              // 成績が無い選手は記録を増やさない
       if (statsIndex[id]) continue;          // 既にあるものは書き直さない(コマンド節約)
       try {
-        await clubDossier.savePlayer(rec);
+        const sp = await clubDossier.savePlayer(rec);
+        if (sp && sp.saved === false) continue; // v97: 読めなかった/保存できなかった選手は索引に時刻を書かない
         statsIndex[id] = runAt.toISOString();
         saved++;
       } catch (e) { noteWarning(stats, `stats_index_save_failed:${id}`, e); } // 1件失敗しても続ける(v92: 痕跡は残す)
     }
-    if (saved) await clubDossier.saveStatsIndex(statsIndex).catch(() => {});
+    if (saved && statsIndexWritable) await clubDossier.saveStatsIndex(statsIndex).catch(() => {});
     stats.recordsSaved = saved;
   }
   return stats;

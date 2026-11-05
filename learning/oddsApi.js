@@ -181,13 +181,23 @@ async function fetchLeagueConsensus(deps, leagueId, nowMs) {
   }
   const url = `https://${ODDS_API_HOST}/v4/sports/${sportKey}/odds` +
     `?apiKey=${encodeURIComponent(env.ODDS_API_KEY)}&regions=eu&markets=h2h&oddsFormat=decimal&dateFormat=iso`;
+  // v97(全体監査): タイムアウト無しの fetch だった(提供元が無応答だと日次学習が止まる。
+  //   他の外部呼び出しはすべて時間制限つき)。既定15秒・ODDS_API_TIMEOUT_MS で調整可。
+  const timeoutMs = Math.max(1000, Number(env && env.ODDS_API_TIMEOUT_MS) || 15000);
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
-    const res = await fetchFn(url);
+    const res = await fetchFn(url, controller ? { signal: controller.signal } : undefined);
     if (!res || !res.ok) return { ok: false, reason: `http_${res ? res.status : "no_response"}`, events: [] };
     const json = await res.json();
     return { ok: true, reason: null, events: buildConsensusEvents(json) };
   } catch (e) {
-    return { ok: false, reason: e && e.name === "AbortError" ? "network" : String((e && e.message) || e).slice(0, 60), events: [] };
+    const msg = String((e && e.message) || e);
+    // 鍵をエラー文に残さない(URLに apiKey を含むため、fetch の失敗文に混ざり得る)
+    const safe = env && env.ODDS_API_KEY ? msg.split(env.ODDS_API_KEY).join("[redacted]") : msg;
+    return { ok: false, reason: e && e.name === "AbortError" ? `timeout_${timeoutMs}ms` : safe.slice(0, 60), events: [] };
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

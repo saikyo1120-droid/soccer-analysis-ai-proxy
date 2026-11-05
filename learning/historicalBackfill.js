@@ -97,6 +97,14 @@ async function fetchSeason(callApiFootball, leagueId, season) {
       const st = r.fixture.status ? r.fixture.status.short : null;
       if (!FINISHED.has(st)) continue;                    // 未実施・中止は学習に使わない
       if (r.goals.home === null || r.goals.away === null) continue;
+      // ---- v97(全体監査): 延長・PK決着(AET/PEN)は90分時点のスコアで学習する ----
+      //   モデルが予測するのは90分の勝敗・得点(日次の答え合わせも score.fulltime で採点)。
+      //   旧実装は goals(延長込み)をそのまま使っていたため、カップ戦の延長戦が
+      //   「90分で2点差がついた試合」として学習データに混ざり、ラベルが濁っていた。
+      //   fulltime が無い応答形式では従来どおり goals を使う(値をでっち上げない)。
+      const ft = (st !== "FT" && r.score && r.score.fulltime
+        && Number.isFinite(r.score.fulltime.home) && Number.isFinite(r.score.fulltime.away))
+        ? r.score.fulltime : null;
       matches.push({
         id: r.fixture.id,
         date: r.fixture.date,
@@ -106,8 +114,9 @@ async function fetchSeason(callApiFootball, leagueId, season) {
         awayId: r.teams.away.id,
         homeName: r.teams.home.name,
         awayName: r.teams.away.name,
-        hg: r.goals.home,
-        ag: r.goals.away,
+        hg: ft ? ft.home : r.goals.home,
+        ag: ft ? ft.away : r.goals.away,
+        ...(ft ? { finishedStatus: st } : {}), // 延長/PK決着だったことを正直に残す
       });
     }
     return { matches, requests, errors };

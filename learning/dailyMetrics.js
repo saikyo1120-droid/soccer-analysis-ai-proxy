@@ -25,6 +25,7 @@
 
 const METRICS_KEY_PREFIX = "learn:metrics:";
 const METRICS_HISTORY_MAX_DAYS = 60;
+const { readManyJSON } = require("./storeRead"); // v97: 複数キーのまとめ読み(MGET)・失敗の区別
 
 /**
  * その日のgrowthLogから、日をまたいで比較できる数値だけを抜き出す。
@@ -48,9 +49,11 @@ function buildDailySnapshot(growthLog, extras) {
     newPredictionsLogged: log.newPredictionsLogged ?? 0,
     weightsUpdated: !!(log.weightsUpdated || log.weightsUpdatedV2),
     // --- Knowledge / Memory ---
-    knowledgeTotal: totals.knowledgeItemsTotal ?? 0,
-    memoryTotal: totals.memoryConclusionsTotal ?? 0,
-    predictionsTotal: totals.predictionsTotal ?? 0,
+    // v97: null は「読めなかった(不明)」の印なので 0 に潰さない(前日比の差分が
+    //   「知識が320件減った」のような嘘になるため)。項目が無い(undefined)場合は従来どおり 0。
+    knowledgeTotal: totals.knowledgeItemsTotal === null ? null : (totals.knowledgeItemsTotal ?? 0),
+    memoryTotal: totals.memoryConclusionsTotal === null ? null : (totals.memoryConclusionsTotal ?? 0),
+    predictionsTotal: totals.predictionsTotal === null ? null : (totals.predictionsTotal ?? 0),
     knowledgeAddedToday: log.knowledgeItemsSavedToday ?? 0,
     knowledgeDuplicateToday: log.knowledgeItemsDuplicateToday ?? 0,
     // --- Failure / Success Learning ---
@@ -173,19 +176,23 @@ function compareSnapshots(today, yesterday) {
  * 記録が無い日は推測で埋めず、そのまま欠落として扱う。
  */
 async function getMetricsTrend(deps, days, todayDateKey) {
-  const { upstashEnabled, upstashGetJSON } = deps || {};
+  const { upstashEnabled, upstashGetJSON, upstashCmd } = deps || {};
   const n = Math.max(2, Math.min(METRICS_HISTORY_MAX_DAYS, days || 14));
-  if (!upstashEnabled || typeof upstashGetJSON !== "function") {
+  if (!upstashEnabled || (typeof upstashGetJSON !== "function" && typeof upstashCmd !== "function")) {
     return { available: false, reasonJa: "Upstashが設定されていないため、日々の指標を読み出せません。", days: [] };
   }
   const base = new Date(`${todayDateKey}T00:00:00Z`).getTime();
-  const rows = [];
-  for (let i = 0; i < n; i++) {
-    const dateKey = new Date(base - i * 86400000).toISOString().slice(0, 10);
-    let snap = null;
-    try { snap = await upstashGetJSON(`${METRICS_KEY_PREFIX}${dateKey}`); } catch (e) { snap = null; }
-    rows.push(snap ? { ...snap, date: dateKey, recorded: true } : { date: dateKey, recorded: false });
+  const dateKeys = [];
+  for (let i = 0; i < n; i++) dateKeys.push(new Date(base - i * 86400000).toISOString().slice(0, 10));
+  // v97(全体監査): N日ぶんを1件ずつ GET していた(既定14回・最大60回)のを MGET 1回にまとめる。
+  //   MGET そのものが失敗した場合は「読めなかった」と正直に返す(以前は全日「記録なし」に化けていた)。
+  //   MGET に対応しない保存先(テストのモック等)では従来どおり 1件ずつ読む。
+  const many = await readManyJSON({ upstashCmd, upstashGetJSON }, dateKeys.map((d) => `${METRICS_KEY_PREFIX}${d}`));
+  if (many.readFailed) {
+    return { available: false, readFailed: true, reasonJa: `保存先(Upstash)から日々の指標を読み出せませんでした${many.firstError ? `(${many.firstError})` : ""}。記録が無いという意味ではありません。`, days: [] };
   }
+  const snaps = many.values.map((v) => ((v && typeof v === "object") ? v : null));
+  const rows = dateKeys.map((dateKey, i) => (snaps[i] ? { ...snaps[i], date: dateKey, recorded: true } : { date: dateKey, recorded: false, ...(many.partial && snaps[i] === null ? { readFailed: true } : {}) }));
   // rows[0] が今日。前日との差分を付ける(前日の記録が無い日は null のまま)。
   const withDelta = rows.map((r, i) => {
     const prev = rows[i + 1] && rows[i + 1].recorded ? rows[i + 1] : null;

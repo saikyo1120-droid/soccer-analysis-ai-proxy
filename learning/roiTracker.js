@@ -20,6 +20,7 @@
  */
 
 const ROI_KEY_PREFIX = "learn:roi:";
+const { readManyJSON, dateKeysBack } = require("./storeRead"); // v97: 複数キーのまとめ読み(MGET)・失敗の区別
 
 function median(values) {
   const v = values.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
@@ -102,24 +103,36 @@ function summarizeRoi(agg) {
 }
 
 async function saveDailyRoi(deps, dateKey, agg) {
-  const { upstashEnabled, upstashGetJSON, upstashSetJSON } = deps || {};
+  const { upstashEnabled, upstashGetJSON, upstashSetJSON, upstashCmd } = deps || {};
   if (!upstashEnabled || !dateKey || !agg) return false;
   try {
-    const existing = await upstashGetJSON(`${ROI_KEY_PREFIX}${dateKey}`).catch(() => null);
-    await upstashSetJSON(`${ROI_KEY_PREFIX}${dateKey}`, mergeRoiDaily(existing, agg));
-    return true;
+    // v97(全体監査): 「読めなかった」のに「無かった」と見なして上書きすると、その日の
+    //   既存ROI(同じ日の前回実行分)が消える(read-merge-write の欠陥)。upstashCmd が
+    //   あれば失敗を区別できる経路で読み、失敗したら保存を見送る(次回の実行で再度足される)。
+    let existing = null;
+    if (typeof upstashCmd === "function") {
+      const r = await readManyJSON({ upstashCmd }, [`${ROI_KEY_PREFIX}${dateKey}`]);
+      if (r.readFailed) return false;
+      existing = r.values[0];
+    } else {
+      existing = await upstashGetJSON(`${ROI_KEY_PREFIX}${dateKey}`).catch(() => null);
+    }
+    const ok = await upstashSetJSON(`${ROI_KEY_PREFIX}${dateKey}`, mergeRoiDaily(existing, agg));
+    return ok !== false;
   } catch (e) { return false; }
 }
 
 /** 直近7日・30日のROIまとめ(記録の無い日は欠落のまま。推測で埋めない) */
 async function getRoiTrend(deps, todayDateKey) {
-  const { upstashEnabled, upstashGetJSON } = deps || {};
+  const { upstashEnabled } = deps || {};
   if (!upstashEnabled) return { available: false, reasonJa: "Upstash未設定のため読み出せません。" };
-  const base = new Date(`${todayDateKey}T00:00:00Z`).getTime();
   let last7 = null, last30 = null, today = null;
-  for (let i = 0; i < 30; i++) {
-    const dk = new Date(base - i * 86400000).toISOString().slice(0, 10);
-    const agg = await upstashGetJSON(`${ROI_KEY_PREFIX}${dk}`).catch(() => null);
+  // v97: 30日ぶんを1件ずつ GET → MGET 1回。読めなかった場合は正直に返す。
+  const dks = dateKeysBack(todayDateKey, 30);
+  const r = await readManyJSON(deps, dks.map((dk) => `${ROI_KEY_PREFIX}${dk}`));
+  if (r.readFailed) return { available: false, readFailed: true, reasonJa: `保存先(Upstash)からROIの記録を読み出せませんでした${r.firstError ? `(${r.firstError})` : ""}。記録が無いという意味ではありません。` };
+  for (let i = 0; i < dks.length; i++) {
+    const agg = r.values[i];
     if (!agg) continue;
     if (i === 0) today = agg;
     if (i < 7) last7 = mergeRoiDaily(last7, agg);
@@ -127,6 +140,7 @@ async function getRoiTrend(deps, todayDateKey) {
   }
   return {
     available: true,
+    partial: !!r.partial, // 一部の日が読めなかった(件数が実際より少ない可能性)
     today: summarizeRoi(today),
     last7Days: summarizeRoi(last7),
     last30Days: summarizeRoi(last30),

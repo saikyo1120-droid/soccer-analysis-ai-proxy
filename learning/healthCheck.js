@@ -33,6 +33,8 @@
  *   はっきり見えるようにします(推測で埋めることはしません)。
  */
 
+const { readManyJSON } = require("./storeRead"); // v97: 複数キーのまとめ読み(MGET)・失敗の区別
+
 const ZERO_CAUSE = {
   NOT_RUN_YET: "NOT_RUN_YET",
   NO_UPSTASH: "NO_UPSTASH",
@@ -225,12 +227,31 @@ async function getRunHistory(deps, days, todayDateKey, opts) {
     : async (key) => upstashGetJSON(key);
   let readFailures = 0;
   let firstReadError = null;
+  const dateKeys = [];
+  for (let i = 0; i < n; i++) dateKeys.push(new Date(base - i * 86400000).toISOString().slice(0, 10));
+  // v97(全体監査): N日ぶん(既定14・最大60)を1件ずつ GET していたのを MGET 1回にまとめる。
+  //   MGET が失敗したときは全日「読めなかった」(=保存先の障害)として扱う。
+  //   MGET に対応しない保存先(テストのモック等)では従来どおり 1件ずつ読む。
+  let mgetLogs = null; // 要素: { ok:true, log } | { ok:false, error }
+  if (typeof upstashCmd === "function") {
+    const many = await readManyJSON({ upstashCmd, upstashGetJSON }, dateKeys.map((d) => `learn:growthlog:${d}`));
+    mgetLogs = dateKeys.map((d, i) => {
+      if (many.readFailed || (many.partial && many.values[i] === null)) return { ok: false, error: many.firstError || "store_read_failed" };
+      const v = many.values[i];
+      return { ok: true, log: (v && typeof v === "object") ? v : null };
+    });
+  }
   for (let i = 0; i < n; i++) {
-    const dateKey = new Date(base - i * 86400000).toISOString().slice(0, 10);
+    const dateKey = dateKeys[i];
     let log = null;
     let readFailed = false;
-    try { log = await strictGet(`learn:growthlog:${dateKey}`); }
-    catch (e) { log = null; readFailed = true; readFailures++; if (!firstReadError) firstReadError = String((e && e.message) || e).slice(0, 160); }
+    if (mgetLogs) {
+      if (mgetLogs[i].ok) log = mgetLogs[i].log;
+      else { readFailed = true; readFailures++; if (!firstReadError) firstReadError = mgetLogs[i].error; }
+    } else {
+      try { log = await strictGet(`learn:growthlog:${dateKey}`); }
+      catch (e) { log = null; readFailed = true; readFailures++; if (!firstReadError) firstReadError = String((e && e.message) || e).slice(0, 160); }
+    }
     if (readFailed) {
       out.push({ date: dateKey, ran: null, readFailed: true });
     } else if (!log) {

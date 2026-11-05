@@ -307,7 +307,22 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   //   一度だけ「改修前のモデル」を保存し、以後この基準と比べ続ける。
   //   基準を毎日更新すると「昨日比」しか分からず、
   //   「最初と比べてどれだけ良くなったか」が永久に分からなくなる。
-  let baseline = upstashEnabled ? await (deps.upstashGetJSON(BASELINE_KEY).catch(() => null)) : null;
+  // v97(全体監査): 基準モデルは「一度だけ保存して以後固定」なので、読めなかった日に
+  //   「無い」と見なして作り直すと、基準が今日の重みに差し替わり「最初と比べてどれだけ
+  //   良くなったか」の比較が壊れる。upstashCmd があれば失敗を区別し、失敗した日は
+  //   基準の保存をしない(比較は今日の base 相当で行い、その旨を残す)。
+  let baseline = null;
+  let baselineReadFailed = false;
+  if (upstashEnabled) {
+    if (typeof deps.upstashCmd === "function") {
+      try {
+        const rawB = await deps.upstashCmd(["GET", BASELINE_KEY]);
+        baseline = rawB ? JSON.parse(rawB) : null;
+      } catch (e) { baselineReadFailed = true; noteVia(deps, "baseline_read_failed", e); }
+    } else {
+      baseline = await deps.upstashGetJSON(BASELINE_KEY).catch(() => null);
+    }
+  }
   if (!baseline) {
     // 和の重みとρを0にしたもの = λ独立化より前の挙動と完全に同一
     baseline = {
@@ -315,7 +330,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
       attackSumSensitivity: 0, concededSumSensitivity: 0,
       fatigueSumSensitivity: 0, xgSumSensitivity: 0, rho: 0,
     };
-    if (upstashEnabled) await upstashSetJSON(BASELINE_KEY, baseline);
+    if (upstashEnabled && !baselineReadFailed) await upstashSetJSON(BASELINE_KEY, baseline);
   }
 
   // ---- v50: チーム別レーティングの学習と、特徴量への注入 ----

@@ -23,6 +23,7 @@
  */
 
 const { noteVia } = require("./warnings"); // v92: 黙って続行した失敗の痕跡(deps.noteWarning があれば記録)
+const { readManyJSON, dateKeysBack } = require("./storeRead"); // v97: 複数キーのまとめ読み(MGET)
 const INTEL_KEY_PREFIX = "learn:intel:";
 const INTEL_REPORT_KEY_PREFIX = "learn:intel:report:";
 const BUFFER_MAX = 500; // メモリ有界: 1日にこれ以上の考察が来たら古い順に落とす(件数はdroppedで正直に数える)
@@ -209,7 +210,7 @@ function mergeIntelDaily(a, b) {
  * 日次学習ジョブから1日1回呼ばれる。保存後にバッファを空にする。
  */
 async function flushIntelDaily(deps, dateKey) {
-  const { upstashEnabled, upstashGetJSON, upstashSetJSON } = deps || {};
+  const { upstashEnabled, upstashGetJSON, upstashSetJSON, upstashCmd } = deps || {};
   const pending = discussSampleBuffer.length;
   if (!upstashEnabled || !dateKey) return { flushed: 0, reasonJa: "Upstash未設定または日付なし" };
   if (!pending && !droppedSamples) return { flushed: 0 };
@@ -234,9 +235,20 @@ async function flushIntelDaily(deps, dateKey) {
   }
   agg.droppedSamples = droppedSamples;
   try {
-    const existing = await upstashGetJSON(`${INTEL_KEY_PREFIX}${dateKey}`).catch(() => null);
+    // v97(全体監査): 読めなかったのに「無かった」と見なして上書きすると、同じ日の
+    //   既存集計(前回実行分)が消える。upstashCmd があれば失敗を区別して保存を見送る
+    //   (バッファは残るので次回の実行で再度足される)。
+    let existing = null;
+    if (typeof upstashCmd === "function") {
+      const r = await readManyJSON({ upstashCmd }, [`${INTEL_KEY_PREFIX}${dateKey}`]);
+      if (r.readFailed) return { flushed: 0, error: `read_failed:${r.firstError || "store"}` };
+      existing = r.values[0];
+    } else {
+      existing = await upstashGetJSON(`${INTEL_KEY_PREFIX}${dateKey}`).catch(() => null);
+    }
     const merged = mergeIntelDaily(existing, agg);
-    await upstashSetJSON(`${INTEL_KEY_PREFIX}${dateKey}`, merged);
+    const ok = await upstashSetJSON(`${INTEL_KEY_PREFIX}${dateKey}`, merged);
+    if (ok === false) return { flushed: 0, error: "write_failed" }; // 保存できていないのにバッファを消さない
     discussSampleBuffer = [];
     droppedSamples = 0;
     return { flushed: pending };
@@ -269,15 +281,15 @@ function summarizeIntelDaily(agg) {
 
 /** ご指示③: 考察の質の推移(今日・昨日・直近7日)を読み出す */
 async function getIntelTrend(deps, todayDateKey) {
-  const { upstashEnabled, upstashGetJSON } = deps || {};
+  const { upstashEnabled } = deps || {};
   if (!upstashEnabled) return { available: false, reasonJa: "Upstash未設定のため読み出せません。" };
   const base = new Date(`${todayDateKey}T00:00:00Z`).getTime();
+  // v97: 8日ぶんを1件ずつ GET → MGET 1回。読めなかった場合は「記録なし」と言わず正直に返す。
+  const dks = dateKeysBack(todayDateKey, 8);
+  const r = await readManyJSON(deps, dks.map((dk) => `${INTEL_KEY_PREFIX}${dk}`));
+  if (r.readFailed) return { available: false, readFailed: true, reasonJa: `保存先(Upstash)から考察の質の記録を読み出せませんでした${r.firstError ? `(${r.firstError})` : ""}。記録が無いという意味ではありません。` };
   const daily = [];
-  for (let i = 0; i < 8; i++) {
-    const dk = new Date(base - i * 86400000).toISOString().slice(0, 10);
-    const agg = await upstashGetJSON(`${INTEL_KEY_PREFIX}${dk}`).catch(() => null);
-    if (agg) daily.push({ date: dk, agg });
-  }
+  dks.forEach((dk, i) => { if (r.values[i]) daily.push({ date: dk, agg: r.values[i] }); });
   const today = daily.find((d) => d.date === todayDateKey) || null;
   const yesterdayKey = new Date(base - 86400000).toISOString().slice(0, 10);
   const yesterday = daily.find((d) => d.date === yesterdayKey) || null;
@@ -693,11 +705,20 @@ async function processAnswerability(deps, subjects, nowIso) {
   const { upstashEnabled, upstashGetJSON, upstashSetJSON, upstashCmd } = deps || {};
   if (!upstashEnabled || !subjects || !subjects.length) return { updated: 0, improvedEvents: 0 };
   let updated = 0, improvedEvents = 0;
-  for (const s of subjects) {
+  // v97(全体監査): 台帳の読み出しを1件ずつ GET → MGET 1回にまとめ、「読めなかった」対象は
+  //   新規扱いで上書きしない(firstStars が今日の値に書き換わり「答えられるようになった」実績が消える欠陥)。
+  const keys = subjects.map((s) => `${ANSWERABILITY_KEY_PREFIX}${s.subjectKey}`);
+  const read = await readManyJSON({ upstashCmd, upstashGetJSON }, keys);
+  if (read.readFailed) { noteVia(deps, "answerability_ledger_read_failed", new Error(read.firstError || "store")); return { updated: 0, improvedEvents: 0, readFailed: true }; }
+  for (let idx = 0; idx < subjects.length; idx++) {
+    const s = subjects[idx];
     try {
-      const key = `${ANSWERABILITY_KEY_PREFIX}${s.subjectKey}`;
-      const existing = await upstashGetJSON(key).catch(() => null);
+      const key = keys[idx];
+      const existing = read.values[idx];
       if (!existing) {
+        // 一部だけ読めなかった(partial)ときは null=未登録 と区別できないので、安全側に倒して
+        // 新規登録しない(次回の実行で改めて)。
+        if (read.partial) continue;
         await upstashSetJSON(key, { subjectJa: s.subjectJa, firstStars: s.bestStars, firstAt: nowIso, bestStars: s.bestStars, bestAt: nowIso, improvedRecorded: false });
         updated++;
         continue;

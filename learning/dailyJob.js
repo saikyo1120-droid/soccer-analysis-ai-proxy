@@ -101,13 +101,15 @@ const {
   classifySuccessReasons, summarizeSuccessReasons, classifyContextualFailureReasons,
   computeFeatureEffectiveness, buildAblationCandidates, mostLikelyScoreline,
   classifyFixtureOfficial,
+  computeMatchProbabilitiesRaw, // v97: 判定に使った最終確率(finalProbs)の記録用
   // v62: 学習した大会かどうかの判定は下の learnedComp を使う(requireは末尾にまとめる)
 } = require("./predictionModel");
 // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ ----
 // ⑨ 予測精度の毎日測定(勝敗/BTTS/Over-Under、Brier・LogLoss・較正)
-const { scorePrediction, buildDailyAccuracy, saveDailyAccuracy, getAccuracyTrend } = require("./accuracyTracker");
+const { scorePrediction, buildDailyAccuracy, saveDailyAccuracy, getAccuracyTrend, confidenceOnPickOf } = require("./accuracyTracker");
 // v92: 「黙って飲み込む失敗」に痕跡を残す(挙動は変えない。learning/warnings.js 参照)
 const { noteWarning, summarizeWarnings, mergeWarningSummaries } = require("./warnings");
+const { readManyJSON } = require("./storeRead"); // v97: 複数キーのまとめ読み(MGET)と「読めなかった」の区別
 // ---- 2026年8月・AI知能計測ラウンド(ご指示①〜⑨) ----
 // 考察の質・RAG使用率の日次保存、エンジン別成長率、Knowledgeの寄与ランキング、
 // 精度低下の自己分析、そして毎日の自己評価「今日のAIは昨日より賢くなったか?」
@@ -129,6 +131,7 @@ const {
   loadTuneConfig, saveTuneConfig, appendHistory,
   buildSelfDiagnosis, buildImprovementProposals, applyProposals, evaluateDueChanges,
   TUNABLE_KNOBS, EVAL_AFTER_DAYS,
+  tuneConfigReadFailed, // v97
 } = require("./selfImprovement");
 const { computeMarketProbs } = require("./accuracyTracker");
 const { CLUB_UNIVERSE, clubsForPrediction } = require("./clubUniverse");
@@ -440,6 +443,8 @@ function mergeGrowthLogs(previous, current) {
     playerFieldsRetryableToday: Math.max(previous.playerFieldsRetryableToday || 0, current.playerFieldsRetryableToday || 0),
     playerUnavailableReasonsToday: mergedUnavailable,
     matchesResolvedToday: sum(previous.matchesResolvedToday, current.matchesResolvedToday),
+    // v97: 同日の再実行では同じ保留分を見送るため、最新の実行の値を採用する(足さない)
+    pendingSkippedNotFinished: current.pendingSkippedNotFinished ?? previous.pendingSkippedNotFinished ?? 0,
     newPredictionsLogged: sum(previous.newPredictionsLogged, current.newPredictionsLogged),
     hypothesesConfirmed: sum(previous.hypothesesConfirmed, current.hypothesesConfirmed),
     hypothesesDiscarded: sum(previous.hypothesesDiscarded, current.hypothesesDiscarded),
@@ -1197,10 +1202,27 @@ async function runDailyLearning(deps) {
   //   修正は宣言を前へ移すだけ(値・使い方は不変)。v92_ops_hardening_test ⑤ で固定。
   const lineupWatchScored = { n: 0, morningSum: 0, preKickSum: 0 }; // v57: 朝版vs直前版
   const pendingIds = (await upstashCmd(["LRANGE", "learn:ownpred:pending", "0", String(OWN_PREDICT_RESOLVE_CAP - 1)]).catch(() => [])) || [];
-  for (const fixtureIdStr of pendingIds) {
+  // ---- v97(全体監査): 保留中の記録を MGET でまとめ読みし、「読めなかった」を区別する ----
+  //   旧実装は1件ずつ upstashGetJSON(失敗→null)で読み、null なら「記録が無い」と見なして
+  //   保留リストから LREM していた。保存先が一時的に読めないだけで、答え合わせ待ちの予想が
+  //   **二度と答え合わせされずに消える**(正答率の母数が減る)欠陥。読めなかった ID は触らない。
+  const pendingRead = await readManyJSON({ upstashCmd, upstashGetJSON }, pendingIds.map((id) => `learn:ownpred:${id}`));
+  if (pendingRead.readFailed && pendingIds.length) warn(`pending_records_read_failed:${pendingRead.firstError || "store"}`);
+  let pendingSkippedNotFinished = 0; // v97: キックオフ+2時間を過ぎていないため API を呼ばなかった件数(実測)
+  for (let pIdx = 0; pIdx < pendingIds.length; pIdx++) {
+    const fixtureIdStr = pendingIds[pIdx];
     try {
-      const record = await upstashGetJSON(`learn:ownpred:${fixtureIdStr}`);
+      if (pendingRead.readFailed) break; // 保存先が読めない。LREM も API 消費もしない
+      const record = pendingRead.values[pIdx];
+      if (!record && pendingRead.partial) continue; // 読めなかった可能性があるので消さない
       if (!record || record.resolved) { await upstashCmd(["LREM", "learn:ownpred:pending", "0", fixtureIdStr]).catch(() => {}); continue; }
+      // ---- v97(全体監査): まだ終わっているはずのない試合は API を呼ばない ----
+      //   保留リストには数日先の試合も並ぶ(予想は「次の試合」に対して作るため)。
+      //   旧実装はそれらにも毎日 /fixtures を1回ずつ呼び、「まだ終わっていない」で捨てていた
+      //   (API予算と Upstash の SET NX ロックを毎日無駄に消費)。キックオフから2時間
+      //   (90分+延長・PK・ロスタイム)経っていない試合は、結果が出ていないので見送る。
+      const kickoffMs = record.kickoff ? new Date(record.kickoff).getTime() : NaN;
+      if (Number.isFinite(kickoffMs) && nowFn().getTime() < kickoffMs + 2 * 60 * 60 * 1000) { pendingSkippedNotFinished++; continue; }
       // ---- 第8次監査(High)の修正: 解決処理の多重実行ロック ----
       // 再デプロイ時の新旧プロセス並走や実行ロック(10分)失効後の再突入で、
       // 同じ試合を2つのプロセスが同時に解決すると、resolved/correctカウンタの
@@ -1361,7 +1383,17 @@ async function runDailyLearning(deps) {
         record.contextualFailureReasons = contextualFailureReasons;
         record.resolvedContext = resolvedContext;
       }
-      await upstashSetJSON(`learn:ownpred:${fixtureIdStr}`, record);
+      // ---- v97(全体監査): 本体の保存が失敗したら、ここで止める ----
+      //   旧実装は SET の結果を見ずに LREM(保留から除外)・INCR(解決数)・RPUSH(学習用の写し)
+      //   へ進んでいたため、保存先が一瞬でも失敗すると「解決済みなのに本体は未解決のまま・
+      //   保留からは消えた=二度と答え合わせされない」記録が生まれ、累計 resolved だけが増えた。
+      //   保存できなかった試合はロックを外して次回の実行に委ねる(結果は消えない)。
+      const savedResolved = await upstashSetJSON(`learn:ownpred:${fixtureIdStr}`, record);
+      if (savedResolved === false) {
+        await upstashCmd(["DEL", `learn:ownpred:resolvelock:${fixtureIdStr}`]).catch(() => {});
+        errors.push(`prediction_resolve_save_failed:${fixtureIdStr}:答え合わせの結果を保存できなかったため、次回の実行でやり直します`);
+        continue;
+      }
       // 第8次監査(High)の修正: 解決済みの個別レコードは学習用の写し(learn:ownpred:recent)
       // に引き継がれるため、本体は180日で自動失効させる(Redisキーの無限成長を止める。
       // 未解決レコードは解決に必要なのでTTLを付けない)。
@@ -1418,14 +1450,11 @@ async function runDailyLearning(deps) {
         // ---- 優先順位⑫: 「大きく外した予測ほど学びが大きい」を数値で判定する ----
         // 予測時に、勝つと思っていた側へ何%の確率を与えていたか。
         // 自信を持っていたほど、外れたときの学びが大きい。
-        const confidenceOnPick = (() => {
-          const p = record.winProbability || record.probabilities || null;
-          if (!p) return null;
-          if (record.predictedWinner === "home" && Number.isFinite(p.homeWinPct)) return p.homeWinPct / 100;
-          if (record.predictedWinner === "away" && Number.isFinite(p.awayWinPct)) return p.awayWinPct / 100;
-          if (record.predictedWinner === "draw" && Number.isFinite(p.drawPct)) return p.drawPct / 100;
-          return null;
-        })();
+        // v97(全体監査): 旧実装は record.winProbability / record.probabilities を参照していたが、
+        //   記録にはそのフィールドが存在しない(λ と finalProbs だけ)ため **常に null** で、
+        //   「大きく外した予測ほど学びが大きい」の判定(missMargin)が一度も働いていなかった。
+        //   採点と同じ関数で、予測した勝敗に与えていた確率を取り出す。
+        const confidenceOnPick = confidenceOnPickOf(record);
         const missMargin = (!record.correct && Number.isFinite(confidenceOnPick)) ? confidenceOnPick : null;
 
         // ---- 優先順位⑳: 「予測 → 結果 → 答え合わせ → 学んだこと」を時系列へ ----
@@ -1554,7 +1583,9 @@ async function runDailyLearning(deps) {
   if (resolvedScoredToday.length) {
     try {
       const aggToday = buildDailyAccuracy(resolvedScoredToday);
-      await saveDailyAccuracy({ upstashEnabled, upstashGetJSON, upstashSetJSON }, dateKey, aggToday);
+      // v97: upstashCmd も渡す(既存記録の読み出し失敗を区別して、上書き消去を防ぐ)。保存できなかった事実は残す。
+      const savedAcc = await saveDailyAccuracy({ upstashEnabled, upstashGetJSON, upstashSetJSON, upstashCmd }, dateKey, aggToday);
+      if (savedAcc === false) errors.push(`accuracy_save_failed:${dateKey}:本日の採点(${resolvedScoredToday.length}件)を日次精度記録へ保存できませんでした(読み出し失敗時は上書きを避けて見送ります)`);
     } catch (e) { errors.push(`accuracy_save_failed:${e.message}`); }
   }
 
@@ -1565,7 +1596,7 @@ async function runDailyLearning(deps) {
   let agendaAppliedToday = null; // ご指示⑩: 前回の学習計画を今日の収集に反映した内容
   // 自己改善ループ③: AIが自分で調整した設定(安全な上下限つき)を読み、
   // 今日の収集(xG周期・選手詳細上限・優先クラブ数)へ実際に反映する。
-  const selfTuneConfig = await loadTuneConfig({ upstashEnabled, upstashGetJSON, noteWarning: warn }); // v92: 読めず既定値に戻った事実を記録
+  const selfTuneConfig = await loadTuneConfig({ upstashEnabled, upstashGetJSON, upstashCmd, noteWarning: warn }); // v92: 読めず既定値に戻った事実を記録 / v97: upstashCmd で失敗を区別(既定値での上書き保存を防ぐ)
 
   // 精度証明ラウンド: 直近の解決済み予測(似た試合の検索と重み学習で共有し、
   // 同一実行内で learn:ownpred:recent を二度読みしない。第8次監査の方針を維持)
@@ -1676,7 +1707,22 @@ async function runDailyLearning(deps) {
   const predictionClubsSeen = [];
   let predictionPoolScanned = 0;
   let predictionStoppedReason = null;
-  for (const team of predictionPool) {
+  // ---- v97(全体監査): 保存済みの重みは予測ループの前に1回だけ読む ----
+  //   旧実装は予測対象クラブごと(1日最大160件)に同じ learn:weights を GET していた
+  //   (内容は実行中に変わらない。重みの更新は後段の④で行われる)。
+  //   読めなかった日は従来どおり「学習前の重みでの予測記録」を避けて予測を見送る。
+  //   実行の途中で読み直すことはしない(1回の実行内で重みが混ざるのを防ぐ)。
+  let storedWeightsOnce = null; // {} = キー未作成(初回)も正当な初期状態
+  let storedWeightsReadError = null;
+  try {
+    const rawStr = await upstashCmd(["GET", "learn:weights"]); // 失敗時はthrowする生コマンドで読む
+    storedWeightsOnce = rawStr ? JSON.parse(rawStr) : {};
+  } catch (e) {
+    storedWeightsReadError = String((e && e.message) || e).slice(0, 120);
+    errors.push(`weights_read_failed_prediction_skipped:all:保存済みの重みを読み出せなかったため、学習前の重みでの予測記録を避けて本日の新規予測を見送りました(${storedWeightsReadError})`);
+    predictionStoppedReason = "weights_unreadable";
+  }
+  for (const team of (storedWeightsReadError ? [] : predictionPool)) {
     if (newPredictionsLogged >= OWN_PREDICT_LOG_CAP) { predictionStoppedReason = "cap"; break; }
     // 予算が尽きかけている日は、ここで打ち切って利用者向けの余力を守る
     if (apiBudget && !apiBudget.canAfford(OWN_PREDICT_MIN_BUDGET)) { predictionStoppedReason = "budget"; break; }
@@ -1695,8 +1741,23 @@ async function runDailyLearning(deps) {
       const fx = upcoming && upcoming.response && upcoming.response[0];
       if (!fx || !fx.fixture) continue;
       const fixtureId = fx.fixture.id;
-      const already = await upstashGetJSON(`learn:ownpred:${fixtureId}`);
-      if (already) continue; // 冪等性: 既に記録済みなら重複させない
+      // ---- v97(全体監査): キックオフ後の試合に「予想」を作らない ----
+      //   「次の試合」の応答に、すでに始まっている/終わっている試合が混じることがある
+      //   (学習中に試合が始まった・提供元の next の解釈)。結果を知り得る時点で作った
+      //   予想を「的中」と数えるのは不正直なので、開始時刻を過ぎた試合・NS/TBD 以外の
+      //   状態の試合は対象外にする(新しい記録は作らず、理由を痕跡として残す)。
+      const koMsForGuard = new Date(fx.fixture.date).getTime();
+      const stShortForGuard = fx.fixture.status && fx.fixture.status.short;
+      if ((Number.isFinite(koMsForGuard) && koMsForGuard <= nowFn().getTime())
+        || (stShortForGuard && stShortForGuard !== "NS" && stShortForGuard !== "TBD")) {
+        warn(`predict_skipped_already_started:${team.nameEn}:${fixtureId}:${stShortForGuard || "?"}`);
+        continue;
+      }
+      // 冪等性: 既に記録済みなら重複させない。v97: 「読めなかった」ときは既存の記録を
+      //   上書きしないよう、この試合は今回見送る(upstashGetJSON は失敗を null に潰すため)。
+      const alreadyRead = await readManyJSON({ upstashCmd, upstashGetJSON }, [`learn:ownpred:${fixtureId}`]);
+      if (alreadyRead.readFailed) { warn(`predict_skipped_store_read_failed:${team.nameEn}:${fixtureId}`); continue; }
+      if (alreadyRead.values[0]) continue;
 
       const isHome = fx.teams.home.id === teamId;
       const opponentName = isHome ? fx.teams.away.name : fx.teams.home.name;
@@ -1815,14 +1876,8 @@ async function runDailyLearning(deps) {
       // 初期重み(未学習状態)で予測が記録され、learningProofの「必ず反映されます」
       // という説明と食い違っていた。読み取れない日は正直に予測を見送る
       // (/api/match-analysis側の第5次修正と同じ方針)。
-      let storedWeightsRaw = null;
-      try {
-        const rawStr = await upstashCmd(["GET", "learn:weights"]); // 失敗時はthrowする生コマンドで読む
-        storedWeightsRaw = rawStr ? JSON.parse(rawStr) : {}; // null=キー未作成(初回)は正当な初期状態
-      } catch (e) {
-        errors.push(`weights_read_failed_prediction_skipped:${team.nameEn}:保存済みの重みを読み出せなかったため、学習前の重みでの予測記録を避けて今回は見送りました`);
-        continue;
-      }
+      // v97: 重みはループの前で1回だけ読んでいる(storedWeightsOnce)。読めなかった日はループ自体を回さない。
+      const storedWeightsRaw = storedWeightsOnce;
 
       // ---- 精度証明ラウンド⑤ → v47で予測の「前」へ移動: オッズの取得 ----
       // 2026年8月18日・v47「予測モデルの根本強化」: これまでオッズは予測の後に
@@ -1894,6 +1949,14 @@ async function runDailyLearning(deps) {
       //   ・ブレンドで判定した場合は record.blendUsed に内訳を残し、画面で開示する
       let predictedWinner = modelOut.predictedWinner;
       let blendUsed = null;
+      // ---- v97(全体監査): 判定に実際に使った「最終確率」を記録に残す(finalProbs) ----
+      //   採点(Brier/LogLoss/較正)と画面の勝率表示は、以後この値を使う(無い旧記録は λ から)。
+      //   混合が無い日は自前モデル(Dixon-Coles・学習済みρ)の確率そのもの。
+      const rhoForProbs = Number.isFinite(weights.rho) ? weights.rho : 0;
+      let finalProbs = (() => {
+        const p = computeMatchProbabilitiesRaw(homeLambda, awayLambda, undefined, rhoForProbs);
+        return p ? { homeWin: p.homeWin, draw: p.draw, awayWin: p.awayWin, source: "model" } : null;
+      })();
       const blendW = Number.isFinite(weights.marketBlend) ? weights.marketBlend : 0;
       if (blendW > 0 && marketImplied) {
         const blended = applyMarketBlend(homeLambda, awayLambda,
@@ -1901,6 +1964,7 @@ async function runDailyLearning(deps) {
         if (blended.blendUsed) {
           predictedWinner = blended.predictedWinner;
           blendUsed = blended.blendUsed;
+          if (blended.probs) finalProbs = { homeWin: blended.probs.home, draw: blended.probs.draw, awayWin: blended.probs.away, source: "market_blend" };
         }
       }
 
@@ -1933,7 +1997,12 @@ async function runDailyLearning(deps) {
         if (b2.apifbBlendUsed) {
           predictedWinner = b2.predictedWinner;
           apifbBlendUsed = b2.apifbBlendUsed;
+          if (b2.probs) finalProbs = { homeWin: b2.probs.home, draw: b2.probs.draw, awayWin: b2.probs.away, source: "second_opinion_blend" };
         }
+      }
+      if (finalProbs) {
+        const r4 = (v) => Math.round(v * 10000) / 10000;
+        finalProbs = { homeWin: r4(finalProbs.homeWin), draw: r4(finalProbs.draw), awayWin: r4(finalProbs.awayWin), source: finalProbs.source };
       }
       const importance = computeFactorImportance(features, weights);
       const topFactor = importance.find((i) => i.stars > 0);
@@ -1980,6 +2049,8 @@ async function runDailyLearning(deps) {
         leagueId: (fx.league && Number.isFinite(Number(fx.league.id))) ? Number(fx.league.id) : null,
         homeFormScore, awayFormScore, predictedWinner, // v1互換フィールド(既存のバックテスト・テストとの互換性のため維持)
         homeLambda, awayLambda, features, weightsSnapshot: weights, factorImportance: importance,
+        // v97: 判定に実際に使った最終確率(採点・表示・較正はこれを優先する。source=model/market_blend/second_opinion_blend)
+        finalProbs,
         // v63: 期待得点が現実的な範囲(0.2〜4.0)の外へ出たか。出た試合は
         //   モデルが表現できる範囲の外なので、画面で正直に断る材料として残す。
         lambdaClamped: modelOut.lambdaClamped === true,
@@ -2049,7 +2120,10 @@ async function runDailyLearning(deps) {
           capturedAt: runAt.toISOString(),
         },
       };
-      await upstashSetJSON(`learn:ownpred:${fixtureId}`, record);
+      // v97(全体監査): 本体が保存できていないのに保留リスト・累計だけ増やさない
+      //   (旧実装は SET の結果を見ずに進み、累計 total が水増しされ、保留に幽霊IDが残っていた)
+      const savedPred = await upstashSetJSON(`learn:ownpred:${fixtureId}`, record);
+      if (savedPred === false) { errors.push(`predict_save_failed:${team.nameEn}:${fixtureId}`); continue; }
       await upstashCmd(["RPUSH", "learn:ownpred:pending", String(fixtureId)]).catch(() => {});
       await upstashCmd(["INCR", "learn:ownpred:total"]).catch(() => {});
       // v77(集客①): 検索エンジン用サイトマップの軽量索引に1行追記(失敗しても予測処理は続行)
@@ -2102,7 +2176,12 @@ async function runDailyLearning(deps) {
   //   ここから名前を補完できるようにする(表示の自己回復)。
   if (upstashEnabled && teamNamesCollected.size) {
     try {
-      const existingNames = (await upstashGetJSON("learn:teamnames").catch(() => null)) || {};
+      // v97(全体監査): 読めなかったのに {} と見なして上書きすると、採集済みの名前対応表
+      //   (最大800件)が今日ぶんだけに縮む(地力ランキングが「チームID 211」に戻る)。
+      //   読めなかった日は保存を見送る(名前は次回の採集で再び足される)。
+      const namesRead = await readManyJSON({ upstashCmd, upstashGetJSON }, ["learn:teamnames"]);
+      if (namesRead.readFailed) throw new Error("read_failed");
+      const existingNames = namesRead.values[0] || {};
       for (const [id, name] of teamNamesCollected) existingNames[id] = name;
       const ids = Object.keys(existingNames);
       if (ids.length > 800) ids.slice(0, ids.length - 800).forEach((id) => delete existingNames[id]);
@@ -2208,10 +2287,25 @@ async function runDailyLearning(deps) {
   //   誤った原因を表示する)。学習に失敗しても、その日の知識は必ず残す。
   // 第8次監査: 二度読み防止 — recentRecordsSharedは上の予測ステージ(似た試合の
   // 検索)と共有(loadRecentRecordsOnce)。既に読み込み済みならそれを再利用する。
+  // ---- v97(全体監査): 重みの読み出しは「読めなかった」を区別する ----
+  //   旧実装は upstashGetJSON(失敗→null)で読んでいたため、保存先が一瞬でも失敗すると
+  //   currentWeights が**初期重み(version 0)**になり、候補が初期重みより良ければ
+  //   「採用」として version 1 を書き込み、**それまで学習してきた重み(version N)を上書きで消す**。
+  //   学習の成果が失われる最悪級の欠陥なので、読めなかった日は調整を見送る。
+  const readWeightsStrict = async () => {
+    try {
+      const raw = await upstashCmd(["GET", "learn:weights"]);
+      return { ok: true, weights: raw ? JSON.parse(raw) : null };
+    } catch (e) {
+      return { ok: false, error: String((e && e.message) || e).slice(0, 120) };
+    }
+  };
   if (totalResolved >= MIN_RESOLVED_FOR_RECALIBRATION) {
     try {
       const recentRecords = await loadRecentRecordsOnce();
-      const storedWeights = await upstashGetJSON("learn:weights");
+      const weightsRead = await readWeightsStrict();
+      if (!weightsRead.ok) throw new Error(`weights_read_failed:${weightsRead.error}(保存済みの重みを読み出せなかったため、初期重みとの誤った比較・上書きを避けて本日の調整を見送りました)`);
+      const storedWeights = weightsRead.weights;
       const currentWeights = { ...EXTENDED_DEFAULT_WEIGHTS, ...DEFAULT_WEIGHTS, ...(storedWeights || {}) };
 
       // ---- ホールドアウト分割(直近30%を検証用に取り置く) ----
@@ -2422,14 +2516,17 @@ async function runDailyLearning(deps) {
         reasonJa: `本日${String(alreadyTuned.ranAt).slice(11, 16)}(UTC)に実行済みのため、過去試合によるモデル調整は再実行しませんでした(同じデータで同じ答えになるため)。`,
       };
     } else {
-      const storedForTune = await upstashGetJSON("learn:weights");
+      // v97: 読めなかった日は初期重みを「現在の重み」と誤認して上書きしないよう、調整を見送る
+      const tuneRead = await readWeightsStrict();
+      if (!tuneRead.ok) throw new Error(`weights_read_failed:${tuneRead.error}(保存済みの重みを読み出せなかったため見送り)`);
+      const storedForTune = tuneRead.weights;
       const baseForTune = { ...EXTENDED_DEFAULT_WEIGHTS, ...DEFAULT_WEIGHTS, ...(storedForTune || {}) };
       // ---- v57: xGの前向き収集(昨日ぶん)と、日付+チームIDで引くlookup ----
       try {
         const yesterday = new Date(runAt.getTime() - 86400000).toISOString().slice(0, 10);
         const seasonGuess = (runAt.getUTCMonth() + 1) >= 7 ? runAt.getUTCFullYear() : runAt.getUTCFullYear() - 1;
         xgCollectResult = await xgCollectMod.collectRecentXg(
-          { callApiFootball, upstashGetJSON, upstashSetJSON, apiBudget },
+          { callApiFootball, upstashGetJSON, upstashSetJSON, apiBudget, upstashCmd }, // v97: 読み出し失敗の区別用
           { leagueIds: DEFAULT_BACKFILL_LEAGUES.map((l) => l.id), season: seasonGuess, dateStr: yesterday, nowIso: runAt.toISOString() });
       } catch (e) {
         errors.push(`xg_collect_failed:${String((e && e.message) || e).slice(0, 40)}`);
@@ -2501,7 +2598,10 @@ async function runDailyLearning(deps) {
     marketBlendFitToday = fitB;
     const MIN_SAMPLES_FOR_BLEND_CHANGE = 40;
     if (upstashEnabled && fitB && fitB.samples >= MIN_SAMPLES_FOR_BLEND_CHANGE) {
-      const storedNow = (await upstashGetJSON("learn:weights").catch(() => null)) || {};
+      // v97: 読めなかった日は {} と見なさない(他の重みが初期値で上書きされるため)
+      const blendRead = await readWeightsStrict();
+      if (!blendRead.ok) throw new Error(`weights_read_failed:${blendRead.error}(保存済みの重みを読み出せなかったため見送り)`);
+      const storedNow = blendRead.weights || {};
       const currentW = Number.isFinite(storedNow.marketBlend) ? storedNow.marketBlend : 0;
       const newW = fitB.adopted ? fitB.w : 0;
       if (Math.abs(newW - currentW) >= 0.005) {
@@ -2536,7 +2636,10 @@ async function runDailyLearning(deps) {
     apifbBlendFitToday = fitA;
     const MIN_SAMPLES_FOR_APIFB_CHANGE = 40;
     if (upstashEnabled && fitA && fitA.samples >= MIN_SAMPLES_FOR_APIFB_CHANGE) {
-      const storedNow = (await upstashGetJSON("learn:weights").catch(() => null)) || {};
+      // v97: 読めなかった日は {} と見なさない(他の重みが初期値で上書きされるため)
+      const apifbRead = await readWeightsStrict();
+      if (!apifbRead.ok) throw new Error(`weights_read_failed:${apifbRead.error}(保存済みの重みを読み出せなかったため見送り)`);
+      const storedNow = apifbRead.weights || {};
       const currentW = Number.isFinite(storedNow.apifbBlend) ? storedNow.apifbBlend : 0;
       const newW = fitA.adopted ? fitA.w : 0;
       if (Math.abs(newW - currentW) >= 0.005) {
@@ -2669,7 +2772,10 @@ async function runDailyLearning(deps) {
       let cum = null;
       try {
         if (upstashEnabled) {
-          cum = (await upstashGetJSON(lineupWatchMod.SCORE_KEY).catch(() => null)) || { n: 0, morningBrierSum: 0, preKickBrierSum: 0 };
+          // v97: 累計は「読めなかった」のに 0 から始めて上書きしない(累計Brier比較が今日ぶんだけに戻る)
+          const cumRead = await readManyJSON({ upstashCmd, upstashGetJSON }, [lineupWatchMod.SCORE_KEY]);
+          if (cumRead.readFailed) throw new Error("read_failed");
+          cum = cumRead.values[0] || { n: 0, morningBrierSum: 0, preKickBrierSum: 0 };
           if (lineupWatchScored.n > 0) {
             cum.n += lineupWatchScored.n;
             cum.morningBrierSum += lineupWatchScored.morningSum;
@@ -2769,6 +2875,8 @@ async function runDailyLearning(deps) {
       detectedPlan: ((typeof getApiPlanInfo === "function") ? getApiPlanInfo() : null) || detectedPlan || null,
     },
     matchesResolvedToday,
+    // v97: キックオフ+2時間を過ぎていないため答え合わせの API を呼ばなかった保留件数(実測・節約の証跡)
+    pendingSkippedNotFinished,
     newPredictionsLogged,
     // 2026年8月・「TOP100の試合が漏れていないか」への回答を、推測ではなく
     // 実測値で返すための集計(どのクラブが未予測かまで含む)
@@ -2881,7 +2989,14 @@ async function runDailyLearning(deps) {
   // (同じ日に複数回実行されても、1日の合計として正しく積み上がるようにするため)。
   await apiBudget.flush();
 
-  const existingToday = await upstashGetJSON(`learn:growthlog:${dateKey}`).catch(() => null);
+  // v97(全体監査): 同日の既存ログは「読めなかった」を区別して読む。読めなかった日は
+  //   既存ログとの合算をあきらめて今回ぶんだけを保存するが、その事実を growthLog に残す
+  //   (以前は失敗→null→「既存なし」と見なし、1回目の実行の知識件数などが黙って消えていた)。
+  const existingTodayRead = await readManyJSON({ upstashCmd, upstashGetJSON }, [`learn:growthlog:${dateKey}`]);
+  const existingToday = existingTodayRead.readFailed ? null : existingTodayRead.values[0];
+  if (existingTodayRead.readFailed) {
+    growthLog.errors = capList([...(growthLog.errors || []), `growthlog_merge_read_failed:${existingTodayRead.firstError || "store"}:同日の既存ログを読めなかったため、今回の実行ぶんだけを保存しました(同日の先の実行の件数は合算できていません)`]);
+  }
   const mergedGrowthLog = mergeGrowthLogs(existingToday, growthLog);
   await upstashSetJSON(`learn:growthlog:${dateKey}`, mergedGrowthLog);
   await upstashSetJSON("learn:growthlog:latest", mergedGrowthLog);
@@ -2906,18 +3021,22 @@ async function runDailyLearning(deps) {
   // **毎日0のまま保存され**、「昨日より賢くなったか」の判定が永久に
   // 「変化がありませんでした」になっていた(このプロジェクトの最重要目標が
   // 数値で証明できない状態だった)。ここで実際の累計を読み出して同梱する。
-  let engineTotalsForMetrics = { knowledgeItemsTotal: 0, memoryConclusionsTotal: 0, predictionsTotal: 0 };
+  // v97(全体監査): 読めなかったカウンターは 0 ではなく null(不明)にする。0 で保存すると
+  //   翌日の前日比が「知識が数百件減った=本物の後退」と誤判定され、自己評価が NO になる。
+  //   3つの GET は MGET 1回にまとめる(対応しない保存先では1件ずつ)。
+  let engineTotalsForMetrics = { knowledgeItemsTotal: null, memoryConclusionsTotal: null, predictionsTotal: null };
   try {
-    const [kRaw, mRaw, pRaw] = await Promise.all([
-      upstashCmd(["GET", "knowledge:totalItemsSavedCounter"]).catch(() => null),
-      upstashCmd(["GET", "memory:totalConclusionsSavedCounter"]).catch(() => null),
-      upstashCmd(["GET", "learn:ownpred:total"]).catch(() => null),
-    ]);
-    engineTotalsForMetrics = {
-      knowledgeItemsTotal: parseInt(kRaw, 10) || 0,
-      memoryConclusionsTotal: parseInt(mRaw, 10) || 0,
-      predictionsTotal: parseInt(pRaw, 10) || 0,
-    };
+    const ctrRead = await readManyJSON({ upstashCmd }, ["knowledge:totalItemsSavedCounter", "memory:totalConclusionsSavedCounter", "learn:ownpred:total"]);
+    const toCount = (v, failed) => (failed ? null : (parseInt(v, 10) || 0));
+    if (ctrRead.readFailed) {
+      warn("engine_totals_read_failed", new Error(ctrRead.firstError || "store"));
+    } else {
+      engineTotalsForMetrics = {
+        knowledgeItemsTotal: toCount(ctrRead.values[0], ctrRead.partial && ctrRead.values[0] === null),
+        memoryConclusionsTotal: toCount(ctrRead.values[1], ctrRead.partial && ctrRead.values[1] === null),
+        predictionsTotal: toCount(ctrRead.values[2], ctrRead.partial && ctrRead.values[2] === null),
+      };
+    }
   } catch (e) { warn("engine_totals_read_failed", e); } // v92: 痕跡は残す
   const metricsSnapshot = buildDailySnapshot({ ...mergedGrowthLog, engineTotals: engineTotalsForMetrics }, {
     learningDurationMs: Date.now() - learningStartedAtMs,
@@ -2934,7 +3053,9 @@ async function runDailyLearning(deps) {
   // 1日の最後に「AIの脳」の測定をまとめて行う(重い読み書きはすべて夜間バッチの
   // ここで行い、利用者の質問時には一切行わない。最終方針⑥)。
   try {
-    const intelDeps = { upstashEnabled, upstashGetJSON, upstashSetJSON };
+    // v97: upstashCmd も渡す(getAccuracyTrend / getIntelTrend / getRoiTrend が MGET で
+    //   まとめ読みできるように。無いと1日ずつ GET に落ちる=コマンド数が約40倍)。
+    const intelDeps = { upstashEnabled, upstashGetJSON, upstashSetJSON, upstashCmd };
     // 成長可視化ラウンド⑥: 「答えられるようになった」台帳の更新。
     // フラッシュでバッファが消える前に、対象ごとの最高星を回収してから処理する。
     const answerabilitySubjects = collectAnswerabilityFromBuffer();
@@ -2963,8 +3084,12 @@ async function runDailyLearning(deps) {
     try {
       const dossierForSim = createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON });
       const clubsForSim = [];
+      // v97: 172クラブを1件ずつ GET → MGET でまとめ読み。読み切れなかった日は索引を作り直さない
+      //   (読めなかったクラブが「似たクラブ」候補から消え、翌日まで検索結果が偏るため)。
+      const simRead = await dossierForSim.getDossiers(CLUB_UNIVERSE.map((c) => c.nameEn));
+      if (simRead.readFailed || simRead.partial) throw new Error(`dossiers_read_${simRead.readFailed ? "failed" : "partial"}(前日の索引を維持)`);
       for (const c of CLUB_UNIVERSE) {
-        const d = await dossierForSim.getDossier(c.nameEn).catch(() => null);
+        const d = simRead.byName.get(c.nameEn) || null;
         if (d) clubsForSim.push({ teamEn: c.nameEn, teamJa: c.nameJa, vector: clubVectorFromDossier(d), traits: clubTraitsFromDossier(d) });
       }
       const simIndex = buildClubSimilarityIndex(clubsForSim, runAt.toISOString());
@@ -3051,7 +3176,8 @@ async function runDailyLearning(deps) {
           pe.baseline = Number.isFinite(metricsNow[pe.metricName]) ? metricsNow[pe.metricName] : null;
         }
       }
-      await saveTuneConfig(intelDeps, selfTuneConfig);
+      const tuneSaved = await saveTuneConfig(intelDeps, selfTuneConfig);
+      if (tuneSaved === false) warn(`self_tune_config_not_saved:${tuneConfigReadFailed(selfTuneConfig) ? "read_failed_defaults_not_persisted" : "write_failed"}`);
       // ⑤ 履歴(診断→提案→変更→評価のすべてを記録)
       const historyEvents = [];
       historyEvents.push({
@@ -3154,21 +3280,28 @@ async function getGrowthLog(deps) {
   //   本番(2026年9月25〜26日)で保存先が月間上限で止まったとき、この読み出しが null になり
   //   画面は「学習エンジンはまだ一度も実行されていません」と**事実と違う表示**をしていた。
   //   GET の失敗はここで捕まえ、readFailed として正直に返す(ranYet は判定不能=null)。
+  // ---- v97(全体監査): 5つの GET(最新記録・答え合わせ累計・3つの累計カウンター)を MGET 1回に ----
+  //   まとめる(ホーム画面が開かれるたびに走る読み出しなので、Upstash コマンド数と往復を減らす)。
+  //   MGET に対応しない保存先(テストのモック等)では readManyJSON が1件ずつ GET に落とす。
+  //   読めなかったカウンターは 0 ではなく null(不明)にする(「無い=0」は正直な0だが、
+  //   「読めなかった」を0と表示するとホーム画面が停止中に「知識0件・予測0件」と嘘をつく)。
+  const KEYS = ["learn:growthlog:latest", "learn:ownpred:resolved", "knowledge:totalItemsSavedCounter", "memory:totalConclusionsSavedCounter", "learn:ownpred:total"];
+  const many = await readManyJSON({ upstashCmd, upstashGetJSON }, KEYS);
+  const failedAt = (idx) => many.readFailed || (many.partial && many.values[idx] === null);
   let latest = null;
   let latestReadError = null;
-  try {
-    const rawLatest = await upstashCmd(["GET", "learn:growthlog:latest"]);
-    if (rawLatest !== null && rawLatest !== undefined) {
-      try { latest = JSON.parse(rawLatest); } catch (e) { latestReadError = `growthlog_parse_failed:${String((e && e.message) || e).slice(0, 120)}`; }
-    }
-  } catch (e) {
-    latestReadError = String((e && e.message) || e).slice(0, 200);
+  if (failedAt(0)) {
+    latestReadError = String(many.firstError || "store_read_failed").slice(0, 200);
+  } else if (many.values[0] && typeof many.values[0] === "object") {
+    latest = many.values[0];
+  } else if (many.values[0] !== null && many.values[0] !== undefined) {
+    latestReadError = "growthlog_parse_failed"; // 壊れた記録(JSONでない)
   }
   let learningSummary = [];
   let learningSummaryReadWarning = null; // v92: 読み出し側の失敗も黙らない(本体は従来どおり返す)
   if (latestReadError) {
     // v94: 読めなかった。「未実行」とは言わない。件数系も 0 ではなく null(不明)にする。
-    //   残りの読み出し(5コマンド)も同じ保存先なので、ここで打ち切る(無駄な失敗を重ねない)。
+    //   残りの読み出しも同じ保存先なので、ここで打ち切る(無駄な失敗を重ねない)。
     return {
       configured: true, ranYet: null, readFailed: true, storeError: latestReadError,
       message: `保存先(Upstash)から学習の記録を読み出せませんでした(${latestReadError})。学習が実行されていないという意味ではありません。`,
@@ -3183,9 +3316,10 @@ async function getGrowthLog(deps) {
     const historyEntries = historyRaw.map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean);
     learningSummary = buildLearningSummary(historyEntries, 5);
   } catch (e) { learningSummaryReadWarning = `learning_summary_read_failed:${String((e && e.message) || e).slice(0, 200)}`; }
-  const totalResolvedRaw = await upstashCmd(["GET", "learn:ownpred:resolved"]).catch(() => null);
-  const totalResolved = parseInt(totalResolvedRaw, 10) || 0;
-  const hasEnoughDataForLearning = totalResolved >= MIN_RESOLVED_FOR_RECALIBRATION;
+  // 読めなかった(通信失敗)カウンターは null、無い(キー未設定)は正直な 0
+  const toCount = (idx) => (failedAt(idx) ? null : (parseInt(many.values[idx], 10) || 0));
+  const totalResolved = toCount(1);
+  const hasEnoughDataForLearning = totalResolved === null ? null : totalResolved >= MIN_RESOLVED_FOR_RECALIBRATION;
 
   // ---- 「AIの成長レポート」ウィジェット(ご要望⑦)向け: Knowledge/Prediction/
   // Memory各エンジンの累計件数。ホーム画面が読み込まれるたびに登録クラブ全件を
@@ -3193,16 +3327,12 @@ async function getGrowthLog(deps) {
   // knowledgeStore.js/memoryStore.jsが保存の都度INCRしている軽量カウンターを
   // そのまま読むだけ(O(1))。失効しても減らない「累計保存件数」である点は
   // 呼び出し側(index.html)で正直にラベルする。
-  const [knowledgeTotalCounterRaw, memoryTotalCounterRaw, predictionTotalCounterRaw] = await Promise.all([
-    upstashCmd(["GET", "knowledge:totalItemsSavedCounter"]).catch(() => null),
-    upstashCmd(["GET", "memory:totalConclusionsSavedCounter"]).catch(() => null),
-    upstashCmd(["GET", "learn:ownpred:total"]).catch(() => null),
-  ]);
   const engineTotals = {
-    knowledgeItemsTotal: parseInt(knowledgeTotalCounterRaw, 10) || 0,
-    memoryConclusionsTotal: parseInt(memoryTotalCounterRaw, 10) || 0,
-    predictionsTotal: parseInt(predictionTotalCounterRaw, 10) || 0,
+    knowledgeItemsTotal: toCount(2),
+    memoryConclusionsTotal: toCount(3),
+    predictionsTotal: toCount(4),
   };
+  const countersReadFailed = [1, 2, 3, 4].some((idx) => failedAt(idx));
 
   if (!latest) {
     return {
@@ -3210,6 +3340,7 @@ async function getGrowthLog(deps) {
       learningSummary, hasEnoughDataForLearning, totalOwnPredictionsResolvedSoFar: totalResolved,
       minResolvedForRecalibration: MIN_RESOLVED_FOR_RECALIBRATION, engineTotals,
       learningSummaryReadWarning,
+      countersReadFailed, // v97: 累計カウンターの一部が読めなかった(該当項目は null)
     };
   }
   return {
@@ -3218,6 +3349,7 @@ async function getGrowthLog(deps) {
     minResolvedForRecalibration: MIN_RESOLVED_FOR_RECALIBRATION, engineTotals,
     // v92: 読み出し時に学習要約が作れなかった場合、その事実を隠さない(null=正常)
     learningSummaryReadWarning,
+    countersReadFailed,
   };
 }
 

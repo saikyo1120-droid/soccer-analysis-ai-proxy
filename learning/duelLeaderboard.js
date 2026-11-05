@@ -130,6 +130,8 @@ async function scoreFixtureDuels(deps, fixtureId, aiPick, actualWinner, nowMs) {
   for (let i = 0; i + 1 < flat.length; i += 2) entries.push([flat[i], flat[i + 1]]);
   const monthKey = `${LB_MONTH_PREFIX}${monthKeyJst(nowMs)}`;
   let scored = 0;
+  let skippedForRead = 0; // v97: 累計を読めずに今回見送った参加者(HASH に残して次回へ)
+  const processedIds = []; // v97: 採点を終えた参加者(見送りがある場合はこの分だけ HDEL する)
   for (const [playerId, raw] of entries) {
     try {
       const pickObj = typeof raw === "string" ? JSON.parse(raw) : raw;
@@ -139,7 +141,19 @@ async function scoreFixtureDuels(deps, fixtureId, aiPick, actualWinner, nowMs) {
       const aiHit = aiPick === actualWinner;
       const outcome = userHit && !aiHit ? "W" : (!userHit && aiHit ? "L" : "D");
       const pKey = `${PLAYER_KEY_PREFIX}${playerId}`;
-      const cur = (await upstashGetJSON(pKey).catch(() => null)) || { w: 0, d: 0, l: 0, userHits: 0, aiHits: 0, n: 0 };
+      // v97(全体監査): 参加者の累計成績を「読めなかった」のに 0 から始めて上書きしない
+      //   (その人の通算の勝ち・負け・的中数が1試合ぶんにリセットされる)。読めなかった人は
+      //   今回スキップし、HASH も残す(次回の学習で再採点される)。
+      let cur = null;
+      try {
+        const rawCur = await upstashCmd(["GET", pKey]);
+        cur = rawCur === null || rawCur === undefined ? null : (typeof rawCur === "object" ? rawCur : JSON.parse(rawCur));
+      } catch (e) {
+        errors.push(`duel_player_read_failed:${String(playerId).slice(0, 8)}`);
+        skippedForRead++;
+        continue;
+      }
+      cur = cur || { w: 0, d: 0, l: 0, userHits: 0, aiHits: 0, n: 0 };
       cur.nickname = (pickObj && pickObj.n) || cur.nickname || "名無しのファン";
       cur.n += 1;
       if (userHit) cur.userHits += 1;
@@ -147,7 +161,7 @@ async function scoreFixtureDuels(deps, fixtureId, aiPick, actualWinner, nowMs) {
       if (outcome === "W") cur.w += 1; else if (outcome === "L") cur.l += 1; else cur.d += 1;
       cur.updatedAt = new Date(nowMs).toISOString();
       const okSave = await upstashSetJSON(pKey, cur);
-      if (okSave === false) { errors.push(`duel_player_save_failed:${String(playerId).slice(0, 8)}`); continue; }
+      if (okSave === false) { errors.push(`duel_player_save_failed:${String(playerId).slice(0, 8)}`); skippedForRead++; continue; }
       if (outcome === "W") {
         await upstashCmd(["ZINCRBY", LB_ALLTIME_KEY, "1", String(playerId)]).catch(() => errors.push("duel_zincr_failed"));
         await upstashCmd(["ZINCRBY", monthKey, "1", String(playerId)]).catch(() => {});
@@ -157,12 +171,19 @@ async function scoreFixtureDuels(deps, fixtureId, aiPick, actualWinner, nowMs) {
         await upstashCmd(["ZADD", LB_ALLTIME_KEY, "NX", "0", String(playerId)]).catch(() => {});
       }
       scored++;
+      processedIds.push(String(playerId));
     } catch (e) {
       errors.push(`duel_score_failed:${fixtureId}`);
     }
   }
-  await upstashCmd(["DEL", key]).catch(() => errors.push(`duel_cleanup_failed:${fixtureId}`));
-  return { scored, errors };
+  // v97: 読めずに見送った参加者がいるときは、採点済みの人だけを HASH から外す(見送った人のピックは残す)。
+  //   全員採点できたときだけ HASH ごと消す(従来どおり)。
+  if (skippedForRead > 0) {
+    if (processedIds.length) await upstashCmd(["HDEL", key, ...processedIds]).catch(() => errors.push(`duel_cleanup_failed:${fixtureId}`));
+  } else {
+    await upstashCmd(["DEL", key]).catch(() => errors.push(`duel_cleanup_failed:${fixtureId}`));
+  }
+  return { scored, errors, deferred: skippedForRead };
 }
 
 module.exports = {

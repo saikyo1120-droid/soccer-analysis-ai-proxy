@@ -87,8 +87,21 @@ function computeFatigueFeature(fixtures, referenceDateMs) {
 // 捨てていた。API-Footballの/injuriesは負傷・出場停止の両方をまとめて
 // 返すため(player.reasonに"Suspended"等が入る)、ここで種別も分けて返す。
 // 実データにある情報をそのまま構造化するだけで、AIの推測は加えない。
-function computeInjuryCountFeature(injuriesResponse) {
-  const list = injuriesResponse || [];
+// ---- v97(全体監査): 「今の」負傷者だけを数える ----
+//   /injuries?team=&season= はシーズン全体の記録(試合ごとに「この試合を欠場した選手」)を返す。
+//   8月に負傷して10月には復帰している選手も、名前の重複排除だけでは「現在の負傷者」として
+//   数え続けていた(負傷者数が実態より多く、予測の injuryDiff と画面の負傷者一覧が古い)。
+//   記録の fixture.date が基準時刻の前後(過去10日〜未来7日)にあるものだけを「現在」とみなす。
+//   日付を持たない応答(古い形式・テストのモック)は従来どおり全件を数える(消しすぎない)。
+const INJURY_WINDOW_PAST_MS = 10 * 24 * 60 * 60 * 1000;
+const INJURY_WINDOW_FUTURE_MS = 7 * 24 * 60 * 60 * 1000;
+function computeInjuryCountFeature(injuriesResponse, refMs) {
+  const all = injuriesResponse || [];
+  const ref = Number.isFinite(refMs) ? refMs : Date.now();
+  const dated = all.filter((r) => r && r.fixture && r.fixture.date && Number.isFinite(new Date(r.fixture.date).getTime()));
+  const list = dated.length
+    ? dated.filter((r) => { const t = new Date(r.fixture.date).getTime(); return t >= ref - INJURY_WINDOW_PAST_MS && t <= ref + INJURY_WINDOW_FUTURE_MS; })
+    : all;
   const seen = new Map(); // name -> {name, reason, type}
   for (const r of list) {
     const name = r && r.player && r.player.name;

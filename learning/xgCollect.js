@@ -68,7 +68,7 @@ function pruneEntries(entries, max) {
  * @param opts { leagueIds, season, dateStr(昨日のYYYY-MM-DD), statsCap }
  */
 async function collectRecentXg(deps, opts) {
-  const { callApiFootball, upstashGetJSON, upstashSetJSON, apiBudget } = deps;
+  const { callApiFootball, upstashGetJSON, upstashSetJSON, apiBudget, upstashCmd } = deps;
   const leagueIds = (opts && opts.leagueIds) || [];
   const dateStr = opts && opts.dateStr;
   const season = opts && opts.season;
@@ -80,7 +80,23 @@ async function collectRecentXg(deps, opts) {
     out.reasonJa = `API予算の残りが少ないため今回は見送りました(必要見込み約${needed}件)。`;
     return out;
   }
-  const saved = (await upstashGetJSON(XG_MAP_KEY).catch(() => null)) || { entries: {} };
+  // v97(全体監査): 既存マップを「読めなかった」のに空と見なして上書きすると、積み上げた
+  //   xG(最大 MAX_ENTRIES 試合ぶん)が今日ぶんだけに縮む。upstashCmd があれば失敗を区別し、
+  //   読めなかった日は収集を見送る(API予算も使わない)。
+  let saved = null;
+  if (typeof upstashCmd === "function") {
+    try {
+      const rawMap = await upstashCmd(["GET", XG_MAP_KEY]);
+      saved = rawMap === null || rawMap === undefined ? null : (typeof rawMap === "object" ? rawMap : JSON.parse(rawMap));
+    } catch (e) {
+      out.reasonJa = `保存済みのxGマップを読み出せなかったため、上書きを避けて今回は見送りました(${String((e && e.message) || e).slice(0, 80)})。`;
+      out.errors.push("xg_map_read_failed");
+      return out;
+    }
+  } else {
+    saved = await upstashGetJSON(XG_MAP_KEY).catch(() => null);
+  }
+  saved = saved || { entries: {} };
   const entries = saved.entries || {};
   out.ran = true;
   let statsBudget = statsCap;

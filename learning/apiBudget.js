@@ -72,6 +72,9 @@ function createApiBudget({
         persisted = true;
       } catch (e) {
         persisted = false;
+        // v97: 「本日の消費を読めなかった=0から数え始める」事実を隠さない(最初のAPI応答の
+        //   残数ヘッダーで即座に合わせ直されるため実害は小さいが、summary() で開示する)。
+        initWarnings.push(`counter_read_failed:${String((e && e.message) || e).slice(0, 120)}`);
       }
       // 旧方式(JSON)で記録された当日分が残っていれば、大きい方を採る。
       // 移行日にだけ意味がある処理で、以後は自然に消える。
@@ -186,6 +189,10 @@ function createApiBudget({
     spentThisRun = Math.max(0, spentThisRun - (Number(n) || 0));
   }
 
+  // v97: EXPIRE を送った日付キーを覚えておく(毎回送ると書き戻し1回につき
+  // Upstashコマンドが2倍になるため。詳細は flush() のコメント)。
+  let expireSentFor = null;
+  let flushCount = 0; // v97: 実際に INCRBY を送った回数(テスト・診断用)
   async function flush() {
     if (!upstashEnabled || !dateKey) return false;
     if (atomic) {
@@ -194,6 +201,7 @@ function createApiBudget({
       try {
         const raw = await upstashCmd(["INCRBY", counterKeyFor(dateKey), String(delta)]);
         spentFlushed += delta;
+        flushCount++;
         const total = Number(raw);
         if (Number.isFinite(total)) {
           // INCRBY の戻り値は「全プロセス合計の確定値」。自分の書き戻し済み分を
@@ -201,8 +209,18 @@ function createApiBudget({
           // 取りこぼさずに反映できる。
           spentBefore = Math.max(0, total - spentFlushed);
         }
-        // 当日ぶんのキーが永久に残らないように48時間で自動削除する
-        await upstashCmd(["EXPIRE", counterKeyFor(dateKey), "172800"]).catch(() => {});
+        // 当日ぶんのキーが永久に残らないように48時間で自動削除する。
+        // v97(全体監査): 以前は書き戻しのたびに EXPIRE を送っていたため、
+        // API呼び出し2件ごとに Upstash コマンドが2つ(INCRBY+EXPIRE)=
+        // **API呼び出し1件につき Upstash 1コマンド**を消費していた(9月の
+        // 無料枠50万コマンド枯渇の一因)。TTL は一度付ければ INCRBY で消えない
+        // (Redis仕様)ので、「このプロセスがその日のキーへ初めて書いたとき」と
+        // 「INCRBY の結果が自分の増分と一致した=キーを自分が作ったとき」だけ送る。
+        const createdByUs = Number.isFinite(total) && total === delta;
+        if (createdByUs || expireSentFor !== dateKey) {
+          await upstashCmd(["EXPIRE", counterKeyFor(dateKey), "172800"]).catch(() => {});
+          expireSentFor = dateKey;
+        }
         return true;
       } catch (e) {
         return false;
@@ -229,6 +247,9 @@ function createApiBudget({
       persistent: persisted,
       // v92: 初期化時に黙って続行した失敗(空配列が正常)
       initWarnings: initWarnings.slice(),
+      // v97: 書き戻し回数と未書き戻し件数(診断用。数字は実測値)
+      flushCount,
+      unflushed: Math.max(0, spentThisRun - spentFlushed),
     };
   }
 

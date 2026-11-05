@@ -467,9 +467,13 @@ const UNOFFICIAL_LEAGUE_PATTERNS = [
 ];
 const RESERVE_TEAM_PATTERNS = [
   /\s(II|III|B)$/,       // "Club Brugge II" "Barcelona B"
-  /\bU-?(17|18|19|21|23)\b/i,
+  /\s(II|III|B)\s*\(/,   // v97: "Real Madrid II (Castilla)" のような括弧付き表記
+  /\bU-?(17|18|19|20|21|23)\b/i, // v97: U20 を追加
   /reserves?$/i,
   /\bYouth\b/i,
+  // v97(全体監査): 各国の2軍表記。"Castilla"(レアル)・"Atlètic"(バルサB)はクラブ固有名なので入れない(誤爆防止)
+  /\b(Amateure|Amateurs|Jong|Espoirs|Primavera|Juvenil)\b/i, // 独・蘭(Jong Ajax)・仏(Espoirs)・伊(Primavera)・西(Juvenil)
+  /\s2$/,                // "Bayer Leverkusen 2" のような末尾の 2
 ];
 /**
  * この試合を「公式戦」として的中率の主集計に入れてよいかを判定する。

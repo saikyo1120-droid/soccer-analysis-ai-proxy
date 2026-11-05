@@ -63,6 +63,37 @@ function computeMarketProbs(homeLambda, awayLambda, maxGoals) {
 }
 
 /**
+ * v97(全体監査): 1X2(勝敗)の「最終確率」を記録から取り出す。
+ *
+ * 予測の判定(predictedWinner)は v50 以降、市場オッズや「2つ目の意見」を混合した
+ * **最終確率**で行われることがある。ところが採点(Brier/LogLoss/較正の自信)と画面の
+ * 勝率表示は、混合前の λ だけから確率を計算し直していたため、
+ *   ・画面の「勝率」と判定の根拠になった確率が食い違う
+ *   ・較正マップ(「55%と言った予想は本当に55%当たるか」)が、判定に使っていない数字で作られる
+ * という不整合があった。予測時に record.finalProbs(判定に実際に使った確率)を保存し、
+ * 以後の採点・表示はこれを優先する。無い記録(v97より前)は従来どおり λ から導く。
+ * @returns {{ homeWin:number, draw:number, awayWin:number, source:string }|null}
+ */
+function oneX2ProbsOf(record) {
+  if (!record) return null;
+  const fp = record.finalProbs;
+  if (fp && [fp.homeWin, fp.draw, fp.awayWin].every((v) => Number.isFinite(v) && v >= 0)) {
+    const total = fp.homeWin + fp.draw + fp.awayWin || 1;
+    return { homeWin: fp.homeWin / total, draw: fp.draw / total, awayWin: fp.awayWin / total, source: fp.source || "final" };
+  }
+  const p = computeMarketProbs(record.homeLambda, record.awayLambda);
+  return p ? { homeWin: p.homeWin, draw: p.draw, awayWin: p.awayWin, source: "lambda" } : null;
+}
+
+/** 記録の予測(predictedWinner)に与えていた確率(=自信)。判定できなければ null。 */
+function confidenceOnPickOf(record) {
+  const p = oneX2ProbsOf(record);
+  if (!p || !record || !record.predictedWinner) return null;
+  const v = record.predictedWinner === "home" ? p.homeWin : record.predictedWinner === "away" ? p.awayWin : record.predictedWinner === "draw" ? p.draw : null;
+  return Number.isFinite(v) ? v : null;
+}
+
+/**
  * AI知能計測ラウンド(ご指示⑥・Top3): ポアソン格子から確率の高い順に
  * 上位Nスコアを返す。予測時と同じλ・同じ格子から機械的に導出するため、
  * 「後から都合の良いスコアを選ぶ」ことはできない。
@@ -103,20 +134,28 @@ function scorePrediction(record) {
   const out = { markets: {} };
 
   // ---- 1X2(勝敗) ----
+  // v97: 判定に実際に使った最終確率(finalProbs)があればそれで採点する(無ければ λ から)
+  const p1x2 = oneX2ProbsOf(record) || probs;
   const actualWinner = record.actualWinner
     || (record.actualScore ? outcomesFromScore(record.actualScore.home, record.actualScore.away)?.winner : null);
   if (actualWinner) {
     const oneHot = { home: actualWinner === "home" ? 1 : 0, draw: actualWinner === "draw" ? 1 : 0, away: actualWinner === "away" ? 1 : 0 };
-    const brier = Math.pow(probs.homeWin - oneHot.home, 2) + Math.pow(probs.draw - oneHot.draw, 2) + Math.pow(probs.awayWin - oneHot.away, 2);
-    const pActual = actualWinner === "home" ? probs.homeWin : actualWinner === "away" ? probs.awayWin : probs.draw;
-    const maxProb = Math.max(probs.homeWin, probs.draw, probs.awayWin);
-    const predictedWinner = probs.homeWin === maxProb ? "home" : probs.awayWin === maxProb ? "away" : "draw";
+    const brier = Math.pow(p1x2.homeWin - oneHot.home, 2) + Math.pow(p1x2.draw - oneHot.draw, 2) + Math.pow(p1x2.awayWin - oneHot.away, 2);
+    const pActual = actualWinner === "home" ? p1x2.homeWin : actualWinner === "away" ? p1x2.awayWin : p1x2.draw;
+    const maxProb = Math.max(p1x2.homeWin, p1x2.draw, p1x2.awayWin);
+    const predictedWinner = p1x2.homeWin === maxProb ? "home" : p1x2.awayWin === maxProb ? "away" : "draw";
+    // v97: 自信=「実際に予測した勝敗に与えていた確率」。以前は最大確率(argmax)を使っていたため、
+    //   引き分け帯のルールや市場混合で argmax と違う勝敗を予測した試合では、較正マップが
+    //   「言っていない数字」で作られていた。記録に予測が無い旧記録だけ argmax を使う。
+    const confidenceOnPick = confidenceOnPickOf({ ...record, finalProbs: record.finalProbs }) ?? maxProb;
     out.markets.oneX2 = {
       hit: record.predictedWinner ? record.predictedWinner === actualWinner : predictedWinner === actualWinner,
       brier: round4(brier),
       logLoss: round4(-Math.log(Math.max(P_FLOOR, pActual))),
-      confidence: round4(maxProb), // 予測時の自信(較正の材料)
-      probs: { homeWin: round4(probs.homeWin), draw: round4(probs.draw), awayWin: round4(probs.awayWin) },
+      confidence: round4(confidenceOnPick), // 予測時の自信(較正の材料)= 予測した勝敗に与えていた確率
+      confidenceBasis: record.predictedWinner ? "pick" : "argmax",
+      probsSource: p1x2.source || "lambda", // "final"(混合後の最終確率) / "lambda"(λのみ・旧記録)
+      probs: { homeWin: round4(p1x2.homeWin), draw: round4(p1x2.draw), awayWin: round4(p1x2.awayWin) },
       // ご指示⑥(Precision/Recall/F1): クラス別混同行列の材料として、
       // 「どのクラスを予測したか」も採点結果に残す(記録に予測が保存されて
       // いればそれを使い、無ければ確率の最大クラス=当時の予測を使う)。
@@ -379,13 +418,24 @@ function summarizeAccuracy(agg) {
 }
 
 async function saveDailyAccuracy(deps, dateKey, aggToday) {
-  const { upstashEnabled, upstashGetJSON, upstashSetJSON } = deps || {};
+  const { upstashEnabled, upstashGetJSON, upstashSetJSON, upstashCmd } = deps || {};
   if (!upstashEnabled || !dateKey || !aggToday) return false;
   try {
-    const existing = await upstashGetJSON(`${ACCURACY_KEY_PREFIX}${dateKey}`).catch(() => null);
+    // v97(全体監査): 「読めなかった」のに「無かった」と見なして上書きすると、同じ日の
+    //   先に保存した採点(1日2回の実行・自動収集の答え合わせ)が消える。upstashCmd があれば
+    //   失敗を区別し、失敗した日は保存を見送る(false を返す=呼び出し側が痕跡を残す)。
+    let existing = null;
+    if (typeof upstashCmd === "function") {
+      try {
+        const raw = await upstashCmd(["GET", `${ACCURACY_KEY_PREFIX}${dateKey}`]);
+        existing = raw === null || raw === undefined ? null : (typeof raw === "object" ? raw : JSON.parse(raw));
+      } catch (e) { return false; }
+    } else {
+      existing = await upstashGetJSON(`${ACCURACY_KEY_PREFIX}${dateKey}`).catch(() => null);
+    }
     const merged = mergeDailyAccuracy(existing, aggToday);
-    await upstashSetJSON(`${ACCURACY_KEY_PREFIX}${dateKey}`, merged);
-    return true;
+    const ok = await upstashSetJSON(`${ACCURACY_KEY_PREFIX}${dateKey}`, merged);
+    return ok !== false;
   } catch (e) { return false; }
 }
 
@@ -489,6 +539,7 @@ async function getAccuracyTrend(deps, todayDateKey) {
 module.exports = {
   ACCURACY_KEY_PREFIX,
   computeMarketProbs, outcomesFromScore, scorePrediction, topScorelines,
+  oneX2ProbsOf, confidenceOnPickOf, // v97
   buildDailyAccuracy, mergeDailyAccuracy, emptyDailyAccuracy,
   computePrecisionRecallF1, computeEce,
   summarizeAccuracy, saveDailyAccuracy, getAccuracyTrend, readDailyAggregates,
