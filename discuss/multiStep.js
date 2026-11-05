@@ -183,7 +183,12 @@ async function executePlannedActions(actions, deps) {
           mine.slice(-3).reverse().forEach((r) => {
             const predJa = r.predictedWinner === "home" ? "ホーム勝ち" : r.predictedWinner === "away" ? "アウェイ勝ち" : "引き分け";
             const resJa = r.correct === true ? "的中" : "外れ";
-            addedFacts.push(`[AI自身の予測実績] ${String(r.kickoff || "").slice(0, 10)} ${r.homeTeamEn}対${r.awayTeamEn}: ${predJa}と予想→${r.actualScore ? `実際${r.actualScore}` : "結果記録あり"}(${resJa})`);
+            // v97: actualScore は { home, away } のオブジェクト。旧コードは文字列連結して
+            //   「実際[object Object]」と表示していた(LLMへ渡す根拠文が壊れていた)。
+            const scoreJa = (r.actualScore && Number.isFinite(Number(r.actualScore.home)) && Number.isFinite(Number(r.actualScore.away)))
+              ? `実際${Number(r.actualScore.home)}-${Number(r.actualScore.away)}`
+              : (r.actualWinner ? `実際は${r.actualWinner === "home" ? "ホーム勝ち" : r.actualWinner === "away" ? "アウェイ勝ち" : "引き分け"}` : "結果記録あり");
+            addedFacts.push(`[AI自身の予測実績] ${String(r.kickoff || "").slice(0, 10)} ${r.homeTeamEn}対${r.awayTeamEn}: ${predJa}と予想→${scoreJa}(${resJa})`);
           });
           executed.push({ type: a.type, clubJa: a.club.nameJa, ok: true, noteJa: `${mine.length}件の答え合わせ済み予測を根拠に追加しました。` });
         }
