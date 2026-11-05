@@ -25,7 +25,7 @@ const TEAM_MAP_TTL_MS = Number(process.env.TEAM_MAP_TTL_MS) || 6 * 60 * 60 * 100
 const SQUAD_TOP_N = 14;            // 「主力」= 出場時間上位14人(先発11+交代3)
 const SQUAD_MIN_RATED = 7;         // 評価点のある主力がこれ未満なら「比較しない」
 const SQUAD_MIN_MINUTES = 90;      // 90分未満しか出ていない選手は主力に数えない
-const KEY_PLAYER_MIN_MINUTES = 180; // 注目選手は180分以上出ている選手から選ぶ
+const KEY_PLAYER_MIN_MINUTES = 270; // 注目選手は270分(フル3試合)以上出ている選手から選ぶ(v98.1: 180分=2試合の評価点は偶然に左右されやすい)
 
 function normalizeName(s) { return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, ""); }
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
