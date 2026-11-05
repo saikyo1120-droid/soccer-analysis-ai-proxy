@@ -124,7 +124,19 @@ function buildEvidencePool(knowledge, teamEn) {
     (ke.reflections || []).forEach((item) => push(item, "matchReflection", typeFor(item, "analysis")));
   }
 
-  return pool;
+  // ---- v97(全体監査): 同じ文の根拠を二重に数えない ----
+  //   learnedFacts(getRecentFactsForTeam=Knowledge Engine の recentFormTrend 事実)と
+  //   knowledgeEngine.facts(同じ Knowledge Engine の全有効事実)は同じ保存元を見ているため、
+  //   直近フォームの事実が必ず2回プールに入り、根拠ランキングで「直近フォーム」の点数が
+  //   不当に膨らんでいた(同じ文を2つの根拠として採点)。文面が同一の根拠は最初の1件だけ残す。
+  const seenStatements = new Set();
+  return pool.filter((it) => {
+    const key = String((it && it.statement) || "").trim();
+    if (!key) return true;
+    if (seenStatements.has(key)) return false;
+    seenStatements.add(key);
+    return true;
+  });
 }
 
 // ---- v78(2026年9月1日・利用者の承認 案2): 選手の質問用の根拠プール ----
