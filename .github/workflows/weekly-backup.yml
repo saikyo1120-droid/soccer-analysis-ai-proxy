@@ -33,11 +33,30 @@ jobs:
           echo "export from: ${EXPORT_URL}"
           mkdir -p backups
           FILE="backups/backup-$(date -u +%Y-%m-%d).json"
-          HTTP_CODE=$(curl -sS -o "${FILE}" -w "%{http_code}" --max-time 120 "${EXPORT_URL}?key=${{ secrets.LEARNING_SECRET_KEY }}")
-          echo "HTTP ${HTTP_CODE}"
-          if [ "${HTTP_CODE}" != "200" ]; then echo "backup export failed"; cat "${FILE}"; exit 1; fi
-          # ok:true を含まない応答(Upstash未設定など)は失敗として扱う
-          grep -q '"ok":true' "${FILE}" || { echo "backup content invalid"; cat "${FILE}"; exit 1; }
+          # ---- v101(2026年11月9日): 不完全なバックアップを「成功」として保存しない ----
+          #   本番実測: 10/25 分は重み・成長ログが null のまま ok:true で保存されていた(サーバー側が読み出し
+          #   失敗を飲み込んでいた)。サーバー側(v101)は読めなかった/中核が無いとき ok:false + partial:true を返す。
+          #   ここでは ①HTTP 200 ②"ok":true ③"partial":true を含まない、の3条件を満たすまで最大3回(60秒おき)
+          #   試す。3回とも不完全なら失敗で終わる(GitHub が失敗メールを送る=気づける)。
+          ATTEMPT=1
+          while :; do
+            HTTP_CODE=$(curl -sS -o "${FILE}" -w "%{http_code}" --max-time 120 "${EXPORT_URL}?key=${{ secrets.LEARNING_SECRET_KEY }}" || echo "000")
+            echo "attempt ${ATTEMPT}: HTTP ${HTTP_CODE}"
+            if [ "${HTTP_CODE}" = "200" ] && grep -q '"ok":true' "${FILE}" && ! grep -q '"partial":true' "${FILE}"; then
+              echo "backup content complete"
+              break
+            fi
+            echo "backup incomplete or failed (attempt ${ATTEMPT}):"
+            head -c 600 "${FILE}" || true
+            echo
+            if [ "${ATTEMPT}" -ge 3 ]; then
+              echo "::error::バックアップが3回とも不完全でした(保存先の読み出し失敗、または中核の保存値が無い)。不完全なファイルは保存しません。"
+              rm -f "${FILE}"
+              exit 1
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 60
+          done
           ls -la backups/
 
       - name: Commit backup
