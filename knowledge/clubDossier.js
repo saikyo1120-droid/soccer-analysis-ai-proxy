@@ -322,6 +322,24 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
     return { saved: ok !== false, isNew: !existing, events };
   }
 
+  // ---- v100(2026年11月8日・総点検): 複数選手の記録をまとめて読む(1人1 GET → 100人ずつ MGET) ----
+  //   本番実測: 自動QAの「選手索引の作り直し」が毎回、保存済みの選手記録 6,000件を1件ずつ GET していた
+  //   (約6,200コマンド/回・学習のたびに実行=1日約1.2万コマンド。Upstash 消費の最大項目)。
+  //   読む内容は同じで、往復(コマンド数)だけを 1/100 にする。MGET に対応しない保存先では
+  //   readManyJSON が1件ずつに戻る。「読めなかった」は readFailed / partial で区別して返す。
+  async function getPlayers(playerIds) {
+    const ids = (playerIds || []).map((x) => String(x)).filter(Boolean);
+    if (!upstashEnabled || !ids.length) return { byId: new Map(), readFailed: false, partial: false, readMode: "none", commands: 0 };
+    const r = await readManyJSON({ upstashCmd, upstashGetJSON }, ids.map((id) => `kb:player:${id}`));
+    const byId = new Map();
+    ids.forEach((id, i) => { if (r.values[i]) byId.set(id, r.values[i]); });
+    return {
+      byId, readFailed: !!r.readFailed, partial: !!r.partial, readMode: r.readMode,
+      // 実際に送ったコマンド数の見積もり(MGET は100件ずつ1コマンド、per-key は1件1コマンド)
+      commands: r.readMode === "mget" ? Math.ceil(ids.length / 100) : ids.length,
+    };
+  }
+
   async function getPlayer(playerId) {
     if (!upstashEnabled || !playerId) return null;
     return (await upstashGetJSON(`kb:player:${playerId}`).catch(() => null)) || null;
@@ -503,7 +521,7 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
   }
 
   return {
-    getDossier, getDossiers, updateSection, savePlayer, getPlayer, getStatsIndex, saveStatsIndex, getCoverageSummary, slugOf,
+    getDossier, getDossiers, updateSection, savePlayer, getPlayer, getPlayers, getStatsIndex, saveStatsIndex, getCoverageSummary, slugOf,
     getSearchIndex, saveSearchIndex, searchPlayers, getScoutFeed,
     getStatsIndexStrict, getSearchIndexStrict, // v97: 「読めなかった」を区別する版(更新で使う)
   };

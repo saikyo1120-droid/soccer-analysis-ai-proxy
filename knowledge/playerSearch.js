@@ -34,6 +34,7 @@
  *   向きが確定できないため **断定しない**(RB/LBではなく「サイドバック」)。
  */
 
+const { readManyJSON } = require("../learning/storeRead"); // v100: 索引ブロックのまとめ読み(MGET)
 const INDEX_KEY = "kb:player:index";           // 互換のため残す(単一キー時代の読み出し)
 const INDEX_META_KEY = "kb:player:index:meta";
 const INDEX_SHARD_PREFIX = "kb:player:index:s"; // 旧形式(世代なし)。移行期の読み出し用に残す
@@ -739,8 +740,21 @@ async function loadIndex(deps) {
   const missingShards = [];
   if (meta && Number.isFinite(meta.shardCount) && meta.shardCount > 0) {
     const gen = Number.isFinite(meta.generation) ? meta.generation : null;
-    for (let i = 0; i < Math.min(MAX_SHARDS, meta.shardCount); i++) {
-      const chunk = await upstashGetJSON(shardKey(gen, i)).catch(() => null);
+    const shardN = Math.min(MAX_SHARDS, meta.shardCount);
+    // ---- v100(2026年11月8日・総点検): ブロックを1件ずつ GET せず、まとめ読み(MGET)する ----
+    //   本番実測: 索引は約8,000人=数十ブロックで、サーバーは30分ごと(+自己修復の確認)に読み直す。
+    //   1ブロック1 GET だと1日千数百コマンドになる。読む内容は同じで、往復だけを減らす。
+    //   MGET が使えない保存先(テストのモック等)では従来どおり1件ずつ読む(結果は同一)。
+    let chunks = null;
+    if (typeof deps.upstashCmd === "function") {
+      try {
+        const keys = []; for (let i = 0; i < shardN; i++) keys.push(shardKey(gen, i));
+        const got = await readManyJSON({ upstashCmd: deps.upstashCmd, upstashGetJSON }, keys);
+        if (got && Array.isArray(got.values) && got.values.length === shardN) chunks = got.values;
+      } catch (e) { chunks = null; /* まとめ読みに失敗したら下で1件ずつ読む(読めなかった事実は missingShards に残る) */ }
+    }
+    for (let i = 0; i < shardN; i++) {
+      const chunk = chunks ? chunks[i] : await upstashGetJSON(shardKey(gen, i)).catch(() => null);
       // 読み出し失敗を黙って捨てない(以前は「900人少ない完全な結果」を返していた)
       if (Array.isArray(chunk)) rows.push(...chunk.filter((r) => Array.isArray(r) && r[COL.id]));
       else missingShards.push(i);
@@ -1546,9 +1560,21 @@ async function rebuildIndexFromStore(deps, opts) {
     return true;
   };
 
+  // ---- v100(2026年11月8日・総点検): クラブの調査ファイルは1クラブ1 GET ではなく、まとめ読み(MGET) ----
+  //   本番実測: 自動QAの修復として毎回走り、232クラブ+選手記録6,000件を1件ずつ読んでいた。
+  //   読む内容・作る索引は同一。往復(コマンド数)だけを減らす。まとめ読みが使えない保存先では
+  //   getDossiers が1件ずつに戻る(結果は同じ)。
+  const dossierNames = clubs.map((c) => c && c.nameEn).filter(Boolean);
+  let dossierMap = new Map();
+  if (typeof clubDossier.getDossiers === "function" && dossierNames.length) {
+    const got = await clubDossier.getDossiers(dossierNames).catch(() => null);
+    if (got && got.byName) { dossierMap = got.byName; stats.redisReads += got.readMode === "mget" ? Math.ceil(dossierNames.length / 100) : dossierNames.length; }
+    else { for (const n of dossierNames) { dossierMap.set(n, await clubDossier.getDossier(n).catch(() => null)); stats.redisReads++; } }
+  } else {
+    for (const n of dossierNames) { dossierMap.set(n, await clubDossier.getDossier(n).catch(() => null)); stats.redisReads++; }
+  }
   for (const club of clubs) {
-    const d = await clubDossier.getDossier(club.nameEn).catch(() => null);
-    stats.redisReads++;
+    const d = dossierMap.get(club.nameEn) || null;
     const squad = d && d.sections && d.sections.squad && d.sections.squad.players;
     if (!Array.isArray(squad) || !squad.length) continue;
     stats.clubsWithSquad++;
@@ -1568,9 +1594,16 @@ async function rebuildIndexFromStore(deps, opts) {
   const ids = Object.keys(statsIndex || {})
     .sort((a, b) => String(statsIndex[b] || "").localeCompare(String(statsIndex[a] || "")))
     .slice(0, cap);
+  // v100: 選手記録も1件ずつではなく、まとめ読み(100件ずつ MGET)。読めなかった件は従来どおり null 扱い
+  let recordMap = null;
+  if (typeof clubDossier.getPlayers === "function" && ids.length) {
+    const got = await clubDossier.getPlayers(ids).catch(() => null);
+    if (got && got.byId) { recordMap = got.byId; stats.redisReads += Number.isFinite(got.commands) ? got.commands : ids.length; stats.playerReadMode = got.readMode || null; }
+  }
   for (const id of ids) {
-    const rec = await clubDossier.getPlayer(id).catch(() => null);
-    stats.redisReads++;
+    let rec;
+    if (recordMap) rec = recordMap.get(String(id)) || null;
+    else { rec = await clubDossier.getPlayer(id).catch(() => null); stats.redisReads++; }
     stats.recordsRead++;
     if (!rec || !rec.id) continue;
     if (put(rec.id, rec)) stats.fromRecords++;
