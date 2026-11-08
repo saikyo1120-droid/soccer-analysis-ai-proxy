@@ -146,7 +146,19 @@ function scoreResolvedPreKick(record) {
     const p = Number.isFinite(probs[o]) ? probs[o] : 1 / 3;
     return sum + Math.pow(p - actual, 2);
   }, 0);
-  return { morningBrier: brier(morning), preKickBrier: brier(pre) };
+  // v101: Brier だけでなく、的中(勝敗)と LogLoss も両方採点する(★6「直前版を公式に昇格するか」の判断材料。
+  //   朝版の判定は record.predictedWinner(公式の予想)、直前版の判定は保存済みの pk.blended.predictedWinner)。
+  const P_FLOOR = 0.005;
+  const logLoss = (probs) => -Math.log(Math.max(P_FLOOR, Number.isFinite(probs[record.actualWinner]) ? probs[record.actualWinner] : 1 / 3));
+  const preKickPick = pk.blended.predictedWinner
+    || (pre.home >= pre.draw && pre.home >= pre.away ? "home" : pre.away >= pre.draw ? "away" : "draw");
+  return {
+    morningBrier: brier(morning), preKickBrier: brier(pre),
+    morningLogLoss: logLoss(morning), preKickLogLoss: logLoss(pre),
+    morningHit: record.predictedWinner ? record.predictedWinner === record.actualWinner : null,
+    preKickHit: preKickPick === record.actualWinner,
+    changed: !!record.predictedWinner && preKickPick !== record.predictedWinner,
+  };
 }
 
 module.exports = {

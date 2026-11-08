@@ -41,6 +41,14 @@ const SPORT_KEYS = {
   2: "soccer_uefa_champs_league",
   3: "soccer_uefa_europa_league",
   848: "soccer_uefa_europa_conference_league",
+  // ---- v101(2026年11月9日): 学習済みなのにコンセンサスの対象外だった3大会 ----
+  //   v87③で学習対象に加えた J1・チャンピオンシップ・ブラジル全国選手権は、この表に無かったため
+  //   1社オッズ(API-Football)か無オッズのままだった(本番実測: 無オッズは直近30日で 14.9%)。
+  //   sport key は The Odds API の公式一覧の表記。万一 key が違えば応答は 404 になり、成長ログの
+  //   oddsApi.failures に「league98:http_404」のように残る(黙って無視しない)。
+  98: "soccer_japan_j_league",
+  40: "soccer_efl_champ",
+  71: "soccer_brazil_campeonato",
 };
 
 const DEFAULT_MONTHLY_BUDGET = 480; // 無料枠500に対する安全マージン

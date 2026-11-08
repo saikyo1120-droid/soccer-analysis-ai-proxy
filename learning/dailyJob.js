@@ -139,6 +139,8 @@ const {
 // ---- 2026年8月・精度証明ラウンド ----
 // ② 較正に基づく自信の自動補正(実測のズレで翌日の表示勝率を補正)
 const { buildCalibrationMap } = require("./calibrationCorrection");
+// v101 ★4: 最終確率の較正(温度スケーリング。レジーム別・ホールドアウト関門つき)
+const probCalibration = require("./probCalibration");
 // ⑤ オッズ比較・ROI(市場という最も厳しい採点者との毎日比較)
 const { extractMatchWinnerOdds, impliedProbsPct, scoreRoiForRecord, emptyRoiDaily, saveDailyRoi, getRoiTrend, ROI_KEY_PREFIX } = require("./roiTracker");
 // ① RAG強化(似たクラブ索引・似た試合の検索)
@@ -388,6 +390,53 @@ function mergeStoreUsage(prev, cur) {
   const curRun = Number.isFinite(cur.commandsThisRun) ? cur.commandsThisRun : 0;
   return { ...cur, commandsToday: prevToday + curRun, runsCounted: ((prev && prev.runsCounted) || (prev ? 1 : 0)) + 1 };
 }
+// ---- v101: 同日再実行の合算規則(mergeGrowthLogs から使う小さな純関数) ----
+function mergeOddsApiStats(a, b) {
+  if (!a) return b || null; if (!b) return a;
+  const sum = (k) => (a[k] || 0) + (b[k] || 0);
+  return {
+    enabled: !!(a.enabled || b.enabled),
+    leaguesFetched: sum("leaguesFetched"), eventsTotal: sum("eventsTotal"), usedInPredictions: sum("usedInPredictions"),
+    failures: Array.from(new Set([...(a.failures || []), ...(b.failures || [])])).slice(0, 5),
+    fixturesConsidered: sum("fixturesConsidered"), fixturesOutOfScope: sum("fixturesOutOfScope"),
+  };
+}
+function mergeXgCollect(a, b) {
+  if (!a) return b || null; if (!b) return a;
+  const out = { ...a, ...b };
+  for (const k of Object.keys(out)) {
+    if (k === "ran") { out.ran = !!(a.ran || b.ran); continue; }
+    if (k === "errors") { out.errors = Array.from(new Set([...(a.errors || []), ...(b.errors || [])])).slice(0, 10); continue; }
+    if (Number.isFinite(a[k]) && Number.isFinite(b[k])) out[k] = a[k] + b[k];
+  }
+  return out;
+}
+function mergeLineupWatch(a, b) {
+  if (!a) return b || null; if (!b) return a;
+  const n = (a.comparedToday || 0) + (b.comparedToday || 0);
+  const avg = (ka, kb) => {
+    const sa = (a.comparedToday || 0) * (Number.isFinite(a[ka]) ? a[ka] : 0);
+    const sb = (b.comparedToday || 0) * (Number.isFinite(b[kb]) ? b[kb] : 0);
+    return n ? Math.round(((sa + sb) / n) * 1000) / 1000 : null;
+  };
+  return {
+    ...a, ...b,
+    comparedToday: n,
+    morningBrierAvgToday: avg("morningBrierAvgToday", "morningBrierAvgToday"),
+    preKickBrierAvgToday: avg("preKickBrierAvgToday", "preKickBrierAvgToday"),
+    morningHitsToday: (a.morningHitsToday || 0) + (b.morningHitsToday || 0),
+    preKickHitsToday: (a.preKickHitsToday || 0) + (b.preKickHitsToday || 0),
+    changedToday: (a.changedToday || 0) + (b.changedToday || 0),
+    cumulative: b.cumulative || a.cumulative || null,
+  };
+}
+function pickFitRecord(a, b) {
+  const has = (x) => x && ((Number.isFinite(x.samples) && x.samples > 0) || x.adopted === true || x.saved === true);
+  if (has(b)) return b;
+  if (has(a)) return a;
+  return b || a || null;
+}
+
 function mergeGrowthLogs(previous, current) {
   if (!previous || previous.date !== current.date) return { ...current, runsToday: 1, firstRanAt: current.ranAt, storeUsage: mergeStoreUsage(null, current.storeUsage) };
   const dedupeByStatement = (a, b) => {
@@ -433,6 +482,18 @@ function mergeGrowthLogs(previous, current) {
       : (previous.modelTuning && previous.modelTuning.ran !== false) ? previous.modelTuning
         : (current.modelTuning || previous.modelTuning || null),
     storeUsage: mergeStoreUsage(previous.storeUsage, current.storeUsage), // v99
+    // ---- v101(本番実測 11/8): 同日2回目の実行が OddsAPI の統計を 0 件で上書きしていた ----
+    //   (新規予想 48 件の日に oddsApi.fixturesConsidered が 0 と表示)。件数は合算・失敗一覧は重複排除。
+    //   xgCollect(昨日の試合の xG 取得)も同じ型なので合算する。
+    oddsApi: mergeOddsApiStats(previous.oddsApi, current.oddsApi),
+    xgCollect: mergeXgCollect(previous.xgCollect, current.xgCollect),
+    // 直前観測の比較: 今日の件数は合算・累計は最新(累計は保存先の同じキーに積まれる)
+    lineupWatch: mergeLineupWatch(previous.lineupWatch, current.lineupWatch),
+    // ブレンド比率・較正の学習結果: 記録のある方(samples>0 / fitted)を優先し、無ければ前回を残す
+    marketBlendFit: pickFitRecord(previous.marketBlendFit, current.marketBlendFit),
+    apifbBlendFit: pickFitRecord(previous.apifbBlendFit, current.apifbBlendFit),
+    probCalibration: (current.probCalibration && current.probCalibration.fitted) ? { ...current.probCalibration, appliedToday: (previous.probCalibration && previous.probCalibration.appliedToday || 0) + (current.probCalibration.appliedToday || 0) }
+      : (previous.probCalibration || current.probCalibration || null),
     // v98 の採用記録: 2回目の実行で採用が0件でも、1回目の採用(名前つき)を消さない
     dynamicUniverse: (current.dynamicUniverse && Array.isArray(current.dynamicUniverse.adoptedNow) && current.dynamicUniverse.adoptedNow.length)
       ? current.dynamicUniverse
@@ -1389,9 +1450,12 @@ async function runDailyLearning(deps) {
           // v100: リーグ別・学習済み/未学習別の内訳のため、大会名と学習済みかどうかを採点結果に添える
           //   (learnedCompetition は予想時に保存(v62)。無い旧記録は大会IDから再判定し、それも無ければ不明)
           record.marketScores.league = record.league || null;
+          record.marketScores.leagueCountry = record.leagueCountry || null; // v101: 同名大会を国名で区別(v101 以降の記録にだけ入っている)
           record.marketScores.learned = typeof record.learnedCompetition === "boolean"
             ? record.learnedCompetition
             : (record.leagueId ? learnedComp.classifyLearnedCompetition(record.leagueId, record.league).learned : null);
+          // v101①: 市場オッズと合成できた予想か(オッズなし=自前モデル単独)。予想時の実測から機械的に決まる
+          record.marketScores.oddsPresent = !!(record.marketImplied && Number.isFinite(record.marketImplied.homePct) && Number.isFinite(record.marketImplied.awayPct));
           resolvedScoredToday.push(record.marketScores);
         }
       } catch (e) { errors.push(`accuracy_scoring_failed:${fixtureIdStr}:${e.message}`); }
@@ -1417,6 +1481,11 @@ async function runDailyLearning(deps) {
           lineupWatchScored.n++;
           lineupWatchScored.morningSum += pkScore.morningBrier;
           lineupWatchScored.preKickSum += pkScore.preKickBrier;
+          // v101③: 的中・LogLoss も累計し、日次の精度集計(30日窓)にも同一試合の比較を残す
+          lineupWatchScored.morningHits = (lineupWatchScored.morningHits || 0) + (pkScore.morningHit ? 1 : 0);
+          lineupWatchScored.preKickHits = (lineupWatchScored.preKickHits || 0) + (pkScore.preKickHit ? 1 : 0);
+          lineupWatchScored.changed = (lineupWatchScored.changed || 0) + (pkScore.changed ? 1 : 0);
+          if (record.marketScores) record.marketScores.lineupCompare = pkScore;
         }
       } catch (e) { warn(`lineup_prekick_score_failed:${fixtureIdStr}`, e); } // 採点は付加情報。失敗しても答え合わせ本体は続行(v92: 痕跡は残す)
 
@@ -1821,6 +1890,16 @@ async function runDailyLearning(deps) {
     errors.push(`weights_read_failed_prediction_skipped:all:保存済みの重みを読み出せなかったため、学習前の重みでの予測記録を避けて本日の新規予測を見送りました(${storedWeightsReadError})`);
     predictionStoppedReason = "weights_unreadable";
   }
+  // ---- v101 ★4: 確率の較正モデル(前夜の学習で保存。無ければ較正なし)もループの前に1回だけ読む ----
+  //   読めなかった日は「較正なし」で予測する(較正は確率の質の調整であり、予測の可否を左右しない)。
+  let calibrationModelOnce = null;
+  let calibrationAppliedToday = 0;
+  if (upstashEnabled && !storedWeightsReadError) {
+    try {
+      const rawCal = await upstashCmd(["GET", probCalibration.MODEL_KEY]);
+      calibrationModelOnce = rawCal ? JSON.parse(rawCal) : null;
+    } catch (e) { warn("calibration_model_read_failed", e); calibrationModelOnce = null; }
+  }
   for (const team of (storedWeightsReadError ? [] : predictionPool)) {
     if (newPredictionsLogged >= OWN_PREDICT_LOG_CAP) { predictionStoppedReason = "cap"; break; }
     // 予算が尽きかけている日は、ここで打ち切って利用者向けの余力を守る
@@ -2115,6 +2194,23 @@ async function runDailyLearning(deps) {
         const r4 = (v) => Math.round(v * 10000) / 10000;
         finalProbs = { homeWin: r4(finalProbs.homeWin), draw: r4(finalProbs.draw), awayWin: r4(finalProbs.awayWin), source: finalProbs.source };
       }
+      // ---- v101 ★4「確率の鋭さ(較正)」: 最終確率に温度 T を適用する(採用済みのレジームだけ) ----
+      //   p^(1/T) は単調変換なので最大確率の勝敗は変わらない(predictedWinner はそのまま=的中率は不変)。
+      //   生の確率(rawFinalProbs)と T を併記し、数字のすり替えにならないようにする。
+      //   較正モデルは前夜の学習が検証(関門)を通したときだけ採用されている(probCalibration.js)。
+      let rawFinalProbs = null;
+      let probCalibrationUsed = null;
+      if (finalProbs && calibrationModelOnce) {
+        const regime = probCalibration.regimeOf({ marketImplied });
+        const ap = probCalibration.applyCalibration({ home: finalProbs.homeWin, draw: finalProbs.draw, away: finalProbs.awayWin }, calibrationModelOnce, regime);
+        if (ap.applied) {
+          const r4 = (v) => Math.round(v * 10000) / 10000;
+          rawFinalProbs = { ...finalProbs };
+          finalProbs = { homeWin: r4(ap.probs.home), draw: r4(ap.probs.draw), awayWin: r4(ap.probs.away), source: finalProbs.source };
+          probCalibrationUsed = { applied: true, regime, T: ap.T, fittedAt: calibrationModelOnce.fittedAt || null };
+          calibrationAppliedToday++;
+        }
+      }
       const importance = computeFactorImportance(features, weights);
       const topFactor = importance.find((i) => i.stars > 0);
 
@@ -2158,10 +2254,14 @@ async function runDailyLearning(deps) {
         league: (fx.league && fx.league.name) ? fx.league.name : null,
         // v57: 直前ウォッチがコンセンサスオッズをリーグ単位で引くためのID
         leagueId: (fx.league && Number.isFinite(Number(fx.league.id))) ? Number(fx.league.id) : null,
+        // v101: 国名(同名大会=イタリアとブラジルの「Serie A」等をリーグ別の集計で区別するため)
+        leagueCountry: (fx.league && fx.league.country) ? String(fx.league.country).slice(0, 40) : null,
         homeFormScore, awayFormScore, predictedWinner, // v1互換フィールド(既存のバックテスト・テストとの互換性のため維持)
         homeLambda, awayLambda, features, weightsSnapshot: weights, factorImportance: importance,
         // v97: 判定に実際に使った最終確率(採点・表示・較正はこれを優先する。source=model/market_blend/second_opinion_blend)
+        //   v101: 較正(温度)を適用した日は較正後の値。生の値は rawFinalProbs に残す。
         finalProbs,
+        ...(rawFinalProbs ? { rawFinalProbs, probCalibration: probCalibrationUsed } : {}),
         // ---- v98: 予想時に「どのデータが使えて、どれが欠けていたか」を記録する ----
         //   missingFeatures は外れ理由(data_missing)・翌日の優先取得・画面の「未取得」表示に使う。
         //   teamId は欠けたデータのチームを翌日の収集で特定するため(名前の推測を避ける)。
@@ -2874,6 +2974,30 @@ async function runDailyLearning(deps) {
     errors.push(`apifb_blend_fit_failed:${e && (e.code || e.message)}`);
   }
 
+  // ---- v101 ★4「確率の鋭さ(較正)」の学習 ----
+  //   答え合わせ済みの記録(生の最終確率と実結果)から、状況別(オッズあり/なし)の温度 T を
+  //   ホールドアウト検証で学習し、関門(検証 LogLoss が 0.002 以上改善・偶然の範囲を超える)を
+  //   通ったレジームだけ採用する。結果は毎晩保存し、翌日の予測(③)が読む。
+  //   採用の有無にかかわらず、学習の経過(T・検証前後・理由)を成長ログに残す(開示)。
+  let probCalibrationToday = null;
+  try {
+    const recentForCal = await loadRecentRecordsOnce();
+    const calModel = probCalibration.fitCalibrationModel(recentForCal, { nowIso: runAt.toISOString() });
+    let saved = false;
+    if (upstashEnabled) {
+      const okSave = await upstashSetJSON(probCalibration.MODEL_KEY, calModel);
+      saved = okSave !== false;
+      if (!saved) errors.push("calibration_model_save_failed");
+    }
+    probCalibrationToday = {
+      fitted: true, saved, appliedToday: calibrationAppliedToday,
+      ...probCalibration.summarizeModel(calModel),
+    };
+  } catch (e) {
+    errors.push(`calibration_fit_failed:${e && (e.code || e.message)}`);
+    probCalibrationToday = { fitted: false, saved: false, appliedToday: calibrationAppliedToday, available: false, reasonJa: `較正の学習に失敗しました(${String((e && e.message) || e).slice(0, 80)})。` };
+  }
+
   await stage("⑤ 知識ベース更新と成長ログ");
   // ---- ⑤ 今日の知識ベース更新と成長ログ ----
   // Stage E以降: 「事実」の保存先はKnowledge Engine(knowledgeStore.js)に一本化。
@@ -3004,6 +3128,11 @@ async function runDailyLearning(deps) {
             cum.n += lineupWatchScored.n;
             cum.morningBrierSum += lineupWatchScored.morningSum;
             cum.preKickBrierSum += lineupWatchScored.preKickSum;
+            // v101③: 的中数も累計する(この項目は v101 以降の採点分だけ。nHits がその母数)
+            cum.nHits = (cum.nHits || 0) + lineupWatchScored.n;
+            cum.morningHits = (cum.morningHits || 0) + (lineupWatchScored.morningHits || 0);
+            cum.preKickHits = (cum.preKickHits || 0) + (lineupWatchScored.preKickHits || 0);
+            cum.changed = (cum.changed || 0) + (lineupWatchScored.changed || 0);
             await upstashSetJSON(lineupWatchMod.SCORE_KEY, cum);
           }
         }
@@ -3012,11 +3141,23 @@ async function runDailyLearning(deps) {
         comparedToday: lineupWatchScored.n,
         morningBrierAvgToday: lineupWatchScored.n ? Math.round((lineupWatchScored.morningSum / lineupWatchScored.n) * 1000) / 1000 : null,
         preKickBrierAvgToday: lineupWatchScored.n ? Math.round((lineupWatchScored.preKickSum / lineupWatchScored.n) * 1000) / 1000 : null,
+        // v101③: 今日の的中数(朝版 / 直前版)と、直前版が別の勝敗を選んだ試合数
+        morningHitsToday: lineupWatchScored.morningHits || 0,
+        preKickHitsToday: lineupWatchScored.preKickHits || 0,
+        changedToday: lineupWatchScored.changed || 0,
         cumulative: cum ? {
           n: cum.n,
           morningBrierAvg: cum.n ? Math.round((cum.morningBrierSum / cum.n) * 1000) / 1000 : null,
           preKickBrierAvg: cum.n ? Math.round((cum.preKickBrierSum / cum.n) * 1000) / 1000 : null,
+          // v101③: 的中率の比較(v101 以降に採点した分のみ。古い累計には無いので母数を別に持つ)
+          hitCompare: (cum.nHits > 0) ? {
+            n: cum.nHits,
+            morningHitRatePct: Math.round((cum.morningHits / cum.nHits) * 1000) / 10,
+            preKickHitRatePct: Math.round((cum.preKickHits / cum.nHits) * 1000) / 10,
+            changed: cum.changed || 0,
+          } : null,
         } : null,
+        noteJa: "朝版(公式の予想)と直前版(確定スタメン+直前オッズ)を同じ試合で両方採点した実測。公式の予想・学習は朝版のまま。的中率の比較は v101 以降の採点分から貯まります。",
       };
     })(),
     // v57: xG前向き収集の実測(何件見て・何件取得し・何件保存したか)
@@ -3040,7 +3181,14 @@ async function runDailyLearning(deps) {
       validNllBase: marketBlendFitToday.validNllBase ?? null,
       validNllBest: marketBlendFitToday.validNllBest ?? null,
       reasonJa: marketBlendFitToday.reasonJa || null,
+      // v101: 市場比率ごとの検証 LogLoss の曲線(w=1.0「市場単独」は診断用で採用対象外)。
+      //   「AIを◯割にすると確率の質がどれだけ変わるか」を、推測ではなく実測で開示するため。
+      curve: Array.isArray(marketBlendFitToday.curve) ? marketBlendFitToday.curve : null,
+      marketAloneValidNll: marketBlendFitToday.marketAloneValidNll ?? null,
+      curveNoteJa: marketBlendFitToday.curve ? "w=市場の比率。validNll が小さいほど検証データでの確率の質が良い。w=1.0 は市場単独(参考値・採用上限は 0.9)。" : null,
     } : null,
+    // v101 ★4: 最終確率の較正(温度)の学習結果と、今日の予想への適用件数(実測のまま)
+    probCalibration: probCalibrationToday,
     // v79(案6): 「2つ目の意見」(API-Football予想)ブレンドの学習結果(実測のまま)
     apifbBlendFit: apifbBlendFitToday ? {
       adopted: !!apifbBlendFitToday.adopted, w: apifbBlendFitToday.w ?? 0,
@@ -3618,6 +3766,7 @@ async function getRecentFactsForTeam(deps, teamNameEnglish) {
 module.exports = {
   runDailyLearning, getGrowthLog, getRecentFactsForTeam,
   llmErrorTag, mergeStoreUsage, // v99(テスト対象)
+  mergeOddsApiStats, mergeXgCollect, mergeLineupWatch, pickFitRecord, // v101(テスト対象)
   computeFormScore, predictOutcome, backtestAccuracy, outcomeFromScore,
   DEFAULT_WEIGHTS, REGISTERED_TEAMS, LEARNING_STAGES,
   buildReflectionText, mergeGrowthLogs,

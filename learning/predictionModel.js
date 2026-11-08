@@ -1352,10 +1352,21 @@ function fitMarketBlend(records, opts) {
     const pick = p.home >= p.draw && p.home >= p.away ? "home" : p.away >= p.draw ? "away" : "draw";
     return pick === x.actual;
   }).length / set.length;
+  // ---- v101: 市場比率ごとの正確さの曲線(開示用) ----
+  //   「AIの比率を上げると確率の質がどれだけ落ちるか/上がるか」を推測ではなく実測で見せる。
+  //   w=1.0(市場単独)は参考値として載せる(採用の上限は従来どおり 0.9。AIを混ぜない予想は出さない)。
+  const r4 = (v) => Math.round(v * 10000) / 10000;
+  const curve = [];
+  for (let w10 = 0; w10 <= 10; w10++) {
+    const w = w10 / 10;
+    curve.push({ w, trainNll: r4(nllOf(train, w)), validNll: r4(nllOf(valid, w)), validAccPct: Math.round(accOf(valid, w) * 1000) / 10 });
+  }
+  const marketAloneValidNll = r4(nllOf(valid, 1));
   if (bestW === 0 || validBest >= validBase) {
     return {
       adopted: false, w: 0, samples: samples.length, bestTrainW: bestW,
       validNllBase: Math.round(validBase * 10000) / 10000, validNllBest: Math.round(validBest * 10000) / 10000,
+      curve, marketAloneValidNll,
       reasonJa: bestW === 0
         ? "学習データ上も自前モデル単独が最良だったため、ブレンドは使いません。"
         : `検証データでブレンド(w=${bestW})が自前モデル単独を上回らなかったため、採用を見送りました(迷ったら現状維持)。`,
@@ -1367,6 +1378,7 @@ function fitMarketBlend(records, opts) {
     validNllBest: Math.round(validBest * 10000) / 10000,
     validAccBasePct: Math.round(accOf(valid, 0) * 1000) / 10,
     validAccBestPct: Math.round(accOf(valid, bestW) * 1000) / 10,
+    curve, marketAloneValidNll,
     reasonJa: `検証${valid.length}件でブレンド(市場${Math.round(bestW * 100)}%+AI${Math.round((1 - bestW) * 100)}%)がNLL ${Math.round(validBase * 10000) / 10000}→${Math.round(validBest * 10000) / 10000}へ改善したため採用しました。`,
   };
 }

@@ -110,15 +110,31 @@ async function appendHistory(deps, events) {
 const TRUST_PART_KEYS = ["form", "injuries", "standings", "xg"];
 const TRUST_PART_JA = { form: "フォーム", injuries: "怪我情報", standings: "順位・勝点", xg: "xG(期待得点)" };
 
+/**
+ * v101: リーグ別集計の表示名。大会名だけだと別の国の同名大会(本番実測: イタリアとブラジルの
+ * 「Serie A」が 154 件の1行に合算、「Super League」はスイスか中国か区別不能)が混ざるため、
+ * 記録に国名(leagueCountry。v101 以降の予想に保存)があれば「Serie A(Italy)」の形にする。
+ * UEFA 大会などの "World" は付けない。国名の無い旧記録は従来どおり大会名のみ。
+ */
+function leagueLabelOf(record) {
+  const name = String((record && record.league) || "").trim();
+  if (!name) return null;
+  const country = String((record && record.leagueCountry) || "").trim();
+  if (!country || /^world$/i.test(country)) return name;
+  return `${name}(${country})`;
+}
+
 function buildSelfDiagnosis(input) {
   const { recentRecords, featureEffectiveness, apiCallStats, errors, accuracyTrend } = input || {};
   const resolved = (recentRecords || []).filter((r) => r && r.resolved && r.actualWinner);
 
   // (a) リーグ別の精度(リーグ情報を持つ新形式の記録のみ。n≥3で表示・n<3は集計外)
+  //   v101: 集計キーは国名つきの表示名(同名大会の合算を防ぐ)
   const byLeague = new Map();
   for (const r of resolved) {
-    if (!r.league) continue;
-    const cur = byLeague.get(r.league) || { n: 0, hits: 0, drawActual: 0, drawPredicted: 0, drawHit: 0 };
+    const leagueLabel = leagueLabelOf(r);
+    if (!leagueLabel) continue;
+    const cur = byLeague.get(leagueLabel) || { n: 0, hits: 0, drawActual: 0, drawPredicted: 0, drawHit: 0 };
     cur.n++;
     if (r.correct) cur.hits++;
     // v78(案4): 引き分けの実際の頻度・予想頻度・的中数もリーグ別に実測する
@@ -128,7 +144,7 @@ function buildSelfDiagnosis(input) {
       cur.drawPredicted++;
       if (r.actualWinner === "draw") cur.drawHit++;
     }
-    byLeague.set(r.league, cur);
+    byLeague.set(leagueLabel, cur);
   }
   const overallN = resolved.length;
   const overallHitPct = overallN ? round1((resolved.filter((r) => r.correct).length / overallN) * 100) : null;
@@ -190,7 +206,7 @@ function buildSelfDiagnosis(input) {
       : (overallN ? "リーグ情報つきの答え合わせ済み予測がまだ3件未満のため、リーグ別の精度は判定不能です(新しい予測記録から自動で貯まります)。" : "答え合わせ済みの予測がまだ無いため、リーグ別の精度は判定不能です。"),
     // v78(案4): リーグ別の常設実測表(的中率+引き分けの実際/予想/的中)
     leagueTable,
-    leagueTableNoteJa: `直近の答え合わせ済み${overallN}件からの実測(3件以上のリーグのみ・件数の多い順)。「引分実際」はそのリーグで実際に引き分けだった割合、「引分予想」はAIが引き分けと予想した割合です。`,
+    leagueTableNoteJa: `直近の答え合わせ済み${overallN}件からの実測(3件以上のリーグのみ・件数の多い順)。「引分実際」はそのリーグで実際に引き分けだった割合、「引分予想」はAIが引き分けと予想した割合です。同名の大会は国名で区別します(v101 以降の記録。国名の無い旧記録は大会名のみ)。`,
     dataGaps,
     dataGapsNoteJa: dataGaps.length ? null : "信頼度つきの予測記録がまだ3件未満のため、データ欠損率は判定不能です。",
     ineffectiveFeatures,
@@ -383,4 +399,5 @@ module.exports = {
   buildSelfDiagnosis, buildImprovementProposals, applyProposals, evaluateDueChanges,
   getSelfImprovementHistory,
   tuneConfigReadFailed, // v97
+  leagueLabelOf, // v101
 };

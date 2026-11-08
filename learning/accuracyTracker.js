@@ -53,10 +53,32 @@ const BY_LEAGUE_OTHER_KEY = "__other__"; // 上限を超えたリーグの受け
 const LN3 = Math.log(3);
 const UNIFORM_BRIER_3WAY = 2 / 3;
 
-/** リーグ名を集計キーに正規化する(表記ゆれで別行にならないように) */
-function leagueKeyOf(name) {
+/**
+ * リーグ名を集計キーに正規化する(表記ゆれで別行にならないように)。
+ * v101: 大会名だけだと別の国の同名大会が1行に合算される(本番実測: イタリアとブラジルの
+ *   「Serie A」が 154 件の1行に、「Super League」はスイスか中国か区別不能)。記録に国名
+ *   (leagueCountry。v101 から保存)があれば「Serie A(Italy)」の形にして区別する。
+ *   UEFA 大会などの国名 "World" は付けない(意味が無いため)。
+ */
+function leagueKeyOf(name, country) {
   const s = String(name || "").trim().replace(/\s+/g, " ");
-  return s ? s.slice(0, 60) : "(大会名なし)";
+  if (!s) return "(大会名なし)";
+  const c = String(country || "").trim().replace(/\s+/g, " ");
+  const base = s.slice(0, 60);
+  if (!c || /^world$/i.test(c)) return base;
+  return `${base}(${c.slice(0, 30)})`;
+}
+
+// ---- v101(2026年11月9日): 計測の物差し ----
+//   ① オッズあり/なし別(市場合成ができた予想と、自前モデル単独の予想の成績を分ける。
+//      無オッズは直近30日で 14.9% あり、その群の的中率が未計測だった)
+//   ② リーグ別の引き分け較正(予想した引き分け確率の平均 vs 実際の引き分け率。
+//      ★5「引き分けの扱い」の判断材料。本番実測: 引き分け実際 21.3% vs 引き分け予想 1.0%)
+//   ③ 朝版 vs 直前版(確定スタメン+直前オッズ)の的中率・Brier・LogLoss(★6 の判断材料。
+//      従来は累計 Brier だけで、的中率も 30 日窓も無かった)
+function emptyOddsBucket() { return { n: 0, hits: 0, brierSum: 0, logLossSum: 0 }; }
+function emptyLineupCompare() {
+  return { n: 0, morningHits: 0, preKickHits: 0, morningBrierSum: 0, preKickBrierSum: 0, morningLogLossSum: 0, preKickLogLossSum: 0, changed: 0, changedPreKickHits: 0, changedMorningHits: 0 };
 }
 
 function skillOf(avgLogLoss, avgBrier) {
@@ -271,15 +293,47 @@ function buildDailyAccuracy(scoredList) {
       // v100: リーグ別・学習済み/未学習別(1X2のみ。採点結果に league / learned が添えられている場合)
       if (m === "oneX2") {
         a.byLeague = a.byLeague || {};
-        let lk = leagueKeyOf(s.league);
+        let lk = leagueKeyOf(s.league, s.leagueCountry); // v101: 国名で同名大会を区別
         if (!a.byLeague[lk] && Object.keys(a.byLeague).length >= BY_LEAGUE_MAX_PER_DAY) lk = BY_LEAGUE_OTHER_KEY;
         a.byLeague[lk] = a.byLeague[lk] || { n: 0, hits: 0 };
         a.byLeague[lk].n++;
         if (mk.hit) a.byLeague[lk].hits++;
+        // v101: リーグ別の引き分け較正の材料(実際の引き分け数と、予想した引き分け確率の合計)
+        if (mk.actual === "draw") a.byLeague[lk].drawActual = (a.byLeague[lk].drawActual || 0) + 1;
+        if (mk.probs && Number.isFinite(mk.probs.draw)) {
+          a.byLeague[lk].drawPredSum = round4((a.byLeague[lk].drawPredSum || 0) + mk.probs.draw);
+          a.byLeague[lk].drawPredN = (a.byLeague[lk].drawPredN || 0) + 1;
+        }
         a.byLearned = a.byLearned || { learned: { n: 0, hits: 0 }, unlearned: { n: 0, hits: 0 }, unknown: { n: 0, hits: 0 } };
         const lb = s.learned === true ? "learned" : s.learned === false ? "unlearned" : "unknown";
         a.byLearned[lb].n++;
         if (mk.hit) a.byLearned[lb].hits++;
+        // v101①: オッズあり/なし別(採点結果に oddsPresent が添えられている記録だけ)
+        if (typeof s.oddsPresent === "boolean") {
+          a.byOdds = a.byOdds || { withOdds: emptyOddsBucket(), noOdds: emptyOddsBucket() };
+          const ob = s.oddsPresent ? a.byOdds.withOdds : a.byOdds.noOdds;
+          ob.n++;
+          if (mk.hit) ob.hits++;
+          ob.brierSum = round4(ob.brierSum + mk.brier);
+          ob.logLossSum = round4(ob.logLossSum + mk.logLoss);
+        }
+        // v101③: 朝版 vs 直前版(直前版の判定がある記録だけ。両方とも同じ試合で採点)
+        const lc = s.lineupCompare;
+        if (lc && Number.isFinite(lc.morningBrier) && Number.isFinite(lc.preKickBrier)) {
+          a.lineup = a.lineup || emptyLineupCompare();
+          a.lineup.n++;
+          if (lc.morningHit) a.lineup.morningHits++;
+          if (lc.preKickHit) a.lineup.preKickHits++;
+          a.lineup.morningBrierSum = round4(a.lineup.morningBrierSum + lc.morningBrier);
+          a.lineup.preKickBrierSum = round4(a.lineup.preKickBrierSum + lc.preKickBrier);
+          if (Number.isFinite(lc.morningLogLoss)) a.lineup.morningLogLossSum = round4(a.lineup.morningLogLossSum + lc.morningLogLoss);
+          if (Number.isFinite(lc.preKickLogLoss)) a.lineup.preKickLogLossSum = round4(a.lineup.preKickLogLossSum + lc.preKickLogLoss);
+          if (lc.changed) {
+            a.lineup.changed++;
+            if (lc.preKickHit) a.lineup.changedPreKickHits++;
+            if (lc.morningHit) a.lineup.changedMorningHits++;
+          }
+        }
       }
     }
     if (s.markets.scoreline) {
@@ -346,8 +400,41 @@ function mergeDailyAccuracy(a, b) {
         let key = k;
         if (!out.oneX2.byLeague[key] && Object.keys(out.oneX2.byLeague).length >= BY_LEAGUE_MAX_PER_DAY * 3) key = BY_LEAGUE_OTHER_KEY;
         out.oneX2.byLeague[key] = out.oneX2.byLeague[key] || { n: 0, hits: 0 };
-        out.oneX2.byLeague[key].n += v.n || 0;
-        out.oneX2.byLeague[key].hits += v.hits || 0;
+        const dst = out.oneX2.byLeague[key];
+        dst.n += v.n || 0;
+        dst.hits += v.hits || 0;
+        // v101: 引き分け較正の材料も合算(古い保存形式には無い → 0 として足す)
+        if (v.drawActual) dst.drawActual = (dst.drawActual || 0) + v.drawActual;
+        if (v.drawPredN) {
+          dst.drawPredN = (dst.drawPredN || 0) + v.drawPredN;
+          dst.drawPredSum = round4((dst.drawPredSum || 0) + (v.drawPredSum || 0));
+        }
+      }
+    }
+  }
+  // v101①: オッズあり/なし別の合算
+  const oddsMaps = [a.oneX2?.byOdds, b.oneX2?.byOdds].filter((x) => x && typeof x === "object");
+  if (oddsMaps.length) {
+    out.oneX2.byOdds = { withOdds: emptyOddsBucket(), noOdds: emptyOddsBucket() };
+    for (const mp of oddsMaps) {
+      for (const k of ["withOdds", "noOdds"]) {
+        const v = mp[k]; if (!v) continue;
+        out.oneX2.byOdds[k].n += v.n || 0;
+        out.oneX2.byOdds[k].hits += v.hits || 0;
+        out.oneX2.byOdds[k].brierSum = round4(out.oneX2.byOdds[k].brierSum + (v.brierSum || 0));
+        out.oneX2.byOdds[k].logLossSum = round4(out.oneX2.byOdds[k].logLossSum + (v.logLossSum || 0));
+      }
+    }
+  }
+  // v101③: 朝版 vs 直前版の合算
+  const lineupMaps = [a.oneX2?.lineup, b.oneX2?.lineup].filter((x) => x && typeof x === "object");
+  if (lineupMaps.length) {
+    out.oneX2.lineup = emptyLineupCompare();
+    for (const mp of lineupMaps) {
+      for (const k of Object.keys(out.oneX2.lineup)) {
+        const v = mp[k];
+        if (!Number.isFinite(v)) continue;
+        out.oneX2.lineup[k] = /Sum$/.test(k) ? round4(out.oneX2.lineup[k] + v) : out.oneX2.lineup[k] + v;
       }
     }
   }
@@ -442,9 +529,19 @@ function summarizeByLeague(byLeague) {
   }
   const rows = Object.entries(byLeague)
     .filter(([, v]) => v && v.n > 0)
-    .map(([k, v]) => ({ league: k === BY_LEAGUE_OTHER_KEY ? "その他" : k, n: v.n, hits: v.hits, hitRatePct: round1((v.hits / v.n) * 100) }))
+    .map(([k, v]) => {
+      const row = { league: k === BY_LEAGUE_OTHER_KEY ? "その他" : k, n: v.n, hits: v.hits, hitRatePct: round1((v.hits / v.n) * 100) };
+      // v101: 引き分け較正(予想した引き分け確率の平均 vs 実際の引き分け率。材料のある行だけ)
+      if (v.drawPredN > 0) {
+        row.drawActualPct = round1(((v.drawActual || 0) / v.n) * 100);
+        row.drawPredAvgPct = round1(((v.drawPredSum || 0) / v.drawPredN) * 100);
+        row.drawGapPt = round1(row.drawPredAvgPct - row.drawActualPct); // マイナス=引き分けを過小評価
+      }
+      return row;
+    })
     .sort((a, b) => b.n - a.n || a.league.localeCompare(b.league));
   const totalN = rows.reduce((s, r) => s + r.n, 0);
+  const drawRows = rows.filter((r) => Number.isFinite(r.drawGapPt) && r.n >= 10);
   return {
     measurable: rows.length > 0,
     leagues: rows.length, totalN,
@@ -455,7 +552,62 @@ function summarizeByLeague(byLeague) {
       if (overall === null) return [];
       return rows.filter((r) => r.n >= 5 && r.hitRatePct <= overall - 15).slice(0, 8);
     })(),
-    noteJa: "1X2の的中率をリーグ(大会)別に数えたものです。母数の小さいリーグは偶然で大きく動くため、5件未満は弱点の判定に使いません。",
+    // v101: 引き分けを最も過小評価しているリーグ(母数10件以上・差の大きい順)。★5 の材料
+    drawCalibration: drawRows.length ? {
+      measurable: true,
+      rows: [...drawRows].sort((a, b) => a.drawGapPt - b.drawGapPt).slice(0, 10).map((r) => ({ league: r.league, n: r.n, drawActualPct: r.drawActualPct, drawPredAvgPct: r.drawPredAvgPct, drawGapPt: r.drawGapPt })),
+      overall: (() => {
+        let n = 0, act = 0, predSum = 0, predN = 0;
+        for (const v of Object.values(byLeague)) { if (!v || !(v.drawPredN > 0)) continue; n += v.n; act += v.drawActual || 0; predSum += v.drawPredSum || 0; predN += v.drawPredN; }
+        return n ? { n, drawActualPct: round1((act / n) * 100), drawPredAvgPct: round1((predSum / predN) * 100), drawGapPt: round1(((predSum / predN) - (act / n)) * 100) } : null;
+      })(),
+      noteJa: "予想した引き分け確率の平均と、実際に引き分けだった割合の差(マイナス=引き分けを少なく見積もっている)。予想の選び方(最大確率)は変えずに、確率の正しさを直す材料です。",
+    } : { measurable: false, reasonJa: "引き分け較正はこの機能(v101)の追加後に答え合わせした分から記録されます(母数10件以上のリーグから表示)。" },
+    noteJa: "1X2の的中率をリーグ(大会)別に数えたものです。母数の小さいリーグは偶然で大きく動くため、5件未満は弱点の判定に使いません。同名の大会は国名で区別します(v101)。",
+  };
+}
+
+/** v101①: オッズあり(市場合成)/ オッズなし(自前モデル単独)別の成績 */
+function summarizeByOdds(byOdds) {
+  if (!byOdds || typeof byOdds !== "object") {
+    return { measurable: false, reasonJa: "オッズあり/なし別の集計はこの機能(v101)の追加後に答え合わせした分から記録されます。" };
+  }
+  const row = (v) => (v && v.n > 0)
+    ? { n: v.n, hits: v.hits, hitRatePct: round1((v.hits / v.n) * 100), avgBrier: round4(v.brierSum / v.n), avgLogLoss: round4(v.logLossSum / v.n), skill: skillOf(v.logLossSum / v.n, v.brierSum / v.n) }
+    : { n: 0, hits: 0, hitRatePct: null, avgBrier: null, avgLogLoss: null, skill: null };
+  const withOdds = row(byOdds.withOdds), noOdds = row(byOdds.noOdds);
+  const total = withOdds.n + noOdds.n;
+  return {
+    measurable: total > 0,
+    withOdds, noOdds,
+    noOddsSharePct: total ? round1((noOdds.n / total) * 100) : null,
+    gapPt: (withOdds.hitRatePct !== null && noOdds.hitRatePct !== null) ? round1(withOdds.hitRatePct - noOdds.hitRatePct) : null,
+    noteJa: "「オッズあり」=市場オッズと合成して判定した予想。「オッズなし」=オッズが取れず自前モデル単独で判定した予想(最も弱い状態)。差が大きいほど、オッズ取得率を上げる(★3)効果が大きいことを示します。",
+  };
+}
+
+/** v101③: 朝版(公式の予想)と直前版(確定スタメン+直前オッズ)の同一試合比較 */
+function summarizeLineupCompare(lineup) {
+  if (!lineup || !(lineup.n > 0)) {
+    return { measurable: false, reasonJa: "朝版 vs 直前版の比較はこの機能(v101)の追加後に答え合わせした分から記録されます(直前情報が取れた試合のみ)。" };
+  }
+  const n = lineup.n;
+  const side = (hits, brierSum, llSum) => ({
+    hitRatePct: round1((hits / n) * 100),
+    avgBrier: round4(brierSum / n),
+    avgLogLoss: Number.isFinite(llSum) && llSum > 0 ? round4(llSum / n) : null,
+  });
+  const morning = side(lineup.morningHits, lineup.morningBrierSum, lineup.morningLogLossSum);
+  const preKick = side(lineup.preKickHits, lineup.preKickBrierSum, lineup.preKickLogLossSum);
+  return {
+    measurable: true, n,
+    morning, preKick,
+    deltaHitPt: round1(preKick.hitRatePct - morning.hitRatePct),
+    deltaBrier: round4(preKick.avgBrier - morning.avgBrier), // マイナス=直前版が良い
+    changed: lineup.changed || 0,
+    changedPreKickHits: lineup.changedPreKickHits || 0,
+    changedMorningHits: lineup.changedMorningHits || 0,
+    noteJa: "同じ試合について、朝の公式予想と、確定スタメン・直前オッズで計算し直した直前版を両方採点したもの。Brier の差がマイナスなら直前版の方が確率が良い。「判定が変わった試合」は直前版が別の勝敗を選んだ試合の数と、その的中数です(★6 の判断材料。公式の予想は朝版のまま)。",
   };
 }
 
@@ -506,6 +658,9 @@ function summarizeAccuracy(agg) {
       out.markets.oneX2.skill = skillOf(a.logLossSum / a.n, a.brierSum / a.n);
       out.markets.oneX2.byLeague = summarizeByLeague(a.byLeague);
       out.markets.oneX2.byLearned = summarizeByLearned(a.byLearned);
+      // v101: オッズあり/なし別・朝版 vs 直前版
+      out.markets.oneX2.byOdds = summarizeByOdds(a.byOdds);
+      out.markets.oneX2.lineupCompare = summarizeLineupCompare(a.lineup);
     }
   }
   if (agg.scoreline && agg.scoreline.n) {
@@ -653,4 +808,5 @@ module.exports = {
   computePrecisionRecallF1, computeEce,
   summarizeAccuracy, saveDailyAccuracy, getAccuracyTrend, readDailyAggregates,
   skillOf, summarizeByLeague, summarizeByLearned, leagueKeyOf, LN3, UNIFORM_BRIER_3WAY, // v100
+  summarizeByOdds, summarizeLineupCompare, emptyOddsBucket, emptyLineupCompare, // v101
 };
