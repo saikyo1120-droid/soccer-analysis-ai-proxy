@@ -482,8 +482,18 @@ test("★欠陥21: 重みの採否は、利用者が見ているモデルで判�
     "検証用データが用意できない場合は空にして、重みを変更しない設計であるべき");
   assert.ok(/skipped_insufficient_holdout/.test(src),
     "検証用データ不足で見送った場合に、その本当の理由を記録すべき");
-  assert.ok(/if \(validScore\.accuracy <= baseValid\.accuracy\) continue;/.test(src),
-    "取り置いた検証データで改善しない候補を採用してはいけない");
+  // v100(2026年11月8日): 採否の関門は純関数 decideWeightGate へ切り出した。「検証用データで改善しない候補は
+  //   採用しない」は保たれる(A: 的中率が学習用・検証用で厳密に改善 / B: 検証LogLossが改善し的中率は許容幅内)。
+  //   従来の `if (validScore.accuracy <= baseValid.accuracy) continue;` は、同値の的中率(勝敗が1件も入れ替わらない
+  //   小さな重み変更)を全部不採用にして24日間学習が止まる原因だったため、文字列検査もそれに合わせて更新する。
+  assert.ok(/const gate = decideWeightGate\(\{/.test(src), "採否の関門(decideWeightGate)が無い");
+  assert.ok(/if \(!gate\) continue;/.test(src), "関門を通らない候補を採用してはいけない");
+  {
+    const pm = require(path.join(ROOT, "server/learning/predictionModel"));
+    // 検証用で LogLoss も的中率も改善しない候補は、どちらの関門も通らない
+    assert.strictEqual(pm.decideWeightGate({ baseTrainAccuracy: 60, baseValidAccuracy: 58, trainAccuracy: 61, validAccuracy: 57, baseTrainLoss: 1.0, baseValidLoss: 1.0, trainLoss: 0.99, validLoss: 1.0 }), null,
+      "取り置いた検証データで改善しない候補を採用してはいけない");
+  }
   assert.ok(/if \(!isSaneWeights\(candidate\)\)/.test(src), "保存前の健全性チェックが無い");
   assert.ok(/if \(written === false\)/.test(src), "書き込み失敗を「更新できた」と報告してはいけない");
 });

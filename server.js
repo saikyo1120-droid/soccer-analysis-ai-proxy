@@ -67,6 +67,7 @@ const { deliberate } = require("./reasoning/deliberation");
 // 定義した後にまとめて注入する(利用箇所は下の方の「Stage D」セクションを参照)。
 let { runDailyLearning } = require("./learning/dailyJob");   // テストで差し替えられるよう let
 const { getGrowthLog, getRecentFactsForTeam, computeFormScore, LEARNING_STAGES, OWN_PREDICT_LOG_CAP: OWN_PREDICT_LOG_CAP_DISPLAY } = require("./learning/dailyJob");
+const dailyJobLib = require("./learning/dailyJob"); // v100: 過去試合によるモデル調整の履歴(getTuningHistory)を日次レポートへ
 // 2026年8月・優先順位⑨: 「今日追加した知識0件」が正常な0件(前回から変化なし)
 // なのか、異常な0件(未実行・キー未設定・予算切れ等)なのかを実データから判定する。
 const { diagnoseZeroKnowledge, diagnoseZeroVerification, getRunHistory, buildEngineStatuses, classifyLearnErrors } = require("./learning/healthCheck");
@@ -466,6 +467,10 @@ const upstashUsage = {
   failedCommands: 0,
   unflushed: 0, storedMonthTotal: null, lastFlushAt: 0, flushFailures: 0, flushInFlight: false,
   processStartedAt: new Date().toISOString(),
+  // v99: このプロセスが起動してからの累計(月替わりでも0に戻さない)。
+  //   学習1回が保存先コマンドを何件使ったかを「開始時と終了時の差」で測るための物差し。
+  //   月間カウンターは月替わりで0に戻るため、月をまたぐ学習で差がマイナスになる。
+  processCommands: 0,
 };
 function rolloverUsageIfNeeded() {
   const m = utcMonthKey();
@@ -482,6 +487,7 @@ function countUpstashCommand(commandArray, kind) {
   upstashUsage.monthCommands++;
   upstashUsage.dayCommands++;
   upstashUsage.unflushed++;
+  upstashUsage.processCommands++; // v99
   upstashUsage.byKind[kind === "pipeline" ? "pipeline" : "single"]++;
   const name = Array.isArray(commandArray) && commandArray.length ? String(commandArray[0]).toUpperCase() : "";
   if (MULTI_KEY_COMMANDS.has(name) && commandArray.length > 2) {
@@ -4532,9 +4538,13 @@ async function maybeSelfHealDailyLearning() {
         //   進捗の開始時刻より後に完走の記録があるなら、それは完走している。
         const progStartedMs = prog.startedAt ? new Date(prog.startedAt).getTime() : null;
         const finishedAfterThisRun = Number.isFinite(ranMs) && Number.isFinite(progStartedMs) && ranMs >= progStartedMs;
-        if (finishedAfterThisRun) {
+        // ---- v99: 今日ぶんの完走記録があるなら、止まっている進捗は「今日2回目の実行の残骸」 ----
+        //   (完走済みの日にもう一度走らせても成果は増えず、保存先・外部API・LLMの消費だけが増える。
+        //    本番実測 11/6: 同日2回の学習で Upstash 約2.9万コマンド/日)
+        const completedToday = recordIsToday(latest, "ranAt");
+        if (finishedAfterThisRun || completedToday) {
           // 完走の記録の方が新しい = 進捗の書き込みだけが失敗した。走らせ直さない。
-          console.log("[self-heal daily-learning] progress looks stale but growth log is newer; treating as finished");
+          console.log("[self-heal daily-learning] progress looks stale but growth log is newer or today's run is complete; treating as finished");
         } else if (Number.isFinite(sinceStage) && sinceStage >= LEARN_STALLED_MS) {
           // 1日に何度も拾い直さない(壊れていて何度やっても完走しない場合の暴走防止)
           let allowed = true;
@@ -4592,11 +4602,69 @@ async function maybeSelfHealDailyLearning() {
   }
 }
 
+// ---- v99(2026年11月6日): 「今日の学習はもう完走したか」を保存先で判定する(全入口で共通) ----
+//   本番実測(11/6): 学習が同じ日に2回まるごと走っていた(09:15 JST と 12:38 JST。10/24・10/25 も2回)。
+//   原因: GitHub Actions の定期実行が「本番 04:17 JST」と「保険 08:43 JST」の2本立てで、
+//   二重起動の防止が「実行ロック(90分で失効)」だけだったため、保険の方は毎回ロックが
+//   消えた後に来て、まるごともう一度走っていた(予想・モデル調整・クラブの核は「本日実行済み」で
+//   飛ばすが、LLMの見解・選手詳細の輪番・最近の試合の取り込み・保存先の読み書きは再実行)。
+//   その結果 Upstash が約2.9万コマンド/日(10月ペースと同じ)で、月間上限50万に 11/22 ごろ達する計算だった。
+//
+//   完走の印 = learn:progress(date=今日・finished=true) または learn:growthlog:latest(date=今日)。
+//   growthlog は学習本体が終わった後にしか書かれないため、今日の日付で存在すれば本体は完走している。
+//   「読めなかった」は「完走していない」と区別して返す(判断できないときは従来の経路に任せる。
+//   保存先が落ちていれば実行ロックの取得(fail-closed)が学習を止める)。
+//   記録の日付(date)と実行時刻(ranAt / at)の両方が今日を指すときだけ「今日完走」とみなす
+//   (日付だけ今日で時刻が2日前のような食い違った記録は信用しない。古い記録は自己修復の
+//    「古い(26時間)」判定に任せる)。
+function recordIsToday(rec, timeField) {
+  if (!rec || rec.date !== appDateKey()) return false;
+  const ts = rec[timeField];
+  if (!ts) return true; // 時刻の記録が無い古い形式は日付だけで判定
+  const ms = new Date(ts).getTime();
+  return !Number.isFinite(ms) ? true : appDateKey(ms) === appDateKey();
+}
+async function dailyLearningCompletedToday() {
+  if (!UPSTASH_ENABLED) return { completed: false, reason: "store_not_configured" };
+  const today = appDateKey();
+  let prog = null, latest = null;
+  try {
+    const got = await upstashMGetJSONStrict(["learn:progress", "learn:growthlog:latest"]);
+    prog = got[0]; latest = got[1];
+  } catch (e) {
+    return { completed: false, readFailed: true, reason: `read_failed:${String((e && e.message) || e).slice(0, 120)}` };
+  }
+  if (prog && prog.finished === true && recordIsToday(prog, "at")) {
+    return { completed: true, source: "progress", date: today, completedAt: prog.at || null };
+  }
+  if (recordIsToday(latest, "ranAt")) {
+    return { completed: true, source: "growthlog", date: today, completedAt: latest.ranAt || null, runsToday: latest.runsToday || 1 };
+  }
+  return { completed: false, date: today };
+}
+function alreadyCompletedTodayResponse(done) {
+  return {
+    ok: true, started: false, skipped: true, alreadyCompleted: true, reason: "ALREADY_COMPLETED_TODAY",
+    date: done.date || appDateKey(), completedAt: done.completedAt || null, source: done.source || null,
+    messageJa: `本日(${done.date || appDateKey()})の学習はすでに完走しています(${done.completedAt ? `完了 ${done.completedAt}` : "完了記録あり"})。同じ日にもう一度まるごと走らせても成果は増えず、保存先(Upstash)・外部API・LLMの消費だけが増えるため見送りました。意図的に再実行したい場合は ?force=1 を付けてください。`,
+  };
+}
+
 // ---- 2026年8月7日・ご指示: 毎日の学習が終わった直後に、必ず自動QAを走らせる ----
 // 学習の入口が複数(GitHub Actions / 自己修復 / 手動)あるため、
 // **すべての入口がこの関数を通る**ようにして、走らせ忘れを構造的に無くす。
 // 自動QAが失敗しても学習の結果は返す(QAは学習の成果を壊してはいけない)。
-async function runDailyLearningThenQA(deps) {
+async function runDailyLearningThenQA(deps, opts) {
+  // ---- v99: 全入口に共通の「今日はもう完走した」ガード(?force=1 のときだけ素通し) ----
+  //   run-daily は応答前にも同じ判定をするが、自己修復・自動QAからの起動もここを通るため、
+  //   最後の砦としてここでも判定する(入口ごとに判定が分かれてズレるのを防ぐ)。
+  if (!(opts && opts.force)) {
+    const done = await dailyLearningCompletedToday();
+    if (done.completed) {
+      console.log("[daily-learning] skipped: already completed today", JSON.stringify({ date: done.date, completedAt: done.completedAt, source: done.source }));
+      return alreadyCompletedTodayResponse(done);
+    }
+  }
   // Renderの無料プランで途中停止させられないよう、学習中だけ自分を起こしておく
   // 自動QA(索引の作り直し・追加収集を含む)が終わるまで起こしておく
   const stopKeepAwake = startKeepAwake("毎日の学習と自動QA");
@@ -4947,7 +5015,12 @@ const seoPages = require("./knowledge/seoPages");
 const { CLUB_UNIVERSE } = require("./learning/clubUniverse");
 const { collectClubPlayersBatch } = require("./learning/universeCollector");
 const playerSearchDeps = {
-  upstashEnabled: UPSTASH_ENABLED, upstashCmd, upstashGetJSON, upstashSetJSON,
+  upstashEnabled: UPSTASH_ENABLED,
+  // v100: clubDossier(v92)と同じく、関数の参照を写し取らず呼び出し時点の入口を通す(本番の挙動は同一。
+  //   テストが保存先を差し替えたとき、選手索引の読み書きだけ本物へ素通りしていた穴を塞ぐ)
+  upstashCmd: (cmd) => upstashCmd(cmd),
+  upstashGetJSON: (key) => upstashGetJSON(key),
+  upstashSetJSON: (key, value) => upstashSetJSON(key, value),
 };
 // ---- v98(2026年11月5日・利用者の指摘「登録選手データがない試合が多い」) ----
 //   動的クラブ宇宙(見た試合のクラブを翌日までに取り込む)と、試合カード用のチーム知識
@@ -5033,9 +5106,31 @@ async function collectPlayersNow(opts) {
   }
 }
 
+// ---- v100(2026年11月8日・総点検): 作り直したばかりの索引を、また全件読み直して作り直さない ----
+//   本番実測: 毎晩の収集が索引を作った数分後に、自動QAが「昨日は言えたことが1件言えない
+//   (ANSWER_REGRESSION)」の修復としてこの関数を呼び、保存先の選手記録6,000件以上を読み直していた
+//   (1回約6,200コマンド・学習のたび=1日約1.2万コマンド。Upstash 消費の最大項目で、直せる異常でもなかった)。
+//   直近 INDEX_REBUILD_MIN_INTERVAL_MS(既定6時間)以内に作られた索引があるときは、理由を返して見送る。
+//   force:true(手動・索引が無い場合の自己修復)は従来どおり作り直す。
+const INDEX_REBUILD_MIN_INTERVAL_MS = Number(process.env.INDEX_REBUILD_MIN_INTERVAL_MS) || 6 * 60 * 60 * 1000;
 async function rebuildPlayerIndexNow(opts) {
   if (indexRebuildInFlight) {
     return { ok: false, alreadyRunning: true, reasonJa: "索引の作り直しは既に実行中です。" };
+  }
+  if (!(opts && opts.force)) {
+    try {
+      // 保存先の最新の索引メタ(builtAt)で判定する(プロセス内の30分キャッシュは収集前の古い内容のことがある)
+      const idx = await loadPlayerIndex(true).catch(() => null);
+      const builtMs = idx && idx.meta && idx.meta.builtAt ? new Date(idx.meta.builtAt).getTime() : NaN;
+      const ageMs = Number.isFinite(builtMs) ? Date.now() - builtMs : NaN;
+      if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < INDEX_REBUILD_MIN_INTERVAL_MS && (idx.rows || []).length > 0) {
+        return {
+          ok: false, skippedFresh: true, count: null, apiCalls: 0, redisReads: 0,
+          builtAt: idx.meta.builtAt, ageMinutes: Math.round(ageMs / 60000), trigger: (opts && opts.trigger) || "manual",
+          reasonJa: `選手索引は${Math.round(ageMs / 60000)}分前(${idx.meta.builtAt})に作られたばかりのため、作り直しを見送りました(保存先の読み出し約${(idx.rows || []).length.toLocaleString("en-US")}件を省きます。${Math.round(INDEX_REBUILD_MIN_INTERVAL_MS / 3600000)}時間以上たっていれば作り直します)。`,
+        };
+      }
+    } catch (e) { /* 鮮度の確認に失敗したら従来どおり作り直す(作り直さない方が危険) */ }
   }
   indexRebuildInFlight = true;
   const t0 = Date.now();
@@ -5369,6 +5464,10 @@ const learningDeps = {
   squadRatingOf: (teamId, nameHint) => teamKnowledge.squadRatingForFeature(teamId, nameHint),
   // 動的クラブ宇宙(候補の記録・今日の採用・収集日の記録)
   dynamicUniverse,
+  // ---- v99 ----
+  // 保存先(Upstash)コマンドの、このプロセス起動からの累計(単調増加)。
+  // 学習が段階ごとに「開始時との差」を取り、1回の学習でどこが何件使うかを実測・開示する。
+  storeCommandsSoFar: () => upstashUsage.processCommands,
 };
 
 // ---- Stage E: Knowledge Engine / Memory Engine / Knowledge Graph への依存注入 ----
@@ -9395,6 +9494,17 @@ async function handleHttpRequest(req, res) {
           }));
           return;
         }
+        // ---- v99: 今日すでに完走していれば、実行ロックを取る前に「完走済み」と返す ----
+        //   (GitHub Actions の保険の定期実行(08:43 JST)が毎回ここで止まる。ok:true なので
+        //    ワークフロー側は失敗扱いにしない。待機ステップは alreadyCompleted を見て飛ばす)
+        if (!forceRequested) {
+          const done = await dailyLearningCompletedToday();
+          if (done.completed) {
+            res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+            res.end(JSON.stringify(alreadyCompletedTodayResponse(done)));
+            return;
+          }
+        }
         const runLockOk = forceRequested
           ? { acquired: true, skipped: false }
           : await tryAcquireDailyRunLock();
@@ -9428,7 +9538,7 @@ async function handleHttpRequest(req, res) {
         if (parsed.searchParams.get("sync") === "1") {
           dailyLearningRunning = true;
           try {
-            const result = await runDailyLearningThenQA(learningDeps);
+            const result = await runDailyLearningThenQA(learningDeps, { force: forceRequested });
             res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
             res.end(JSON.stringify(result));
           } finally {
@@ -9444,7 +9554,7 @@ async function handleHttpRequest(req, res) {
         dailyLearningRunning = true;
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify({ ok: true, started: true, message: "学習ジョブをバックグラウンドで開始しました。数分後に/api/growth-logで結果を確認してください。" }));
-        runDailyLearningThenQA(learningDeps)
+        runDailyLearningThenQA(learningDeps, { force: forceRequested })
           .catch((e) => {
             console.error("[run-daily background error]", e && e.stack || e);
           })
@@ -10059,7 +10169,7 @@ async function handleHttpRequest(req, res) {
             return raw === null || raw === undefined ? null : JSON.parse(raw);
           } catch (e) { latestReadFailed = String((e && e.message) || e).slice(0, 160); return null; }
         };
-        const [growthRaw, accuracyTrend, agenda, intelReport, answerability, selfImproveHistory, coverage, weightsImpact] = await Promise.all([
+        const [growthRaw, accuracyTrend, agenda, intelReport, answerability, selfImproveHistory, coverage, weightsImpact, weightsNowRaw, tuningHistory] = await Promise.all([
           readLatestStrict(),
           getAccuracyTrend(learningDeps, todayKey).catch(() => ({ available: false })),
           loadLatestAgenda(learningDeps).catch(() => null),
@@ -10091,8 +10201,48 @@ async function handleHttpRequest(req, res) {
               ? { available: true, items, noteJa: "重みを更新した日に、その更新が過去の実試合の予測をどう変えたかを再計算した記録です(直近10件)。" }
               : { available: false, noteJa: "重みの更新がまだ行われていないため、学習が予測に与えた影響の記録はありません(検証済みの試合が必要件数に達すると始まります)。" };
           })(),
+          // ---- v100(2026年11月8日・総点検): 「AIがいま何を信じているか」を開示する ----
+          //   保存済みの重み(version・最終更新・市場ブレンド比・モデルの形・基礎値・各特徴量の重み)は
+          //   どのエンドポイントにも出ておらず、外から「学習が止まっているか」「市場に何割頼っているか」を
+          //   確かめられなかった。GET 1回。
+          learningDeps.upstashGetJSON("learn:weights").catch(() => null),
+          // 過去試合によるモデル調整(バックテスト)の履歴: 自前モデル単独の LogLoss の推移(賢さの推移)
+          dailyJobLib.getTuningHistory(learningDeps, 7).catch(() => ({ available: false, items: [] })),
         ]);
         const g = growthRaw || {};
+        const weightsNow = (() => {
+          if (!weightsNowRaw || typeof weightsNowRaw !== "object") return { available: false, noteJa: "保存済みの重みを読み出せませんでした(未学習、または保存先の障害)。" };
+          const w = weightsNowRaw;
+          const updatedMs = w.updatedAt ? new Date(w.updatedAt).getTime() : NaN;
+          const sens = {};
+          for (const [fKey, wKey] of Object.entries(predictionModel.FEATURE_WEIGHT_MAP || {})) sens[fKey] = Number.isFinite(w[wKey]) ? Math.round(w[wKey] * 1000) / 1000 : 0;
+          return {
+            available: true,
+            version: w.version ?? null, updatedAt: w.updatedAt || null,
+            daysSinceUpdate: Number.isFinite(updatedMs) ? Math.max(0, Math.floor((Date.now() - updatedMs) / 86400000)) : null,
+            modelForm: w.modelForm || "add",
+            homeBase: w.homeBase ?? null, awayBase: w.awayBase ?? null, rho: w.rho ?? 0, drawBand: Number.isFinite(w.drawBand) ? w.drawBand : 0.15,
+            marketBlend: Number.isFinite(w.marketBlend) ? w.marketBlend : 0,
+            apifbBlend: Number.isFinite(w.apifbBlend) ? w.apifbBlend : 0,
+            sensitivities: sens,
+            noteJa: `最終確率 = (1−marketBlend)×自前モデル + marketBlend×市場オッズ(オッズが取れた試合のみ)。marketBlend ${Number.isFinite(w.marketBlend) ? Math.round(w.marketBlend * 100) : 0}% は実測の検証で毎晩決め直しています。`,
+          };
+        })();
+        const tuningHistoryCompact = (() => {
+          const items = (tuningHistory && Array.isArray(tuningHistory.items)) ? tuningHistory.items : [];
+          const r4 = (x) => (Number.isFinite(x) ? Math.round(x * 10000) / 10000 : null);
+          return {
+            available: items.length > 0,
+            items: items.slice(0, 7).map((t) => ({
+              date: t.date || null, adopted: !!t.adopted,
+              oldLogLoss: r4(t.oldEval && t.oldEval.logLoss), newLogLoss: r4(t.newEval && t.newEval.logLoss),
+              oldBrier: r4(t.oldEval && t.oldEval.brier), newBrier: r4(t.newEval && t.newEval.brier),
+              testSize: t.testSize ?? null, trainSize: t.trainSize ?? null, datasetSize: t.datasetSize ?? null,
+              reasonJa: t.reasonJa ? String(t.reasonJa).slice(0, 200) : null,
+            })),
+            noteJa: "過去試合(学習コーパス)の検証用30%に対する自前モデル単独の LogLoss(市場オッズを含まない)。当てずっぽうは ln3≒1.0986。小さいほど賢い。",
+          };
+        })();
         // v94: 保存先の状態(読めなかった・止まっている)を同梱し、劣化した結果は長くキャッシュしない
         const storeNowDr = storeStatusSnapshot();
         // 劣化の判定は「いま実際に読めたか」で行う(storeIsDown() は復旧後も最長10分 down を返すため使わない)
@@ -10121,6 +10271,21 @@ async function handleHttpRequest(req, res) {
           //   過去試合による旧モデル vs 新モデルの多指標比較と、採用/不採用の理由。
           //   「精度が上がったこと」を数字で示すための中核。
           modelTuning: g.modelTuning || null,
+          // ---- v99: 同じ日に何回走ったか(2以上なら二重実行。v99 以降は1のはず)と、
+          //   学習1回あたりの保存先コマンド数(段階別・実測)。/api/growth-log は全文が大きく
+          //   外部の確認ツールでは末尾まで読めないため、要点だけここに載せる。
+          runsToday: g.runsToday ?? (g.ranAt ? 1 : null),
+          firstRanAt: g.firstRanAt || g.ranAt || null,
+          lastRanAt: g.ranAt || null,
+          storeUsage: g.storeUsage || null,
+          // ---- v100: 「AIがいま何を信じているか」「学習の関門は何を見たか」「自前モデルの賢さの推移」 ----
+          weightsNow,
+          weightGate: g.weightGate || null,
+          tuningHistory: tuningHistoryCompact,
+          marketBlendFit: g.marketBlendFit || null,
+          apifbBlendFit: g.apifbBlendFit || null,
+          lineupWatch: g.lineupWatch || null,
+          clubElo: g.clubElo || null,
           isToday: g.date === todayKey,
           noteJa: g.date
             ? (g.date === todayKey ? "本日の学習実行の実測値です。" : `最新の学習記録は${g.date}のものです(本日分はまだ実行されていません)。`)
@@ -10160,6 +10325,23 @@ async function handleHttpRequest(req, res) {
             universePlayersFromSquadSync: (g.universe && g.universe.playersFromSquadSync) ?? null,
             universePlayersFromDetailStats: (g.universe && g.universe.playersFromDetailStats) ?? null,
             universeRan: !!(g.universe),
+            // ---- v99: v98 で増えた指標(動的クラブ・teamId対応表・主力評価点)をここにも載せる ----
+            //   (成長ログ本体には v98 から入っていたが、このレポートに無く外部から確認できなかった)
+            universeDynamic: (g.universe && g.universe.dynamic) || null,
+            dynamicUniverse: g.dynamicUniverse ? {
+              ok: g.dynamicUniverse.ok ?? null,
+              adoptedNow: Array.isArray(g.dynamicUniverse.adoptedNow) ? g.dynamicUniverse.adoptedNow.length : (g.dynamicUniverse.adoptedNow ?? null),
+              adoptedNowNames: Array.isArray(g.dynamicUniverse.adoptedNow) ? g.dynamicUniverse.adoptedNow.slice(0, 20).map((c) => c && (c.nameEn || c.name)).filter(Boolean) : [],
+              adoptedAll: Array.isArray(g.dynamicUniverse.adoptedAll) ? g.dynamicUniverse.adoptedAll.length : (g.dynamicUniverse.adoptedAll ?? null),
+              adoptedTodayBefore: g.dynamicUniverse.adoptedTodayBefore ?? null,
+              candidates: g.dynamicUniverse.candidates ?? null,
+              prunedSeen: g.dynamicUniverse.prunedSeen ?? null,
+              retired: g.dynamicUniverse.retired ?? null,
+              warnings: Array.isArray(g.dynamicUniverse.warnings) ? g.dynamicUniverse.warnings.slice(0, 10) : [],
+              reasonJa: g.dynamicUniverse.reasonJa || null,
+            } : null,
+            teamMapSaved: (g.universe && g.universe.teamMapSaved) ?? null,
+            squadRatingUsedToday: g.squadRatingUsedToday ?? null,
           },
           // ---- ② API使用数 ----
           apiUsage: g.apiBudget ? {
@@ -10486,6 +10668,16 @@ module.exports = {
       playerIndexState.available = playerIndexState.rows.length > 0;
     },
     learningDeps,
+  },
+  // v100: 総点検(索引作り直しの鮮度ガード・保存先の差し替え・日次レポートの開示)の検証用(本番では誰も呼ばない)
+  __v100ForTest: {
+    rebuildPlayerIndexNow, loadPlayerIndex, INDEX_REBUILD_MIN_INTERVAL_MS, playerSearchDeps, clubDossier,
+    playerIndexState: () => playerIndexState,
+  },
+  // v99: 同日2回目の学習ガード・保存先コマンド数の実測の検証用(本番では誰も呼ばない)
+  __v99ForTest: {
+    dailyLearningCompletedToday, alreadyCompletedTodayResponse, runDailyLearningThenQA, triggerDailyLearningForRepair,
+    processCommands: () => upstashUsage.processCommands,
   },
   // v94: 保存先の健全性・使用量・空回り防止の検証用(本番では誰も呼ばない)
   __storeForTest: {

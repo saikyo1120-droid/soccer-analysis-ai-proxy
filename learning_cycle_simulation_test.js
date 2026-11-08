@@ -45,12 +45,16 @@ function createMockRedis() {
 
 // 最小限のAPI-Footballモック(このテストの主眼は重み更新なので、
 // 外部データは「毎日同じ」でよい)。
+// v100: 「翌日の予測に更新後の重みが使われる」を本当に確かめるには、翌日に**新しい**試合が
+//   予測されなければならない(同じ試合IDは「予測済み」として飛ばされ、記録0件になる)。
+//   日ごとに違う試合IDを返せるよう、テスト側から日番号を切り替えられるようにする。
+let simulatedDay = 0;
 async function callApiFootball(endpoint, params) {
   if (endpoint === "/teams") return { response: [{ team: { id: 100, name: params.search } }] };
   if (endpoint === "/fixtures" && params.next) {
     // ② 今日以降の試合(これを予測して Prediction Engine へ保存する)
     return { response: [{
-      fixture: { id: 7777, date: new Date(Date.now() + 86400e3).toISOString(), status: { short: "NS" } },
+      fixture: { id: 7777 + simulatedDay * 1000, date: new Date(Date.now() + 86400e3).toISOString(), status: { short: "NS" } },
       teams: { home: { id: 100, name: "Home FC" }, away: { id: 2, name: "Away FC" } },
       goals: { home: null, away: null },
       league: { id: 39, season: 2026 },
@@ -134,10 +138,18 @@ function seedResolvedRecords(mock, count) {
     const adopted = history.filter((h) => h.adopted);
     if (adopted.length) {
       const last = adopted[adopted.length - 1];
-      assert.ok(last.newAccuracy > last.oldAccuracy,
-        `採用するのは的中率が本当に改善する場合だけのはず(old=${last.oldAccuracy} new=${last.newAccuracy})`);
+      // v100: 採用の関門は2つ。A) 的中率が厳密に改善 / B) 検証LogLossが改善し、的中率は許容幅(0.5pt)以上落ちない
+      if (last.gate === "logloss") {
+        assert.ok(Number.isFinite(last.oldLogLoss) && Number.isFinite(last.newLogLoss) && last.newLogLoss < last.oldLogLoss,
+          `LogLoss関門で採用したなら検証LogLossが下がっているはず(old=${last.oldLogLoss} new=${last.newLogLoss})`);
+        assert.ok(last.newAccuracy >= last.oldAccuracy - 0.5,
+          `LogLoss関門で採用しても的中率を0.5pt以上落としてはいけない(old=${last.oldAccuracy} new=${last.newAccuracy})`);
+      } else {
+        assert.ok(last.newAccuracy > last.oldAccuracy,
+          `的中率関門で採用するのは的中率が本当に改善する場合だけのはず(old=${last.oldAccuracy} new=${last.newAccuracy})`);
+      }
       assert.notDeepStrictEqual(after, before, "採用された場合は重みが実際に変わっているはず");
-      console.log(`        → 重みが更新されました: sensitivity ${before.sensitivity} → ${after.sensitivity}(的中率 ${last.oldAccuracy}% → ${last.newAccuracy}%)`);
+      console.log(`        → 重みが更新されました(関門: ${last.gate || "accuracy"}): sensitivity ${before.sensitivity} → ${after.sensitivity}(的中率 ${last.oldAccuracy}% → ${last.newAccuracy}%・LogLoss ${last.oldLogLoss} → ${last.newLogLoss})`);
     } else {
       // 悪化する変更を採用しないのは正しい挙動。その場合は重みが変わらないことを確認。
       assert.deepStrictEqual(after.sensitivity, before.sensitivity, "不採用なら重みは変わらないはず");
@@ -153,15 +165,21 @@ function seedResolvedRecords(mock, count) {
     for (const r of records) await mock.upstashCmd(["RPUSH", "learn:ownpred:recent", JSON.stringify(r)]);
     await mock.upstashSetJSON("learn:weights", { homeBase: 1.0, awayBase: 1.0, sensitivity: 0.02, version: 0, updatedAt: null });
 
+    simulatedDay = 1;
     await runDailyLearning({ callApiFootball, resolveTeamId, upstashEnabled: true, ...mock, now: () => new Date("2026-08-11T03:00:00Z") });
     const weightsAfterDay2 = await mock.upstashGetJSON("learn:weights");
 
-    // 翌日: 新しい予測を記録させ、その予測が「更新後の重み」を使っていることを確認する
+    // 翌日: 新しい予測(別の試合ID)を記録させ、その予測が「更新後の重み」を使っていることを確認する
+    simulatedDay = 2;
     await runDailyLearning({ callApiFootball, resolveTeamId, upstashEnabled: true, ...mock, now: () => new Date("2026-08-12T03:00:00Z") });
+    simulatedDay = 0;
     const pendingIds = await mock.upstashCmd(["LRANGE", "learn:ownpred:pending", "0", "-1"]);
     let checked = 0;
     for (const id of pendingIds || []) {
       const rec = await mock.upstashGetJSON(`learn:ownpred:${id}`);
+      // v100: 2日目の実行は「予想(③)→重みの学習(④)」の順なので、2日目に記録された予想は更新前の重みで正しい。
+      //   「翌日の予想が更新後の重みを使う」ことを確かめるため、3日目(8/12)に記録された予想だけを見る。
+      if (rec && rec.loggedAt && !String(rec.loggedAt).startsWith("2026-08-12")) continue;
       if (rec && rec.weightsSnapshot) {
         assert.strictEqual(rec.weightsSnapshot.sensitivity, weightsAfterDay2.sensitivity,
           "翌日の予測は、前日に更新された重みを使っているはず(⑫ 翌日の予測へ反映)");

@@ -8965,3 +8965,106 @@ v98 を本番で照合(GitHub 15ファイル一致・全55テスト合格・本�
 3. **注目選手の出場時間しきい値を 180分→270分(フル3試合)に**: 本番の実測で「180分(2試合)の選手が評価点7.58で注目選手1位」になっていた。
    2試合ぶんの評価点は偶然に左右されやすいため、3試合以上出ている選手から選ぶ(画面には出場時間を併記)。
 検証: `v98_knowledge_coverage_test.js` に3件追加(26/26)。既存を含む全55本合格。実ブラウザ検査(日本語/英語・JSエラー0件・英語画面の日本語漏れ0件)。
+
+## 開発ログ・ラウンド80(2026年11月6日) — v99「学習が同じ日に2回まるごと走る」の根本対応(本番実測から)
+
+### 実測で分かったこと(11/6 の毎日の精度報告)
+- 学習が **同じ日に2回**走っていた(11/6: 09:15 JST と 12:38 JST。`runHistory` によると 10/24・10/25 も2回)。
+- 原因: GitHub Actions の定期実行が「本番 04:17 JST(`17 19 * * *`)」+「保険 08:43 JST(`43 23 * * *`)」の2本立てで、
+  二重起動の防止が **実行ロック(`learn:runlock:<日付>`・90分で失効)だけ**だったため、保険の方は毎回ロックが消えた後に来て、
+  まるごともう一度走っていた。予想・モデル調整・クラブの核は「本日実行済み」で飛ぶが、LLMの見解(172クラブ)・選手詳細の輪番(150人)・
+  最近の試合の取り込み(260試合)・それに伴う保存先の読み書きは再実行されていた。
+- その結果、Upstash の消費が **1日 29,154 コマンド**(11/5 10:50Z 674 → 11/6 10:40Z 29,828。10月と同じペース)で、
+  月間上限50万に **11/22 ごろ**達する計算だった(10月は 10/28 に上限超で保存先が停止していた)。
+- 同時に判明: ① 動的クラブの「1日20件まで」が2回目にも効かず **40件**採用(`teamKnowledge.dynamicCount 40`)。
+  ② LLM空応答の停止理由(v98.1 で用意した `stop_reason`)が記録(`daily_view_failed:Barcelona:EMPTY_RESPONSE`)に残らない
+  (記録が `e.code` だけを使っていた)。③ 学習1回が保存先コマンドを何件使うかの内訳が無く、削減の当たりが付けられない。
+
+### 修正・新設
+① **「今日はもう完走した」ガード**(`server.js`: `dailyLearningCompletedToday()` / `recordIsToday()` / `alreadyCompletedTodayResponse()`)
+- 完走の印 = `learn:progress`(date=今日・finished=true)または `learn:growthlog:latest`(date=今日)。記録の日付と実行時刻の両方が今日を
+  指すときだけ完走とみなす(日付だけ今日で時刻が2日前のような食い違った記録は信用しない)。
+- `/api/learning/run-daily` は実行ロックを取る前に判定し、完走済みなら `{ok:true, started:false, alreadyCompleted:true, reason:"ALREADY_COMPLETED_TODAY"}`
+  を返して何もしない(`?force=1` は従来どおり素通し)。保存先が読めないときは判断せず、実行ロックの fail-closed(v94)に任せる。
+- 全入口(GitHub Actions / 自己修復 / 自動QAの再起動 / 手動)が通る `runDailyLearningThenQA(deps, {force})` でも同じ判定(最後の砦)。
+- 自己修復の「止まった学習の拾い直し」は、今日の完走記録があれば「今日2回目の残骸」と判断して拾い直さない(完走記録が無い日は従来どおり拾い直す)。
+- `.github/workflows/daily-learning.yml`: 応答の `alreadyCompleted:true` を見て「完了を待つ」ステップを飛ばす(以前は 22 分待って偽の失敗になるところ)。
+  保険の実行(08:43 JST)は、本当に取りこぼした日だけ学習を走らせる。
+② **動的クラブの1日上限を同日の合計で効かせる**(`learning/dynamicUniverse.js`): `adoptedAt` が今日の件数を数え、残りだけ採用。
+  戻り値に `adoptedTodayBefore` / `perDay`、見送り時は `reasonJa`。
+③ **LLM空応答の手がかりを記録に残す**(`learning/dailyJob.js` の `llmErrorTag()`・`llm/index.js`):
+  `daily_view_failed:<クラブ>:EMPTY_RESPONSE(stop_reason=…, blocks=…・再試行も空)` の形。再試行も空だった場合はエラーに `retriedAfterEmpty:true` と
+  「(1.5秒後の再試行も空)」を付けて投げる。
+④ **学習1回あたりの保存先コマンド数を段階別に実測**(`server.js` の `upstashUsage.processCommands`(単調増加)→ `learningDeps.storeCommandsSoFar`、
+  `dailyJob.js` の `stage()` で差分を記録): 成長ログ `storeUsage {measured, commandsThisRun, commandsToday, runsCounted, byStage[上位12], noteJa}`、
+  `learn:progress.storeCommandsThisRun`、各段階の `storeCmds`。計測関数が無い環境では `measured:false`(でっち上げない)。
+⑥ **同日2回目の「見送り」記録が1回目のモデル調整の結果を消していた**(`mergeGrowthLogs`・本番実測 11/7: 2回目の `modelTuning {ran:false, 本日実行済み}` が
+  1回目の採否・指標を上書きし、日次レポートの `modelTuning` が空になっていた)→ 実際に走った方(`ran:true`)を残す。
+⑤ **日次レポートの開示を補う**(`/api/learning/daily-report`): `runsToday` / `firstRanAt` / `lastRanAt` / `storeUsage`、
+  `updates.universeDynamic` / `updates.dynamicUniverse`(採用数・名前・候補数・上限の根拠)/ `updates.teamMapSaved` / `updates.squadRatingUsedToday`。
+  (`/api/growth-log` は全文が約5万字を超え、外部の確認ツールでは末尾まで読めなかったため)
+
+### 検証(実測)
+- 新規 `v99_single_run_test.js` **17/17**: 判定(記録なし/進捗/成長ログ/食い違い/読めない)、run-daily の完走済み応答と `?force=1`、
+  未完走日の従来動作(起動→再送はロック→完走後は見送り)、自己修復(残骸は拾わない/本当に止まった学習は拾う)、自動QAの再起動、
+  保存先停止時の fail-closed 維持、動的クラブの同日上限、`llmErrorTag`、`generateLLM` の再試行、`storeUsage` の実測(合計・段階別・同日合算・未計測)、
+  本番の配線、日次レポートの開示、ワークフロー、モデル調整記録の合算。
+- 既存を含む **全56本合格**。起動スモーク 18経路すべて200。実ブラウザ検査(日本語/英語・JSエラー0件)合格(画面は変更なし)。
+
+### 配備後の確認手順(利用者)
+1. 翌日の `/api/learning/daily-report?d=<日付>` で `runsToday` が **1**、`storeUsage.commandsThisRun`(学習1回のコマンド数)と `byStage` が出る。
+2. `/api/health` の `upstashUsage.monthEstimate` の1日の増分が、11/6 の 29,154 から大きく下がる(目安: 1.5万以下)。
+3. GitHub の Actions タブで「Daily Learning Engine」の 08:43 JST の実行が緑のまま「本日は完走済みのためスキップ(正常)」と出る。
+4. `/api/learning/health` の `teamKnowledge.dynamicCount` が1日20件以内で増える。`zeroKnowledge` の空応答の記録に `stop_reason=…` が付く。
+
+## 開発ログ・ラウンド81(2026年11月8日) — v100「本当に賢くなっているか」の総点検(利用者の指示)
+
+### 利用者の指示
+「もう一度、本当に賢くなっているか隅々まで確認。不具合があれば直す。作り始めてからの賢さの上昇幅を的中率以外の%で示し、
+どういう意味で賢くなったかを明確に。精査の過程で的中率が上がる方法があれば示す。時間はかかってもよい」
+
+### 実測で分かったこと(本番 11/8・すべて /api の保存値と README の過去記録から)
+- **自前モデル単独の賢さは大きく上がった**: 当てずっぽう(3択均等・LogLoss ln3≒1.0986)に対する技能スコア
+  `1 − LogLoss/ln3` が、8/20 の **−74.7%**(NLL 1.9188・当てずっぽう以下)→ 8/25 **−6.5%**(1.1702)→ 11/5 **+7.3%**
+  (過去試合の検証用 LogLoss 1.018)。損失は **−47%**。
+- **画面に出す最終予想(市場オッズ90%+AI10%の合成・較正つき)の技能スコアは +12〜14%**(30日 LogLoss 0.963・Brier 0.57。
+  10/20 は 0.9422 / 0.5571=+14.2%・16.4%)。直近3週間は横ばい〜微減。通算の的中率は 38.2%(8/18・178件)→ 55.0%(11/8・1,755件)。
+- **知識は大きく増えた**: 知識 6,116 → 14,408 件(9/11→11/8・+135%)、記憶 959 → 2,371(+147%)、追跡クラブ 11 → 292、
+  選手記録 107 → 6,398、学習大会 5 → 15。
+- **しかし重みの学習は 10/15(version 33)から24日間止まっていた**。候補は毎晩 LogLoss を最小化して作るのに、採否は
+  「的中率が学習用・検証用の両方で**厳密に**上がったときだけ」(同値も不採用)。小さな重み変更では勝敗(argmax)が1件も
+  変わらず同値→不採用、が構造的に続いていた(学習の物差し≠関門の物差し)。学習計画は毎日「次回の重み学習で再評価」と
+  書き続けていた。
+- **Upstash 消費の最大項目は自動QAの「選手索引の作り直し」**: 収集が索引を作った数分後に、「昨日は言えたことが1件言えない」の
+  修復として選手記録 6,000件+クラブ 232件を**1件ずつ GET**(約6,200コマンド/回・1日2回)。直せる異常でもなかった。
+- リーグ別・学習済み/未学習別の内訳はどのエンドポイントにも無く、母数57件で47.4%だった 11/8 の原因を調べられなかった。
+  AIがいま信じている重み(version・市場ブレンド比・各特徴量)もどこにも出ていなかった。
+
+### 修正・新設(v100。v99 の内容も含む)
+① **重み採否の関門を LogLoss 基準に**(`predictionModel.decideWeightGate` 純関数・`dailyJob` 段階④):
+  A) 従来どおり的中率が両方で厳密に改善 **または** B) 検証LogLossが `WEIGHT_GATE_MIN_LOGLOSS_GAIN`(既定0.002)以上下がり、
+  学習用LogLossも下がり、的中率が学習用・検証用とも `WEIGHT_GATE_ACCURACY_TOLERANCE_PT`(既定0.5pt)以上は落ちない。
+  「劣化禁止」は B の下限で守る。`WEIGHT_GATE_MODE=accuracy` で従来に戻せる。重み履歴に `oldLogLoss/newLogLoss/gate`、
+  成長ログに `weightGate`(候補数・通過数・採用した関門・検証LogLoss)。シミュレーション(learning_cycle_simulation_test)では
+  従来 100%→100% で凍結していた学習が LogLoss 0.8917→0.0349 で採用され、翌日の予想に反映された。
+② **索引の作り直しの鮮度ガードとまとめ読み**(`server.rebuildPlayerIndexNow`・`playerSearch.rebuildIndexFromStore`/`loadIndex`・
+  `clubDossier.getPlayers` 新設): 6時間以内に作られた索引は作り直さず理由を返す(`INDEX_REBUILD_MIN_INTERVAL_MS`)。
+  作り直すときも選手記録・調査ファイルを 100件ずつ MGET(テスト実測: 300人+3クラブで GET 0・MGET 5、約6,200→約70コマンド)。
+  索引ブロックの読み出しも MGET(30分ごとの読み直しで1日千数百コマンド削減)。
+③ **リーグ別・学習済み/未学習別・技能スコア**(`accuracyTracker`): 日次集計に `byLeague` / `byLearned` を積み、日次レポートの
+  `accuracy.*.markets.oneX2` に `byLeague(rows/weakRows)` `byLearned(gapPt)` `skill(logLossSkillPct/brierSkillPct)` を出す。
+④ **日次レポートの開示**: `weightsNow`(version・最終更新・据え置き日数・modelForm・homeBase/awayBase・rho・drawBand・
+  marketBlend・apifbBlend・特徴量ごとの重み)/ `weightGate` / `tuningHistory`(過去試合による自前モデル単独の LogLoss 推移・7件)/
+  `marketBlendFit`(自前単独 vs 合成の検証NLL)/ `apifbBlendFit` / `lineupWatch` / `clubElo`。
+⑤ **学習計画の正直さ**(`learningAgenda`): 重みが3日以上据え置きなら「ただし重みはN日間据え置き(候補X件のうちY件が関門を通過)」を添える。
+⑥ `playerSearchDeps` を呼び出し時点の入口に(テストで保存先を差し替えたとき索引だけ本物へ出ていた穴)。
+
+### 検証(実測)
+- 新規 `v100_intelligence_audit_test.js` **9/9**(集計・合算・関門9ケース・まとめ読みのコマンド数・getPlayers・学習計画・
+  鮮度ガード(見送り/force/古い索引)・日次レポートの開示)。`audit5`(関門の文字列検査を純関数検査へ)・`learning_cycle_simulation`
+  (新関門での採用と翌日反映)を更新。既存を含む **全57本合格**。起動スモーク 18経路すべて200。実ブラウザ検査合格(画面は変更なし)。
+
+### 配備後の確認手順(利用者)
+1. 翌日の `/api/learning/daily-report`: `weightsNow.version` が 33 より進む日が出る(採用時は `weightGate.adoptedGate` が "logloss" か "accuracy")。
+2. `accuracy.last30Days.markets.oneX2.skill.logLossSkillPct` が「賢さ」の定点(当てずっぽう=0%)。`byLearned.gapPt` が学習対象拡張の余地。
+3. `/api/qa/latest` の修復ログに「選手索引は◯分前に作られたばかりのため、作り直しを見送りました」が出て、Upstash の1日の増分が下がる。
