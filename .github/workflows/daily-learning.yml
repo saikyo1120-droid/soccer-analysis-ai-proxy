@@ -24,9 +24,15 @@ on:
     # (3時間42分の遅れ)。混雑を避けるため、00分から外した時刻に変更する。
     - cron: "17 19 * * *" # 毎日 UTC 19:17 = 日本時間 翌4:17
     # 取りこぼし対策の再実行。上の実行が遅延・失敗しても、その日のうちに必ず
-    # 一度は学習が走るようにする。同日2回目は収集の同日ガード
-    # (kb:universe:ran:<date>)が働き、同じ収集を繰り返さないので無駄がない。
-    - cron: "43 23 * * *" # 毎日 UTC 23:43 = 日本時間 翌8:43(保険)
+    # 一度は学習が走るようにする。
+    # ---- v99(2026年11月6日)・本番実測で判明した無駄の修正 ----
+    #   「同日2回目は収集の同日ガードが働くので無駄がない」は誤りだった。クラブの核・
+    #   予想・モデル調整は飛ぶが、LLMの見解・選手詳細の輪番・最近の試合の取り込み・
+    #   保存先の読み書きはまるごと再実行され、Upstash の消費が1日約2.9万コマンド
+    #   (10月と同じペース=月間上限50万に 11/22 ごろ到達)になっていた。
+    #   サーバー側(v99)が「今日すでに完走していれば alreadyCompleted:true を返して何もしない」
+    #   ようになったため、この保険は本当に取りこぼした日だけ学習を走らせる。
+    - cron: "43 23 * * *" # 毎日 UTC 23:43 = 日本時間 翌8:43(保険。完走済みなら何もしない)
   workflow_dispatch: {} # 「Actions」タブから手動実行もできるようにしておく(動作確認用)
 
 jobs:
@@ -48,6 +54,7 @@ jobs:
       #      (これが無いと、「呼び出しには成功したが実際には裏で失敗していた」
       #      ことに誰も気づけない)。
       - name: Call the daily learning engine endpoint (fire-and-forget)
+        id: call
         run: |
           curl -sS -X POST "${LEARNING_ENDPOINT_URL}?key=${LEARNING_SECRET_KEY}" \
             --max-time 60 \
@@ -66,6 +73,19 @@ jobs:
           if ! grep -q '"ok":true' response.json; then
             echo "::error::学習エンジンの呼び出しに失敗しました(応答に \"ok\":true が含まれません)。上のresponse.jsonの内容を確認してください。よくある原因: LEARNING_SECRET_KEYとRenderのAUTO_COLLECT_SECRETの不一致/Render側のエラー。"
             exit 1
+          fi
+          # ---- v99: サーバーが「本日はすでに完走済み」と答えたら、ここで正常終了する ----
+          #   (この後の「完了を待つ」ステップは ranAt の更新を待つため、完走済みの日に
+          #    待つと22分後に偽の失敗になる。保険の実行(08:43 JST)は毎日ここに来る想定)
+          if grep -q '"alreadyCompleted":true' response.json; then
+            echo "本日の学習はすでに完走済みのため、サーバーは何もしませんでした(正常)。"
+            echo "### 日次学習: 本日は完走済みのためスキップ(正常)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat response.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "already_completed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_completed=false" >> "$GITHUB_OUTPUT"
           fi
         env:
           LEARNING_ENDPOINT_URL: ${{ secrets.LEARNING_ENDPOINT_URL }}
@@ -94,6 +114,8 @@ jobs:
           LEARNING_SECRET_KEY: ${{ secrets.LEARNING_SECRET_KEY }}
 
       - name: Wait for the background job, then verify it actually finished
+        # v99: 完走済みでスキップされた日は、待っても ranAt は更新されないので飛ばす
+        if: steps.call.outputs.already_completed != 'true'
         run: |
           # このステップの開始時刻を基準に、「その後にranAtが更新されたか」だけを
           # 見るシンプルな判定にする(経過秒数の計算で毎回帳尻を合わせるより確実)。
