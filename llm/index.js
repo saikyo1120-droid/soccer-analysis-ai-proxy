@@ -79,7 +79,18 @@ async function generateLLM({ systemPrompt, userPrompt, maxTokens, tier, timeoutM
   } catch (e) {
     if (!(e && e.code === "EMPTY_RESPONSE")) throw e;
     await new Promise((r) => setTimeout(r, EMPTY_RESPONSE_RETRY_DELAY_MS));
-    out = await provider.generate(req);
+    try {
+      out = await provider.generate(req);
+    } catch (e2) {
+      // v99: 再試行も失敗したことを呼び出し側の記録に残せるようにする(黙って同じエラーを投げない)
+      if (e2 && typeof e2 === "object") {
+        e2.retriedAfterEmpty = true;
+        if (e2.code === "EMPTY_RESPONSE" && typeof e2.message === "string" && !/再試行/.test(e2.message)) {
+          e2.message = `${e2.message}(${EMPTY_RESPONSE_RETRY_DELAY_MS / 1000}秒後の再試行も空)`;
+        }
+      }
+      throw e2;
+    }
     if (out && typeof out === "object") out.retriedAfterEmpty = true;
   }
   // v51: プロバイダーは従来どおり文字列を返してもよいし、{text, model, fallbackFrom}を
