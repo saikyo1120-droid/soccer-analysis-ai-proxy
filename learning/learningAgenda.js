@@ -79,15 +79,33 @@ function buildLearningAgenda(resolvedRecords, topFailureReasons, opts) {
     // v98: 予想時にデータが欠けていた(外れ理由として正式に扱う)
     data_missing: { targetJa: "データ不足の解消", actionJa: "欠けていたチームを動的クラブの候補として記録し、翌日の収集で優先的に取得します(固定名簿の外のクラブも取り込みます)。" },
   };
+  // ---- v100: 「次回の重み学習で再評価」が実際には何日も採用に至っていないとき、その事実を添える ----
+  //   本番実測(11/8): 「直近フォームを重視しすぎた ×286」が毎日並び、毎日「次回の重み学習で再評価」と
+  //   書かれていたが、重みは 10/15 から24日間一度も変わっていなかった(関門を通る改善が無かった)。
+  //   予定だけを書き続けるのは不正直なので、据え置きの日数と理由を一緒に書く。
+  const ws = (opts && opts.weightsState) || null;
+  const reevalNote = (() => {
+    if (!ws) return "";
+    if (ws.weightsUpdatedToday) return "(本日の重み学習で重みが更新されました)";
+    if (Number.isFinite(ws.daysSinceUpdate) && ws.daysSinceUpdate >= 3) {
+      const gateJa = ws.gate && Number.isFinite(ws.gate.candidates)
+        ? `直近の学習では候補${ws.gate.candidates}件のうち${ws.gate.passed || 0}件が採否の関門(検証LogLossの改善と的中率の維持)を通りました。`
+        : "";
+      return `(ただし重みは${ws.daysSinceUpdate}日間据え置きです。毎晩の学習で候補は作っていますが、検証データで改善が確認できたものだけを採用しています。${gateJa})`;
+    }
+    return "";
+  })();
   for (const fr of (topFailureReasons || []).slice(0, 3)) {
     if (!fr || !fr.id || fr.count < 2) continue; // 1回だけの外れで方針は変えない
     const map = reasonToAction[fr.id];
+    const baseAction = (map && map.actionJa) || "次回の重み学習(毎日実行)で該当特徴量の重みが再評価されます。";
     items.push({
       kind: "theme",
       targetEn: fr.id,
       targetJa: (map && map.targetJa) || fr.labelJa,
       reasonJa: `直近の外れた予測のうち${fr.count}件で「${fr.labelJa}」が原因と分析されたため。`,
-      actionJa: (map && map.actionJa) || "次回の重み学習(毎日実行)で該当特徴量の重みが再評価されます。",
+      actionJa: /重み/.test(baseAction) ? baseAction + reevalNote : baseAction,
+      weightsDaysSinceUpdate: ws && Number.isFinite(ws.daysSinceUpdate) ? ws.daysSinceUpdate : undefined,
     });
   }
 

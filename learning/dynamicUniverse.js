@@ -193,7 +193,13 @@ function createDynamicUniverse(deps) {
         || (b.seen || 0) - (a.seen || 0)
         || String(b.lastSeen || "").localeCompare(String(a.lastSeen || "")));
     const room = Math.max(0, maxAdopted - adopted.map.size);
-    const pick = candidates.slice(0, Math.min(perDay, room));
+    // ---- v99: 「1日 perDay 件まで」は同じ日に何回呼ばれても合計で効かせる ----
+    //   本番実測(11/6): 学習が同日に2回走り、各回20件ずつ=40件採用されていた(上限の2倍)。
+    //   採用済み一覧の adoptedAt が今日の件数を数え、その残りだけ採用する。
+    let adoptedTodayBefore = 0;
+    for (const v of adopted.map.values()) if (v && v.adoptedAt === today) adoptedTodayBefore++;
+    const remainingToday = Math.max(0, perDay - adoptedTodayBefore);
+    const pick = candidates.slice(0, Math.min(remainingToday, room));
     const adoptedNow = [];
     if (pick.length) {
       const args = ["HSET", ADOPTED_KEY];
@@ -221,7 +227,14 @@ function createDynamicUniverse(deps) {
     }
     if (refreshArgs.length > 2) { try { await upstashCmd(refreshArgs); } catch (e) { noteWarning(out, "dyn_lastseen_refresh_failed", e); } }
     const adoptedAll = [...adopted.map.entries()].map(([id, v]) => ({ teamId: Number(id), ...v }));
-    return { ...out, ok: true, adoptedNow, adoptedAll, candidates: candidates.length, prunedSeen: toDelete.length, retired: retire.length };
+    const result = {
+      ...out, ok: true, adoptedNow, adoptedAll, candidates: candidates.length, prunedSeen: toDelete.length, retired: retire.length,
+      adoptedTodayBefore, perDay, // v99: 同日の合計上限の根拠(呼ばれた時点で何件すでに採用済みだったか)
+    };
+    if (adoptedTodayBefore >= perDay && candidates.length) {
+      result.reasonJa = `本日はすでに${adoptedTodayBefore}件採用済みのため(1日${perDay}件まで)、今回の採用は見送りました(候補${candidates.length}件は明日以降)。`;
+    }
+    return result;
   }
 
   /**

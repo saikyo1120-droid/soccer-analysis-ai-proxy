@@ -40,6 +40,34 @@ const { poissonPmf } = require("./predictionModel");
 const ACCURACY_KEY_PREFIX = "learn:accuracy:";
 const P_FLOOR = 0.005; // log(0)回避
 
+// ---- v100(2026年11月8日・「本当に賢くなっているか」の総点検) ----
+//   ① リーグ別・学習済み/未学習別の的中率を日次集計に積む(内訳が無く、母数20件以上で
+//      52%未満の日に原因を調べる手段が無かった。本番 11/8: 57件 47.4% で内訳が取れなかった)。
+//   ② 「賢さ」を的中率以外で測る技能スコア(スキルスコア)を同じ集計から出す:
+//        LogLoss スキル = 1 − 平均LogLoss ÷ ln3(当てずっぽう=3択均等の損失)
+//        Brier  スキル = 1 − 平均Brier ÷ (2/3)(同じく3択均等の Brier)
+//      0% = 当てずっぽうと同じ、100% = 完璧。マイナスは当てずっぽう以下。
+//   いずれも保存済みの実測だけから機械的に計算する(推測で埋めない)。
+const BY_LEAGUE_MAX_PER_DAY = 60;        // 1日の集計に持つリーグ数の上限(超えたぶんは「その他」へ)
+const BY_LEAGUE_OTHER_KEY = "__other__"; // 上限を超えたリーグの受け皿
+const LN3 = Math.log(3);
+const UNIFORM_BRIER_3WAY = 2 / 3;
+
+/** リーグ名を集計キーに正規化する(表記ゆれで別行にならないように) */
+function leagueKeyOf(name) {
+  const s = String(name || "").trim().replace(/\s+/g, " ");
+  return s ? s.slice(0, 60) : "(大会名なし)";
+}
+
+function skillOf(avgLogLoss, avgBrier) {
+  const ll = Number.isFinite(avgLogLoss) ? Math.round((1 - avgLogLoss / LN3) * 1000) / 10 : null;
+  const br = Number.isFinite(avgBrier) ? Math.round((1 - avgBrier / UNIFORM_BRIER_3WAY) * 1000) / 10 : null;
+  return {
+    logLossSkillPct: ll, brierSkillPct: br,
+    noteJa: "技能スコア=当てずっぽう(3択均等)に対してどれだけ損失が小さいか。0%で同等、100%で完璧、マイナスは当てずっぽう以下。的中率とは別の、確率の質(較正と鋭さ)の指標です。",
+  };
+}
+
 /**
  * ポアソン格子から全市場の確率を導出する(勝敗と同一のモデル・同一のλ)。
  */
@@ -240,6 +268,19 @@ function buildDailyAccuracy(scoredList) {
         a.perClass[mk.actual].actual++;
         if (mk.predicted === mk.actual) a.perClass[mk.predicted].correct++;
       }
+      // v100: リーグ別・学習済み/未学習別(1X2のみ。採点結果に league / learned が添えられている場合)
+      if (m === "oneX2") {
+        a.byLeague = a.byLeague || {};
+        let lk = leagueKeyOf(s.league);
+        if (!a.byLeague[lk] && Object.keys(a.byLeague).length >= BY_LEAGUE_MAX_PER_DAY) lk = BY_LEAGUE_OTHER_KEY;
+        a.byLeague[lk] = a.byLeague[lk] || { n: 0, hits: 0 };
+        a.byLeague[lk].n++;
+        if (mk.hit) a.byLeague[lk].hits++;
+        a.byLearned = a.byLearned || { learned: { n: 0, hits: 0 }, unlearned: { n: 0, hits: 0 }, unknown: { n: 0, hits: 0 } };
+        const lb = s.learned === true ? "learned" : s.learned === false ? "unlearned" : "unknown";
+        a.byLearned[lb].n++;
+        if (mk.hit) a.byLearned[lb].hits++;
+      }
     }
     if (s.markets.scoreline) {
       agg.scoreline.n++;
@@ -294,6 +335,31 @@ function mergeDailyAccuracy(a, b) {
     out.oneX2.perClass[cls].pred = (a.oneX2?.perClass?.[cls]?.pred || 0) + (b.oneX2?.perClass?.[cls]?.pred || 0);
     out.oneX2.perClass[cls].actual = (a.oneX2?.perClass?.[cls]?.actual || 0) + (b.oneX2?.perClass?.[cls]?.actual || 0);
     out.oneX2.perClass[cls].correct = (a.oneX2?.perClass?.[cls]?.correct || 0) + (b.oneX2?.perClass?.[cls]?.correct || 0);
+  }
+  // v100: リーグ別・学習済み/未学習別の合算(古い保存形式には無い → 片方だけでも合算できる)
+  const leagueMaps = [a.oneX2?.byLeague, b.oneX2?.byLeague].filter((x) => x && typeof x === "object");
+  if (leagueMaps.length) {
+    out.oneX2.byLeague = {};
+    for (const mp of leagueMaps) {
+      for (const [k, v] of Object.entries(mp)) {
+        if (!v) continue;
+        let key = k;
+        if (!out.oneX2.byLeague[key] && Object.keys(out.oneX2.byLeague).length >= BY_LEAGUE_MAX_PER_DAY * 3) key = BY_LEAGUE_OTHER_KEY;
+        out.oneX2.byLeague[key] = out.oneX2.byLeague[key] || { n: 0, hits: 0 };
+        out.oneX2.byLeague[key].n += v.n || 0;
+        out.oneX2.byLeague[key].hits += v.hits || 0;
+      }
+    }
+  }
+  const learnedMaps = [a.oneX2?.byLearned, b.oneX2?.byLearned].filter((x) => x && typeof x === "object");
+  if (learnedMaps.length) {
+    out.oneX2.byLearned = { learned: { n: 0, hits: 0 }, unlearned: { n: 0, hits: 0 }, unknown: { n: 0, hits: 0 } };
+    for (const mp of learnedMaps) {
+      for (const lb of ["learned", "unlearned", "unknown"]) {
+        out.oneX2.byLearned[lb].n += (mp[lb] && mp[lb].n) || 0;
+        out.oneX2.byLearned[lb].hits += (mp[lb] && mp[lb].hits) || 0;
+      }
+    }
   }
   out.scoreline.n = (a.scoreline?.n || 0) + (b.scoreline?.n || 0);
   out.scoreline.hits = (a.scoreline?.hits || 0) + (b.scoreline?.hits || 0);
@@ -369,6 +435,45 @@ function computeEce(calibration) {
   };
 }
 
+/** v100: リーグ別の内訳(件数の多い順・上位25)。記録の無い古い集計は measurable:false */
+function summarizeByLeague(byLeague) {
+  if (!byLeague || typeof byLeague !== "object") {
+    return { measurable: false, reasonJa: "リーグ別の集計はこの機能(v100)の追加後に答え合わせした分から記録されます。", rows: [] };
+  }
+  const rows = Object.entries(byLeague)
+    .filter(([, v]) => v && v.n > 0)
+    .map(([k, v]) => ({ league: k === BY_LEAGUE_OTHER_KEY ? "その他" : k, n: v.n, hits: v.hits, hitRatePct: round1((v.hits / v.n) * 100) }))
+    .sort((a, b) => b.n - a.n || a.league.localeCompare(b.league));
+  const totalN = rows.reduce((s, r) => s + r.n, 0);
+  return {
+    measurable: rows.length > 0,
+    leagues: rows.length, totalN,
+    rows: rows.slice(0, 25),
+    // 母数5件以上で、全体より15pt以上低いリーグ(弱点の候補。断定はしない)
+    weakRows: (() => {
+      const overall = totalN ? rows.reduce((s, r) => s + r.hits, 0) / totalN * 100 : null;
+      if (overall === null) return [];
+      return rows.filter((r) => r.n >= 5 && r.hitRatePct <= overall - 15).slice(0, 8);
+    })(),
+    noteJa: "1X2の的中率をリーグ(大会)別に数えたものです。母数の小さいリーグは偶然で大きく動くため、5件未満は弱点の判定に使いません。",
+  };
+}
+
+/** v100: 学習済み大会 / 未学習大会 / 不明(旧記録)の内訳 */
+function summarizeByLearned(byLearned) {
+  if (!byLearned || typeof byLearned !== "object") {
+    return { measurable: false, reasonJa: "学習済み/未学習別の集計はこの機能(v100)の追加後に答え合わせした分から記録されます。" };
+  }
+  const row = (v) => (v && v.n > 0) ? { n: v.n, hits: v.hits, hitRatePct: round1((v.hits / v.n) * 100) } : { n: 0, hits: 0, hitRatePct: null };
+  const learned = row(byLearned.learned), unlearned = row(byLearned.unlearned), unknown = row(byLearned.unknown);
+  return {
+    measurable: (learned.n + unlearned.n + unknown.n) > 0,
+    learned, unlearned, unknown,
+    gapPt: (learned.hitRatePct !== null && unlearned.hitRatePct !== null) ? round1(learned.hitRatePct - unlearned.hitRatePct) : null,
+    noteJa: "「学習済み」=AIが過去試合を取り込んでいる大会(地力レーティングが効く)。「未学習」=学習データの無い大会(市場オッズとフォーム等だけで予想)。差が大きいほど、学習対象の拡張で上がる余地が大きいことを示します。",
+  };
+}
+
 /** 集計を人間が読む形(的中率%・平均Brier・平均LogLoss・較正表)へ変換 */
 function summarizeAccuracy(agg) {
   if (!agg) return null;
@@ -397,6 +502,10 @@ function summarizeAccuracy(agg) {
     if (m === "oneX2") {
       out.markets.oneX2.precisionRecallF1 = computePrecisionRecallF1(a.perClass);
       out.markets.oneX2.ece = computeEce(a.calibration);
+      // v100: 技能スコア(当てずっぽう基準)・リーグ別・学習済み/未学習別
+      out.markets.oneX2.skill = skillOf(a.logLossSum / a.n, a.brierSum / a.n);
+      out.markets.oneX2.byLeague = summarizeByLeague(a.byLeague);
+      out.markets.oneX2.byLearned = summarizeByLearned(a.byLearned);
     }
   }
   if (agg.scoreline && agg.scoreline.n) {
@@ -543,4 +652,5 @@ module.exports = {
   buildDailyAccuracy, mergeDailyAccuracy, emptyDailyAccuracy,
   computePrecisionRecallF1, computeEce,
   summarizeAccuracy, saveDailyAccuracy, getAccuracyTrend, readDailyAggregates,
+  skillOf, summarizeByLeague, summarizeByLearned, leagueKeyOf, LN3, UNIFORM_BRIER_3WAY, // v100
 };

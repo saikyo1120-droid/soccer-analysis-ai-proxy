@@ -684,6 +684,34 @@ function computeFeatureEffectiveness(records, weights, opts) {
   return { measurable: true, sampleSize: usable.length, baseLoss: Math.round(base * 10000) / 10000, features };
 }
 
+// ---- v100(2026年11月8日・総点検): 重み候補の採否の関門(純関数) ----
+//   本番実測: 重みは 10/15(version 33)から24日間一度も採用されなかった。候補は LogLoss を
+//   最小化して作るのに、採否は「的中率(argmax)が学習用・検証用の両方で厳密に上がる」だけ
+//   (同値も不採用)だったため、小さな重みの変化=勝敗の入れ替わり無し=同値=不採用、が
+//   構造的に続いていた(学習の物差しと関門の物差しの不一致)。
+//   採用条件(どちらかを満たせば通す):
+//     A) "accuracy": 的中率が学習用・検証用の両方で厳密に改善(従来の関門。そのまま残す)
+//     B) "logloss" : 検証LogLossが minLogLossGain 以上下がり、学習用LogLossも下がり、
+//                    かつ的中率が学習用・検証用とも accuracyTolerancePt 以上は落ちない(劣化禁止の下限)
+//   mode が "accuracy" のときは A だけで判定する(従来の挙動へ戻す逃げ道)。
+//   戻り値: 通った関門の名前("accuracy" / "logloss")。通らなければ null。
+function decideWeightGate(input) {
+  const i = input || {};
+  const num = (v) => (Number.isFinite(v) ? v : null);
+  const bTA = num(i.baseTrainAccuracy), bVA = num(i.baseValidAccuracy), tA = num(i.trainAccuracy), vA = num(i.validAccuracy);
+  if (bTA === null || bVA === null || tA === null || vA === null) return null;
+  if (tA > bTA && vA > bVA) return "accuracy";
+  const mode = String(i.mode || "logloss").toLowerCase() === "accuracy" ? "accuracy" : "logloss";
+  if (mode !== "logloss") return null;
+  const bTL = num(i.baseTrainLoss), bVL = num(i.baseValidLoss), tL = num(i.trainLoss), vL = num(i.validLoss);
+  if (bTL === null || bVL === null || tL === null || vL === null) return null;
+  const minGain = Number.isFinite(i.minLogLossGain) ? Math.max(0, i.minLogLossGain) : 0.002;
+  const tol = Number.isFinite(i.accuracyTolerancePt) ? Math.max(0, i.accuracyTolerancePt) : 0.5;
+  const lossOk = vL <= bVL - minGain && tL < bTL;
+  const accOk = vA >= bVA - tol && tA >= bTA - tol;
+  return lossOk && accOk ? "logloss" : null;
+}
+
 // 有害と実測された特徴量を0にした候補を作る(ご指示⑧「不要な特徴量は重みを
 // 減らす」の実行部)。候補は必ず既存のホールドアウト関門(学習用・検証用の
 // 両方で改善した場合のみ採用)を通るため、誤検出で予測が悪化することはない。
@@ -1479,6 +1507,7 @@ function applyMarketBlend(homeLambda, awayLambda, rho, marketImplied, w) {
 
 module.exports = {
   missingFeaturesOf, // v98
+  decideWeightGate, // v100: 重み採否の関門(純関数)
   EXTENDED_DEFAULT_WEIGHTS,
   FEATURE_WEIGHT_MAP,
   FEATURE_SUM_WEIGHT_MAP,

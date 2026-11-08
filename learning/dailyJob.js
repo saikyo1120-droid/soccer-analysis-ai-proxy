@@ -50,6 +50,21 @@
  */
 const { REGISTERED_TEAMS } = require("./registeredTeams");
 
+// ---- v99: LLMの失敗を記録するとき、コードだけでなく原因の手がかりも残す ----
+//   本番実測(11/5・11/6): daily_view_failed:Barcelona:EMPTY_RESPONSE としか残らず、
+//   v98.1 で用意した停止理由(stop_reason=…・blocks=…)がエラーメッセージ側にしか無いため
+//   日次レポートから原因を読めなかった。コードの後ろに手がかりだけを短く添える。
+function llmErrorTag(e) {
+  const code = e && e.code ? String(e.code) : "";
+  const msg = e && e.message ? String(e.message) : "";
+  if (!code) return msg.slice(0, 160);
+  const hint = msg.match(/stop_reason=[^,)]+(?:,\s*blocks=[^)]*)?/);
+  const parts = [];
+  if (hint) parts.push(hint[0]);
+  if (e && e.retriedAfterEmpty) parts.push("再試行も空");
+  return parts.length ? `${code}(${parts.join("・")})` : code;
+}
+
 // ---- 学習の全段階(自動QAが「完走したか」を判定するための唯一の正解表) ----
 // ここを増やしたら stage() の呼び出しも同じ順序で増やすこと。
 // 自動QA(autoQA.js)はこの配列と learn:progress を突き合わせて完走を判定する。
@@ -103,6 +118,7 @@ const {
   classifyFixtureOfficial,
   computeMatchProbabilitiesRaw, // v97: 判定に使った最終確率(finalProbs)の記録用
   FEATURE_LABELS_JA, // v98: 学習計画の「データ不足」内訳の表示名
+  computeNegativeLogLikelihood, decideWeightGate, // v100: 重み採否の関門(検証LogLoss)
   // v62: 学習した大会かどうかの判定は下の learnedComp を使う(requireは末尾にまとめる)
 } = require("./predictionModel");
 // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズ ----
@@ -364,8 +380,16 @@ function buildReflectionText(record, weightsUsed, failureReasons) {
 // 同じ日付の既存ログがあれば、件数を合算し、一覧は内容(statement)で重複排除
 // して連結し、モデルの状態を表す値(的中率・重み更新の有無等)だけは最新の
 // 実行の値を使う。
+// v99: 学習1回あたりの保存先コマンド数は「最新の実行の内訳」を見せつつ、同日の合計も持つ
+function mergeStoreUsage(prev, cur) {
+  if (!cur) return prev || null;
+  const prevToday = prev && Number.isFinite(prev.commandsToday) ? prev.commandsToday
+    : (prev && Number.isFinite(prev.commandsThisRun) ? prev.commandsThisRun : 0);
+  const curRun = Number.isFinite(cur.commandsThisRun) ? cur.commandsThisRun : 0;
+  return { ...cur, commandsToday: prevToday + curRun, runsCounted: ((prev && prev.runsCounted) || (prev ? 1 : 0)) + 1 };
+}
 function mergeGrowthLogs(previous, current) {
-  if (!previous || previous.date !== current.date) return { ...current, runsToday: 1, firstRanAt: current.ranAt };
+  if (!previous || previous.date !== current.date) return { ...current, runsToday: 1, firstRanAt: current.ranAt, storeUsage: mergeStoreUsage(null, current.storeUsage) };
   const dedupeByStatement = (a, b) => {
     const seen = new Set((a || []).map((f) => f && f.statement));
     return [...(a || []), ...(b || []).filter((f) => !(f && seen.has(f.statement)))];
@@ -402,7 +426,17 @@ function mergeGrowthLogs(previous, current) {
     //   2回目の実行でこれらが取れなかった日に前回の値まで消える。
     //   また実行中の重複削減の実測は「置き換え」ではなく「合算」が正しい。
     predictionCoverage: current.predictionCoverage || previous.predictionCoverage || null,
-    modelTuning: current.modelTuning || previous.modelTuning || null,
+    // v99(本番実測 11/7): 同日2回目の実行は「本日実行済みのため見送り」(ran:false)の記録を持ち、
+    //   それが1回目の本当の調整結果(採否・指標)を上書きして日次レポートから消していた。
+    //   実際に走った方(ran:true)の記録を残す(両方とも見送りなら従来どおり最新)。
+    modelTuning: (current.modelTuning && current.modelTuning.ran !== false) ? current.modelTuning
+      : (previous.modelTuning && previous.modelTuning.ran !== false) ? previous.modelTuning
+        : (current.modelTuning || previous.modelTuning || null),
+    storeUsage: mergeStoreUsage(previous.storeUsage, current.storeUsage), // v99
+    // v98 の採用記録: 2回目の実行で採用が0件でも、1回目の採用(名前つき)を消さない
+    dynamicUniverse: (current.dynamicUniverse && Array.isArray(current.dynamicUniverse.adoptedNow) && current.dynamicUniverse.adoptedNow.length)
+      ? current.dynamicUniverse
+      : (previous.dynamicUniverse || current.dynamicUniverse || null),
     apiRunMemo: (() => {
       const a = previous.apiRunMemo, b = current.apiRunMemo;
       if (!a) return b || null;
@@ -877,7 +911,52 @@ async function runDailyLearning(deps) {
   const runStartedAt = runAt.toISOString();
   const stageLog = [];
   let stageIndex = 0;
+  // ---- v99: 保存先(Upstash)コマンド数を段階ごとに実測する ----
+  //   deps.storeCommandsSoFar() はプロセス起動からの累計(単調増加)。段階の切り替わりごとに
+  //   差分を前の段階へ記録し、学習1回の合計と「どこで何件使ったか」を成長ログに残す。
+  //   本番実測(11/6): 学習1回あたり約1.3万コマンド(推定)の内訳が分からず、削減の当たりが
+  //   付けられなかった。でっち上げず、計れる環境(関数が渡された場合)でだけ数える。
+  const storeCountFn = typeof deps.storeCommandsSoFar === "function" ? deps.storeCommandsSoFar : null;
+  const storeCountNow = () => { try { const v = Number(storeCountFn()); return Number.isFinite(v) ? v : null; } catch (e) { warn("store_count_read_failed", e); return null; } };
+  const storeCountAtStart = storeCountFn ? storeCountNow() : null;
+  let storeCountAtStage = storeCountAtStart;
+  const closeStageStoreCount = () => {
+    if (storeCountAtStage === null || !stageLog.length) return;
+    const now = storeCountNow();
+    if (now === null) return;
+    stageLog[stageLog.length - 1].storeCmds = Math.max(0, now - storeCountAtStage);
+    storeCountAtStage = now;
+  };
+  const buildStoreUsage = () => {
+    if (storeCountAtStart === null) {
+      return { measured: false, commandsThisRun: null, byStage: [], noteJa: "保存先コマンド数の計測関数が渡されていないため、この実行では計測していません。" };
+    }
+    closeStageStoreCount();
+    const now = storeCountNow();
+    const total = now === null ? null : Math.max(0, now - storeCountAtStart);
+    const byStage = stageLog
+      .filter((s) => Number.isFinite(s.storeCmds) && s.storeCmds > 0)
+      .map((s) => ({ name: s.name, storeCmds: s.storeCmds }))
+      .sort((a, b) => b.storeCmds - a.storeCmds)
+      .slice(0, 12);
+    return {
+      measured: true, commandsThisRun: total, byStage,
+      noteJa: total === null
+        ? "合計を確定できませんでした(計測関数が数値を返しませんでした)。"
+        : `この実行で保存先(Upstash)へ送ったコマンドは${total.toLocaleString("en-US")}件です(段階別は多い順・上位12段階。学習の途中経過の記録・予算の書き戻しも含む実測)。`,
+    };
+  };
+  // 成長ログを合算(mergeGrowthLogs)した後に、知能計測ぶんまで含めた最終値へ更新する
+  const refreshStoreUsage = (merged) => {
+    if (!merged || !merged.storeUsage || merged.storeUsage.measured !== true) return;
+    const before = Number.isFinite(merged.storeUsage.commandsThisRun) ? merged.storeUsage.commandsThisRun : 0;
+    const fresh = buildStoreUsage();
+    const after = Number.isFinite(fresh.commandsThisRun) ? fresh.commandsThisRun : before;
+    const today = Number.isFinite(merged.storeUsage.commandsToday) ? merged.storeUsage.commandsToday : before;
+    merged.storeUsage = { ...fresh, commandsToday: Math.max(0, today - before + after), runsCounted: merged.storeUsage.runsCounted || 1 };
+  };
   const stage = async (name) => {
+    closeStageStoreCount();
     stageIndex++;
     const at = new Date().toISOString();
     stageLog.push({ n: stageIndex, name, at });
@@ -1060,7 +1139,7 @@ async function runDailyLearning(deps) {
           });
         }
       } catch (e) {
-        errors.push(`daily_view_failed:${team.nameEn}:${e.code || e.message}`);
+        errors.push(`daily_view_failed:${team.nameEn}:${llmErrorTag(e)}`); // v99: stop_reason 等の手がかりつき
       }
     }
   } else {
@@ -1307,6 +1386,12 @@ async function runDailyLearning(deps) {
           record.marketScores.official = record.official !== undefined
             ? record.official !== false
             : classifyFixtureOfficial(record.league, record.homeTeamEn, record.awayTeamEn).official;
+          // v100: リーグ別・学習済み/未学習別の内訳のため、大会名と学習済みかどうかを採点結果に添える
+          //   (learnedCompetition は予想時に保存(v62)。無い旧記録は大会IDから再判定し、それも無ければ不明)
+          record.marketScores.league = record.league || null;
+          record.marketScores.learned = typeof record.learnedCompetition === "boolean"
+            ? record.learnedCompetition
+            : (record.leagueId ? learnedComp.classifyLearnedCompetition(record.leagueId, record.league).learned : null);
           resolvedScoredToday.push(record.marketScores);
         }
       } catch (e) { errors.push(`accuracy_scoring_failed:${fixtureIdStr}:${e.message}`); }
@@ -2325,6 +2410,8 @@ async function runDailyLearning(deps) {
   let v2AccuracyBefore = null;
   let v2AccuracyAfter = null;
   let v1BacktestReference = null; // 旧v1モデルの的中率(参考値。採否の判定には使わない)
+  let weightGateToday = null; // v100: 重み採否の関門の実測(物差し・候補数・通過数・採用した関門)
+  let weightsMetaNow = null;  // v100: 本日の重み学習が読んだ保存済み重みの version / 最終更新
 
   // 2026年8月・第5次監査での設計変更(ご指示「より良い設計を積極的に提案・実装して
   // ください」に基づく)。
@@ -2379,6 +2466,7 @@ async function runDailyLearning(deps) {
       if (!weightsRead.ok) throw new Error(`weights_read_failed:${weightsRead.error}(保存済みの重みを読み出せなかったため、初期重みとの誤った比較・上書きを避けて本日の調整を見送りました)`);
       const storedWeights = weightsRead.weights;
       const currentWeights = { ...EXTENDED_DEFAULT_WEIGHTS, ...DEFAULT_WEIGHTS, ...(storedWeights || {}) };
+      weightsMetaNow = { version: currentWeights.version || 0, updatedAt: currentWeights.updatedAt || null };
 
       // ---- ホールドアウト分割(直近30%を検証用に取り置く) ----
       // learn:ownpred:recent は古い順に並んでいるため、末尾が新しい。
@@ -2402,6 +2490,21 @@ async function runDailyLearning(deps) {
       const scoreOn = (records, w) => (records && records.length ? backtestAccuracyV2(records, w) : null);
       const baseTrain = scoreOn(fitSet, currentWeights);
       const baseValid = scoreOn(validSet, currentWeights);
+      // ---- v100(2026年11月8日・総点検): 採否の関門を「的中率が両方で厳密に上がる」から
+      //      「検証LogLossが下がり、的中率は落とさない」へ ----
+      //   本番実測: 重みは 10/15(version 33)から24日間一度も採用されず、毎晩「改善なし」。
+      //   原因は関門の設計: 候補は LogLoss(確率の質)を最小化して作るのに、採否は
+      //   **的中率(argmax)が学習用・検証用の両方で厳密に上がったときだけ**(同値も不採用)。
+      //   小さな重み変更では予想の勝敗(argmax)はほとんど変わらないため、的中率は同値になり
+      //   構造的に不採用が続いていた(学習の物差しと関門の物差しが違っていた)。
+      //   README の主指標(LogLoss / Brier)に合わせ、次のどちらかで採用する:
+      //     A) 従来どおり的中率が学習用・検証用の両方で厳密に改善(そのまま残す)
+      //     B) 検証用LogLossが WEIGHT_GATE_MIN_LOGLOSS_GAIN(既定0.002)以上下がり、学習用LogLossも下がり、
+      //        かつ的中率が学習用・検証用とも WEIGHT_GATE_ACCURACY_TOLERANCE_PT(既定0.5pt)以上は落ちない
+      //   「劣化禁止」は B の的中率の下限で守る。WEIGHT_GATE_MODE=accuracy で従来の関門だけに戻せる。
+      const GATE_MODE = String(process.env.WEIGHT_GATE_MODE || "logloss").toLowerCase() === "accuracy" ? "accuracy" : "logloss";
+      const GATE_MIN_LOGLOSS_GAIN = Number.isFinite(Number(process.env.WEIGHT_GATE_MIN_LOGLOSS_GAIN)) ? Number(process.env.WEIGHT_GATE_MIN_LOGLOSS_GAIN) : 0.002;
+      const GATE_ACC_TOL = Number.isFinite(Number(process.env.WEIGHT_GATE_ACCURACY_TOLERANCE_PT)) ? Number(process.env.WEIGHT_GATE_ACCURACY_TOLERANCE_PT) : 0.5;
       // 参考値として旧v1モデルの的中率も残す(表示には使わない)
       const v1Reference = backtestAccuracy(recentRecords, currentWeights);
 
@@ -2416,7 +2519,7 @@ async function runDailyLearning(deps) {
         }
       } catch (e) { errors.push(`feature_effectiveness_failed:${e.message}`); }
 
-      const adopt = async (candidate, method, note) => {
+      const adopt = async (candidate, method, note, extra) => {
         // ---- 保存前の安全確認(第5次監査で追加) ----
         if (!isSaneWeights(candidate)) {
           errors.push(`weights_rejected_insane:${method}`);
@@ -2441,6 +2544,7 @@ async function runDailyLearning(deps) {
           newAccuracy: scoreOn(validSet, newWeights) ? scoreOn(validSet, newWeights).accuracy : null,
           sampleSize: validSet.length,
           holdout: canHoldout, note,
+          ...(extra || {}), // v100: oldLogLoss / newLogLoss / gate(検証LogLossの前後と、通った関門)
         })]).catch(() => {});
         return true;
       };
@@ -2448,6 +2552,18 @@ async function runDailyLearning(deps) {
       if (baseTrain && baseValid) {
         v2AccuracyBefore = baseValid.accuracy;
         v2AccuracyAfter = baseValid.accuracy;
+        // v100: 関門の物差し(LogLoss)。計算できない場合は従来の的中率関門だけで判定する
+        const lossOn = (records, w) => (records && records.length ? computeNegativeLogLikelihood(records, w, trustOpts) : null);
+        const baseTrainLoss = lossOn(fitSet, currentWeights);
+        const baseValidLoss = lossOn(validSet, currentWeights);
+        weightGateToday = {
+          mode: GATE_MODE, minLogLossGain: GATE_MIN_LOGLOSS_GAIN, accuracyTolerancePt: GATE_ACC_TOL,
+          fitSize: fitSet.length, validSize: validSet.length,
+          baseTrainLogLoss: Number.isFinite(baseTrainLoss) ? Math.round(baseTrainLoss * 10000) / 10000 : null,
+          baseValidLogLoss: Number.isFinite(baseValidLoss) ? Math.round(baseValidLoss * 10000) / 10000 : null,
+          baseTrainAccuracyPct: baseTrain.accuracy, baseValidAccuracyPct: baseValid.accuracy,
+          candidates: 0, passed: 0, adoptedGate: null, bestValidLogLoss: null, bestValidAccuracyPct: null,
+        };
 
         // ---- 候補①: ホーム補正と感度の近傍探索(旧グリッドサーチ) ----
         // 探索そのものは残すが、**採点はv2モデルで行う**。homeBase は
@@ -2478,21 +2594,42 @@ async function runDailyLearning(deps) {
         ];
 
         let best = null;
+        weightGateToday.candidates = allCandidates.length;
         for (const c of allCandidates) {
           const trainScore = scoreOn(fitSet, c.w);
           const validScore = scoreOn(validSet, c.w);
           if (!trainScore || !validScore) continue;
-          // **学習用でも検証用でも改善している候補だけ**を採用対象にする。
-          // 検証用だけで良く見える候補は、たまたま当たっただけの可能性が高い。
-          if (trainScore.accuracy <= baseTrain.accuracy) continue;
-          if (validScore.accuracy <= baseValid.accuracy) continue;
-          if (!best || validScore.accuracy > best.validScore.accuracy) best = { ...c, trainScore, validScore };
+          const trainLoss = lossOn(fitSet, c.w);
+          const validLoss = lossOn(validSet, c.w);
+          // 関門の判定は純関数(predictionModel.decideWeightGate)に切り出してテストする
+          const gate = decideWeightGate({
+            baseTrainAccuracy: baseTrain.accuracy, baseValidAccuracy: baseValid.accuracy,
+            trainAccuracy: trainScore.accuracy, validAccuracy: validScore.accuracy,
+            baseTrainLoss, baseValidLoss, trainLoss, validLoss,
+            mode: GATE_MODE, minLogLossGain: GATE_MIN_LOGLOSS_GAIN, accuracyTolerancePt: GATE_ACC_TOL,
+          });
+          if (!gate) continue;
+          weightGateToday.passed++;
+          // 選び方: 検証LogLossが小さい順(測れなければ従来どおり検証的中率が高い順)
+          const better = !best
+            || (Number.isFinite(validLoss) && Number.isFinite(best.validLoss)
+              ? (validLoss < best.validLoss - 1e-9 || (Math.abs(validLoss - best.validLoss) <= 1e-9 && validScore.accuracy > best.validScore.accuracy))
+              : validScore.accuracy > best.validScore.accuracy);
+          if (better) best = { ...c, trainScore, validScore, trainLoss, validLoss, gate };
         }
 
         if (best) {
+          const r4 = (x) => (Number.isFinite(x) ? Math.round(x * 10000) / 10000 : null);
+          weightGateToday.adoptedGate = best.gate;
+          weightGateToday.bestValidLogLoss = r4(best.validLoss);
+          weightGateToday.bestValidAccuracyPct = best.validScore.accuracy;
           const ok = await adopt(best.w, best.method,
-            `学習用${fitSet.length}件で${baseTrain.accuracy}%→${best.trainScore.accuracy}%、` +
-            `取り置いた検証用${validSet.length}件でも${baseValid.accuracy}%→${best.validScore.accuracy}%と改善したため採用しました。`);
+            best.gate === "accuracy"
+              ? `学習用${fitSet.length}件で${baseTrain.accuracy}%→${best.trainScore.accuracy}%、` +
+                `取り置いた検証用${validSet.length}件でも${baseValid.accuracy}%→${best.validScore.accuracy}%と改善したため採用しました。`
+              : `取り置いた検証用${validSet.length}件でLogLossが${r4(baseValidLoss)}→${r4(best.validLoss)}へ下がり(学習用${fitSet.length}件も${r4(baseTrainLoss)}→${r4(best.trainLoss)})、` +
+                `的中率も検証用${baseValid.accuracy}%→${best.validScore.accuracy}%・学習用${baseTrain.accuracy}%→${best.trainScore.accuracy}%と許容幅(−${GATE_ACC_TOL}pt)の中に収まったため採用しました(確率の質を上げる更新)。`,
+            { oldLogLoss: r4(baseValidLoss), newLogLoss: r4(best.validLoss), gate: best.gate });
           if (ok) {
             weightsUpdated = true;
             weightsUpdatedV2 = best.method === "gradient_descent_v2";
@@ -2523,11 +2660,13 @@ async function runDailyLearning(deps) {
             } catch (e) { errors.push(`prediction_shift_failed:${e.message}`); }
           }
         } else {
+          const r4 = (x) => (Number.isFinite(x) ? Math.round(x * 10000) / 10000 : null);
           await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
             date: dateKey, adopted: false, method: "holdout_validated", oldWeights: currentWeights, newWeights: null,
             oldAccuracy: baseValid.accuracy, newAccuracy: null, sampleSize: validSet.length, holdout: canHoldout,
+            oldLogLoss: r4(baseValidLoss), gate: GATE_MODE, // v100: 据え置いた日も検証LogLossを残す(推移を追えるように)
             note: canHoldout
-              ? "学習用と検証用の両方で改善する候補が見つからなかったため、重みは変更しませんでした(過学習の防止)。"
+              ? `候補${allCandidates.length}件のいずれも関門(検証LogLossが${GATE_MIN_LOGLOSS_GAIN}以上改善し的中率を−${GATE_ACC_TOL}pt以上落とさない、または的中率が学習用・検証用の両方で改善)を通らなかったため、重みは変更しませんでした(検証用${validSet.length}件: LogLoss ${r4(baseValidLoss)}・的中率${baseValid.accuracy}%)。`
               : "検証用に取り置けるだけのデータがまだ無いため、慎重を期して重みは変更しませんでした。",
           })]).catch(() => {});
         }
@@ -2807,7 +2946,20 @@ async function runDailyLearning(deps) {
     // 実測(どのクラブで外しているか・何が原因で外れているか)から優先順位つきの
     // 学習計画を作り、保存する。明日の収集(上の③-b)がこれを読んで実行する。
     try {
-      agendaToday = buildLearningAgenda(recentForFailures, topFailureReasonsRecent, { nowIso: runAt.toISOString(), featureLabelsJa: FEATURE_LABELS_JA }); // v98: データ不足の内訳に日本語名を使う
+      // v100: 重みが最後に採用された日からの日数を渡す(「次回の重み学習で再評価」が何日続いているかを正直に書くため)
+      let weightsMetaForAgenda = weightsMetaNow || weightsMetaUsedToday;
+      try {
+        // 市場ブレンド等の採用で version が進んでいることがあるため、計画を書く直前の保存済み重みを読み直す(GET 1回)
+        const wNow = await readWeightsStrict();
+        if (wNow.ok && wNow.weights) weightsMetaForAgenda = { version: wNow.weights.version || 0, updatedAt: wNow.weights.updatedAt || null };
+      } catch (e) { warn("agenda_weights_read_failed", e); }
+      const weightsUpdatedMs = weightsMetaForAgenda && weightsMetaForAgenda.updatedAt ? new Date(weightsMetaForAgenda.updatedAt).getTime() : NaN;
+      const weightsState = {
+        weightsUpdatedToday: weightsUpdated === true,
+        daysSinceUpdate: Number.isFinite(weightsUpdatedMs) ? Math.max(0, Math.floor((runAt.getTime() - weightsUpdatedMs) / 86400000)) : null,
+        gate: weightGateToday ? { mode: weightGateToday.mode, candidates: weightGateToday.candidates, passed: weightGateToday.passed, baseValidLogLoss: weightGateToday.baseValidLogLoss } : null,
+      };
+      agendaToday = buildLearningAgenda(recentForFailures, topFailureReasonsRecent, { nowIso: runAt.toISOString(), featureLabelsJa: FEATURE_LABELS_JA, weightsState }); // v98: データ不足の内訳に日本語名を使う / v100: 重みの据え置き日数
       await saveAgenda({ upstashEnabled, upstashSetJSON }, dateKey, agendaToday);
     } catch (e) { errors.push(`agenda_build_failed:${e.message}`); }
   } catch (e) { warn("failure_summary_failed", e); } // v92: 痕跡は残す
@@ -2993,6 +3145,7 @@ async function runDailyLearning(deps) {
     ownAccuracyBefore, ownAccuracyAfter,
     weightsUpdated, // v1(フォーム差のみ)モデルの重みが更新されたか
     weightsUpdatedV2, v2AccuracyBefore, v2AccuracyAfter, // v2(拡張特徴量)モデルの重みが更新されたか
+    weightGate: weightGateToday, // v100: 採否の関門の実測(検証LogLoss・候補数・通過数・採用した関門)
     totalOwnPredictionsResolved: totalResolved,
     knowledgeNewToday, knowledgeUpdatedToday, knowledgeStaleTotal, // 「昨日より知識が増えている」ことの可視化用
     v1BacktestReference, // 旧v1モデルの的中率(参考値。採否の判定には使っていない)
@@ -3058,6 +3211,8 @@ async function runDailyLearning(deps) {
     errors: capList(errors),
     // v92: 黙って続行した付加処理の失敗(件数+内訳)。公開画面には出さず、日次レポートで確認する
     warnings: summarizeWarnings(jobLog),
+    // v99: 学習1回あたりの保存先(Upstash)コマンド数(段階別の実測)。計れない環境では measured:false
+    storeUsage: buildStoreUsage(),
   };
 
   // 同じ日付の既存ログがあれば合算する(上のmergeGrowthLogsのコメント参照)。
@@ -3319,6 +3474,8 @@ async function runDailyLearning(deps) {
     // 注: SETはTTLを消すため、日付つきキーは再保存の後で必ずEXPIREを付け直す。
     mergedGrowthLog.intelligence = intelligenceReport;
     mergedGrowthLog.knowledgeByCategoryToday = knowledgeByCategoryToday || mergedGrowthLog.knowledgeByCategoryToday || null;
+    // v99: 知能計測・指標保存までを含めた最終の保存先コマンド数に更新する(同日の合算は維持)
+    refreshStoreUsage(mergedGrowthLog);
     await upstashSetJSON(`learn:growthlog:${dateKey}`, mergedGrowthLog);
     await upstashSetJSON("learn:growthlog:latest", mergedGrowthLog);
     await upstashCmd(["EXPIRE", `learn:growthlog:${dateKey}`, String(120 * 86400)]).catch(() => {});
@@ -3334,11 +3491,15 @@ async function runDailyLearning(deps) {
   // 最後まで到達したことを記録する(途中で止まった場合は finished:false のまま残る)
   if (upstashEnabled) {
     try {
+      closeStageStoreCount(); // v99: 最後の段階の実測も進捗の記録に残す
+      const storeCountAtFinish = storeCountAtStart === null ? null : storeCountNow();
       await upstashSetJSON("learn:progress", {
         date: dateKey, startedAt: runStartedAt, stage: "完了", stageIndex: stageIndex + 1,
         at: new Date().toISOString(),
         elapsedSec: Math.max(0, Math.round((Date.now() - runAt.getTime()) / 1000)),
         finished: true, stages: stageLog.slice(-30),
+        // v99: 学習1回の保存先コマンド数(合計)。成長ログの storeUsage と同じ物差し
+        storeCommandsThisRun: storeCountAtStart === null || storeCountAtFinish === null ? null : Math.max(0, storeCountAtFinish - storeCountAtStart),
       });
     } catch (e) { warn("progress_finish_save_failed", e); } // v92: 痕跡は残す
   }
@@ -3456,6 +3617,7 @@ async function getRecentFactsForTeam(deps, teamNameEnglish) {
 
 module.exports = {
   runDailyLearning, getGrowthLog, getRecentFactsForTeam,
+  llmErrorTag, mergeStoreUsage, // v99(テスト対象)
   computeFormScore, predictOutcome, backtestAccuracy, outcomeFromScore,
   DEFAULT_WEIGHTS, REGISTERED_TEAMS, LEARNING_STAGES,
   buildReflectionText, mergeGrowthLogs,
