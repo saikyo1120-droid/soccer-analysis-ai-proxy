@@ -1203,6 +1203,12 @@
   // ---- ⑭ v63「極端な確率の是正」(較正後の確信度・範囲外の開示) ----
   add({
     "確信度(実績で補正)": ["Confidence (corrected by track record)", "置信度(按实绩校正)", "Confianza (corregida por el historial)"],
+    // v101: 温度較正(予想時に適用)と引き分け注意
+    "確信度(較正済み)": ["Confidence (calibrated)", "置信度(已校准)", "Confianza (calibrada)"],
+    "実測で学習した較正": ["calibration learned from measured results", "基于实测学习的校准", "calibración aprendida de resultados medidos"],
+    "引き分け注意": ["Draw alert", "平局提示", "Atención: empate"],
+    "引き分けの確率が": ["draw probability is", "平局概率为", "la probabilidad de empate es del"],
+    "と高めの試合です(予想は最も確率の高い勝敗のまま)": [" — relatively high for this match (the pick stays the most likely outcome)", ",本场偏高(预测仍为概率最高的结果)", ", alta para este partido (la predicción sigue siendo el resultado más probable)"],
     "モデル生値": ["raw model value", "模型原始值", "valor bruto del modelo"],
     "同じ自信帯の実測": ["measured results in the same confidence band: ", "同一置信区间的实测", "resultados medidos en la misma banda: "],
     "件から補正": [" cases used for this correction", "场校正", " casos usados para esta corrección"],
@@ -11441,9 +11447,20 @@ function predConfidenceLineHtml(p) {
       outOfRange: false,
     };
   }
-  if (!c || !Number.isFinite(c.displayPct)) return "";
   const lines = [];
-  if (c.calibrated) {
+  // ---- v101 ★5(表示): 引き分けの確率が高い試合は、予想(最大確率の勝敗)は変えずに1行で知らせる ----
+  //   本番実測: 実際の引き分けは21%あるのに、3択の最大確率に引き分けが選ばれるのは1%。確率そのものは
+  //   出ているので、30%以上のときだけ「三つ巴」であることを正直に伝える(数字は既存の probs と同じ)。
+  const drawPct = p && p.probs && Number.isFinite(p.probs.drawPct) ? Number(p.probs.drawPct) : null;
+  if (drawPct !== null && drawPct >= 30 && p.predictedWinner !== "draw") {
+    lines.push(`<div class="value-note" style="margin-top:2px;">⚖️ <span>引き分け注意</span>: <span>引き分けの確率が</span> <strong>${drawPct}%</strong><span>と高めの試合です(予想は最も確率の高い勝敗のまま)</span></div>`);
+  }
+  if (!c || !Number.isFinite(c.displayPct)) return lines.join("");
+  if (c.calibrated && c.method === "temperature") {
+    // v101 ★4: 予想時に温度較正を適用済み(表示側の帯補正は重ねない)。生値=較正前の最終確率
+    const gap = Number.isFinite(c.gapPt) ? c.gapPt : null;
+    lines.push(`<div class="value-note" style="margin-top:2px;">🎚️ <span>確信度(較正済み)</span>: <strong>${Number(c.displayPct)}%</strong>(<span>モデル生値</span> ${Number(c.rawPct)}%${gap !== null && gap !== 0 ? ` ・ ${gap > 0 ? "+" : ""}${gap}pt` : ""} ・ <span>実測で学習した較正</span>${Number.isFinite(c.temperature) ? ` T=${Number(c.temperature)}` : ""})</div>`);
+  } else if (c.calibrated) {
     const big = Number.isFinite(c.gapPt) && Math.abs(c.gapPt) >= 15;
     lines.push(`<div class="value-note" style="margin-top:2px;">🎚️ <span>確信度(実績で補正)</span>: <strong${big ? ' style="color:var(--series-2);"' : ""}>${Number(c.displayPct)}%</strong>(<span>モデル生値</span> ${Number(c.rawPct)}%${Number.isFinite(c.basisN) ? ` ・ <span>同じ自信帯の実測</span>${Number(c.basisN)}<span>件から補正</span>` : ""})</div>`);
   }

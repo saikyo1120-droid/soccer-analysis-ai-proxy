@@ -82,6 +82,7 @@ const { getMetricsTrend } = require("./learning/dailyMetrics");
 const { getAccuracyTrend, computeMarketProbs, oneX2ProbsOf } = require("./learning/accuracyTracker"); // v97: oneX2ProbsOf(最終確率の優先)
 // 2026年8月・精度証明ラウンド②: 較正(実測のズレ)に基づく表示勝率の自動補正
 const { applyCalibration } = require("./learning/calibrationCorrection");
+const probCalibrationLib = require("./learning/probCalibration"); // v101 ★4: 最終確率の温度較正(開示用)
 // 自己改善ループ⑤: 「この1か月でAIが何を改善してきたか」の履歴読み出し
 const { getSelfImprovementHistory } = require("./learning/selfImprovement");
 // 2026年8月・AI知能計測ラウンド(ご指示③⑤): 考察の質とRAG使用率を、質問時は
@@ -3212,7 +3213,11 @@ function buildTodayPredictionEntry(fixture, record, calibrationMap) {
   const rawWinnerPct = probs
     ? (record.predictedWinner === "home" ? probs.homeWin * 100 : record.predictedWinner === "away" ? probs.awayWin * 100 : probs.draw * 100)
     : null;
-  const calibrated = (rawWinnerPct !== null) ? applyCalibration(rawWinnerPct, calibrationMap) : null;
+  // ---- v101 ★4: 予想時に温度較正を適用済みの記録(record.probCalibration.applied)には、表示側の帯補正を重ねない ----
+  //   finalProbs は既に較正後の値。帯補正(較正マップ)まで掛けると二重に補正される。
+  //   生の値は record.rawFinalProbs にあるので、「モデル生値」としてそちらを併記する。
+  const tempCal = (record.probCalibration && record.probCalibration.applied === true && record.rawFinalProbs) ? record.probCalibration : null;
+  const calibrated = (rawWinnerPct !== null && !tempCal) ? applyCalibration(rawWinnerPct, calibrationMap) : null;
   // ---- v63「極端な確率の是正」 ----
   //   本番実測で「アウェイ勝利93%」が表示されていたが、AI自身の較正
   //   (同じ自信帯の実測)では46%だった。実測でズレが分かっているのに
@@ -3220,15 +3225,33 @@ function buildTodayPredictionEntry(fixture, record, calibrationMap) {
   //   主表示は**実績で較正した確率**にし、モデル生値は必ず併記する
   //   (数字のすり替えではなく、より正しい方を前に出す)。
   const rawWinnerPctRounded = (rawWinnerPct !== null) ? Math.round(rawWinnerPct) : null;
-  const confidence = (rawWinnerPctRounded === null) ? null : {
+  const tempRawPct = (() => {
+    if (!tempCal) return null;
+    const rf = record.rawFinalProbs;
+    const v = record.predictedWinner === "home" ? rf.homeWin : record.predictedWinner === "away" ? rf.awayWin : rf.draw;
+    return Number.isFinite(v) ? Math.round(v * 100) : null;
+  })();
+  const confidence = (rawWinnerPctRounded === null) ? null : (tempCal ? {
+    // 温度較正済み: 主表示は較正後(finalProbs)、生値は較正前(rawFinalProbs)
+    displayPct: rawWinnerPctRounded,
+    rawPct: tempRawPct !== null ? tempRawPct : rawWinnerPctRounded,
+    calibrated: true,
+    method: "temperature",
+    temperature: Number.isFinite(tempCal.T) ? tempCal.T : null,
+    regime: tempCal.regime || null,
+    basisN: null,
+    gapPt: tempRawPct !== null ? (rawWinnerPctRounded - tempRawPct) : null,
+    outOfRange: record.lambdaClamped === true,
+  } : {
     displayPct: calibrated ? calibrated.calibratedPct : rawWinnerPctRounded,
     rawPct: rawWinnerPctRounded,
     calibrated: !!calibrated,
+    method: calibrated ? "bin" : null,
     basisN: calibrated ? calibrated.basisN : null,
     gapPt: calibrated ? (calibrated.calibratedPct - rawWinnerPctRounded) : null,
     // 生値が範囲外に振り切れた予測(λが上限・下限に張り付いた)かどうか
     outOfRange: record.lambdaClamped === true,
-  };
+  });
   return {
     // 精度証明ラウンド: 較正補正・市場比較(オッズ)・似た試合(RAG強化)
     calibrated,
@@ -3455,45 +3478,76 @@ async function handlePredictionsToday() {
 // をJSONで出力する。GitHub Actions(weekly-backup.yml)が週1回これを取得して
 // リポジトリへ保存する。知識アイテム本体は含めない(APIから数日で再収集できる
 // 派生データであり、容量が大きいため。この選択も応答に明記して開示する)。
+// ---- v101(2026年11月9日): バックアップの「読めなかった」を黙って null にしない ----
+//   本番実測: 10/25 の週次バックアップ(リポジトリ backups/)は weights・weightsHistory・calibration・
+//   growthLogLatest・agendaLatest が null、精度履歴は30日のうち15日欠落なのに ok:true で保存されていた。
+//   原因は読み出し失敗を catch(() => null) で飲み込み、常に ok:true を返していたこと(Actions 側の合格判定は
+//   "ok":true の有無だけ)。さらに 11/1 分はコミット自体が無い。
+//   直し: ① 読み出しは失敗を投げる MGET(129回の個別 GET → 2〜3回)で行い、失敗したら ok:false ② 中核の
+//   キー(重み・成長ログ最新)が無い=空のバックアップは partial:true かつ ok:false で返す(復元に使えないものを
+//   「成功」と呼ばない) ③ 何が欠けたかを missing に列挙する。Actions 側(weekly-backup.yml)は partial を失敗
+//   扱いにして1回だけ再試行する。
+const BACKUP_CORE_KEYS = ["learn:weights", "learn:growthlog:latest"];
 async function handleBackupExport() {
   if (!UPSTASH_ENABLED) return { status: 200, body: { ok: false, reasonJa: "Upstash未設定のためバックアップ対象がありません。" } };
   const todayKey = appDateKey();
-  const getJ = (k) => upstashGetJSON(k).catch(() => null);
   const base = new Date(`${todayKey}T00:00:00Z`).getTime();
   const days = [];
   for (let i = 0; i < 30; i++) days.push(new Date(base - i * 86400000).toISOString().slice(0, 10));
-  const [weights, weightsHistoryRaw, apiplan, calibration, similarClubs, knowledgeUsage, growthLatest, intelLatest, agendaLatest] = await Promise.all([
-    getJ("learn:weights"),
-    upstashCmd(["LRANGE", "learn:weights:history", "-50", "-1"]).catch(() => []),
-    getJ("learn:apiplan"),
-    getJ("learn:calibration:map"),
-    getJ("kb:similar:clubs"),
-    getJ("knowledge:usage"),
-    getJ("learn:growthlog:latest"),
-    getJ("learn:intel:report:latest"),
-    getJ("learn:agenda:latest"),
-  ]);
-  const perDay = async (prefix) => {
-    const rows = await Promise.all(days.map((d) => getJ(`${prefix}${d}`)));
+  const scalarKeys = ["learn:weights", "learn:apiplan", "learn:calibration:map", "kb:similar:clubs", "knowledge:usage", "learn:growthlog:latest", "learn:intel:report:latest", "learn:agenda:latest", "learn:calibration:model"];
+  const perDayPrefixes = ["learn:accuracy:", "learn:metrics:", "learn:roi:", "learn:intel:"];
+  const dayKeys = [];
+  for (const prefix of perDayPrefixes) for (const d of days) dayKeys.push(`${prefix}${d}`);
+  let scalars, dayValues, weightsHistoryRaw;
+  const missing = [];
+  try {
+    [scalars, dayValues] = await Promise.all([
+      upstashMGetJSONStrict(scalarKeys),
+      upstashMGetJSONStrict(dayKeys),
+    ]);
+  } catch (e) {
+    const msg = String((e && (e.code || e.message)) || e).slice(0, 120);
+    return {
+      status: 200,
+      body: {
+        ok: false, partial: true, error: msg,
+        exportedAt: new Date().toISOString(), version: 2,
+        reasonJa: `保存先(Upstash)からの読み出しに失敗したため、バックアップを作れませんでした(${msg})。空のバックアップを「成功」として保存しないよう ok:false で返しています。`,
+      },
+    };
+  }
+  try {
+    weightsHistoryRaw = await upstashCmd(["LRANGE", "learn:weights:history", "-50", "-1"]);
+    if (!Array.isArray(weightsHistoryRaw)) weightsHistoryRaw = [];
+  } catch (e) { weightsHistoryRaw = null; missing.push("learn:weights:history"); }
+  const byKey = {};
+  scalarKeys.forEach((k, i) => { byKey[k] = scalars[i] ?? null; });
+  const perDay = (prefix) => {
     const out = {};
-    days.forEach((d, i) => { if (rows[i]) out[d] = rows[i]; });
+    const offset = perDayPrefixes.indexOf(prefix) * days.length;
+    days.forEach((d, i) => { const v = dayValues[offset + i]; if (v) out[d] = v; });
     return out;
   };
-  const [accuracyByDay, metricsByDay, roiByDay, intelByDay] = await Promise.all([
-    perDay("learn:accuracy:"), perDay("learn:metrics:"), perDay("learn:roi:"), perDay("learn:intel:"),
-  ]);
+  for (const k of BACKUP_CORE_KEYS) if (byKey[k] === null) missing.push(k);
+  const partial = missing.length > 0;
   return {
     status: 200,
     body: {
-      ok: true,
+      ok: !partial,
+      partial,
+      missing,
       exportedAt: new Date().toISOString(),
-      version: 1,
+      version: 2,
       noteJa: "AIの学習状態(重み・精度/ROI/知能の履歴30日・較正・似たクラブ索引・知識使用実績)のバックアップです。知識アイテム本体は含みません(APIから再収集できる派生データのため。消失時は数日で自動再収集されます)。",
+      ...(partial ? { reasonJa: `中核の保存値(${missing.join(" / ")})が読めなかった、または存在しないため、このバックアップは不完全です(ok:false)。保存先の状態を確認してください。` } : {}),
       data: {
-        weights, weightsHistory: (weightsHistoryRaw || []).map((s) => { try { return JSON.parse(s); } catch (e) { return null; } }).filter(Boolean),
-        apiplan, calibration, similarClubs, knowledgeUsage,
-        growthLogLatest: growthLatest, intelReportLatest: intelLatest, agendaLatest,
-        accuracyByDay, metricsByDay, roiByDay, intelByDay,
+        weights: byKey["learn:weights"],
+        weightsHistory: Array.isArray(weightsHistoryRaw) ? weightsHistoryRaw.map((s) => { try { return typeof s === "string" ? JSON.parse(s) : s; } catch (e) { return null; } }).filter(Boolean) : null,
+        apiplan: byKey["learn:apiplan"], calibration: byKey["learn:calibration:map"],
+        calibrationModel: byKey["learn:calibration:model"], // v101 ★4
+        similarClubs: byKey["kb:similar:clubs"], knowledgeUsage: byKey["knowledge:usage"],
+        growthLogLatest: byKey["learn:growthlog:latest"], intelReportLatest: byKey["learn:intel:report:latest"], agendaLatest: byKey["learn:agenda:latest"],
+        accuracyByDay: perDay("learn:accuracy:"), metricsByDay: perDay("learn:metrics:"), roiByDay: perDay("learn:roi:"), intelByDay: perDay("learn:intel:"),
       },
     },
   };
@@ -10169,7 +10223,7 @@ async function handleHttpRequest(req, res) {
             return raw === null || raw === undefined ? null : JSON.parse(raw);
           } catch (e) { latestReadFailed = String((e && e.message) || e).slice(0, 160); return null; }
         };
-        const [growthRaw, accuracyTrend, agenda, intelReport, answerability, selfImproveHistory, coverage, weightsImpact, weightsNowRaw, tuningHistory] = await Promise.all([
+        const [growthRaw, accuracyTrend, agenda, intelReport, answerability, selfImproveHistory, coverage, weightsImpact, weightsNowRaw, tuningHistory, calibrationModelRaw] = await Promise.all([
           readLatestStrict(),
           getAccuracyTrend(learningDeps, todayKey).catch(() => ({ available: false })),
           loadLatestAgenda(learningDeps).catch(() => null),
@@ -10208,6 +10262,8 @@ async function handleHttpRequest(req, res) {
           learningDeps.upstashGetJSON("learn:weights").catch(() => null),
           // 過去試合によるモデル調整(バックテスト)の履歴: 自前モデル単独の LogLoss の推移(賢さの推移)
           dailyJobLib.getTuningHistory(learningDeps, 7).catch(() => ({ available: false, items: [] })),
+          // v101 ★4: 最終確率の較正モデル(温度 T・採否・検証前後)。GET 1回
+          learningDeps.upstashGetJSON(probCalibrationLib.MODEL_KEY).catch(() => null),
         ]);
         const g = growthRaw || {};
         const weightsNow = (() => {
@@ -10282,6 +10338,12 @@ async function handleHttpRequest(req, res) {
           weightsNow,
           weightGate: g.weightGate || null,
           tuningHistory: tuningHistoryCompact,
+          // v101 ★4: 確率の較正(保存済みモデルの要約+今日の学習での学習経過・適用件数)
+          probCalibration: {
+            model: probCalibrationLib.summarizeModel(calibrationModelRaw),
+            today: g.probCalibration || null,
+            noteJa: "最終確率の温度較正。model=いま予想に使われている較正(前夜までに関門を通ったもの)、today=最新の学習での学習経過(採否・検証 LogLoss の前後・適用件数)。的中率には影響せず、確率の質(技能スコア・ECE)だけが変わります。",
+          },
           marketBlendFit: g.marketBlendFit || null,
           apifbBlendFit: g.apifbBlendFit || null,
           lineupWatch: g.lineupWatch || null,
@@ -10673,6 +10735,10 @@ module.exports = {
   __v100ForTest: {
     rebuildPlayerIndexNow, loadPlayerIndex, INDEX_REBUILD_MIN_INTERVAL_MS, playerSearchDeps, clubDossier,
     playerIndexState: () => playerIndexState,
+  },
+  // v101: バックアップ export の partial 判定・較正済み記録の表示・日次レポート開示の検証用(本番では誰も呼ばない)
+  __v101ForTest: {
+    handleBackupExport, BACKUP_CORE_KEYS, buildTodayPredictionEntry, probCalibrationLib,
   },
   // v99: 同日2回目の学習ガード・保存先コマンド数の実測の検証用(本番では誰も呼ばない)
   __v99ForTest: {

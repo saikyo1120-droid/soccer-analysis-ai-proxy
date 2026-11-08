@@ -9068,3 +9068,67 @@ v98 を本番で照合(GitHub 15ファイル一致・全55テスト合格・本�
 1. 翌日の `/api/learning/daily-report`: `weightsNow.version` が 33 より進む日が出る(採用時は `weightGate.adoptedGate` が "logloss" か "accuracy")。
 2. `accuracy.last30Days.markets.oneX2.skill.logLossSkillPct` が「賢さ」の定点(当てずっぽう=0%)。`byLearned.gapPt` が学習対象拡張の余地。
 3. `/api/qa/latest` の修復ログに「選手索引は◯分前に作られたばかりのため、作り直しを見送りました」が出て、Upstash の1日の増分が下がる。
+
+## 開発ログ・ラウンド82(2026年11月9日) — v101「計測の物差し+確率の較正+不具合A〜D」(★2〜★5 実装前の見立ての1本目)
+
+### 経緯
+総点検レポート(ラウンド81)の ★2〜★5 について利用者から「★2 は出来るなら全て実装」「★5 までの内容も全て実装したい」
+「意見を聞いてから決める」と要望。見立て(★2〜★5_実装前の見立て_2026-11-09.md)で、最終予想が「市場 9割+AI 1割」である以上、
+的中率の上がり幅は合計 +1〜2pt、賢さ(確率の質)の上がり幅の方が大きいと説明し、**v101(計測+★4+不具合修正)→ v102(11/17・★2+★3)→
+v103(11/30・★5+★6)** の順で進めることに決定。利用者の指示で、「AI自身の判断(市場なしの純粋版)」の表示・採点は v101 から外した。
+
+### 本番実測(11/8〜11/9)で分かったこと
+- 直近30日 772件: 自信 33〜45%(243件)は実際に 52.7% 当たり、70%以上(123件)は 74%。ECE 6.8%。帯ごとに完全に較正できた場合の
+  LogLoss 改善は 0.0134(0.9673→0.9539=技能 12.0→13.2%・同一データの上限)。直近7日は形が違い(ECE 3.3%)不安定。
+- 無オッズ(自前モデル単独)の予想が 611件中 91件=14.9%。この群の的中率は未計測だった。
+- 引き分け: 実際 21.3%(1,503件中320)に対し予想は 1.0%。リーグ別の「予想した引き分け確率 vs 実際」が無かった。
+- 直前版(確定スタメン+直前オッズ)は累計 Brier 0.571→0.563(270件)で朝版より良いが、的中率も30日窓も無かった。
+- **不具合A** 週次バックアップ(`backups/`)の 10/25 分が重み・重み履歴・較正・成長ログ・学習計画 null、精度履歴 30日中15日欠落のまま
+  `ok:true` で保存されていた(export が読み出し失敗を `catch(() => null)` で飲み込み常に ok:true)。11/1 分はコミットが無い。
+- **不具合B** リーグ別の表(自己診断 `leagueTable`・v100 `byLeague`)が大会名キーで、イタリアとブラジルの「Serie A」が 154件の1行に合算、
+  「Super League」はスイスか中国か区別不能。
+- **不具合C** 同日2回目の学習が `oddsApi` 統計を 0 件で上書き(新規予想 48件の日に fixturesConsidered 0)。`xgCollect` も同型。
+- **不具合D** OddsAPI(複数社コンセンサス)の対象が12大会で、学習済みの J1・チャンピオンシップ・ブラジルが対象外(1社オッズか無オッズ)。
+- **配備の落とし穴**: 5回連続アップロードの Deploy が Render 上で競合し、3番目のコミット(50adc26)が最後に Live になって server.js と
+  learning/ が旧版のまま約2時間動いていた(Deploy failed は出ない)。Manual Deploy → Deploy latest commit で解消。
+
+### 修正・新設(v101)
+① **★4 確率の較正**(`learning/probCalibration.js` 新設): 最終確率 p を p^(1/T) に正規化する温度 T を、**オッズあり/なしのレジーム別**に
+  学習。答え合わせ済みの記録(生の確率 `rawFinalProbs`・無ければ `finalProbs`)を時系列で 70/30 に分け、検証 LogLoss が T=1 より
+  0.002 以上改善し、かつ試合ごとの差の z 値が 1.64 以上(偶然の範囲を超える)のときだけ採用(学習 80件・検証 30件未満は T=1)。
+  単調変換なので最大確率の勝敗は不変=**的中率は数学的に変わらない**。採用時は記録に `rawFinalProbs` と `probCalibration{T,regime}` を
+  併記(数字のすり替えをしない)。毎晩 `learn:calibration:model` に保存し、翌日の予想(段階③)が読む。合成データの検証: 較正済み
+  データでの誤採用 0〜3%、真の歪み(T=0.7・800件)の検出率 約4割(劣化禁止を優先した慎重な関門。件数が増えれば検出率は上がる)。
+② **表示の二重補正回避**(`server.buildTodayPredictionEntry`): 温度較正済みの記録には帯補正(較正マップ)を重ねない。
+  `confidence.method = "temperature"`、`rawPct` は較正前。画面は「🎚️ 確信度(較正済み): 38%(モデル生値 36% ・ +2pt ・ 実測で学習した較正 T=0.85)」。
+③ **計測の物差し**(`accuracyTracker`): `byOdds`(オッズあり/なし別の件数・的中率・Brier・LogLoss・技能・無オッズの割合・差)/
+  `byLeague` 各行に `drawActualPct` `drawPredAvgPct` `drawGapPt`(マイナス=引き分けの過小評価)と `drawCalibration`(母数10件以上の
+  過小評価リーグ表+全体)/ `lineupCompare`(同一試合での朝版 vs 直前版の的中率・Brier・LogLoss・判定が変わった試合数と的中)。
+  `lineupWatch.scoreResolvedPreKick` が的中・LogLoss・changed も返し、累計 `learn:lineupwatch:score` に `hitCompare` を追加。
+④ **市場比率ごとの正確さの曲線**(`fitMarketBlend.curve`): w=0〜1.0 の検証 NLL・的中率(w=1.0=市場単独は参考値・採用上限は 0.9 のまま)。
+  成長ログ/日次レポートの `marketBlendFit.curve` `marketAloneValidNll`。
+⑤ **★5(表示)引き分け注意**: 引き分け確率 30%以上の試合に「⚖️ 引き分け注意: 引き分けの確率が 33% と高めの試合です(予想は最も確率の高い
+  勝敗のまま)」を1行(4言語)。予想の選び方(argmax)は変えない。
+⑥ **不具合A**: `/api/backup/export` を MGET(129回→3回)にし、読み出し失敗は `ok:false`、中核(重み・成長ログ最新)が無ければ `ok:false +
+  partial:true + missing[]`。`weekly-backup.yml` は HTTP200・ok:true・partial 無しの3条件を満たすまで最大3回(60秒おき)試し、
+  3回とも不完全なら失敗で終える(不完全なファイルは保存しない)。バックアップに `calibrationModel` を追加。
+⑦ **不具合B**: 予想記録に `leagueCountry` を保存し、`accuracyTracker.leagueKeyOf(name, country)` と `selfImprovement.leagueLabelOf` で
+  「Serie A(Italy)」「Serie A(Brazil)」のように区別(UEFA 大会の "World" は付けない。国名の無い旧記録は大会名のみ)。
+⑧ **不具合C**: `mergeGrowthLogs` に `oddsApi`(合算)/ `xgCollect`(合算)/ `lineupWatch`(今日は合算・累計は最新)/ `marketBlendFit`・
+  `apifbBlendFit`(記録のある方)/ `probCalibration`(学習した方+適用件数の合算)の規則を追加。
+⑨ **不具合D**: `oddsApi.SPORT_KEYS` に 98 `soccer_japan_j_league`・40 `soccer_efl_champ`・71 `soccer_brazil_campeonato`。key が違えば
+  `oddsApi.failures` に `league98:http_404` の形で残る(黙って無視しない)。
+⑩ 日次レポートに `probCalibration{model, today}`(いま使われている較正と、今夜の学習の経過・適用件数)。`sw.js` を v101 に。
+
+### 検証(実測)
+- 新規 `v101_measurement_test.js` **17/17**(温度の単調性と argmax 不変・合成データでの採用/不採用/件数不足・レジーム別適用・新しい集計と
+  合算・直前版の採点・合算規則・曲線・リーグ表の国名・SPORT_KEYS・backup export の3状態と MGET 回数・二重補正回避・日次レポートの開示・
+  画面文言と辞書・**本物の日次学習で較正が翌日の予想に適用され生値と T が残る**)。既存を含む **全58本合格**。起動スモーク 18経路
+  (Node 22 / Node 18 の両方)。実ブラウザ検査(日英: 引き分け注意・較正済み確信度・帯補正を重ねない・日本語漏れ0)、
+  EN/ZH/ES の日本語漏れ検査 17/17。
+
+### 配備後の確認手順(利用者)
+1. **アップロード後、Render の画面上部の Live コミットが最新(最後にアップロードしたコミット)か確認**。違えば Manual Deploy → Deploy latest commit。
+2. 翌日の `/api/learning/daily-report`: `probCalibration.today.fitted=true`(採否と理由は `regimes.*.reasonJa`)、
+   `accuracy.last7Days.markets.oneX2.byOdds` / `byLeague.drawCalibration` / `lineupCompare` が貯まり始める(v101 以降の答え合わせ分から)。
+3. 日曜の週次バックアップ(`backups/backup-2026-11-15.json`)に `"partial":false` と `calibrationModel` があること。

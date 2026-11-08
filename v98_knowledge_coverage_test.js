@@ -552,9 +552,10 @@ function mockStore() {
     const dictPart = html.slice(0, html.indexOf("/* ==== 辞書ここまで ==== */"));
     assert.ok(/"キックオフ":\s*\[/.test(dictPart), "辞書に「キックオフ」が無い");
   });
-  await t("U3 sw.js は v98・index.html は ?v=98", () => {
+  await t("U3 sw.js の版は index.html の画面更新に追従している(v101 で v98→v101 へ更新)・index.html の言語パックは ?v=98", () => {
     const sw = fs.readFileSync(SW_JS, "utf8");
-    assert.ok(/soccer-ai-shell-v98/.test(sw), "sw.js の版");
+    assert.ok(/soccer-ai-shell-v(98|99|10\d)/.test(sw), "sw.js の版");
+    assert.ok(!/soccer-ai-shell-v98"/.test(sw), "v101 で画面を更新したので sw.js の版は v98 のままではいけない");
     assert.ok(/\?v=98/.test(html), "index.html の版");
   });
 
