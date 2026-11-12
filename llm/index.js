@@ -103,4 +103,44 @@ async function generateLLM({ systemPrompt, userPrompt, maxTokens, tier, timeoutM
   return { text, provider: name, tier: usedTier, model, modelFallbackFrom: (isObj && out.fallbackFrom) || null, truncated: !!(isObj && out.truncated), retriedAfterEmpty: !!(isObj && out.retriedAfterEmpty) };
 }
 
-module.exports = { generateLLM, currentProviderName, resolveTier, PROVIDERS };
+/* ----------------------------------------------------------------------------
+ * v104: 複数ターン+道具(tool use)+流れる表示(streaming)の入り口。
+ *   会話エンジン(server.js handleDiscuss)だけが使う。プロバイダーが generateMessages を
+ *   持たない(openai/gemini/openrouter/local はまだ1往復のみ)ときは TOOLS_UNSUPPORTED を
+ *   投げ、呼び出し側は従来の1往復(generateLLM)へ戻る=プロバイダーを切り替えても壊れない。
+ * -------------------------------------------------------------------------- */
+function providerCapabilities() {
+  const name = currentProviderName();
+  const loader = PROVIDERS[name];
+  if (!loader) return { provider: name, tools: false, streaming: false };
+  const p = loader();
+  return {
+    provider: name,
+    tools: typeof p.generateMessages === "function" && p.supportsTools === true,
+    streaming: typeof p.generateMessages === "function" && p.supportsStreaming === true,
+  };
+}
+
+async function generateConversation({ systemPrompt, messages, tools, maxTokens, tier, timeoutMs, stream, onDelta }) {
+  const name = currentProviderName();
+  const loader = PROVIDERS[name];
+  if (!loader) {
+    const err = new Error(`未知のLLM_PROVIDERです: "${name}"(対応済み: ${Object.keys(PROVIDERS).join(", ")})`);
+    err.code = "UNKNOWN_PROVIDER";
+    throw err;
+  }
+  const provider = loader();
+  if (typeof provider.generateMessages !== "function") {
+    const err = new Error(`LLM_PROVIDER "${name}" は複数ターン・道具つきの会話に未対応です(1往復の generate のみ)`);
+    err.code = "TOOLS_UNSUPPORTED";
+    throw err;
+  }
+  const usedTier = resolveTier(tier);
+  const out = await provider.generateMessages({
+    systemPrompt: systemPrompt || "", messages: messages || [], tools: tools || [],
+    maxTokens: maxTokens || 700, tier: usedTier, timeoutMs, stream: !!stream, onDelta,
+  });
+  return { ...out, provider: name, tier: usedTier, model: out.model || (typeof provider.resolveModel === "function" ? provider.resolveModel(usedTier) : null) };
+}
+
+module.exports = { generateLLM, generateConversation, providerCapabilities, currentProviderName, resolveTier, PROVIDERS };
