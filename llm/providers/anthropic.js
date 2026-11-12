@@ -179,4 +179,181 @@ async function generate({ systemPrompt, userPrompt, maxTokens, tier, timeoutMs, 
   }
 }
 
-module.exports = { generate, resolveModel };
+/* ============================================================================
+ * v104(2026年11月12日・利用者の決定「会話(1〜7)を今すぐ実装」): 道具を使える会話と流れる表示
+ * ----------------------------------------------------------------------------
+ * generate() は「system + 利用者の文1つ → 文章1つ」の1往復専用だった。会話の
+ * ①道具(tool use: AIが必要なデータを自分で取りに行く)と ④流れる表示(streaming)には、
+ *   ・複数ターンの messages(tool_use → tool_result の往復)
+ *   ・tools の定義(JSON Schema)
+ *   ・SSE(server-sent events)の逐次読み出し
+ * が必要なので、別関数 generateMessages() として追加する。generate() には1ビットも
+ * 手を入れない(毎日の学習・マッチ分析・従来の会話はそのまま動く=劣化禁止)。
+ *
+ * 返り値: { content: [{type:"text",text}|{type:"tool_use",id,name,input}], stopReason, model, text, usage }
+ *   text   … content の text ブロックを結合したもの(互換用)
+ *   onDelta(text) … stream:true のとき、本文の断片が届くたびに呼ばれる(tool_use の入力は流さない)
+ * 失敗時は generate() と同じ code(TIMEOUT / HTTP_ERROR / EMPTY_RESPONSE / NO_KEY)を投げる。
+ * ========================================================================== */
+const ANTHROPIC_STREAM_IDLE_MS = parseInt(process.env.ANTHROPIC_STREAM_IDLE_MS, 10) || 30000; // 断片が30秒途絶えたら時間切れ
+
+function buildMessagesBody(model, { systemPrompt, messages, tools, maxTokens, stream }) {
+  const body = {
+    model,
+    max_tokens: maxTokens || 700,
+    system: systemPrompt || "",
+    messages: Array.isArray(messages) && messages.length ? messages : [{ role: "user", content: "" }],
+  };
+  if (Array.isArray(tools) && tools.length) body.tools = tools;
+  if (stream) body.stream = true;
+  return body;
+}
+
+function normalizeContentBlocks(blocks) {
+  const content = [];
+  for (const b of Array.isArray(blocks) ? blocks : []) {
+    if (!b || typeof b !== "object") continue;
+    if (b.type === "text" && typeof b.text === "string") content.push({ type: "text", text: b.text });
+    else if (b.type === "tool_use") content.push({ type: "tool_use", id: String(b.id || ""), name: String(b.name || ""), input: (b.input && typeof b.input === "object") ? b.input : {} });
+  }
+  return content;
+}
+
+async function throwHttpError(res) {
+  let bodyText = await res.text().catch(() => "");
+  if (ANTHROPIC_API_KEY && ANTHROPIC_API_KEY.length >= 8) bodyText = bodyText.split(ANTHROPIC_API_KEY).join("[redacted]");
+  const err = new Error(`Anthropic API HTTP ${res.status}: ${bodyText.slice(0, 300)}`);
+  err.code = "HTTP_ERROR";
+  err.httpStatus = res.status;
+  err.bodyText = bodyText;
+  throw err;
+}
+
+function parseSseChunk(chunk) {
+  let evName = null; const dataLines = [];
+  for (const line of chunk.split("\n")) {
+    if (line.startsWith("event:")) evName = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+  }
+  return { evName, data: dataLines.join("\n") };
+}
+
+/** SSE を1イベントずつ読み、content ブロックを組み立てる(本文の断片は onDelta へ) */
+async function readStreamedMessage(res, onDelta, idleMs) {
+  const reader = res.body && typeof res.body.getReader === "function" ? res.body.getReader() : null;
+  if (!reader) {
+    const err = new Error("Anthropic APIのストリーム応答を読み出せません(body が無い)");
+    err.code = "STREAM_UNAVAILABLE";
+    throw err;
+  }
+  const decoder = new TextDecoder();
+  const blocks = []; // index 順
+  let stopReason = null;
+  let usage = null;
+  let buffer = "";
+  let streamError = null;
+  const handleEvent = (evName, dataStr) => {
+    if (!dataStr) return;
+    let ev;
+    try { ev = JSON.parse(dataStr); } catch (e) { return; } // 壊れたイベントは無視(本文は後続で続く)
+    const type = ev.type || evName;
+    if (type === "content_block_start") {
+      const cb = ev.content_block || {};
+      blocks[ev.index] = cb.type === "tool_use"
+        ? { type: "tool_use", id: cb.id || "", name: cb.name || "", json: "" }
+        : { type: "text", text: typeof cb.text === "string" ? cb.text : "" };
+    } else if (type === "content_block_delta") {
+      const d = ev.delta || {};
+      const blk = blocks[ev.index] || (blocks[ev.index] = { type: "text", text: "" });
+      if (d.type === "text_delta" && typeof d.text === "string") {
+        blk.text = (blk.text || "") + d.text;
+        if (typeof onDelta === "function" && d.text) { try { onDelta(d.text); } catch (e) { /* 表示側の失敗は本文に影響させない */ } }
+      } else if (d.type === "input_json_delta" && typeof d.partial_json === "string") {
+        blk.json = (blk.json || "") + d.partial_json;
+      }
+    } else if (type === "message_delta") {
+      if (ev.delta && ev.delta.stop_reason) stopReason = ev.delta.stop_reason;
+      if (ev.usage) usage = { ...(usage || {}), ...ev.usage };
+    } else if (type === "message_start") {
+      if (ev.message && ev.message.usage) usage = { ...(usage || {}), ...ev.message.usage };
+    } else if (type === "error") {
+      const msg = (ev.error && ev.error.message) || "stream error";
+      streamError = new Error(`Anthropic APIのストリーム中にエラー: ${String(msg).slice(0, 200)}`);
+      streamError.code = "STREAM_ERROR";
+    }
+  };
+  const processBuffer = (final) => {
+    let idx;
+    while ((idx = buffer.indexOf("\n\n")) !== -1) {
+      const chunk = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      const { evName, data } = parseSseChunk(chunk);
+      handleEvent(evName, data);
+    }
+    if (final && buffer.trim()) {
+      const { evName, data } = parseSseChunk(buffer);
+      buffer = "";
+      handleEvent(evName, data);
+    }
+  };
+  for (;;) {
+    let timer = null;
+    const idle = new Promise((_, reject) => { timer = setTimeout(() => { const e = new Error(`Anthropic APIのストリームが${idleMs}ms途絶えました`); e.code = "TIMEOUT"; reject(e); }, idleMs); });
+    let step;
+    try {
+      step = await Promise.race([reader.read(), idle]);
+    } catch (e) {
+      try { await reader.cancel(); } catch (e2) { /* 既に閉じている */ }
+      throw e;
+    } finally { clearTimeout(timer); }
+    if (step.done) break;
+    buffer += decoder.decode(step.value, { stream: true });
+    processBuffer(false);
+    if (streamError) { try { await reader.cancel(); } catch (e2) { /* 既に閉じている */ } throw streamError; }
+  }
+  processBuffer(true);
+  const content = [];
+  for (const b of blocks) {
+    if (!b) continue;
+    if (b.type === "tool_use") {
+      let input = {};
+      if (b.json) { try { input = JSON.parse(b.json); } catch (e) { input = { __invalidJson: b.json.slice(0, 200) }; } }
+      content.push({ type: "tool_use", id: b.id, name: b.name, input });
+    } else content.push({ type: "text", text: b.text || "" });
+  }
+  return { content, stopReason, usage };
+}
+
+async function generateMessages({ systemPrompt, messages, tools, maxTokens, tier, model: modelOverride, timeoutMs, stream, onDelta }) {
+  if (!ANTHROPIC_API_KEY) {
+    const err = new Error("ANTHROPIC_API_KEY が設定されていません(.envを確認してください)");
+    err.code = "NO_KEY";
+    throw err;
+  }
+  const model = modelOverride || resolveModel(tier);
+  const body = buildMessagesBody(model, { systemPrompt, messages, tools, maxTokens, stream: !!stream });
+  const headers = { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": ANTHROPIC_VERSION, "content-type": "application/json" };
+  const callTimeout = timeoutMs || ANTHROPIC_TIMEOUT_MS;
+  let out;
+  if (stream) {
+    // 接続の確立(ヘッダー到着)までは timeoutMs、その後は断片ごとの無応答時間で判定する
+    const res = await fetchWithTimeout(ANTHROPIC_API_BASE, { method: "POST", headers: { ...headers, accept: "text/event-stream" }, body: JSON.stringify(body) }, callTimeout);
+    if (!res.ok) await throwHttpError(res);
+    out = await readStreamedMessage(res, onDelta, ANTHROPIC_STREAM_IDLE_MS);
+  } else {
+    const res = await fetchWithTimeout(ANTHROPIC_API_BASE, { method: "POST", headers, body: JSON.stringify(body) }, callTimeout);
+    if (!res.ok) await throwHttpError(res);
+    const json = await res.json();
+    out = { content: normalizeContentBlocks(json.content), stopReason: json.stop_reason || null, usage: json.usage || null };
+  }
+  const text = out.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+  const hasToolUse = out.content.some((b) => b.type === "tool_use");
+  if (!text && !hasToolUse) {
+    const err = new Error(`Anthropic APIから空の応答が返されました(stop_reason=${out.stopReason || "?"}, blocks=${out.content.map((b) => b.type).join(",") || "empty"})`);
+    err.code = "EMPTY_RESPONSE";
+    throw err;
+  }
+  return { content: out.content, stopReason: out.stopReason, model, text, truncated: out.stopReason === "max_tokens", usage: out.usage || null };
+}
+
+module.exports = { generate, generateMessages, resolveModel, supportsTools: true, supportsStreaming: true };
