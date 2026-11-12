@@ -141,6 +141,8 @@ const {
 const { buildCalibrationMap } = require("./calibrationCorrection");
 // v101 ★4: 最終確率の較正(温度スケーリング。レジーム別・ホールドアウト関門つき)
 const probCalibration = require("./probCalibration");
+// v104 J: 試合内容の予測(勝敗確率と整合するスコア分布・2.5点以上/両チーム得点の較正・表示元の関門)
+const matchContent = require("./matchContent");
 // ⑤ オッズ比較・ROI(市場という最も厳しい採点者との毎日比較)
 const { extractMatchWinnerOdds, impliedProbsPct, scoreRoiForRecord, emptyRoiDaily, saveDailyRoi, getRoiTrend, ROI_KEY_PREFIX } = require("./roiTracker");
 // ① RAG強化(似たクラブ索引・似た試合の検索)
@@ -494,6 +496,9 @@ function mergeGrowthLogs(previous, current) {
     apifbBlendFit: pickFitRecord(previous.apifbBlendFit, current.apifbBlendFit),
     probCalibration: (current.probCalibration && current.probCalibration.fitted) ? { ...current.probCalibration, appliedToday: (previous.probCalibration && previous.probCalibration.appliedToday || 0) + (current.probCalibration.appliedToday || 0) }
       : (previous.probCalibration || current.probCalibration || null),
+    // v104 J: 試合内容モデルの学習結果も同じ規則(今日作った件数は合算・学習結果は記録のある方)
+    matchContent: (current.matchContent && current.matchContent.fitted) ? { ...current.matchContent, builtToday: (previous.matchContent && previous.matchContent.builtToday || 0) + (current.matchContent.builtToday || 0) }
+      : (previous.matchContent || current.matchContent || null),
     // v98 の採用記録: 2回目の実行で採用が0件でも、1回目の採用(名前つき)を消さない
     dynamicUniverse: (current.dynamicUniverse && Array.isArray(current.dynamicUniverse.adoptedNow) && current.dynamicUniverse.adoptedNow.length)
       ? current.dynamicUniverse
@@ -1900,6 +1905,16 @@ async function runDailyLearning(deps) {
       calibrationModelOnce = rawCal ? JSON.parse(rawCal) : null;
     } catch (e) { warn("calibration_model_read_failed", e); calibrationModelOnce = null; }
   }
+  // ---- v104 J: 試合内容モデル(表示元の切り替え・2.5点以上/両チーム得点の較正)も1回だけ読む ----
+  //   読めなかった日は既定(λ版・較正なし)で content を作る(勝敗の予想には一切影響しない)。
+  let contentModelOnce = null;
+  let contentBuiltToday = 0;
+  if (upstashEnabled && !storedWeightsReadError) {
+    try {
+      const rawCm = await upstashCmd(["GET", matchContent.MODEL_KEY]);
+      contentModelOnce = rawCm ? JSON.parse(rawCm) : null;
+    } catch (e) { warn("content_model_read_failed", e); contentModelOnce = null; }
+  }
   for (const team of (storedWeightsReadError ? [] : predictionPool)) {
     if (newPredictionsLogged >= OWN_PREDICT_LOG_CAP) { predictionStoppedReason = "cap"; break; }
     // 予算が尽きかけている日は、ここで打ち切って利用者向けの余力を守る
@@ -2290,6 +2305,15 @@ async function runDailyLearning(deps) {
         // 自己矛盾が起こる(本番の反省画面で実際に発生)。予想した勝敗と
         // 整合するスコアの中での最頻値(条件付き最頻値)を保存する。
         predictedScoreline: mostLikelyScoreline(homeLambda, awayLambda, 6, undefined, predictedWinner),
+        // ---- v104 J: 試合内容の予測(λ版と、公開中の勝敗確率と整合する版の両方を保存して採点する) ----
+        //   表示元・較正は前夜の学習が保存した learn:content:model に従う(無ければ λ版・較正なし)。
+        content: (() => {
+          try {
+            const c = matchContent.buildMatchContent({ homeLambda, awayLambda, finalProbs, rho: Number.isFinite(weights.rho) ? weights.rho : 0, model: contentModelOnce });
+            if (c) contentBuiltToday++;
+            return c;
+          } catch (e) { warn(`content_build_failed:${fixtureId}`, e); return null; }
+        })(),
         // 2026年8月18日: 公式戦かどうかを保存時に判定する(親善・2軍は参考扱い。
         // 予想は出し続けるが、的中率の主集計から分ける)。
         ...(() => {
@@ -2998,6 +3022,33 @@ async function runDailyLearning(deps) {
     probCalibrationToday = { fitted: false, saved: false, appliedToday: calibrationAppliedToday, available: false, reasonJa: `較正の学習に失敗しました(${String((e && e.message) || e).slice(0, 80)})。` };
   }
 
+  // ---- v104 J「試合内容の予測」の学習 ----
+  //   答え合わせ済みの記録(content の λ版/整合版と実スコア)から、①表示元の切り替え(整合版が
+  //   試合ごとの Brier 差の z 検定で本当に良いときだけ採用・悪化したら戻す) ②2.5点以上・両チーム
+  //   得点の温度較正(v101 と同じ関門)を学習し、翌日の予測(③)が読む learn:content:model に保存する。
+  let matchContentToday = null;
+  try {
+    const recentForContent = await loadRecentRecordsOnce();
+    let prevModel = null;
+    if (upstashEnabled) {
+      try {
+        const rawPrev = await upstashCmd(["GET", matchContent.MODEL_KEY]);
+        prevModel = rawPrev ? JSON.parse(rawPrev) : null;
+      } catch (e) { warn("content_model_prev_read_failed", e); prevModel = contentModelOnce; }
+    }
+    const cm = matchContent.fitContentModel(recentForContent, { prevModel, nowIso: runAt.toISOString() });
+    let saved = false;
+    if (upstashEnabled) {
+      const okSave = await upstashSetJSON(matchContent.MODEL_KEY, cm);
+      saved = okSave !== false;
+      if (!saved) errors.push("content_model_save_failed");
+    }
+    matchContentToday = { fitted: true, saved, builtToday: contentBuiltToday, ...matchContent.summarizeModel(cm) };
+  } catch (e) {
+    errors.push(`content_fit_failed:${e && (e.code || e.message)}`);
+    matchContentToday = { fitted: false, saved: false, builtToday: contentBuiltToday, available: false, reasonJa: `試合内容モデルの学習に失敗しました(${String((e && e.message) || e).slice(0, 80)})。` };
+  }
+
   await stage("⑤ 知識ベース更新と成長ログ");
   // ---- ⑤ 今日の知識ベース更新と成長ログ ----
   // Stage E以降: 「事実」の保存先はKnowledge Engine(knowledgeStore.js)に一本化。
@@ -3189,6 +3240,7 @@ async function runDailyLearning(deps) {
     } : null,
     // v101 ★4: 最終確率の較正(温度)の学習結果と、今日の予想への適用件数(実測のまま)
     probCalibration: probCalibrationToday,
+    matchContent: matchContentToday, // v104 J
     // v79(案6): 「2つ目の意見」(API-Football予想)ブレンドの学習結果(実測のまま)
     apifbBlendFit: apifbBlendFitToday ? {
       adopted: !!apifbBlendFitToday.adopted, w: apifbBlendFitToday.w ?? 0,

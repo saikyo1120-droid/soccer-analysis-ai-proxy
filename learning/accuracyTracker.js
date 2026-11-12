@@ -51,6 +51,8 @@ const P_FLOOR = 0.005; // log(0)回避
 const BY_LEAGUE_MAX_PER_DAY = 60;        // 1日の集計に持つリーグ数の上限(超えたぶんは「その他」へ)
 const BY_LEAGUE_OTHER_KEY = "__other__"; // 上限を超えたリーグの受け皿
 const LN3 = Math.log(3);
+// v104 J: 試合内容の予測(2.5点以上・両チーム得点・スコア上位)の採点と集計
+const matchContent = require("./matchContent");
 const UNIFORM_BRIER_3WAY = 2 / 3;
 
 /**
@@ -235,6 +237,10 @@ function scorePrediction(record) {
         top3Hit: top3 ? top3.some((t) => t.scoreline === actualSl) : null,
       };
     }
+    // ---- v104 J: 試合内容(λ版・整合版・表示した版)の採点。content の無い旧記録は null ----
+    try {
+      out.content = matchContent.scoreContent(record, score);
+    } catch (e) { out.contentScoreErrorJa = `試合内容の採点に失敗(${(e && e.message) || "unknown"})`; }
   }
   return out;
 }
@@ -335,6 +341,9 @@ function buildDailyAccuracy(scoredList) {
           }
         }
       }
+    }
+    if (s.content) {
+      agg.content = matchContent.addContentScore(agg.content || matchContent.emptyContentAgg(), s.content); // v104 J
     }
     if (s.markets.scoreline) {
       agg.scoreline.n++;
@@ -452,6 +461,9 @@ function mergeDailyAccuracy(a, b) {
   out.scoreline.hits = (a.scoreline?.hits || 0) + (b.scoreline?.hits || 0);
   out.scoreline.top3N = (a.scoreline?.top3N || 0) + (b.scoreline?.top3N || 0);
   out.scoreline.top3Hits = (a.scoreline?.top3Hits || 0) + (b.scoreline?.top3Hits || 0);
+  // v104 J: 試合内容の集計(古い保存形式には無い → 片方だけでも合算)
+  const contentMerged = matchContent.mergeContentAgg(a.content, b.content);
+  if (contentMerged) out.content = contentMerged;
   return out;
 }
 
@@ -676,6 +688,8 @@ function summarizeAccuracy(agg) {
       noteJa: "1X2のTop3的中率は3クラスしか無いため定義上100%になり無意味です。そのためTop3は最も難しい「スコア一致」で測っています。",
     };
   }
+  // v104 J: 試合内容の予測(λ版 vs 整合版・表示した確率の較正)
+  out.matchContent = matchContent.summarizeContentAgg(agg.content);
   out.measurable = any;
   if (!any) out.reasonJa = "この期間に答え合わせできた予測がありません(試合が無い・まだ結果が出ていない場合は正常です)。";
   return out;
