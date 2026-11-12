@@ -3547,6 +3547,132 @@
     ["⦿のデータが予想時に取得できておらず、これらを考慮せずに予想していました(欠けていたデータは翌日の収集で優先的に取りに行きます)。", "$1 data wasn't available at prediction time, so it wasn't considered (missing data is fetched with priority in the next collection).", "预测时未能获取$1的数据,因此未予考虑(缺失的数据将在下次收集中优先获取)。", "Los datos de $1 no estaban disponibles al predecir, así que no se consideraron (los datos faltantes se obtienen con prioridad en la siguiente recogida)."],
   ];
   for (var rp5 = 0; rp5 < RAWP5.length; rp5++) P.push([pat(RAWP5[rp5][0]), RAWP5[rp5][1], RAWP5[rp5][2], RAWP5[rp5][3]]);
+  /* ==== v104(2026年11月12日): 会話の改良(1〜7)と試合内容の見立て(J)の文言 ==== */
+  add({
+    // 会話の進行状況(サーバーの status と画面の文言)
+    "AIが考えています…": ["The AI is thinking…", "AI正在思考…", "La IA está pensando…"],
+    "質問を受け付けました": ["Question received", "已收到问题", "Pregunta recibida"],
+    "実データを確認しています…": ["Checking real data…", "正在核对实际数据…", "Comprobando datos reales…"],
+    "取得したデータをもとに考えています…": ["Thinking with the data just fetched…", "正在根据获取的数据思考…", "Pensando con los datos obtenidos…"],
+    "上位モデルが最終回答をまとめています…": ["A stronger model is writing the final answer…", "更强的模型正在整理最终回答…", "Un modelo superior está redactando la respuesta final…"],
+    "重いモデルが時間切れのため、高速モデルで答え直しています…": ["The heavy model timed out; answering again with the fast model…", "重型模型超时,正改用快速模型回答…", "El modelo pesado agotó el tiempo; respondiendo con el modelo rápido…"],
+    "流れる表示に失敗したため、従来の方式で取得しています…": ["Streaming failed; fetching the answer the usual way…", "流式显示失败,改用常规方式获取…", "Falló la transmisión en vivo; obteniendo la respuesta del modo habitual…"],
+    "今日のAI予想を確認しています…": ["Checking today's AI predictions…", "正在查看今天的AI预测…", "Consultando las predicciones de hoy…"],
+    "予想の詳細を確認しています…": ["Checking the prediction details…", "正在查看预测详情…", "Consultando los detalles de la predicción…"],
+    "クラブの現状を確認しています…": ["Checking the club's current situation…", "正在查看球队现状…", "Consultando la situación actual del club…"],
+    "対戦分析を確認しています…": ["Running the head-to-head analysis…", "正在进行对阵分析…", "Realizando el análisis del enfrentamiento…"],
+    "選手の今季成績を確認しています…": ["Checking the player's season stats…", "正在查看球员本赛季数据…", "Consultando las estadísticas del jugador…"],
+    "外した予想の反省を確認しています…": ["Checking the review of missed predictions…", "正在查看预测失误的反思…", "Consultando la revisión de pronósticos fallidos…"],
+    "的中率の実測を確認しています…": ["Checking the measured accuracy…", "正在查看实测命中率…", "Consultando la precisión medida…"],
+    // 質問の種類ごとの描画
+    "予想:": ["Prediction:", "预测:", "Pronóstico:"],
+    "根拠:": ["Basis:", "依据:", "Base:"],
+    "注意:": ["Caution:", "注意:", "Atención:"],
+    "AIが確認したデータ:": ["Data the AI checked:", "AI查看的数据:", "Datos que consultó la IA:"],
+    "(確認回数の上限に達したため、ここまでの情報で回答)": ["(reached the lookup limit, so answered with the information so far)", "(已达查询次数上限,以目前信息作答)", "(se alcanzó el límite de consultas; respondió con la información disponible)"],
+    "どのクラブのことでしょうか?": ["Which club do you mean?", "你指的是哪支球队?", "¿A qué club te refieres?"],
+    "(予想を生成できませんでした)": ["(could not generate a prediction)", "(未能生成预测)", "(no se pudo generar el pronóstico)"],
+    "AIの回答をうまく受け取れなかったため、今回はお答えできませんでした。お手数ですが、もう一度お試しください。": ["The AI's reply could not be received properly, so there is no answer this time. Please try again.", "未能正确接收AI的回答,本次无法作答。请再试一次。", "No se pudo recibir correctamente la respuesta de la IA, así que esta vez no hay respuesta. Inténtalo de nuevo."],
+    // 会話の設定(⑤)
+    "⚙️ 会話の設定(好きなクラブ・呼び名)": ["⚙️ Chat settings (favourite club, nickname)", "⚙️ 对话设置(喜欢的球队・昵称)", "⚙️ Ajustes del chat (club favorito, apodo)"],
+    "好きなクラブ(例: アーセナル)": ["Favourite club (e.g. Arsenal)", "喜欢的球队(例: 阿森纳)", "Club favorito (p. ej. Arsenal)"],
+    "呼び名(任意)": ["Nickname (optional)", "昵称(可选)", "Apodo (opcional)"],
+    "保存": ["Save", "保存", "Guardar"],
+    "消す": ["Clear", "清除", "Borrar"],
+    "この設定はこの端末の中だけに保存され、質問のたびにAIへ渡します(サーバーには保存しません)。詳しさは画面上部の「超入門/標準/戦術」に連動します。": ["These settings are stored only on this device and sent to the AI with each question (never stored on the server). The detail level follows the Beginner/Standard/Tactics switch at the top.", "这些设置只保存在本设备,每次提问时传给AI(不会保存在服务器)。详细程度与页面顶部的「超入门/标准/战术」联动。", "Estos ajustes se guardan solo en este dispositivo y se envían a la IA con cada pregunta (nunca se guardan en el servidor). El nivel de detalle sigue el selector Principiante/Estándar/Táctica de arriba."],
+    "保存しました。次の質問からAIがこの設定を踏まえて答えます。": ["Saved. From the next question the AI will take these settings into account.", "已保存。从下一个问题起,AI会参考这些设置回答。", "Guardado. A partir de la próxima pregunta la IA tendrá en cuenta estos ajustes."],
+    "設定を空にしました。": ["Settings cleared.", "设置已清空。", "Ajustes vaciados."],
+    "設定を消しました。": ["Settings deleted.", "设置已删除。", "Ajustes borrados."],
+    // 試合内容の見立て(J)
+    "試合内容の見立て": ["Match outlook", "比赛走向预估", "Perfil del partido"],
+    "合計": ["total", "合计", "total"],
+    "点見込み": [" goals expected", "球(预期)", " goles previstos"],
+    "2.5点以上": ["Over 2.5", "2.5球以上", "Más de 2,5"],
+    "最有力": ["most likely", "最可能", "más probable"],
+    "較正済み": ["calibrated", "已校准", "calibrado"],
+    "較正中": ["calibrating", "校准中", "calibrando"],
+    "接戦(拮抗)": ["close contest (evenly matched)", "势均力敌", "partido igualado"],
+    "ホームがやや優勢": ["home side slightly favoured", "主队略占优", "el local ligeramente favorito"],
+    "アウェイがやや優勢": ["away side slightly favoured", "客队略占优", "el visitante ligeramente favorito"],
+    "ホームが大きく優勢": ["home side clearly favoured", "主队明显占优", "el local claramente favorito"],
+    "アウェイが大きく優勢": ["away side clearly favoured", "客队明显占优", "el visitante claramente favorito"],
+    "ロースコア寄り": ["leaning low-scoring", "偏低比分", "tendencia a pocos goles"],
+    "標準的な得点": ["average scoring", "正常进球数", "goles en la media"],
+    "打ち合いになりやすい": ["likely to be open and high-scoring", "容易打成对攻", "propenso a muchos goles"],
+    "特になし": ["Nothing in particular", "无特别事项", "Nada en particular"],
+    // 確信度の内訳(6段階の熟考が「、」で繋ぐ断片。画面側 translateReasonJa が断片ごとに訳す)
+    "分析に必要なデータがすべて揃っている": ["all the data needed for the analysis is in place", "分析所需的数据全部齐备", "todos los datos necesarios para el análisis están disponibles"],
+    "採用した見方を裏づける実データが無い": ["no real data backs the adopted view", "没有实际数据支持所采纳的观点", "ningún dato real respalda la visión adoptada"],
+    "採用した見方を裏づけるのはAIによる推定のみで、実データが無い": ["only AI estimates back the adopted view, with no real data", "支持所采纳观点的只有AI推定,没有实际数据", "solo estimaciones de la IA respaldan la visión adoptada, sin datos reales"],
+    "対抗する見方より根拠が明確に強い": ["the evidence is clearly stronger than for the rival view", "依据明显强于对立观点", "la evidencia es claramente más fuerte que la de la visión rival"],
+    "対抗する見方と根拠の強さが拮抗している": ["the evidence is about as strong as for the rival view", "依据强度与对立观点势均力敌", "la evidencia es tan fuerte como la de la visión rival"],
+    "他の見方にはそもそも根拠となるデータが無く": ["the other views have no supporting data at all", "其他观点根本没有依据数据", "las otras visiones no tienen ningún dato de apoyo"],
+    "比較ができていない": ["so no comparison was possible", "因此无法比较", "por lo que no fue posible comparar"],
+    "直近の試合結果(フォーム)": ["recent results (form)", "近期比赛结果(状态)", "resultados recientes (forma)"],
+    "怪我人・出場停止": ["injuries and suspensions", "伤病・停赛", "lesiones y sanciones"],
+    "過去の対戦成績": ["head-to-head record", "历史交锋战绩", "historial de enfrentamientos"],
+    "xG(チャンスの質)": ["xG (chance quality)", "xG(机会质量)", "xG (calidad de ocasiones)"],
+    "得点関与(ゴール・アシスト)の実績": ["goal involvement (goals and assists)", "进球参与(进球・助攻)", "participación en goles (goles y asistencias)"],
+    "出場機会(出場試合数)": ["playing time (appearances)", "出场机会(出场次数)", "minutos (partidos jugados)"],
+    "試合評価(平均レーティング)": ["match ratings (average)", "比赛评分(平均)", "valoración por partido (media)"],
+    "チャンスメイク指標(キーパス・パス成功率など)": ["chance-creation metrics (key passes, pass accuracy, etc.)", "创造机会指标(关键传球・传球成功率等)", "métricas de creación (pases clave, precisión, etc.)"],
+    "守備・対人指標(タックル・デュエルなど)": ["defensive and duel metrics (tackles, duels, etc.)", "防守・对抗指标(抢断・对抗等)", "métricas defensivas y de duelos (entradas, duelos, etc.)"],
+    "所属クラブの状況": ["the player's club situation", "所属球队的情况", "la situación de su club"],
+    "確信度の内訳はこの回答には付いていません。": ["No confidence breakdown is attached to this answer.", "本回答没有附带置信度明细。", "Esta respuesta no incluye desglose de confianza."],
+  });
+  var RAWP7 = [
+    ["⦿のデータが不足しているため。", "because $1 data is lacking.", "因为$1的数据不足。", "porque faltan datos de $1."],
+  ];
+  for (var rp7 = 0; rp7 < RAWP7.length; rp7++) P.push([pat(RAWP7[rp7][0]), RAWP7[rp7][1], RAWP7[rp7][2], RAWP7[rp7][3]]);
+  // ---- v104: 確信度の内訳(「A、B、Cのデータが不足しているため。 別の一文。」)を断片ごとに訳す ----
+  //   熟考の理由は断片を「、」で繋ぎ「ため。」で結ぶため、全文一致の辞書では訳せない。
+  //   文ごと → 断片ごと(「・」の一覧は要素ごと)に辞書を引き、訳せない断片は原文のまま残す(でっち上げない)。
+  window.translateReasonJa = function (text) {
+    var str = String(text == null ? "" : text);
+    if (appLang === "ja" || !str || !/[ぁ-んァ-ヶ一-龥]/.test(str)) return str;
+    var whole = tr(str.trim());
+    if (whole !== null && !JA_LEFT_RE.test(whole)) return whole;
+    var sentences = str.split("。").map(function (x) { return x.trim(); }).filter(Boolean).map(function (x) { return x + "。"; });
+    var joinWord = { en: ", ", zh: "，", es: ", " }[appLang] || ", ";
+    var tail = { en: " — hence this confidence level.", zh: "，因此是这个置信度。", es: " — de ahí este nivel de confianza." }[appLang] || "";
+    var out = sentences.map(function (sent) {
+      var t1 = tr(sent.trim());
+      if (t1 !== null && !JA_LEFT_RE.test(t1)) return t1;
+      var m = sent.trim().match(/^(.*)ため。$/);
+      if (!m) return t1 !== null ? t1 : sent;
+      var parts = m[1].split("、").map(function (frag) {
+        var f = frag.trim();
+        var tf = tr(f);
+        if (tf !== null && !JA_LEFT_RE.test(tf)) return tf;
+        var lm = f.match(/^(.+)のデータが不足している$/);
+        if (lm) {
+          var items = lm[1].split("・").map(function (it) { var ti = tr(it.trim()); return ti === null ? it.trim() : ti; });
+          var listed = items.join(appLang === "zh" ? "、" : ", ");
+          return { en: listed + " data is lacking", zh: listed + "的数据不足", es: "faltan datos de " + listed }[appLang] || (listed + " data is lacking");
+        }
+        return tf !== null ? tf : f;
+      });
+      return parts.join(joinWord) + tail;
+    });
+    return out.join(" ");
+  };
+  var RAWP6 = [
+    ["対象: ⦿", "Subject: $1", "对象: $1", "Tema: $1"],
+    ["「⦿」はどのクラブのことでしょうか?(候補: ⦿)", "Which club do you mean by \"$1\"? (candidates: $2)", "「$1」指的是哪支球队?(候选: $2)", "¿A qué club te refieres con \"$1\"? (candidatos: $2)"],
+    ["今日のAI予想: ⦿件", "Today's AI predictions: $1", "今日AI预测: $1条", "Predicciones de hoy: $1"],
+    ["今日のAI予想: ⦿件(次の試合)", "Today's AI predictions: $1 (next matches)", "今日AI预测: $1条(下一场)", "Predicciones de hoy: $1 (próximos partidos)"],
+    ["予想の詳細: 試合ID ⦿", "Prediction details: fixture $1", "预测详情: 比赛ID $1", "Detalles del pronóstico: partido $1"],
+    ["クラブの現状: ⦿(事実⦿件)", "Club status: $1 ($2 facts)", "球队现状: $1(事实$2条)", "Situación del club: $1 ($2 hechos)"],
+    ["対戦分析: ⦿", "Head-to-head analysis: $1", "对阵分析: $1", "Análisis del enfrentamiento: $1"],
+    ["選手の今季成績: ⦿", "Player's season stats: $1", "球员本赛季数据: $1", "Estadísticas del jugador: $1"],
+    ["外した予想: ⦿件(窓内 ⦿件)", "Missed predictions: $1 (of $2 in the window)", "预测失误: $1条(窗口内$2条)", "Pronósticos fallidos: $1 (de $2 en la ventana)"],
+    ["的中率の実測", "Measured accuracy", "实测命中率", "Precisión medida"],
+    ["今日のAI予想: ⦿", "Today's AI predictions: $1", "今日AI预测: $1", "Predicciones de hoy: $1"],
+    ["クラブの現状: ⦿", "Club status: $1", "球队现状: $1", "Situación del club: $1"],
+    ["外した予想の反省: ⦿", "Review of missed predictions: $1", "预测失误的反思: $1", "Revisión de fallos: $1"],
+    ["予想の詳細: ⦿", "Prediction details: $1", "预测详情: $1", "Detalles del pronóstico: $1"],
+  ];
+  for (var rp6 = 0; rp6 < RAWP6.length; rp6++) P.push([pat(RAWP6[rp6][0]), RAWP6[rp6][1], RAWP6[rp6][2], RAWP6[rp6][3]]);
   /* ==== 辞書ここまで ==== */
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
   else boot();
@@ -3611,6 +3737,17 @@
       <input type="text" id="heroChatInput" placeholder="例: レアル・マドリード vs バルセロナ / 久保建英はどんな選手？">
       <button class="apply-btn" id="heroChatBtn" style="margin-top:0; width:auto; padding:9px 18px;">聞く ▶</button>
     </div>
+    <!-- v104 ⑤: 会話の設定(端末内だけに保存。サーバーには送るが保存しない) -->
+    <details id="heroChatSettings" style="margin-top:6px;">
+      <summary class="value-note" style="cursor:pointer;">⚙️ 会話の設定(好きなクラブ・呼び名)</summary>
+      <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:6px;">
+        <input type="text" id="chatProfileClub" maxlength="40" placeholder="好きなクラブ(例: アーセナル)" style="flex:1 1 160px; min-width:140px;">
+        <input type="text" id="chatProfileNick" maxlength="20" placeholder="呼び名(任意)" style="flex:0 1 120px; min-width:100px;">
+        <button class="apply-btn" id="chatProfileSaveBtn" style="margin-top:0; width:auto; padding:6px 12px;">保存</button>
+        <button class="apply-btn" id="chatProfileClearBtn" style="margin-top:0; width:auto; padding:6px 12px; opacity:.8;">消す</button>
+      </div>
+      <p class="value-note" id="chatProfileNote" style="margin-top:4px;">この設定はこの端末の中だけに保存され、質問のたびにAIへ渡します(サーバーには保存しません)。詳しさは画面上部の「超入門/標準/戦術」に連動します。</p>
+    </details>
     <div id="heroChatMessages" style="margin-top:12px;"></div>
   </div>
 
@@ -6598,12 +6735,34 @@ function getTrivia(player) {
    against common intents and composes an answer from the player's own
    registered fields (summary/attrs/strengths/weaknesses/contract/tactics),
    so it never invents a fact that isn't already in the database. */
+// ---- v104: 選手の別名は「語として」含まれるときだけ一致させる ----
+//   旧実装は単純な部分一致だったため、2文字の別名「ター」(ヨナタン・ター)が「マンチェスター」に、
+//   「ロー」「カイ」のような短い別名が無関係な語の中に一致し、別人の選手カードが開いていた
+//   (実ブラウザ検査で再現: 「マンチェスターはどう?」→ Jonathan Tah)。カタカナ・漢字・ラテン文字の
+//   別名は、その直前・直後が同じ種類の文字でないときだけ一致とみなす。
+function aliasOccursAsWord(norm, aliasNorm) {
+  if (!aliasNorm) return false;
+  const KATA = /[ァ-ヶー・]/, LATIN = /[a-z0-9]/, KANJI = /[一-龥ぁ-ん]/;
+  const kindOf = (ch) => (KATA.test(ch) ? "kata" : LATIN.test(ch) ? "latin" : KANJI.test(ch) ? "kanji" : null);
+  const firstKind = kindOf(aliasNorm.charAt(0)), lastKind = kindOf(aliasNorm.charAt(aliasNorm.length - 1));
+  let from = 0;
+  for (;;) {
+    const idx = norm.indexOf(aliasNorm, from);
+    if (idx === -1) return false;
+    const before = idx > 0 ? norm.charAt(idx - 1) : "";
+    const after = norm.charAt(idx + aliasNorm.length);
+    const okBefore = !before || !firstKind || kindOf(before) !== firstKind;
+    const okAfter = !after || !lastKind || kindOf(after) !== lastKind;
+    if (okBefore && okAfter) return true;
+    from = idx + 1;
+  }
+}
 function detectMentionedPlayer(text, excludeKey) {
   const norm = normalizeName(text);
   for (const key in PLAYERS) {
     if (key === excludeKey) continue;
     const p = PLAYERS[key];
-    if (p.aliases.some(a => norm.indexOf(normalizeName(a)) !== -1)) return { key, ...p };
+    if (p.aliases.some(a => aliasOccursAsWord(norm, normalizeName(a)))) return { key, ...p };
   }
   return null;
 }
@@ -9344,7 +9503,7 @@ function findAllMentionedPlayers(text, limit) {
   const found = [];
   for (const key in PLAYERS) {
     const p = PLAYERS[key];
-    if (p.aliases.some(a => norm.indexOf(normalizeName(a)) !== -1)) {
+    if (p.aliases.some(a => aliasOccursAsWord(norm, normalizeName(a)))) { // v104: 語境界つき(「ター」が「マンチェスター」に当たらない)
       found.push({ key, ...p });
       if (found.length >= limit) break;
     }
@@ -9374,6 +9533,7 @@ function detectClubMention(q) {
   //   カタカナ語が続いていない場合**に限る。「レアル」単独なら短縮形とみなすが、
   //   「レアル・ベティス」のように続きがある場合は、その全体が登録クラブ名と
   //   一致しない限り、知らないクラブとして扱う(nullを返し、一般質問として扱う)。
+  const matchedTokens = new Map(); // クラブ名 → 一致した短縮形
   const tokenMatches = clubs.filter((c) => {
     const tokens = c.split(/[・\s]/).filter(Boolean).filter((t) => t.length >= 2);
     return tokens.some((t) => {
@@ -9385,18 +9545,28 @@ function detectClubMention(q) {
         // トークンの直後を見る。カタカナ・長音が続いていれば、それは
         // 「別のクラブの名前の一部」である可能性が高いので短縮形とみなさない。
         const after = norm.slice(idx + nt.length);
-        if (!/^[ァ-ヴーァ-ヶー・]/.test(after)) return true;
+        if (!/^[ァ-ヴーァ-ヶー・]/.test(after)) { matchedTokens.set(c, nt); return true; }
         from = idx + 1;
       }
     });
   });
   if (!tokenMatches.length) return null;
-  if (tokenMatches.length === 1) return tokenMatches[0];
-  // multiple clubs share a token (e.g. レアル・マドリード / レアル・ソシエダ both match "レアル") ->
-  // prefer whichever has more registered players, since that's almost always the one meant.
-  const counts = {};
-  Object.values(PLAYERS).forEach(p => { const b = clubBase(p); counts[b] = (counts[b] || 0) + 1; });
-  return tokenMatches.sort((a, b) => (counts[b] || 0) - (counts[a] || 0))[0];
+  if (tokenMatches.length === 1) {
+    // v104 ⑦: 登録クラブの中では一意でも、より広い辞書(UEFA TOP100)で同じ短縮形を先頭に持つクラブが
+    //   他にもある(「マンチェスター」→ シティ/ユナイテッド)なら推測せず、サーバーの名寄せ・聞き返しに任せる。
+    const tok = matchedTokens.get(tokenMatches[0]) || "";
+    if (tok && typeof UNIVERSE_CLUB_JA_TO_EN === "object") {
+      const wider = Object.keys(UNIVERSE_CLUB_JA_TO_EN).filter((ja) => normalizeName(ja).startsWith(tok)).map((ja) => UNIVERSE_CLUB_JA_TO_EN[ja]);
+      if (new Set(wider).size >= 2) return null;
+    }
+    return tokenMatches[0];
+  }
+  // multiple clubs share a token (e.g. レアル・マドリード / レアル・ソシエダ both match "レアル", or
+  // マンチェスター・シティ / ・ユナイテッド both match "マンチェスター").
+  // v104 ⑦: 以前は「登録選手が多い方」を推測で選んでいた。推測で別クラブの実データを出すより、
+  //   主題なしでサーバーへ渡し、サーバーの名寄せ(別名表=「レアル」はレアル・マドリード)か
+  //   聞き返し(「マンチェスター」→ シティ/ユナイテッドのボタン)に任せる。
+  return null;
 }
 const TACTIC_LABELS_CLUB = { possession: "ポゼッションサッカー", counter: "ショートカウンター", buildup: "丁寧なビルドアップ", longball: "ロングボール主体の戦術" };
 function buildClubAnswer(clubName, level) {
@@ -9480,7 +9650,10 @@ function isLikelyPlayerName(token) {
 function guessUnregisteredPlayerName(q) {
   const kata = String(q || "").match(/[ァ-ヴー]{2,}/g);
   if (kata && kata.length) {
-    const candidates = kata.filter(isLikelyPlayerName).sort((a, b) => b.length - a.length);
+    // v104 ⑥⑦: 既知のクラブ名の先頭(「マンチェスター」「ボルシア」)は選手名と推測しない(サーバーの名寄せ・聞き返しに任せる)
+    const clubHeads = (typeof UNIVERSE_CLUB_JA_TO_EN === "object" ? Object.keys(UNIVERSE_CLUB_JA_TO_EN) : []).concat(typeof CLUB_JA_TO_EN === "object" ? Object.keys(CLUB_JA_TO_EN) : []).map((ja) => normalizeName(ja));
+    const looksLikeClub = (t) => { const nt = normalizeName(t); return clubHeads.some((c) => c === nt || c.startsWith(nt)); };
+    const candidates = kata.filter(isLikelyPlayerName).filter((t) => !looksLikeClub(t)).sort((a, b) => b.length - a.length);
     if (candidates.length) return candidates[0];
   }
   const jp = KNOWN_JP_SURNAMES.find((s) => q.indexOf(s) !== -1);
@@ -9748,38 +9921,122 @@ async function warmUpBackendForChat() {
     return true;
   } catch (e) { return false; }
 }
-async function fetchDiscussApiOnce(question, subject, playerHint, history) {
+async function fetchDiscussApiOnce(question, subject, playerHint, history, extra) {
   const url = `${API_PROXY_BASE}/discuss`;
   // v56: 利用者の言語設定を渡す(AIの回答はサーバー側で選択言語のまま生成される)
   const lang = (typeof window !== "undefined" && window.appLang) ? window.appLang : "ja";
   const data = await fetchJsonWithTimeout(url, DISCUSS_TIMEOUT_MS, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    // v79(案5): 直近の会話(最大3往復・要旨のみ)を文脈として渡す
-    body: JSON.stringify({ question, subject, playerHint, lang, history: Array.isArray(history) ? history.slice(-3) : [] }),
+    // v79(案5)→v104(⑤): 直近の会話(最大10往復・要旨のみ)と利用者の設定(端末内)を文脈として渡す
+    body: JSON.stringify({ question, subject, playerHint, lang, history: Array.isArray(history) ? history.slice(-DISCUSS_HISTORY_MAX) : [], profile: (extra && extra.profile) || null }),
   });
   backendConfirmedWarm = true; // 200が返った=サーバーは起きている
   return data;
 }
-async function fetchDiscussApi(question, subject, playerHint, history, onColdStart) {
+// ---- v104 ④: 流れる表示。/api/discuss/stream(NDJSON)を fetch + ReadableStream で読む ----
+//   1行1イベント: status(進行)/ delta(本文の断片)/ reset(道具を使ったので途中経過を消す)/ final(完成した応答)/ error。
+//   ストリームが使えない・途中で壊れた(final が来ない)ときは null を返し、呼び出し側が従来の一括取得へ戻る。
+const DISCUSS_STREAM_IDLE_MS = 45000; // 断片が45秒途絶えたら諦めて従来方式へ
+async function fetchDiscussStreamOnce(question, subject, playerHint, history, extra, handlers) {
+  if (typeof ReadableStream === "undefined" || typeof TextDecoder === "undefined") return null;
+  const url = `${API_PROXY_BASE}/discuss/stream`;
+  const lang = (typeof window !== "undefined" && window.appLang) ? window.appLang : "ja";
+  const controller = (typeof AbortController === "function") ? new AbortController() : null;
+  let idleTimer = null;
+  const armIdle = () => { if (!controller) return; clearTimeout(idleTimer); idleTimer = setTimeout(() => { try { controller.abort(); } catch (e) {} }, DISCUSS_STREAM_IDLE_MS); };
+  try {
+    armIdle();
+    const res = await fetch(url, {
+      method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/x-ndjson" },
+      body: JSON.stringify({ question, subject, playerHint, lang, history: Array.isArray(history) ? history.slice(-DISCUSS_HISTORY_MAX) : [], profile: (extra && extra.profile) || null }),
+      signal: controller ? controller.signal : undefined,
+    });
+    if (!res.ok || !res.body) return null;
+    backendConfirmedWarm = true;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let final = null;
+    const handleLine = (line) => {
+      const l = line.trim();
+      if (!l) return;
+      let ev; try { ev = JSON.parse(l); } catch (e) { return; }
+      if (ev.t === "status" && handlers.onStatus) handlers.onStatus(ev);
+      else if (ev.t === "delta" && handlers.onDelta) handlers.onDelta(String(ev.text || ""));
+      else if (ev.t === "reset" && handlers.onReset) handlers.onReset();
+      else if (ev.t === "final") final = ev;
+      else if (ev.t === "error") final = { t: "error", body: { ok: false, message: ev.message } };
+    };
+    for (;;) {
+      const step = await reader.read();
+      if (step.done) break;
+      armIdle();
+      buf += decoder.decode(step.value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n")) !== -1) { handleLine(buf.slice(0, idx)); buf = buf.slice(idx + 1); }
+    }
+    if (buf.trim()) handleLine(buf);
+    return final ? final.body : null;
+  } catch (e) {
+    return null;
+  } finally { clearTimeout(idleTimer); }
+}
+async function fetchDiscussApi(question, subject, playerHint, history, onColdStart, extra, handlers) {
   // 1回目の前に、まだ温まっていなければ先に起床させる(重いPOSTでの起床待ちを避ける)
   if (!backendConfirmedWarm) {
     if (typeof onColdStart === "function") { try { onColdStart(); } catch (e) {} }
     await warmUpBackendForChat();
   }
+  // v104 ④: まず流れる表示で試す。final が届かなければ従来の一括取得へ(応答は同じ形)
+  if (handlers && DISCUSS_STREAM_ENABLED) {
+    const streamed = await fetchDiscussStreamOnce(question, subject, playerHint, history, extra, handlers);
+    if (streamed) return streamed;
+    if (handlers.onReset) { try { handlers.onReset(); } catch (e) {} }
+    if (handlers.onStatus) { try { handlers.onStatus({ key: "fallback", ja: "流れる表示に失敗したため、従来の方式で取得しています…" }); } catch (e) {} }
+  }
   try {
-    return await fetchDiscussApiOnce(question, subject, playerHint, history);
+    return await fetchDiscussApiOnce(question, subject, playerHint, history, extra);
   } catch (e1) {
     // 通信失敗(起床待ちのタイムアウト等)。サーバーはこの時点で起きている可能性が
     // 高いので、少し待って自動でもう1回だけ試す。
     if (typeof onColdStart === "function") { try { onColdStart(); } catch (e) {} }
     try { await new Promise((r) => setTimeout(r, 1500)); } catch (e) {}
     try {
-      return await fetchDiscussApiOnce(question, subject, playerHint, history);
+      return await fetchDiscussApiOnce(question, subject, playerHint, history, extra);
     } catch (e2) {
       return null;
     }
   }
+}
+const DISCUSS_STREAM_ENABLED = true;
+const DISCUSS_HISTORY_MAX = 10; // v104 ⑤: 3→10往復
+
+// ---- v104 ⑤: 利用者の設定(好きなクラブ・詳しさ・呼び名)。端末内(localStorage)だけに保存し、質問のたびに送る ----
+const DISCUSS_PROFILE_KEY = "soccerAiChatProfile";
+function readDiscussProfile() {
+  try {
+    const raw = localStorage.getItem(DISCUSS_PROFILE_KEY);
+    const p = raw ? JSON.parse(raw) : null;
+    if (!p || typeof p !== "object") return null;
+    const out = {};
+    if (p.favoriteClub) out.favoriteClub = String(p.favoriteClub).slice(0, 40);
+    if (p.nickname) out.nickname = String(p.nickname).slice(0, 20);
+    if (p.level) out.level = String(p.level);
+    return Object.keys(out).length ? out : null;
+  } catch (e) { return null; }
+}
+function writeDiscussProfile(p) {
+  try { if (!p || !Object.keys(p).length) localStorage.removeItem(DISCUSS_PROFILE_KEY); else localStorage.setItem(DISCUSS_PROFILE_KEY, JSON.stringify(p)); } catch (e) { /* 端末ストレージが使えない環境では保存しない(会話自体は動く) */ }
+}
+/** 送信用: 画面の「詳しさ」(超入門/標準/戦術)を会話の詳しさに写す(設定で上書きされていなければ) */
+function discussProfileForRequest() {
+  const p = readDiscussProfile() || {};
+  const lvl = p.level || (state && state.level === "beginner" ? "beginner" : state && state.level === "expert" ? "expert" : "standard");
+  const out = { level: lvl };
+  if (p.favoriteClub) out.favoriteClub = p.favoriteClub;
+  if (p.nickname) out.nickname = p.nickname;
+  return out;
 }
 
 // ---- v79(2026年9月1日・利用者の承認 案5): 会話の文脈記憶(端末内のみ) ----
@@ -9916,7 +10173,8 @@ function renderDiscussReplyHtml(resp) {
   // confidence を持たない応答で TypeError となり、回答が一切表示されず
   // 吹き出しが「🧠 AIが考えています…」のまま固まっていた。
   const confidenceReasonJa = (resp.confidence && resp.confidence.reasonJa) || "確信度の内訳はこの回答には付いていません。";
-  const confidenceHtml = `<div class="discuss-confidence">${stars} <span class="value-note">${escapeHtml(confidenceReasonJa)}</span></div>`;
+  // v104: 熟考の理由(断片を「、」で繋いだ文)は画面側で断片ごとに訳す(非日本語のときだけ。日本語表示は原文のまま)
+  const confidenceHtml = `<div class="discuss-confidence">${stars} <span class="value-note">${escapeHtml((typeof window.translateReasonJa === "function") ? window.translateReasonJa(confidenceReasonJa) : confidenceReasonJa)}</span></div>`;
   // ---- v76(2026年9月1日・利用者意見調査の還元C): 生成情報の開示 ----
   //   調査で分かったこと: 「AI搭載」を名乗るだけでモデル名を明かさないサービスは
   //   信頼されない(比較サイトの主要評価軸が「モデル名の開示」だった)。また
@@ -9937,6 +10195,64 @@ function renderDiscussReplyHtml(resp) {
   return { text: body + thoughtChangeHtml, extras: `${confidenceHtml}${multiStepHtml}${ragHtml}${deliberationHtml}${graphHtml}${timelineHtml}${factsHtml}${genInfoHtml}${followupsHtml}` };
 }
 
+// ---- v104 ①: 質問の種類ごとの描画(議論は従来の renderDiscussReplyHtml のまま) ----
+function discussCommonExtrasHtml(resp) {
+  const factsHtml = resp.facts && resp.facts.length
+    ? `<details class="discuss-facts"><summary>📊 根拠にした事実を見る(${resp.facts.length}件)</summary><ul>${resp.facts.map(f => `<li>${escapeHtml(f)}</li>`).join("")}</ul></details>`
+    : "";
+  const tools = resp.meta && resp.meta.tools;
+  const toolsHtml = (tools && Array.isArray(tools.calls_list) && tools.calls_list.length)
+    ? `<div class="value-note" style="margin-top:4px;">🧰 AIが確認したデータ: ${tools.calls_list.map((c) => escapeHtml(c.summaryJa || c.name)).join(" / ")}${tools.exhausted ? "(確認回数の上限に達したため、ここまでの情報で回答)" : ""}</div>`
+    : "";
+  const genModelName = resp.meta && resp.meta.llmModel ? String(resp.meta.llmModel) : null;
+  const genInfoHtml = genModelName ? `<div class="value-note" style="margin-top:4px; opacity:.75;">🏷️ 生成モデル: ${escapeHtml(genModelName)}</div>` : "";
+  const followupsHtml = resp.followUpQuestions && resp.followUpQuestions.length
+    ? `<div class="followup-chip-row">${resp.followUpQuestions.map(q => `<button class="chat-followup-btn" data-q="${escapeHtml(q)}">・${escapeHtml(q)}</button>`).join("")}</div>`
+    : "";
+  return `${toolsHtml}${factsHtml}${genInfoHtml}${followupsHtml}`;
+}
+function textToParagraphsHtml(text) {
+  const t = String(text || "").trim();
+  if (!t) return "";
+  return t.split(/\n{2,}/).map((para) => `<p>${escapeHtml(para).replace(/\n/g, "<br>")}</p>`).join("");
+}
+function renderPlainReplyHtml(resp) {
+  const note = resp.formatNoteJa ? `<p class="value-note">※ ${escapeHtml(resp.formatNoteJa)}</p>` : "";
+  const truncated = resp.truncatedNoteJa ? `<p class="value-note">${escapeHtml(resp.truncatedNoteJa)}</p>` : "";
+  return { text: note + truncated + textToParagraphsHtml(resp.answerText || ""), extras: discussCommonExtrasHtml(resp) };
+}
+function renderPredictionReplyHtml(resp) {
+  const p = resp.prediction || {};
+  const note = resp.formatNoteJa ? `<p class="value-note">※ ${escapeHtml(resp.formatNoteJa)}</p>` : "";
+  const truncated = resp.truncatedNoteJa ? `<p class="value-note">${escapeHtml(resp.truncatedNoteJa)}</p>` : "";
+  let body = note + truncated;
+  body += `<p>🔮 <strong>予想:</strong> ${escapeHtml(p.prediction || "(予想を生成できませんでした)")}</p>`;
+  if (p.basis) body += `<p>📊 <strong>根拠:</strong> ${escapeHtml(p.basis)}</p>`;
+  if (p.caution && !/^特になし/.test(p.caution)) body += `<p class="value-note">⚠️ 注意: ${escapeHtml(p.caution)}</p>`;
+  // 予想の確信度は本文(予想欄の「確信度 高/中/低」と確率)に含まれる。6段階の熟考の星(クラブ知識の揃い具合)は
+  //   「勝敗の予想の確からしさ」とは別物で、並べると矛盾して見える(実ブラウザ検査で確認)ため、予想モードでは出さない。
+  return { text: body, extras: discussCommonExtrasHtml(resp) };
+}
+function renderClarifyHtml(resp, originalQuestion) {
+  const opts = Array.isArray(resp.options) ? resp.options : [];
+  const buttons = opts.map((o) => `<button class="chat-followup-btn chat-clarify-btn" data-q="${escapeHtml(originalQuestion)}" data-subject="${escapeHtml(JSON.stringify(o.subject || {}))}">・${escapeHtml(o.label)}</button>`).join("");
+  return { text: `<p>❓ ${escapeHtml(resp.question || "どのクラブのことでしょうか?")}</p>`, extras: `<div class="followup-chip-row">${buttons}</div>` };
+}
+function renderDiscussByMode(resp, originalQuestion) {
+  const mode = resp && resp.mode;
+  if (mode === "clarify") return renderClarifyHtml(resp, originalQuestion);
+  if (mode === "prediction") return renderPredictionReplyHtml(resp);
+  if (mode === "fact" || mode === "smalltalk" || mode === "offtopic") return renderPlainReplyHtml(resp);
+  return renderDiscussReplyHtml(resp); // discussion(従来の7欄)・mode の無い旧応答
+}
+/** 記憶の要旨(質問の種類ごとに) */
+function discussAnswerSummary(resp) {
+  if (!resp) return "";
+  if (resp.mode === "prediction" && resp.prediction) return String(resp.prediction.prediction || "").slice(0, 400);
+  if (resp.answerText) return String(resp.answerText).slice(0, 400);
+  return String(resp.finalConclusion || resp.mostImportantOpinion || resp.aiOpinion || "").slice(0, 400);
+}
+
 // hero chat・選手個別チャット共通の議論モードフロー。
 // pushFn: 新しいメッセージオブジェクトを履歴配列に積む関数
 // renderFn: 履歴を再描画する関数
@@ -9944,7 +10260,7 @@ function renderDiscussReplyHtml(resp) {
 //   旧実装は Enter の連打・ボタンの二度押しでそのまま2本目の考察リクエストを送っていた
 //   (利用者の1日10回のAI考察枠を1回の質問で2回ぶん消費し、回答も二重に並ぶ)。
 const discussInFlightKeys = new Set();
-async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn, forcedPlayerName, surfaceKey) {
+async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn, forcedPlayerName, surfaceKey, forcedSubject) {
   const inflightKey = surfaceKey || ((contextPlayer && contextPlayer.name) ? `card:${contextPlayer.name}` : "hero");
   if (discussInFlightKeys.has(inflightKey)) {
     const waitMsg = "前の質問にAIが答えている途中です。回答が出てから、もう一度送ってください。";
@@ -9954,13 +10270,15 @@ async function runDiscussFlow(q, dLevel, contextPlayer, pushFn, renderFn, forced
   }
   discussInFlightKeys.add(inflightKey);
   try {
-    await runDiscussFlowInner(q, dLevel, contextPlayer, pushFn, renderFn, forcedPlayerName, surfaceKey);
+    await runDiscussFlowInner(q, dLevel, contextPlayer, pushFn, renderFn, forcedPlayerName, surfaceKey, forcedSubject);
   } finally {
     discussInFlightKeys.delete(inflightKey);
   }
 }
-async function runDiscussFlowInner(q, dLevel, contextPlayer, pushFn, renderFn, forcedPlayerName, surfaceKey) {
+async function runDiscussFlowInner(q, dLevel, contextPlayer, pushFn, renderFn, forcedPlayerName, surfaceKey, forcedSubject) {
   let { subject, playerHint, resolvedPlayer } = buildDiscussSubject(q, contextPlayer, forcedPlayerName);
+  // v104 ⑦: 聞き返しで利用者が選んだクラブを主題にする
+  if (forcedSubject && forcedSubject.type) { subject = forcedSubject; playerHint = null; resolvedPlayer = null; }
   // ---- v79(案5): 文脈記憶の読み出し ----
   //   記憶は「画面」単位(ヒーローチャット=hero / 選手カードごと=card:◯◯)。
   //   ヒーローチャットで選手名に言及した質問と、その続きの代名詞質問が
@@ -9974,30 +10292,54 @@ async function runDiscussFlowInner(q, dLevel, contextPlayer, pushFn, renderFn, f
     subject = mem.lastSubject;
     if (!playerHint && mem.lastPlayerHint) playerHint = mem.lastPlayerHint;
   }
-  const pendingMsg = { role: "ai", text: `<p class="value-note">🧠 AIが考えています…(実データを確認し、考察を組み立てています。最大1分ほどかかることがあります)</p>`, extras: "" };
+  const tr = (s) => ((typeof window !== "undefined" && window.t) ? window.t(s) : s);
+  const pendingMsg = { role: "ai", text: `<p class="value-note">🧠 ${escapeHtml(tr("AIが考えています…"))}</p>`, extras: "" };
   pushFn(pendingMsg);
   renderFn();
 
   // v84: 起床待ちのあいだは「起動中」と正直に出す(黙って固まったように見せない)。
   const onColdStart = () => {
     var startMsg = "AIサーバーを起動しています…(しばらく使われていなかったため、目を覚ますのに最大1分ほどかかります。そのままお待ちください)";
-    pendingMsg.text = `<p class="value-note">⏳ ${escapeHtml((typeof window !== "undefined" && window.t) ? window.t(startMsg) : startMsg)}</p>`;
+    pendingMsg.text = `<p class="value-note">⏳ ${escapeHtml(tr(startMsg))}</p>`;
     try { renderFn(); } catch (e) {}
   };
-  const resp = await fetchDiscussApi(q, subject, playerHint, mem.turns, onColdStart);
+  // ---- v104 ④: 進行状況と本文の断片を、届いたそばから吹き出しに描く ----
+  let streamedText = "";
+  let lastStatusJa = "";
+  let lastPaint = 0;
+  const paint = (force) => {
+    const now = Date.now();
+    if (!force && now - lastPaint < 120) return; // 描画は最大 8回/秒(断片ごとに全再描画しない)
+    lastPaint = now;
+    const statusHtml = lastStatusJa ? `<p class="value-note">⏳ ${escapeHtml(tr(lastStatusJa))}</p>` : "";
+    const bodyHtml = streamedText ? `<p class="discuss-streaming">${escapeHtml(streamedText.replace(/###[^#\n]{1,20}###/g, "").trim()).replace(/\n/g, "<br>")}</p>` : "";
+    pendingMsg.text = statusHtml + bodyHtml;
+    try { renderFn(); } catch (e) {}
+  };
+  const handlers = {
+    onStatus: (ev) => { lastStatusJa = ev.ja || ""; paint(true); },
+    onDelta: (text) => { streamedText += text; paint(false); },
+    onReset: () => { streamedText = ""; paint(true); },
+  };
+  const resp = await fetchDiscussApi(q, subject, playerHint, mem.turns, onColdStart, { profile: discussProfileForRequest() }, handlers);
 
   if (resp && resp.ok) {
-    const rendered = renderDiscussReplyHtml(resp);
+    const rendered = renderDiscussByMode(resp, q);
     pendingMsg.text = rendered.text;
     pendingMsg.extras = rendered.extras;
-    // ---- v79(案5): 文脈記憶への書き込み(要旨のみ・最大3往復) ----
+    // ---- v79(案5)→v104(⑤): 文脈記憶への書き込み(要旨のみ・最大10往復) ----
     try {
-      const summary = String(resp.finalConclusion || resp.mostImportantOpinion || resp.aiOpinion || "").slice(0, 600);
-      if (summary) {
-        mem.turns.push({ q: String(q).slice(0, 500), a: summary });
-        while (mem.turns.length > 3) mem.turns.shift();
+      if (resp.mode !== "clarify") {
+        const summary = discussAnswerSummary(resp);
+        if (summary) {
+          mem.turns.push({ q: String(q).slice(0, 300), a: summary });
+          while (mem.turns.length > DISCUSS_HISTORY_MAX) mem.turns.shift();
+        }
+        // サーバーが解決した主題(⑥)も引き継ぎに使う
+        const rs = resp.resolvedSubject;
+        if (rs && rs.type) { mem.lastSubject = { type: rs.type, labelJa: rs.labelJa || rs.labelEn, labelEn: rs.labelEn || null }; mem.lastPlayerHint = rs.type === "player" ? (playerHint || null) : null; }
+        else if (subject && subject.type) { mem.lastSubject = subject; mem.lastPlayerHint = playerHint || null; }
       }
-      if (subject && subject.type) { mem.lastSubject = subject; mem.lastPlayerHint = playerHint || null; }
     } catch (e) { /* 記憶は付加機能。失敗しても回答表示に影響させない */ }
   } else {
     // 議論エンジンに接続できなかった/失敗した場合: 「考えたふり」はせず正直に状況を
@@ -10005,7 +10347,7 @@ async function runDiscussFlowInner(q, dLevel, contextPlayer, pushFn, renderFn, f
     // v85: サーバーが返す原因別メッセージ(時間切れ・混雑・キー・残高等)は日本語で
     // 返るため、非日本語表示では window.t で訳す(辞書に無ければ原文のまま=でっち上げない)。
     const reasonRaw = (resp && resp.message) ? resp.message : "AIサーバーの起動に時間がかかっているようです(しばらく使われていなかったサーバーが目を覚ますまで最大1分ほどかかります)。もう一度送信すると、多くの場合そのまま話せます。";
-    const reason = (typeof window !== "undefined" && window.t) ? window.t(reasonRaw) : reasonRaw;
+    const reason = tr(reasonRaw);
     let fallback = "";
     if (subject.type === "club" && subject.labelJa) fallback = buildClubAnswer(subject.labelJa, dLevel);
     else if (subject.type === "player" && resolvedPlayer) {
@@ -10014,6 +10356,7 @@ async function runDiscussFlowInner(q, dLevel, contextPlayer, pushFn, renderFn, f
     }
     pendingMsg.text = `<p class="value-note">⚠️ ${escapeHtml(reason)}</p>` +
       (fallback ? `<p>${escapeHtml(fallback)}</p><p class="value-note">(↑参考として、登録データに基づく要約を表示しています。AIによる考察ではありません)</p>` : "");
+    pendingMsg.extras = "";
   }
   renderFn();
 }
@@ -10286,6 +10629,25 @@ document.getElementById("heroChatBtn").addEventListener("click", () => {
   heroAskAI(input.value);
   input.value = "";
 });
+// ---- v104 ⑤: 会話の設定の読み書き(端末内だけ) ----
+(function initChatProfileUi() {
+  const clubEl = document.getElementById("chatProfileClub");
+  const nickEl = document.getElementById("chatProfileNick");
+  const noteEl = document.getElementById("chatProfileNote");
+  if (!clubEl || !nickEl) return;
+  const fill = () => { const p = readDiscussProfile() || {}; clubEl.value = p.favoriteClub || ""; nickEl.value = p.nickname || ""; };
+  fill();
+  const sayJa = (msg) => { if (noteEl) noteEl.textContent = (typeof window.t === "function") ? window.t(msg) : msg; };
+  document.getElementById("chatProfileSaveBtn").addEventListener("click", () => {
+    const p = {};
+    const club = clubEl.value.trim().slice(0, 40); const nick = nickEl.value.trim().slice(0, 20);
+    if (club) p.favoriteClub = club;
+    if (nick) p.nickname = nick;
+    writeDiscussProfile(p);
+    sayJa(Object.keys(p).length ? "保存しました。次の質問からAIがこの設定を踏まえて答えます。" : "設定を空にしました。");
+  });
+  document.getElementById("chatProfileClearBtn").addEventListener("click", () => { writeDiscussProfile(null); fill(); sayJa("設定を消しました。"); });
+})();
 document.getElementById("heroChatInput").addEventListener("keydown", (e) => {
   if (e.isComposing || e.keyCode === 229) return; // v97: 日本語入力の変換確定の Enter では送らない
   if (e.key === "Enter") { heroAskAI(e.target.value); e.target.value = ""; }
@@ -10293,6 +10655,17 @@ document.getElementById("heroChatInput").addEventListener("keydown", (e) => {
 // AI対話パートナーの「深掘り質問」チップ(hero chat側) — #heroChatMessages自体は
 // 固定の要素なので、ここで一度だけイベント委譲すればよい。
 document.getElementById("heroChatMessages").addEventListener("click", (e) => {
+  const cl = e.target.closest(".chat-clarify-btn");
+  if (cl) {
+    // v104 ⑦: 聞き返しで選んだクラブを主題にして、元の質問をそのまま聞き直す
+    let forced = null;
+    try { forced = JSON.parse(cl.dataset.subject || "null"); } catch (err) { forced = null; }
+    const q = cl.dataset.q || "";
+    heroChatHistory.push({ role: "user", text: escapeHtml(`${q}(${cl.textContent.replace(/^・/, "")})`) });
+    renderHeroChatUI();
+    runDiscussFlow(q, effectiveDialogueLevel(q, state.level), null, (msg) => heroChatHistory.push(msg), renderHeroChatUI, undefined, "hero", forced);
+    return;
+  }
   const btn = e.target.closest(".chat-followup-btn");
   if (btn) heroAskAI(btn.dataset.q);
 });
@@ -11481,11 +11854,23 @@ function predUnlearnedLineHtml(p) {
 //   すでに出している予想と**同じ確率分布**から取り出した数字。新しい推定は無い。
 //   利用者のご指示(情報が溢れて見にくくなるのを避ける)に従い、
 //   既定は折りたたみ1行。押した人にだけ中身を見せる。
+// ---- v104 J「試合内容の見立て」: 常時1行(合計得点の見込み・2.5点以上・両チーム得点・最有力スコア・一言) ----
+//   サーバーが記録ごとに保存した content(勝敗と同じスコア分布から機械的に導出・較正の状態つき)。
+//   v104 より前の記録には無い(その場合は何も出さない=でっち上げない)。
+function predContentLineHtml(p) {
+  const c = p && p.content;
+  if (!c || !Number.isFinite(Number(c.over25Pct))) return "";
+  const top = Array.isArray(c.topScorelines) && c.topScorelines.length ? c.topScorelines[0] : null;
+  const calNote = c.calibrated ? "較正済み" : "較正中";
+  // 見立ての文は「接戦(拮抗)・ロースコア寄り」のように2つの語を「・」で繋いだ形。語ごとに span で包むと辞書で訳せる
+  const styleHtml = String(c.styleJa || "").split("・").map((x) => `<span>${escapeHtml(x)}</span>`).join("・");
+  return `<div class="value-note" style="margin-top:2px;">🧪 <span>試合内容の見立て</span>: <strong>${styleHtml}</strong> ・ <span>合計</span> <strong>${Number(c.expTotalGoals).toFixed(1)}</strong><span>点見込み</span> ・ <span>2.5点以上</span> <strong>${Number(c.over25Pct)}%</strong> ・ <span>両チーム得点</span> <strong>${Number(c.bttsPct)}%</strong>${top ? ` ・ <span>最有力</span> <strong>${escapeHtml(String(top.scoreline))}</strong>(${Number(top.pct)}%)` : ""} <span style="opacity:.75;">(<span>${calNote}</span>)</span></div>`;
+}
 function predScenarioLineHtml(p) {
   if (!p) return "";
   const hasScenarios = Array.isArray(p.scenarios) && p.scenarios.length;
   const d = p.derived;
-  if (!hasScenarios && !d) return "";
+  if (!hasScenarios && !d) return predContentLineHtml(p);
   const scenarioLine = hasScenarios
     ? `<div class="value-note" style="margin-top:2px;"><span>スコアの可能性(上位5件)</span>: ${p.scenarios.map((s) => `${escapeHtml(String(s.scoreline))} <strong>${Number(s.pct)}%</strong>`).join(" ・ ")}</div>`
     : "";
@@ -11494,7 +11879,7 @@ function predScenarioLineHtml(p) {
   const derivedLine = d
     ? `<div class="value-note" style="margin-top:2px;"><span>両チーム得点</span> <strong>${Number(d.bttsPct)}%</strong> ・ <span>3点以上</span> <strong>${Number(d.over25Pct)}%</strong> ・ <span>完封</span> ${homeName} <strong>${Number(d.homeCleanSheetPct)}%</strong> / ${awayName} <strong>${Number(d.awayCleanSheetPct)}%</strong></div>`
     : "";
-  return `<details style="margin-top:2px;"><summary style="cursor:pointer; font-size:12px; color:var(--series-2);">📊 スコアの可能性・傾向</summary>${scenarioLine}${derivedLine}</details>`;
+  return `${predContentLineHtml(p)}<details style="margin-top:2px;"><summary style="cursor:pointer; font-size:12px; color:var(--series-2);">📊 スコアの可能性・傾向</summary>${scenarioLine}${derivedLine}</details>`;
 }
 // 一覧の行に足す1行の予想ストリップ(軽さ優先: バー無し・テキストのみ)
 function predStripHtml(p) {

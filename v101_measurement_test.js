@@ -386,7 +386,7 @@ const req = (method, p) => new Promise((resolve, reject) => {
       assert.ok(new RegExp(`"${k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}":\\s*\\[`).test(dictPart), "辞書に無い: " + k);
     }
     const sw = fs.readFileSync(path.join(__dirname, "sw.js"), "utf8");
-    assert.ok(/soccer-ai-shell-v101/.test(sw), "sw.js の版が v101 になっていない");
+    assert.ok(/soccer-ai-shell-v(101|10[2-9]|1[1-9]\d)/.test(sw), "sw.js の版が v101 以降になっていない"); // v104 で画面更新のため版を進めた
   });
 
   /* ================= J: 本物の日次学習で較正が予想に適用される ================= */

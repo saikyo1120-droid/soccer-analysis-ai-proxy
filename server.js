@@ -44,7 +44,12 @@ const lineupWatchLib = require("./learning/lineupWatch");
 const oddsApiLib = require("./learning/oddsApi");
 const { extractMatchWinnerOdds: extractMatchWinnerOddsLW, impliedProbsPct: impliedProbsPctLW } = require("./learning/roiTracker");
 const { planInformationNeeds } = require("./discuss/planner");
-const { generateLLM, currentProviderName } = require("./llm");
+const { generateLLM, generateConversation, providerCapabilities, currentProviderName } = require("./llm");
+// ---- v104(2026年11月12日): 会話の改良(質問の種類・道具・主題の解決・聞き返し・流れる表示・記憶) ----
+const discussIntent = require("./discuss/intent");
+const subjectResolver = require("./discuss/subjectResolver");
+const discussTools = require("./discuss/tools");
+const discussToolLoop = require("./discuss/toolLoop");
 
 // Stage E: Knowledge Engine / Memory Engine / Reasoning Engine(Hypothesis
 // Generator + Evidence Ranking)。実体は server/knowledge/・server/memory/・
@@ -83,6 +88,7 @@ const { getAccuracyTrend, computeMarketProbs, oneX2ProbsOf } = require("./learni
 // 2026年8月・精度証明ラウンド②: 較正(実測のズレ)に基づく表示勝率の自動補正
 const { applyCalibration } = require("./learning/calibrationCorrection");
 const probCalibrationLib = require("./learning/probCalibration"); // v101 ★4: 最終確率の温度較正(開示用)
+const matchContentLib = require("./learning/matchContent"); // v104 J: 試合内容の予測(表示・開示・会話の道具)
 // 自己改善ループ⑤: 「この1か月でAIが何を改善してきたか」の履歴読み出し
 const { getSelfImprovementHistory } = require("./learning/selfImprovement");
 // 2026年8月・AI知能計測ラウンド(ご指示③⑤): 考察の質とRAG使用率を、質問時は
@@ -3199,8 +3205,17 @@ function buildPredictionBasis(record) {
   };
 }
 
-function buildTodayPredictionEntry(fixture, record, calibrationMap) {
+function buildTodayPredictionEntry(fixture, record, calibrationMap, contentModel) {
   if (!fixture || !record) return null;
+  // ---- v104 J: 試合内容の見立て(記録に content がある v104 以降の予想だけ。旧記録は null=でっち上げない) ----
+  const contentView = (() => {
+    if (!record.content) return null;
+    try {
+      const cal = contentModel && contentModel.calibration;
+      const samples = cal && cal.over25 ? ((cal.over25.nTrain || 0) + (cal.over25.nValid || 0)) : null;
+      return matchContentLib.describeContent(record.content, { calibrationSamples: Number.isFinite(samples) ? samples : undefined });
+    } catch (e) { return null; }
+  })();
   // v97(全体監査): 画面の勝率は「判定に実際に使った最終確率」(record.finalProbs。市場混合・
   //   2つ目の意見を含む)を優先する。以前は λ だけから計算し直していたため、混合で判定した
   //   試合では表示の勝率と判定の根拠が食い違っていた。旧記録(finalProbs 無し)は従来どおり λ から。
@@ -3283,6 +3298,8 @@ function buildTodayPredictionEntry(fixture, record, calibrationMap) {
     //   スコア分布**を取り出すだけ。新しい推定も外部データも足していない。
     //   画面では折りたたみ1行に収める(情報過多を避けるため)。
     ...buildScenarioFields(record),
+    // v104 J: 試合内容の見立て(合計得点・2.5点以上・両チーム得点・スコア上位3・一言の見立て・較正の状態)
+    content: contentView,
     // v50: 市場ブレンドで判定した予想は、その内訳(市場◯%+AI◯%)を必ず開示する
     blend: record.blendUsed ? {
       marketPct: record.blendUsed.marketPct, aiPct: record.blendUsed.aiPct,
@@ -3362,6 +3379,7 @@ async function handlePredictionsToday() {
   const fixtures = fx.fixtures || [];
   let predictions = [];
   let calibrationMap = null;
+  let contentModelForToday = null; // v104 J
   // v97(全体監査): 読めなかった(保存先停止・通信失敗)ことを「予想が無い」に潰さない。
   //   旧実装は1試合1 GET(最大80回)+失敗時 null だったため、9月の Upstash 停止中は
   //   「本日の試合の中にAIが予想を保存している試合はまだありません」と断定して
@@ -3373,10 +3391,12 @@ async function handlePredictionsToday() {
     // 表示上限と揃える。v97: 80回の GET → 較正マップ込みで MGET 1〜2回(往復・コマンド数の削減)。
     const target = fixtures.slice(0, 80);
     try {
-      const values = await upstashMGetJSONStrict(["learn:calibration:map", ...target.map((f) => `learn:ownpred:${f.id}`)]);
+      // v104 J: 試合内容モデル(較正の件数の開示用)も同じ MGET で読む(+1キー・往復は増えない)
+      const values = await upstashMGetJSONStrict(["learn:calibration:map", matchContentLib.MODEL_KEY, ...target.map((f) => `learn:ownpred:${f.id}`)]);
       calibrationMap = values[0] || null;
-      const records = values.slice(1);
-      predictions = target.map((f, i) => buildTodayPredictionEntry(f, records[i], calibrationMap)).filter(Boolean);
+      contentModelForToday = values[1] || null;
+      const records = values.slice(2);
+      predictions = target.map((f, i) => buildTodayPredictionEntry(f, records[i], calibrationMap, contentModelForToday)).filter(Boolean);
       predictions.sort((a, b) => new Date(a.kickoff || 0) - new Date(b.kickoff || 0));
     } catch (e) {
       readFailed = true;
@@ -3408,14 +3428,14 @@ async function handlePredictionsToday() {
       const pendingIds = (await upstashCmd(["LRANGE", "learn:ownpred:pending", "-40", "-1"])) || [];
       // v97: 40回の GET → MGET 1回。calibrationMapは上で取得済みの場合がある(未取得のときだけ読む)
       const keys = pendingIds.map((id) => `learn:ownpred:${id}`);
-      const values = await upstashMGetJSONStrict(fixtures.length ? keys : ["learn:calibration:map", ...keys]);
+      const values = await upstashMGetJSONStrict(fixtures.length ? keys : ["learn:calibration:map", matchContentLib.MODEL_KEY, ...keys]);
       let recs = values;
-      if (!fixtures.length) { calibrationMap = values[0] || null; recs = values.slice(1); }
+      if (!fixtures.length) { calibrationMap = values[0] || null; contentModelForToday = values[1] || null; recs = values.slice(2); }
       upcomingPredictions = selectUpcomingPredictionRecords(recs, Date.now())
         .map((r) => buildTodayPredictionEntry({
           id: r.fixtureId, date: r.kickoff, status: "NS", league: r.league || null,
           home: { name: r.homeTeamEn }, away: { name: r.awayTeamEn }, score: null,
-        }, r, calibrationMap))
+        }, r, calibrationMap, contentModelForToday))
         .filter(Boolean);
     } catch (e) {
       // 付加情報。失敗しても本日ぶんの表示は返すが、v97: 「読めなかった」は痕跡を残し、
@@ -5773,13 +5793,19 @@ async function loadMatchupContext() {
     elo: null,
   };
   if (UPSTASH_ENABLED) {
-    const [ratings, teamNames, teamStats, weightsRaw, eloDaily] = await Promise.all([
+    const [ratings, teamNames, teamStats, weightsRaw, eloDaily, teamMapRaw] = await Promise.all([
       upstashGetJSON(RATINGS_KEY).catch(() => null),
       upstashGetJSON("learn:teamnames").catch(() => null),
       upstashGetJSON(TEAM_STATS_KEY).catch(() => null),
       upstashCmd(["GET", "learn:weights"]).catch(() => null),
       upstashGetJSON(CLUBELO_DAILY_KEY).catch(() => null),
+      // v104 ⑥: 動的クラブ宇宙(v98)の日本語名も名寄せの辞書に加える(学習で増えた292クラブ)。GET 1回(10分キャッシュ)
+      upstashGetJSON("kb:universe:teammap").catch(() => null),
     ]);
+    try {
+      const extra = (teamMapRaw && Array.isArray(teamMapRaw.clubs)) ? teamMapRaw.clubs.filter((c) => c && c.nameEn && c.nameJa).map((c) => ({ nameEn: c.nameEn, nameJa: c.nameJa })) : [];
+      if (extra.length) ctx.jaMap = matchupLib.buildJaMap([...CLUB_UNIVERSE, ...extra]);
+    } catch (e) { /* 辞書の拡張は付加機能。失敗しても従来の辞書で続ける */ }
     ctx.ratings = ratings || null;
     ctx.teamStats = teamStats || null;
     try { ctx.weights = weightsRaw ? { ...EXTENDED_DEFAULT_WEIGHTS, ...JSON.parse(weightsRaw) } : EXTENDED_DEFAULT_WEIGHTS; }
@@ -5851,7 +5877,9 @@ async function handleMatchup(query) {
   return { status: 200, body };
 }
 
-async function handleMatchAnalysis(query, clientIp) {
+async function handleMatchAnalysis(query, clientIp, opts) {
+  // v104 ②: 会話の道具から呼ぶときは LLM の作文(narrative)を省く(データだけ欲しい。費用と待ち時間を掛けない)
+  const skipLlm = !!(opts && opts.skipLlm);
   const homeRaw = (query.get("home") || "").trim();
   const awayRaw = (query.get("away") || "").trim();
   // v82(2026年9月5日・多言語): LLMが書く4欄(narrative等)だけ利用者の言語で
@@ -5872,7 +5900,7 @@ async function handleMatchAnalysis(query, clientIp) {
   // 同じ対戦の連打で毎回23件のAPIを使わないよう、30分キャッシュする。
   // v82: 言語もキーに含める(言語別にLLM文が異なるため。日本語利用者のキーは
   // "ja"が付くだけで、ヒット率・費用のふるまいは従来と同じ)
-  const maCacheKey = cacheKeyOf("match-analysis", [homeRaw.toLowerCase(), awayRaw.toLowerCase(), maLang, appDateKey()]);
+  const maCacheKey = cacheKeyOf("match-analysis", [homeRaw.toLowerCase(), awayRaw.toLowerCase(), maLang, appDateKey(), skipLlm ? "data" : "full"]);
   const maCached = cacheGet(maCacheKey);
   if (maCached) return { status: 200, body: maCached };
 
@@ -6202,7 +6230,9 @@ async function handleMatchAnalysis(query, clientIp) {
   // 全体枠が減り続ける(返金も無い)。/api/discuss と同じ正しい順序に統一する:
   //   ①per-IP を先に消費(弾かれたら全体枠は一切減らさない)
   //   ②全体枠を消費(弾かれたら、直前に消費した per-IP の1枠を返金する)
-  if (typeof generateLLM === "function" && tryConsumeLlmBudgetForIp(clientIp)) {
+  if (skipLlm) {
+    // v104 ②: 会話の道具からの呼び出し。作文(narrative)は要らないので LLM 予算を一切使わない(下の決定論的な文が入る)
+  } else if (typeof generateLLM === "function" && tryConsumeLlmBudgetForIp(clientIp)) {
    if (await tryConsumeLlmBudget()) {
     try {
       const systemPrompt = [
@@ -7013,7 +7043,61 @@ function normalizeAppLang(v) {
   return APP_LANGS.has(s) ? s : "ja";
 }
 
-function buildDiscussSystemPrompt(lang) {
+// ---- v104: 会話の設定(環境変数で止められる。既定はすべて有効) ----
+const DISCUSS_TOOLS_ENABLED = String(process.env.DISCUSS_TOOLS || "1") !== "0";          // ② 道具つきの会話
+const DISCUSS_RESOLVE_SUBJECT = String(process.env.DISCUSS_RESOLVE_SUBJECT || "1") !== "0"; // ⑥ 主題の解決
+const DISCUSS_TOOL_MAX_ROUNDS = Math.max(1, parseInt(process.env.DISCUSS_TOOL_MAX_ROUNDS, 10) || 3);
+const DISCUSS_TOOL_MAX_CALLS = Math.max(1, parseInt(process.env.DISCUSS_TOOL_MAX_CALLS, 10) || 5);
+const DISCUSS_HISTORY_TURNS = Math.max(1, parseInt(process.env.DISCUSS_HISTORY_TURNS, 10) || 10);  // ⑤ 記憶(往復数)
+
+/**
+ * v104 ①: 質問の種類(mode)ごとの system prompt。
+ *   discussion … 従来の7欄(1文字も変えていない)
+ *   prediction / fact / smalltalk / offtopic … 共通の原則(でっち上げ禁止・事実と意見の書き分け)+種類ごとの形式
+ *   extras.tools … 道具の使い方の指示(道具つきの会話のときだけ)
+ *   extras.profile … 利用者の設定(詳しさ・好きなクラブ)に合わせた調子
+ */
+function buildDiscussSystemPrompt(lang, mode, extras) {
+  const m = mode || "discussion";
+  const ex = extras || {};
+  const l = normalizeAppLang(lang);
+  if (m === "discussion") {
+    const base = buildDiscussSystemPromptDiscussion(l);
+    return [base, discussToolInstructionText(ex.tools), discussProfileInstructionText(ex.profile)].filter(Boolean).join("\n\n");
+  }
+  const common = [
+    "あなたはサッカーの分析官です。与えられた「事実」と、道具で取得できたデータだけを根拠として、利用者の質問に答えてください。",
+    "事実に無い具体的な数字・固有名詞(スコア・日付・移籍額・選手名など)を新たに作ってはいけません。無いものは「取得できません」「データにありません」と正直に書いてください。",
+    "事実と自分の意見は明確に書き分けてください(「〜という結果が出ています」と「私は〜と考えます」のように)。",
+    "【最重要】回答は、利用者の質問そのものに正面から答えてください。1文目は質問への直接の答えから書き始めてください。",
+    "利用者の文体に合わせてください(短い口語なら短く・丁寧語なら丁寧に)。絵文字は使わないでください。",
+    l === "ja" ? "日本語で書いてください。" : `本文は必ず${APP_LANG_NAMES_JA[l]}で書いてください(利用者がその言語を選択しています)。クラブ名・選手名・大会名は、回答言語で一般的な表記を使ってください。`,
+  ];
+  return [common.join("\n"), discussIntent.formatInstructionsFor(m, l), discussToolInstructionText(ex.tools), discussProfileInstructionText(ex.profile)].filter(Boolean).join("\n\n");
+}
+
+function discussToolInstructionText(enabled) {
+  if (!enabled) return "";
+  return [
+    "【道具の使い方】あなたは道具(tools)で、このサイトが持つ実データを取りに行けます。",
+    "・今日の試合やAIの予想・確率・根拠、順位・怪我人・直近の結果、選手の今季成績、対戦分析、AIが外した理由、的中率を聞かれたら、推測せず該当の道具で取得してから答えてください。",
+    "・手元の事実だけで十分に答えられるときは道具を使わないでください(1つの質問で使えるのは数回まで)。",
+    "・道具の結果に書かれた数字・固有名詞だけを引用し、ok:false や「取得できません」の項目はそのまま正直に伝えてください。",
+    "・道具を使う前に長い文章を書かないでください(使うなら先に道具、その後に本文)。",
+  ].join("\n");
+}
+
+function discussProfileInstructionText(profile) {
+  if (!profile || !Object.keys(profile).length) return "";
+  const lines = ["【利用者の設定(本人が画面で設定)】" + describeDiscussProfileJa(profile)];
+  if (profile.level === "beginner") lines.push("詳しさ「初心者」: 専門用語には一言の補足を付け、数字は要点だけに絞ってください。");
+  if (profile.level === "expert") lines.push("詳しさ「専門」: 数字(確率・xG・順位・フォーム)を中心に、前置きなく簡潔に。");
+  if (profile.favoriteClub) lines.push(`好きなクラブ「${profile.favoriteClub}」: その試合や話題が含まれるときは先に触れてください(無いときは無理に触れない)。`);
+  return lines.join("\n");
+}
+
+/** 従来(v68〜v101)の7欄の system prompt。v104 でも議論モードはこの文面をそのまま使う */
+function buildDiscussSystemPromptDiscussion(lang) {
   const l = normalizeAppLang(lang);
   const langLines = l === "ja"
     ? ["必ず次の形式で、日本語で出力してください。見出し以外の余計な文章は含めないでください。"]
@@ -7149,16 +7233,164 @@ function parseDiscussLlmOutput(rawText) {
 //   形式が不正な要素は黙って捨てる(エラーにしない=従来の1問完結の動作に戻るだけ)。
 function sanitizeDiscussHistory(raw) {
   if (!Array.isArray(raw)) return [];
-  return raw.slice(-3).map((t) => {
+  // v104 ⑤: 3往復 → 10往復(DISCUSS_HISTORY_TURNS)。1往復あたり質問300字・回答要旨400字に切り詰める
+  //   (10往復でも最大7,000字=プロンプトの肥大を防ぐ。古い往復から落とす)。
+  return raw.map((t) => {
     if (!t || typeof t !== "object") return null;
-    const q = String(t.q || "").trim().slice(0, 500);
-    const a = String(t.a || "").trim().slice(0, 800);
+    const q = String(t.q || "").trim().slice(0, 300);
+    const a = String(t.a || "").trim().slice(0, 400);
     if (!q || !a) return null;
     return { q, a };
-  }).filter(Boolean);
+  }).filter(Boolean).slice(-DISCUSS_HISTORY_TURNS);
 }
 
-async function handleDiscuss(body, clientIp) {
+// ---- v104 ⑤: 利用者の設定(端末内に保存され、質問のたびに送られてくる。サーバーには保存しない) ----
+const DISCUSS_LEVELS = new Set(["beginner", "standard", "expert"]);
+function sanitizeDiscussProfile(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const out = {};
+  const fav = String(raw.favoriteClub || "").trim().slice(0, 40);
+  if (fav && !/[<>{}]/.test(fav)) out.favoriteClub = fav;
+  const level = String(raw.level || "").trim();
+  if (DISCUSS_LEVELS.has(level)) out.level = level;
+  const nick = String(raw.nickname || "").trim().slice(0, 20);
+  if (nick && !/[<>{}]/.test(nick)) out.nickname = nick;
+  return Object.keys(out).length ? out : null;
+}
+function describeDiscussProfileJa(profile) {
+  if (!profile) return "";
+  const parts = [];
+  if (profile.nickname) parts.push(`呼び名: ${profile.nickname}`);
+  if (profile.favoriteClub) parts.push(`好きなクラブ: ${profile.favoriteClub}`);
+  if (profile.level) parts.push(`詳しさ: ${profile.level === "beginner" ? "初心者" : profile.level === "expert" ? "専門" : "標準"}`);
+  return parts.join(" / ");
+}
+
+/** v104 ①: 質問の種類ごとに回答AIの出力を分ける(画面と知能計測が読む共通の形へ) */
+function parseDiscussOutputForMode(mode, text) {
+  if (mode === "discussion") return parseDiscussLlmOutput(text);
+  if (mode === "prediction") {
+    const p = discussIntent.parsePredictionOutput(text);
+    return {
+      predictionFields: { prediction: p.prediction, basis: p.basis, caution: p.caution },
+      answerText: null,
+      followUpQuestions: p.followUpQuestions, parsedOk: p.parsedOk,
+      // 知能計測・記憶の要旨・互換のため、従来の欄にも写す
+      generalView: "", aiOpinion: [p.prediction, p.basis].filter(Boolean).join(" "), counterArgument: p.caution || "",
+      finalConclusion: p.prediction || "", futureOutlook: "", mostImportantOpinion: "",
+    };
+  }
+  const pl = discussIntent.parsePlainOutput(text);
+  return {
+    predictionFields: null, answerText: pl.answerText,
+    followUpQuestions: pl.followUpQuestions, parsedOk: !!pl.answerText,
+    generalView: "", aiOpinion: pl.answerText, counterArgument: "", finalConclusion: "", futureOutlook: "", mostImportantOpinion: "",
+  };
+}
+
+/** v85/v104: LLM の失敗を原因別の日本語メッセージへ(画面を見るだけで原因が分かるように) */
+function discussLlmErrorMessageJa(e) {
+  const httpStatus = e && e.httpStatus;
+  if (e && e.code === "NO_KEY") return "AIのAPIキーが設定されていないため、考察機能はまだ利用できません(サーバーの環境変数をご確認ください)。";
+  if (e && e.code === "TIMEOUT") return "AIの考察に時間がかかりすぎたため、いったん中断しました。もう一度お試しいただくと、多くの場合そのまま考察できます。";
+  if (httpStatus === 429) return "いまAIへのアクセスが混み合っています(レート制限)。少し時間をおいてからもう一度お試しください。";
+  if (httpStatus === 401 || httpStatus === 403) return "AIのAPIキーが正しくないか、権限が不足しているようです(サーバーの設定をご確認ください)。";
+  if (httpStatus === 402 || (e && /credit|balance|quota/i.test(String(e.message)))) return "AI提供元の利用残高が不足しているようです(課金状況をご確認ください)。";
+  return "AIの考察生成に一時的に失敗しました。少し時間をおいてからもう一度お試しください。";
+}
+
+/**
+ * v104 ②: 会話の道具(discuss/tools.js)に渡す実関数。すべて既存の読み出し・計算関数を呼ぶだけ
+ * (新しい推定は作らない。API-Football を使うものは既存の予算保護とキャッシュをそのまま通る)。
+ */
+function buildDiscussToolDeps(clientIp) {
+  return {
+    getTodayPredictions: async () => (await handlePredictionsToday()).body,
+    getPredictionRecord: async (fixtureId) => {
+      if (!UPSTASH_ENABLED) return null;
+      const [rec, calMap, cm] = await upstashMGetJSONStrict([`learn:ownpred:${fixtureId}`, "learn:calibration:map", matchContentLib.MODEL_KEY]);
+      if (!rec) return null;
+      return buildTodayPredictionEntry({
+        id: rec.fixtureId, date: rec.kickoff, status: rec.resolved ? "FT" : "NS", league: rec.league || null, country: rec.leagueCountry || null,
+        home: { name: rec.homeTeamEn }, away: { name: rec.awayTeamEn },
+        score: (rec.actualScore && Number.isFinite(Number(rec.actualScore.home))) ? { home: rec.actualScore.home, away: rec.actualScore.away } : null,
+      }, rec, calMap || null, cm || null);
+    },
+    resolveClub: async (name) => {
+      const ctx = await loadMatchupContext();
+      const r = matchupLib.resolveClub(name, ctx);
+      return r.ok ? { ok: true, labelEn: r.name, labelJa: r.nameJa || null, teamId: r.id } : { ok: false, reason: r.reason, candidates: r.candidates || null };
+    },
+    gatherClubFacts: async (labelEn, needs, labelJa) => {
+      const knowledge = await knowledgeSource.gatherClubKnowledge(labelEn, needs, labelJa);
+      const facts = formatClubFacts(knowledge, needs) || [];
+      // 順位・xG は毎晩の調査ファイル(dossier)にあることが多い(鮮度7日以内のものだけ)
+      try {
+        const dossier = await clubDossier.getDossier(labelEn);
+        const secs = dossier && dossier.sections;
+        const fresh = (sec, limitH) => { const t = sec && sec.computedAt ? new Date(sec.computedAt).getTime() : NaN; return Number.isFinite(t) && (Date.now() - t) <= limitH * 3600000; };
+        if (secs && fresh(secs.standings, 168) && secs.standings.position !== null) facts.push(`国内リーグ順位: ${secs.standings.position}位・勝点${secs.standings.points ?? "不明"}(${Math.round((Date.now() - new Date(secs.standings.computedAt).getTime()) / 86400000)}日前の実測)`);
+        if (secs && fresh(secs.xg, 168) && secs.xg.xgNet !== null) facts.push(`xG(チャンスの質)の収支: ${secs.xg.xgNet > 0 ? "+" : ""}${secs.xg.xgNet}(直近試合の平均)`);
+      } catch (e) { facts.push(`(調査ファイルの読み出しに失敗: ${String((e && e.message) || e).slice(0, 60)})`); }
+      if (Array.isArray(knowledge.errors) && knowledge.errors.length) facts.push(`(取得できなかった項目: ${knowledge.errors.join("・")})`);
+      return facts;
+    },
+    getMatchAnalysis: async (home, away) => {
+      const q = new URLSearchParams({ home, away, lang: "ja" });
+      const { body } = await handleMatchAnalysis(q, clientIp, { skipLlm: true });
+      if (!body || body.ok === false) return body;
+      // 回答AIに渡す分だけ(作文欄・画面用の大きな配列は省く)
+      const pick = {};
+      for (const k of ["home", "away", "probs", "predictedWinner", "predictedScoreline", "features", "featureSummaryJa", "dataNotes", "h2h", "headToHead", "injuries", "standings", "formations", "topScorers", "form", "confidence", "keyFactors", "limitsJa"]) if (body[k] !== undefined) pick[k] = body[k];
+      return Object.keys(pick).length ? { ok: true, ...pick } : body;
+    },
+    getPlayerStats: async (name, team) => {
+      const q = new URLSearchParams({ name, team: team || "", teamEn: "", birth: "" });
+      const { body } = await handlePlayerSeasonStats(q);
+      return body;
+    },
+    getRecentResolved: async () => {
+      if (!UPSTASH_ENABLED) return null;
+      let recs = cacheGet("clubsummary:recentrecs");
+      if (recs === undefined) {
+        const raw = await upstashCmd(["LRANGE", "learn:ownpred:recent", "-300", "-1"]);
+        recs = (raw || []).map((x) => { try { return typeof x === "object" ? x : JSON.parse(x); } catch (e) { return null; } }).filter((r) => r && r.resolved);
+        cacheSet("clubsummary:recentrecs", recs, 10 * 60 * 1000);
+      }
+      return recs.slice().reverse(); // 新しい順
+    },
+    getAccuracySummary: async () => {
+      const cached = cacheGet("discuss:accuracy-summary");
+      if (cached !== undefined) return cached;
+      const trend = await getAccuracyTrend(learningDeps, appDateKey()).catch(() => null);
+      const pick = (sum) => {
+        const o = sum && sum.markets && sum.markets.oneX2;
+        if (!o || !o.measurable) return null;
+        return {
+          n: o.n, hitRatePct: o.hitRatePct, official: o.official || null, avgBrier: o.avgBrier, avgLogLoss: o.avgLogLoss,
+          skillPct: o.skill ? o.skill.logLossSkillPct : null, ecePct: o.ece && Number.isFinite(o.ece.ecePct) ? o.ece.ecePct : (o.ece && o.ece.value) || null,
+          byLearned: o.byLearned && o.byLearned.measurable ? { learnedPct: o.byLearned.learned.hitRatePct, unlearnedPct: o.byLearned.unlearned.hitRatePct, gapPt: o.byLearned.gapPt } : null,
+          byOdds: o.byOdds && o.byOdds.measurable ? o.byOdds : null,
+          byLeague: o.byLeague && Array.isArray(o.byLeague.rows) ? o.byLeague.rows.slice(0, 12).map((r) => ({ league: r.league || r.key, n: r.n, hitRatePct: r.hitRatePct })) : null,
+          matchContent: sum.matchContent && sum.matchContent.measurable ? { n: sum.matchContent.n, shown: sum.matchContent.shown, compare: sum.matchContent.compare } : null,
+          scoreline: sum.scoreline || null,
+        };
+      };
+      const out = trend && trend.available ? {
+        last7Days: pick(trend.last7Days), last30Days: pick(trend.last30Days),
+        byLeague: (trend.last30Days && trend.last30Days.markets && trend.last30Days.markets.oneX2 && trend.last30Days.markets.oneX2.byLeague && trend.last30Days.markets.oneX2.byLeague.rows) ? trend.last30Days.markets.oneX2.byLeague.rows.slice(0, 20).map((r) => ({ league: r.league || r.key, n: r.n, hitRatePct: r.hitRatePct })) : [],
+        partial: !!trend.partial, recordedDays: trend.recordedDays,
+        noteJa: "7日/30日は答え合わせ時に日ごとに保存した集計の合算(当日を含まない)。技能スコア=1−LogLoss/ln3(当てずっぽう=0%)。",
+      } : { noteJa: "精度の記録を読み出せませんでした", partial: true };
+      cacheSet("discuss:accuracy-summary", out, 5 * 60 * 1000);
+      return out;
+    },
+  };
+}
+
+async function handleDiscuss(body, clientIp, hooks) {
+  // v104 ④: hooks.emit(ev) があれば進行状況・本文の断片を流す(/api/discuss/stream)。無ければ従来どおり一括で返す。
+  const emit = (hooks && typeof hooks.emit === "function") ? hooks.emit : () => {};
   if (!body || typeof body !== "object") return { status: 400, body: { ok: false, error: "invalid JSON body" } };
   const question = String(body.question || "").trim();
   if (!question) return { status: 400, body: { ok: false, error: "question is required" } };
@@ -7177,6 +7409,62 @@ async function handleDiscuss(body, clientIp) {
       },
     };
   }
+
+  // ---- v104(2026年11月12日): 主題の解決(⑥)・聞き返し(⑦)・質問の種類(①)・利用者の設定(⑤) ----
+  //   いずれも LLM を呼ばない(費用ゼロ)。予算を消費する前に行い、「聞き返し」で終わる質問は
+  //   利用者の1日の回数を減らさない。
+  const subject = (body.subject && typeof body.subject === "object") ? { ...body.subject } : { type: null };
+  const appLang = normalizeAppLang(body.lang);
+  const discussProfile = sanitizeDiscussProfile(body.profile);
+  const discussHistory = sanitizeDiscussHistory(body.history);
+  let subjectResolution = null;
+  // 画面が「選手名らしき語」を推測しただけ(登録選手でも実検索の手がかりも無い)のときは、クラブ名の可能性を先に確かめる
+  //   (実ブラウザ検査で再現: 「マンチェスターはどう?」が選手「マンチェスター」の検索へ回っていた)
+  const guessedPlayerOnly = subject.type === "player" && body.playerHint && typeof body.playerHint === "object"
+    && !body.playerHint.teamEn && !body.playerHint.birth && !(body.subject && body.subject.resolvedPlayer);
+  if (guessedPlayerOnly && DISCUSS_RESOLVE_SUBJECT) {
+    try {
+      const rctx0 = await loadMatchupContext();
+      const r0 = subjectResolver.resolveSubjectFromQuestion(question, rctx0);
+      if ((r0 && r0.subject) || (r0 && r0.clarify)) { subject.type = null; subject.labelJa = null; subject.labelEn = null; subject.playerGuessDropped = true; }
+    } catch (e) { /* 判定できなければ推測した選手名のまま */ }
+  }
+  if (!subject.type && DISCUSS_RESOLVE_SUBJECT) {
+    try {
+      const rctx = await loadMatchupContext();
+      subjectResolution = subjectResolver.resolveSubjectFromQuestion(question, rctx);
+      if (subjectResolution && subjectResolution.subject) {
+        subject.type = "club";
+        subject.labelJa = subjectResolution.subject.labelJa || subjectResolution.subject.labelEn;
+        subject.labelEn = subjectResolution.subject.labelEn;
+        subject.teamId = subjectResolution.subject.teamId;
+        subject.resolvedBy = "server";
+      } else if (subjectResolution && subjectResolution.clarify) {
+        // ⑦ 1つに絞れないクラブ名が含まれ、確定したクラブが1つも無い → 推測せず1回だけ聞き返す
+        const c = subjectResolution.clarify;
+        return {
+          status: 200,
+          body: {
+            ok: true, mode: "clarify",
+            question: subjectResolver.clarifyMessageJa(c),
+            token: c.token,
+            options: c.candidates.map((name) => ({ label: name, subject: { type: "club", labelJa: name, labelEn: name } })),
+            lang: appLang,
+            meta: { subjectResolution: { method: "ambiguous", token: c.token, candidates: c.candidates } },
+          },
+        };
+      }
+    } catch (e) {
+      // 名寄せは付加機能。失敗しても従来どおり(主題なし)で続ける。理由は meta に残す(黙らない)
+      subjectResolution = { subject: null, clubs: [], clarify: null, method: "error", errorJa: String((e && e.message) || e).slice(0, 120) };
+    }
+  }
+  const intent = discussIntent.classifyIntent(question, {
+    subject,
+    hasMatchContext: /今日|明日|昨日|今夜|今週|試合|対戦|today|tonight|tomorrow|yesterday|match|game|今天|明天|比赛|hoy|mañana|partido/i.test(question),
+  });
+  const discussMode = intent.mode;
+  const lightweightMode = discussMode === "smalltalk" || discussMode === "offtopic";
 
   // 予算チェックはPlanner/RAG/Reasoning Engineより先に行う。どうせLLMを呼べない
   // ならAPI-Football側のクォータも消費させないため。①IPごとの上限→②サイト全体の
@@ -7205,12 +7493,10 @@ async function handleDiscuss(body, clientIp) {
     };
   }
 
-  const subject = (body.subject && typeof body.subject === "object") ? body.subject : { type: null };
-  // v56: 利用者の言語設定(未指定・不正値は日本語=これまでと完全に同じ動作)
-  const appLang = normalizeAppLang(body.lang);
-  // v51(第10次監査でvarから昇格): 実成績が取れた選手の質問は上位モデルで考察する
+  // v56: 利用者の言語設定は上(v104 で前倒し)。v51(第10次監査でvarから昇格): 実成績が取れた選手の質問は上位モデルで考察する
   let playerStatsFoundForTier = false;
   const plan = planInformationNeeds(question, subject);
+  if (subjectResolution && subjectResolution.subject) emit({ t: "status", key: "subject", ja: `対象: ${subject.labelJa || subject.labelEn}` });
 
   let facts = [];
   let stats = {};
@@ -7226,7 +7512,11 @@ async function handleDiscuss(body, clientIp) {
   let memorySubjectKey = null;
   let previousConclusion = null;
 
-  if (subject.type === "club") {
+  if (lightweightMode) {
+    // v104 ①: 挨拶・雑談・サッカー以外は実データを取りに行かない(費用ゼロで短く返す)
+    confidence = null;
+  } else if (subject.type === "club") {
+    emit({ t: "status", key: "gathering", ja: "実データを確認しています…" });
     if (!subject.labelEn) {
       facts.push(`「${subject.labelJa || "対象クラブ"}」の英語名が特定できなかったため、実データの取得を省略しました。`);
       confidence = { stars: 1, reasonJa: "クラブを実データ上で特定できなかったため、一般的な知識のみに基づく考察です。" };
@@ -7676,7 +7966,11 @@ async function handleDiscuss(body, clientIp) {
   const msSubject = subject.type === "player"
     ? { ...subject, playerName: (body.playerHint && body.playerHint.name) || null }
     : subject;
-  if (discussMultiStep.isMultiStepEnabled() && (subject.type === "club" || subject.type === "player" || !subject.type)) {
+  // v104 ②: 道具つきの会話が使える(プロバイダー対応+有効+事実/予想/議論の質問)ときは、
+  //   回答AI自身が必要なデータを取りに行くので、計画AI(多段思考)は使わない(二重取得と費用を避ける)。
+  const discussCaps = providerCapabilities();
+  const useToolLoop = DISCUSS_TOOLS_ENABLED && discussCaps.tools && !lightweightMode;
+  if (!useToolLoop && discussMultiStep.isMultiStepEnabled() && (subject.type === "club" || subject.type === "player" || !subject.type)) {
     // 「最後の1枠」を計画に使わないための予約ルール:
     //   計画の呼び出し(+1)をしても、他の誰かの回答用に最低1枠が残る場合だけ
     //   多段思考を実行する。残り予算が少ない日は、多段思考より「より多くの
@@ -7729,7 +8023,9 @@ async function handleDiscuss(body, clientIp) {
   // 優先順位④: 6段階の検討結果をLLMへ渡し、「私は○○が最も重要だと考えます」で
   // 締めることを明示的に指示する(テンプレート化を避けるため、根拠の状況に
   // 応じて内容が毎回変わる内部メモをそのまま添える)。
-  if (deliberationResult) {
+  // v104: 「最後は必ず〜で締める」は7欄の議論モードだけ(事実・予想の短い回答には付けない。熟考の結果自体は
+  //   reasoningBundle 経由で渡っている)
+  if (deliberationResult && discussMode === "discussion") {
     reasoningPromptBlock += `\n\n${deliberationResult.promptNote}\n` +
       `【必ず守ること】最後は必ず「${deliberationResult.stages.step6_finalConclusion.headlineJa}」という趣旨の一文で締めてください。` +
       (appLang !== "ja" ? "(この趣旨を、利用者が選択した回答言語で自然に述べてください)" : "") +
@@ -7739,9 +8035,16 @@ async function handleDiscuss(body, clientIp) {
   //   これまでAI会話は1問ごとに記憶を失っていた(「じゃあ彼の弱点は?」の
   //   「彼」が誰か分からなかった)。画面が送る直近の往復(最大3)を参考情報
   //   として添える。LLM呼び出し回数は従来どおり1回のまま。
-  const discussHistory = sanitizeDiscussHistory(body.history);
   knowledgeMeta.historyTurns = discussHistory.length;
+  knowledgeMeta.mode = discussMode;
+  knowledgeMeta.intentReasonJa = intent.reasonJa;
+  knowledgeMeta.subjectResolution = subjectResolution ? { method: subjectResolution.method, clubs: (subjectResolution.clubs || []).map((c) => c.labelEn), errorJa: subjectResolution.errorJa || null } : null;
+  knowledgeMeta.profileUsed = discussProfile ? Object.keys(discussProfile) : [];
   const userPrompt = [
+    ...(discussProfile && Object.keys(discussProfile).length ? [
+      `利用者について(本人が画面で設定した内容。回答の調子と例の選び方に使う): ${describeDiscussProfileJa(discussProfile)}`,
+      "",
+    ] : []),
     ...(discussHistory.length ? [
       "直前の会話(参考情報。「彼」「その選手」などの指す相手はこの文脈で解釈してください。ただし事実の根拠としては、この下の「取得できた事実」を優先すること):",
       ...discussHistory.map((t, i) => `- 質問${i + 1}: ${t.q}\n  回答${i + 1}(要旨): ${t.a}`),
@@ -7776,67 +8079,97 @@ async function handleDiscuss(body, clientIp) {
 
   let llmOut;
   let llmModelUsed = null, llmTierUsed = null, llmWasTruncated = false;
+  let discussRun = null; // v104: 道具の往復の記録(開示用)
+  // v104 ①: 質問の種類ごとの出力指示。議論(discussion)は従来の7欄をそのまま使う
+  const systemPromptForMode = buildDiscussSystemPrompt(appLang, discussMode, { tools: useToolLoop, profile: discussProfile });
   try {
-    // v51: 上限700では7項目の濃い日本語回答が途中で切れる(本番実画面で
-    // 「…むしろ得点・アシストという直結指」の尻切れを確認)。上限を引き上げ、
-    // それでも切れた場合はプロバイダー側が1回だけ書き直し、なお切れたら
-    // truncatedフラグで受け取って利用者に正直に注記する。
-    // ---- v85(2026年9月8日・本番実測での特定): 重い考察が「時間切れ」で毎回失敗 ----
-    //   heavy(claude-opus-5・1400トークン)は生成に40〜70秒かかるのに、内部の
-    //   タイムアウトが30秒のままで、完成前に打ち切られていた(同時刻の本番で
-    //   軽量モデルのマッチ分析は成功=キー・残高は正常と実測)。
-    //   ①待ち時間を延ばす(heavyは60秒) ②尻切れ書き直しはしない(対話は待ち時間
-    //   優先。切れたら正直に注記) ③それでも時間切れなら軽量モデルへ自動切替して
-    //   必ず答えを返す(使ったモデルはmeta.llmModelで開示)。
-    const isHeavy = llmTier === "heavy";
-    const { text, tier: usedTier, model: usedModel, truncated: llmTruncated, modelFallbackFrom } = await generateLLM({
-      systemPrompt: buildDiscussSystemPrompt(appLang), userPrompt,
-      maxTokens: isHeavy ? 1400 : 1100, tier: llmTier,
-      timeoutMs: isHeavy ? 60000 : 30000,
-      truncateRetry: false,
-      timeoutFallbackToLight: isHeavy,       // heavyが時間切れなら軽量モデルへ1回だけ切替
-      timeoutFallbackTimeoutMs: 25000,
-      timeoutFallbackMaxTokens: 1000,        // 切替後は少し短めにして確実に完成させる
-    });
-    llmTierUsed = usedTier || null;
-    llmModelUsed = usedModel || null;
-    llmWasTruncated = !!llmTruncated;
-    if (modelFallbackFrom) {
-      console.error(`[discuss] heavyモデル(${modelFallbackFrom})が時間切れのため、${usedModel}で回答しました`);
+    if (useToolLoop) {
+      // ---- v104 ②④: 道具つきの会話ループ(軽量モデルで道具を往復 → 重い質問は上位モデルで仕上げ) ----
+      //   予算: 2往復目以降はサイト全体の予算を1回ずつ消費する(個人の回数は質問1回=1回のまま)。
+      const toolDeps = buildDiscussToolDeps(clientIp);
+      const tools = discussTools.toolDefinitions(toolDeps);
+      const loopTier = "light";
+      const finalTier = llmTier === "heavy" ? "heavy" : null;
+      emit({ t: "status", key: "thinking", ja: "AIが考えています…" });
+      const run = await discussToolLoop.runToolLoop({
+        systemPrompt: systemPromptForMode, userContent: userPrompt, tools,
+        execute: (name, input) => discussTools.executeTool(name, input, toolDeps),
+        generateConversation, tier: loopTier, finalTier, fallbackTier: "light",
+        stream: !!(hooks && hooks.stream), emit,
+        maxRounds: DISCUSS_TOOL_MAX_ROUNDS, maxCalls: DISCUSS_TOOL_MAX_CALLS,
+        maxTokens: discussMode === "discussion" ? 1400 : (discussMode === "prediction" ? 900 : 700),
+        timeoutMs: 40000, finalTimeoutMs: 60000, finalMaxTokens: 1400, fallbackTimeoutMs: 25000,
+        canAffordRound: async () => tryConsumeLlmBudget(),
+        finalInstruction: "上の下書きと取得済みのデータをもとに、指定の形式で最終回答を書き直してください。数字・固有名詞は取得済みの事実にあるものだけを使い、無いものは「取得できません」と書くこと。",
+      });
+      discussRun = { rounds: run.rounds, calls: run.calls, toolCalls: run.toolCalls, exhausted: run.exhausted, streamed: !!(hooks && hooks.stream), finalSkippedForBudget: !!run.finalSkippedForBudget };
+      llmTierUsed = run.tier || loopTier;
+      llmModelUsed = run.model || null;
+      llmWasTruncated = !!run.truncated;
+      if (run.fallbackFrom) console.error(`[discuss] heavyモデルが時間切れのため、${run.model}で回答しました`);
+      llmOut = parseDiscussOutputForMode(discussMode, run.text);
+    } else {
+      // ---- 従来の1往復(道具なし。他プロバイダー・DISCUSS_TOOLS=0・挨拶や雑談) ----
+      const isHeavy = llmTier === "heavy" && !lightweightMode;
+      emit({ t: "status", key: "thinking", ja: "AIが考えています…" });
+      const { text, tier: usedTier, model: usedModel, truncated: llmTruncated, modelFallbackFrom } = await generateLLM({
+        systemPrompt: systemPromptForMode, userPrompt,
+        maxTokens: lightweightMode ? 300 : (isHeavy ? 1400 : 1100), tier: isHeavy ? "heavy" : "light",
+        timeoutMs: isHeavy ? 60000 : 30000,
+        truncateRetry: false,
+        timeoutFallbackToLight: isHeavy,       // heavyが時間切れなら軽量モデルへ1回だけ切替
+        timeoutFallbackTimeoutMs: 25000,
+        timeoutFallbackMaxTokens: 1000,        // 切替後は少し短めにして確実に完成させる
+      });
+      llmTierUsed = usedTier || null;
+      llmModelUsed = usedModel || null;
+      llmWasTruncated = !!llmTruncated;
+      if (modelFallbackFrom) {
+        console.error(`[discuss] heavyモデル(${modelFallbackFrom})が時間切れのため、${usedModel}で回答しました`);
+      }
+      llmOut = parseDiscussOutputForMode(discussMode, text);
     }
-    llmOut = parseDiscussLlmOutput(text);
   } catch (e) {
     // これまでここでエラーの中身(実際のAnthropic APIのHTTPステータス・応答本文)を
     // 一切ログに残していなかったため、本番で「AIの考察生成に失敗しました」が
     // 続いても原因(APIキー不正・クレジット不足・レート制限・モデル名不正 等)を
     // 特定する手段がなかった。Renderの「Logs」タブで実際の原因が読めるようにする。
     console.error("[discuss] generateLLM failed:", e.code || "(no code)", "-", e.message);
-    // v97: 回答を返せなかったので、この利用者の1回ぶんとサイト全体の1回ぶんを返す
-    //   (利用者の責任ではない失敗で残り回数が減るのは不公平。多段思考ぶんの計画呼び出しは
-    //    実際に実行されているので返さない)。
-    refundLlmBudgetForIp(clientIp);
-    await refundLlmBudget().catch(() => {});
-    // v85: 原因ごとに正直な日本語メッセージを出し分ける(画面を見るだけで原因が
-    // 分かるように)。Renderの「Logs」タブにも従来どおり原因を残す。
-    const httpStatus = e && e.httpStatus;
-    let message;
-    if (e && e.code === "NO_KEY") {
-      message = "AIのAPIキーが設定されていないため、考察機能はまだ利用できません(サーバーの環境変数をご確認ください)。";
-    } else if (e && e.code === "TIMEOUT") {
-      message = "AIの考察に時間がかかりすぎたため、いったん中断しました。もう一度お試しいただくと、多くの場合そのまま考察できます。";
-    } else if (httpStatus === 429) {
-      message = "いまAIへのアクセスが混み合っています(レート制限)。少し時間をおいてからもう一度お試しください。";
-    } else if (httpStatus === 401 || httpStatus === 403) {
-      message = "AIのAPIキーが正しくないか、権限が不足しているようです(サーバーの設定をご確認ください)。";
-    } else if (httpStatus === 402 || (e && /credit|balance|quota/i.test(String(e.message)))) {
-      message = "AI提供元の利用残高が不足しているようです(課金状況をご確認ください)。";
+    // ---- v104: 道具つきの往復が「リクエストが不正(400)」や「道具が未対応」で失敗したときは、従来の1往復で1回だけやり直す ----
+    //   (道具の定義や会話形式の問題で会話全体が止まらないようにする。何が起きたかは meta.tools に残す)
+    const toolPathFailed = useToolLoop && e && (e.code === "TOOLS_UNSUPPORTED" || (e.code === "HTTP_ERROR" && e.httpStatus === 400));
+    if (toolPathFailed) {
+      try {
+        emit({ t: "reset" });
+        emit({ t: "status", key: "fallback", ja: "道具つきの会話に失敗したため、従来の方式で答え直しています…" });
+        const isHeavy2 = llmTier === "heavy";
+        const r2 = await generateLLM({
+          systemPrompt: buildDiscussSystemPrompt(appLang, discussMode, { tools: false, profile: discussProfile }), userPrompt,
+          maxTokens: isHeavy2 ? 1400 : 1100, tier: isHeavy2 ? "heavy" : "light", timeoutMs: isHeavy2 ? 60000 : 30000,
+          truncateRetry: false, timeoutFallbackToLight: isHeavy2, timeoutFallbackTimeoutMs: 25000, timeoutFallbackMaxTokens: 1000,
+        });
+        llmTierUsed = r2.tier || null; llmModelUsed = r2.model || null; llmWasTruncated = !!r2.truncated;
+        llmOut = parseDiscussOutputForMode(discussMode, r2.text);
+        discussRun = { rounds: 0, calls: 0, toolCalls: [], exhausted: false, streamed: false, fallbackReasonJa: `道具つきの会話が失敗(${e.code || "?"}${e.httpStatus ? ` HTTP ${e.httpStatus}` : ""})したため、従来の1往復で回答` };
+        console.error("[discuss] tool path failed, answered with the legacy single call:", e.code || "(no code)", "-", String(e.message).slice(0, 200));
+      } catch (e2) {
+        console.error("[discuss] legacy fallback also failed:", e2.code || "(no code)", "-", e2.message);
+        refundLlmBudgetForIp(clientIp);
+        await refundLlmBudget().catch(() => {});
+        return { status: 200, body: { ok: false, reason: e2.code || (e2 && e2.httpStatus ? `http_${e2.httpStatus}` : "llm_error"), message: discussLlmErrorMessageJa(e2), mode: discussMode } };
+      }
     } else {
-      message = "AIの考察生成に一時的に失敗しました。少し時間をおいてからもう一度お試しください。";
+      // v97: 回答を返せなかったので、この利用者の1回ぶんとサイト全体の1回ぶんを返す
+      //   (利用者の責任ではない失敗で残り回数が減るのは不公平。多段思考ぶんの計画呼び出しは
+      //    実際に実行されているので返さない)。
+      refundLlmBudgetForIp(clientIp);
+      await refundLlmBudget().catch(() => {});
+      const message = discussLlmErrorMessageJa(e);
+      return {
+        status: 200,
+        body: { ok: false, reason: e.code || (e && e.httpStatus ? `http_${e.httpStatus}` : "llm_error"), message, mode: discussMode },
+      };
     }
-    return {
-      status: 200,
-      body: { ok: false, reason: e.code || (httpStatus ? `http_${httpStatus}` : "llm_error"), message },
-    };
   }
 
   // ---- Stage E: Memory Engineへの結論の保存 + Knowledge Engineへの分析の昇格 ----
@@ -7923,7 +8256,11 @@ async function handleDiscuss(body, clientIp) {
   // (数ミリ秒)と配列への追加だけで、Redisへの書き込みは日次学習ジョブが
   // 1日1回まとめて行う(最終方針⑥「質問した瞬間に重い処理を行う設計は禁止」)。
   let intelligenceForMeta = null;
-  try {
+  // v104: 「考察の質」の計測は従来どおり議論(7欄)の回答だけで行う(事実・予想の短い回答を混ぜると
+  //   質スコアの推移が別物になり、v84 以降の計測と比べられなくなるため)。
+  if (discussMode !== "discussion") {
+    intelligenceForMeta = { reasoningQualityScore: null, noteJa: `質問の種類「${discussMode}」の回答は考察の質スコアの対象外(議論モードだけを計測)`, ragUtilization: null };
+  } else try {
     const quality = intelligenceMetrics.scoreReasoningQuality({
       facts,
       answerFields: {
@@ -7972,6 +8309,14 @@ async function handleDiscuss(body, clientIp) {
     status: 200,
     body: {
       ok: true,
+      // ---- v104: 質問の種類と、種類ごとの本文 ----
+      //   mode: smalltalk / offtopic / fact / prediction / discussion
+      //   answerText: fact・smalltalk・offtopic の本文(見出し無し) / prediction: {prediction, basis, caution}
+      //   discussion は従来どおり generalView〜mostImportantOpinion の7欄。
+      mode: discussMode,
+      answerText: llmOut.answerText || null,
+      prediction: llmOut.predictionFields || null,
+      resolvedSubject: (subject && subject.type) ? { type: subject.type, labelJa: subject.labelJa || null, labelEn: subject.labelEn || null, resolvedBy: subject.resolvedBy || "client" } : null,
       facts,
       stats,
       // 2026年8月・「議論できるAI」強化フェーズ(ご要望⑤): 検索AIのような
@@ -7984,9 +8329,11 @@ async function handleDiscuss(body, clientIp) {
       //   「なぜ他の欄が空なのか」はどこにも書かれていなかった。
       //   何が起きたのかを正直に伝える(でっち上げて欄を埋めることはしない)。
       formatNoteJa: llmOut.parsedOk ? null
-        : (llmOut.aiOpinion
-          ? "AIの回答を、いつもの6つの観点(一般論/AIの意見/反対意見/最終結論/今後の見通し/最も重要な点)に整えることができませんでした。以下はAIが述べた内容そのものです。"
-          : "AIの回答をうまく受け取れなかったため、今回はお答えできませんでした。お手数ですが、もう一度お試しください。"),
+        : (discussMode !== "discussion"
+          ? (llmOut.answerText || (llmOut.predictionFields && llmOut.predictionFields.prediction) ? null : "AIの回答をうまく受け取れなかったため、今回はお答えできませんでした。お手数ですが、もう一度お試しください。")
+          : (llmOut.aiOpinion
+            ? "AIの回答を、いつもの6つの観点(一般論/AIの意見/反対意見/最終結論/今後の見通し/最も重要な点)に整えることができませんでした。以下はAIが述べた内容そのものです。"
+            : "AIの回答をうまく受け取れなかったため、今回はお答えできませんでした。お手数ですが、もう一度お試しください。")),
       generalView: llmOut.generalView,
       aiOpinion: llmOut.aiOpinion,
       counterArgument: llmOut.counterArgument,
@@ -7998,7 +8345,7 @@ async function handleDiscuss(body, clientIp) {
       // v51: 2回試しても切れた場合だけ、正直に注記する(黙って尻切れを見せない)
       truncatedNoteJa: llmWasTruncated ? "※ 回答が長くなり、文字数上限のため末尾が一部省略されています。" : null,
       lang: appLang, // v56: どの言語設定で回答したか(既定はja)
-      meta: { ...knowledgeMeta, llmProvider: currentProviderName(), llmTier: llmTierUsed, llmModel: llmModelUsed, llmTruncated: llmWasTruncated, parsedOk: llmOut.parsedOk, intelligence: intelligenceForMeta },
+      meta: { ...knowledgeMeta, llmProvider: currentProviderName(), llmTier: llmTierUsed, llmModel: llmModelUsed, llmTruncated: llmWasTruncated, parsedOk: llmOut.parsedOk, intelligence: intelligenceForMeta, tools: discussRun ? { rounds: discussRun.rounds, calls: discussRun.calls, calls_list: discussRun.toolCalls, exhausted: discussRun.exhausted, finalSkippedForBudget: !!discussRun.finalSkippedForBudget, fallbackReasonJa: discussRun.fallbackReasonJa || null } : { rounds: 0, calls: 0, calls_list: [], exhausted: false, reasonJa: useToolLoop ? null : (lightweightMode ? "挨拶・雑談のため道具は使わない" : (DISCUSS_TOOLS_ENABLED ? "このLLMプロバイダーは道具つきの会話に未対応(従来の1往復)" : "DISCUSS_TOOLS=0 のため従来の1往復")) } },
     },
   };
 }
@@ -9316,6 +9663,39 @@ async function handleHttpRequest(req, res) {
         res.end(JSON.stringify(body));
         return;
       }
+      // ---- v104 ④: 流れる表示(NDJSON ストリーム)。中身は /api/discuss と同じ handleDiscuss ----
+      //   1行1イベント: {t:"status",key,ja} / {t:"delta",text} / {t:"reset"} / {t:"final",status,body} / {t:"error",message}
+      //   画面側は fetch + ReadableStream で読む(EventSource は POST を送れないため)。失敗時は画面が
+      //   従来の /api/discuss へ自動で戻る。
+      if (pathname === "/api/discuss/stream") {
+        if (req.method !== "POST") {
+          res.writeHead(405, { "Content-Type": "application/json; charset=utf-8", "Allow": "POST" });
+          res.end(JSON.stringify({ ok: false, error: "method not allowed, use POST" }));
+          return;
+        }
+        let parsedBody;
+        try {
+          parsedBody = await readJsonBody(req);
+        } catch (e) {
+          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/x-ndjson; charset=utf-8", "Cache-Control": "no-cache, no-store", "X-Accel-Buffering": "no", "Connection": "keep-alive" });
+        let closed = false;
+        res.on("close", () => { closed = true; });
+        const writeEvent = (ev) => { if (closed) return; try { res.write(JSON.stringify(ev) + "\n"); } catch (e) { closed = true; } };
+        writeEvent({ t: "status", key: "accepted", ja: "質問を受け付けました" });
+        try {
+          const { status, body } = await handleDiscuss(parsedBody, clientKeyFromRequest(req), { emit: writeEvent, stream: true });
+          writeEvent({ t: "final", status, body });
+        } catch (e) {
+          console.error("[discuss/stream] failed:", e && (e.code || e.message));
+          writeEvent({ t: "error", message: "AIの考察生成に一時的に失敗しました。少し時間をおいてからもう一度お試しください。" });
+        }
+        if (!closed) res.end();
+        return;
+      }
       if (pathname === "/api/backup/export") {
         // 精度証明ラウンド④: 学習状態のバックアップ。内部データを含むため、
         // debug-status等と同じくAUTO_COLLECT_SECRET設定時は?key=一致を要求する。
@@ -10223,7 +10603,7 @@ async function handleHttpRequest(req, res) {
             return raw === null || raw === undefined ? null : JSON.parse(raw);
           } catch (e) { latestReadFailed = String((e && e.message) || e).slice(0, 160); return null; }
         };
-        const [growthRaw, accuracyTrend, agenda, intelReport, answerability, selfImproveHistory, coverage, weightsImpact, weightsNowRaw, tuningHistory, calibrationModelRaw] = await Promise.all([
+        const [growthRaw, accuracyTrend, agenda, intelReport, answerability, selfImproveHistory, coverage, weightsImpact, weightsNowRaw, tuningHistory, calibrationModelRaw, contentModelRaw] = await Promise.all([
           readLatestStrict(),
           getAccuracyTrend(learningDeps, todayKey).catch(() => ({ available: false })),
           loadLatestAgenda(learningDeps).catch(() => null),
@@ -10264,6 +10644,8 @@ async function handleHttpRequest(req, res) {
           dailyJobLib.getTuningHistory(learningDeps, 7).catch(() => ({ available: false, items: [] })),
           // v101 ★4: 最終確率の較正モデル(温度 T・採否・検証前後)。GET 1回
           learningDeps.upstashGetJSON(probCalibrationLib.MODEL_KEY).catch(() => null),
+          // v104 J: 試合内容モデル(表示元の関門・2.5点以上/両チーム得点の較正)。GET 1回
+          learningDeps.upstashGetJSON(matchContentLib.MODEL_KEY).catch(() => null),
         ]);
         const g = growthRaw || {};
         const weightsNow = (() => {
@@ -10348,6 +10730,16 @@ async function handleHttpRequest(req, res) {
           apifbBlendFit: g.apifbBlendFit || null,
           lineupWatch: g.lineupWatch || null,
           clubElo: g.clubElo || null,
+          // ---- v104 J: 試合内容の予測(表示元の切り替え関門・較正・直近7日/30日の精度) ----
+          //   model=いま予想に使われている設定(前夜までの学習結果)、today=最新の学習での経過、
+          //   last7Days/last30Days=λ版 vs 整合版の Brier・Top1/Top3・表示した確率の自信のズレ(ECE)。
+          matchContent: {
+            model: matchContentLib.summarizeModel(contentModelRaw),
+            today: g.matchContent || null,
+            last7Days: (accuracyTrend && accuracyTrend.last7Days && accuracyTrend.last7Days.matchContent) || null,
+            last30Days: (accuracyTrend && accuracyTrend.last30Days && accuracyTrend.last30Days.matchContent) || null,
+            noteJa: "試合内容(合計得点の見込み・2.5点以上・両チーム得点・スコア上位)の予測。勝敗の予想(1X2)は変えず、公開中の勝敗確率と整合するスコア分布(整合版)が λ だけの分布より本当に良いときだけ表示を切り替えます(試合ごとの Brier 差の z 検定・100件以上)。2.5点以上/両チーム得点の確率は v101 と同じ関門つきの温度較正。",
+          },
           isToday: g.date === todayKey,
           noteJa: g.date
             ? (g.date === todayKey ? "本日の学習実行の実測値です。" : `最新の学習記録は${g.date}のものです(本日分はまだ実行されていません)。`)
@@ -10739,6 +11131,12 @@ module.exports = {
   // v101: バックアップ export の partial 判定・較正済み記録の表示・日次レポート開示の検証用(本番では誰も呼ばない)
   __v101ForTest: {
     handleBackupExport, BACKUP_CORE_KEYS, buildTodayPredictionEntry, probCalibrationLib,
+  },
+  // v104: 会話の改良と試合内容の予測の検証用(本番では誰も呼ばない)
+  __v104ForTest: {
+    handleDiscuss, buildDiscussSystemPrompt, parseDiscussOutputForMode, sanitizeDiscussHistory, sanitizeDiscussProfile,
+    buildDiscussToolDeps, discussLlmErrorMessageJa, matchContentLib, buildTodayPredictionEntry,
+    constants: { DISCUSS_TOOLS_ENABLED, DISCUSS_RESOLVE_SUBJECT, DISCUSS_TOOL_MAX_ROUNDS, DISCUSS_TOOL_MAX_CALLS, DISCUSS_HISTORY_TURNS },
   },
   // v99: 同日2回目の学習ガード・保存先コマンド数の実測の検証用(本番では誰も呼ばない)
   __v99ForTest: {

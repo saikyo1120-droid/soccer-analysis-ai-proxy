@@ -75,6 +75,8 @@ const STUB = {
         },
         scenarios: [{ scoreline: "1-1", pct: 13 }],
         derived: { bttsPct: 55, over25Pct: 49, homeCleanSheetPct: 21, awayCleanSheetPct: 18 },
+        // v104 J: 試合内容の見立て(サーバー describeContent の形)
+        content: { source: "lambda", sourceJa: "自前モデルの期待得点からのスコア分布", expTotalGoals: 2.4, over25Pct: 49, under25Pct: 51, bttsPct: 55, homeCleanSheetPct: 21, awayCleanSheetPct: 18, topScorelines: [{ scoreline: "1-1", pct: 13 }, { scoreline: "1-0", pct: 11 }, { scoreline: "2-1", pct: 9 }], styleJa: "接戦(拮抗)・標準的な得点", calibrated: false, calibrationNoteJa: "較正中(答え合わせ 12件。件数が貯まるまで生値)" },
         loggedAt: "2026-09-08T04:35:00Z",
       },
       {
