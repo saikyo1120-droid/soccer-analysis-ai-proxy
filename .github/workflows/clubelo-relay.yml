@@ -71,9 +71,12 @@ jobs:
               URL="${SCHEME}://api.clubelo.com/${D}"
               echo "--- 取得を試行: ${URL}"
               # ② 終了コードではなくHTTPコードで判定する(-sS単体だと502でもexit 0になる)
+              # v104.1: curl は失敗時にも -w の "000" を出すため、従来の `|| echo "000"` だと "000000" になっていた。
+              #   出力が空のときだけ "000" を補う。
               CODE=$(curl -sS --connect-timeout 20 --max-time 45 \
                 -A "soccer-analysis-ai/1.0 (github-actions clubelo relay)" \
-                -o elo.csv -w "%{http_code}" "${URL}" 2>curlerr.txt || echo "000")
+                -o elo.csv -w "%{http_code}" "${URL}" 2>curlerr.txt || true)
+              [ -n "${CODE}" ] || CODE="000"
               ERR=$(tr -d '\r\n' < curlerr.txt | cut -c1-120)
               LINES=$(wc -l < elo.csv 2>/dev/null || echo 0)
               echo "    HTTP=${CODE} 行数=${LINES} ${ERR:+エラー=$ERR}"
@@ -85,17 +88,31 @@ jobs:
           done
 
           if [ -z "${FOUND}" ]; then
-            echo "::error::提供元(api.clubelo.com)からCSVを取得できませんでした(最後のHTTPコード: ${LAST_CODE})。本番は従来どおり直接取得+保存の代用で動きます。"
+            # ---- v104.1(2026年11月14日): 提供元の停止を「このワークフローの失敗」にしない ----
+            #   api.clubelo.com は 2026年8月31日から応答していません(本番の実測)。このワークフローは
+            #   1日3回動くため、提供元が止まっている間ずっと GitHub から失敗メールが1日3通届いていました。
+            #   提供元が止まっているのは、こちらの設定の誤りではなく、こちらでは直せません。
+            #   そこで「取得できなかった」ことは従来どおり本番へ報告して記録に残し(/api/diag/clubelo と
+            #   日次レポートで確認できます)、このワークフロー自体は正常終了にします。
+            #   こちら側の問題(秘密のキーの不一致など、本番が中継を受け取れない場合)は、下で従来どおり失敗にします。
+            echo "::notice::提供元(api.clubelo.com)が応答しないため、今回は中継できませんでした(最後のHTTPコード: ${LAST_CODE})。提供元側の停止であり、こちらの設定の問題ではありません。本番は保存済みのEloデータで動き続け、提供元が復旧すれば次の実行で自動的に取り込みます。"
             head -c 300 elo.csv 2>/dev/null || true
             report_failure "fetch" "${LAST_CODE}" "no_csv_from_provider"
-            exit 1
+            {
+              echo "### ClubElo 中継: 提供元が応答しないため見送り(正常終了)"
+              echo ""
+              echo "- 最後のHTTPコード: ${LAST_CODE}"
+              echo "- 提供元(api.clubelo.com)側の停止です。本番への記録は済んでいます(/api/diag/clubelo)。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
 
           echo "取得成功: ${FOUND}(行数 $(wc -l < elo.csv))"
           HTTP=$(curl -sS --max-time 90 --retry 2 --retry-delay 15 -X POST \
             "${INGEST}?key=${LEARNING_SECRET_KEY}&date=${FOUND}" \
             -H "Content-Type: text/csv" --data-binary @elo.csv \
-            -o response.json -w "%{http_code}" || echo "000")
+            -o response.json -w "%{http_code}" || true)
+          [ -n "${HTTP}" ] || HTTP="000"
           echo "中継のHTTP: ${HTTP}"
           cat response.json 2>/dev/null || true
           if ! grep -q '"ok":true' response.json 2>/dev/null; then

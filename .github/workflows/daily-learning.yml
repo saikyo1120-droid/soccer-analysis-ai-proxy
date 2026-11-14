@@ -38,6 +38,8 @@ on:
 jobs:
   run-daily-learning:
     runs-on: ubuntu-latest
+    # v104.1: 学習の完了を最大60分待つため、ジョブ全体の上限を明示する(既定の6時間まで居座らない)
+    timeout-minutes: 80
     steps:
       # 2026年8月・本番調査で発見された不具合の修正: 以前はこのリクエストが
       # 「学習ジョブが完全に終わるまで」応答を返さなかったため、実際の本番データ
@@ -56,6 +58,14 @@ jobs:
       - name: Call the daily learning engine endpoint (fire-and-forget)
         id: call
         run: |
+          # ---- v104.1(2026年11月14日): 「偽の失敗」メールの原因の修正 その1 ----
+          #   完了の判定は「/api/growth-log の ranAt が、この呼び出しより後か」で行う。
+          #   ranAt は**学習を開始した時刻**(サーバーがこの呼び出しを受けた時刻)なので、
+          #   基準は「呼び出す直前の時刻」でなければならない。従来は基準を「待機ステップの開始時刻」
+          #   (=この後の自動収集ステップが終わった後)に取っていたため、自動収集に10秒以上かかった日は
+          #   学習が正常に完走しても絶対に合格できなかった。呼び出す直前の時刻を記録して後段へ渡す。
+          call_epoch=$(date +%s)
+          echo "call_epoch=${call_epoch}" >> "$GITHUB_OUTPUT"
           curl -sS -X POST "${LEARNING_ENDPOINT_URL}?key=${LEARNING_SECRET_KEY}" \
             --max-time 60 \
             --retry 2 \
@@ -87,6 +97,14 @@ jobs:
           else
             echo "already_completed=false" >> "$GITHUB_OUTPUT"
           fi
+          # v104.1: 別のきっかけ(もう一方の予約・自己修復)で既に学習が走っている場合。
+          #   その実行の開始時刻はこの呼び出しより前なので、完了の判定では基準時刻を広げる。
+          if grep -q '"alreadyRunning":true' response.json; then
+            echo "本日の学習は既に実行中でした(この呼び出しでは新しく起動していません)。その完了を待ちます。"
+            echo "already_running=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_running=false" >> "$GITHUB_OUTPUT"
+          fi
         env:
           LEARNING_ENDPOINT_URL: ${{ secrets.LEARNING_ENDPOINT_URL }}
           LEARNING_SECRET_KEY: ${{ secrets.LEARNING_SECRET_KEY }}
@@ -117,43 +135,61 @@ jobs:
         # v99: 完走済みでスキップされた日は、待っても ranAt は更新されないので飛ばす
         if: steps.call.outputs.already_completed != 'true'
         run: |
-          # このステップの開始時刻を基準に、「その後にranAtが更新されたか」だけを
-          # 見るシンプルな判定にする(経過秒数の計算で毎回帳尻を合わせるより確実)。
-          job_started_epoch=$(date +%s)
-          echo "バックグラウンドの学習処理が終わるまで待ちます(最大6分)..."
-          GROWTH_LOG_URL="${LEARNING_ENDPOINT_URL%/api/learning/run-daily}/api/growth-log"
+          # ---- v104.1(2026年11月14日): 「偽の失敗」メールの原因の修正 その2 ----
+          #   本番実測(11/14): 学習は 27分 で14段階すべて完走していたのに、このステップは
+          #   「22分待っても更新されない」として毎日失敗し、GitHub から失敗メールが届いていた。
+          #   原因は2つ:
+          #     ①待ち時間(22分)が、学習の所要時間(収集対象の拡大で 15分→27分)より短い
+          #     ②基準時刻が「このステップの開始」だった(ranAt=学習の開始時刻は、それより必ず前)
+          #   直し: 基準は「呼び出す直前の時刻」(上のステップが記録)。待ち時間は最大60分。
+          #   学習が既に実行中だった日(alreadyRunning)は、その実行の開始が呼び出しより前なので
+          #   基準を4時間前まで広げる(その日のうちに始まった実行の完了を確認できれば合格)。
+          CALL_EPOCH="${{ steps.call.outputs.call_epoch }}"
+          ALREADY_RUNNING="${{ steps.call.outputs.already_running }}"
+          if [ -z "${CALL_EPOCH}" ]; then CALL_EPOCH=$(date +%s); fi
+          if [ "${ALREADY_RUNNING}" = "true" ]; then SLACK=14400; else SLACK=120; fi
+          THRESHOLD=$((CALL_EPOCH - SLACK))
+          echo "バックグラウンドの学習処理が終わるまで待ちます(最大60分)。基準時刻: $(date -u -d "@${THRESHOLD}" +%FT%TZ) 以降に開始した学習の完了を確認します。"
+          BASE_URL="${LEARNING_ENDPOINT_URL%/api/learning/run-daily}"
+          GROWTH_LOG_URL="${BASE_URL}/api/growth-log"
+          PROGRESS_URL="${BASE_URL}/api/learning/progress"
           attempt=0
-          # 2026年8月・実際に発生した「6分で失敗扱い」の修正:
-          #   TOP100クラブのフル収集は本番実測で約15分かかる(2026-08-05は
-          #   20:16開始→20:31完了)。待ち時間が6分しか無かったため、正常に
-          #   処理が進んでいるのに毎回「失敗」と表示されていた(偽の失敗)。
-          #   さらに重要な副次効果として、この待機ループの30秒ごとのアクセスが
-          #   Render無料プランのスリープを防いでいる。待ち時間を延ばすことで、
-          #   長い収集処理の途中でサーバーが眠って中断される事故も防げる。
-          max_attempts=44   # 30秒間隔 x 44回 = 最大22分待つ
+          # 30秒間隔 x 120回 = 最大60分待つ(本番実測の所要 27分 の約2倍。学習が伸びても偽の失敗にしない)。
+          # この30秒ごとのアクセスは、長い収集処理の途中でサーバーが眠るのを防ぐ役目も兼ねている。
+          max_attempts=120
           success=0
           while [ $attempt -lt $max_attempts ]; do
             sleep 30
             attempt=$((attempt + 1))
-            curl -sS --max-time 30 "$GROWTH_LOG_URL" -o growth.json || true
+            # サーバーはこの応答を5分キャッシュするため、完了から検知まで最大5分ほど遅れることがある
+            curl -sS --max-time 30 "${GROWTH_LOG_URL}?t=$(date +%s)" -o growth.json || true
             ran_at=$(jq -r '.ranAt // empty' growth.json 2>/dev/null || echo "")
             if [ -n "$ran_at" ]; then
               ran_at_epoch=$(date -d "$ran_at" +%s 2>/dev/null || echo 0)
-              echo "確認 ${attempt}/${max_attempts}: 最新の実行時刻(ranAt) = ${ran_at}"
-              # このステップを開始した時刻より後に更新されていれば、今回のリクエスト
-              # によるジョブが実際に完了して保存されたとみなせる(多少のクロック
-              # ずれを考慮して10秒の余裕を持たせる)。
-              if [ "$ran_at_epoch" -gt 0 ] && [ "$ran_at_epoch" -ge $((job_started_epoch - 10)) ]; then
+              if [ "$ran_at_epoch" -gt 0 ] && [ "$ran_at_epoch" -ge "$THRESHOLD" ]; then
+                echo "確認 ${attempt}/${max_attempts}: 学習の完了を確認しました(開始時刻 ranAt = ${ran_at})"
                 success=1
                 break
               fi
             fi
+            # 10回に1回(5分ごと)、いまどの段階かを表示する(ログを見れば進み具合が分かる)
+            if [ $((attempt % 10)) -eq 0 ]; then
+              stage=$(curl -sS --max-time 20 "${PROGRESS_URL}?t=$(date +%s)" 2>/dev/null | jq -r '.verdictJa // empty' 2>/dev/null || echo "")
+              echo "確認 ${attempt}/${max_attempts}: まだ完了していません(保存済みの最新 ranAt = ${ran_at:-なし})。${stage}"
+            fi
           done
-          cat growth.json 2>/dev/null || true
           if [ "$success" != "1" ]; then
-            echo "::error::学習ジョブの開始には成功しましたが、22分待っても/api/growth-logの実行時刻が更新されませんでした。バックグラウンド処理が失敗している可能性が高いです(通常はフル収集でも15分程度で完了します)。Renderのログを確認してください。なお、この後も処理が続いて完了する場合があるため、サイトの日付が更新されていれば実害はありません。"
+            echo "---- 学習の進捗(/api/learning/progress)----"
+            curl -sS --max-time 20 "${PROGRESS_URL}?t=$(date +%s)" 2>/dev/null | jq -c '{verdictJa, secondsSinceLastStage, dailyLearningRunning, stage: .progress.stage, finished: .progress.finished}' 2>/dev/null || true
+            echo "::error::学習ジョブの開始には成功しましたが、60分待っても学習の完了(/api/growth-log の実行時刻の更新)を確認できませんでした。上の「学習の進捗」に、どの段階で止まっているかが出ています。Renderのログも確認してください。この後に処理が完了する場合もあります(サイトの「昨日学んだこと」の日付が今日になっていれば実害はありません)。"
             exit 1
           fi
+          {
+            echo "### 日次学習: 完了を確認しました"
+            echo ""
+            echo "- 学習の開始時刻(ranAt): $(jq -r '.ranAt // "不明"' growth.json 2>/dev/null)"
+            echo "- 確認までの待ち時間: 約 $((attempt / 2)) 分"
+          } >> "$GITHUB_STEP_SUMMARY"
           echo "学習ジョブの完了を確認しました。"
         env:
           LEARNING_ENDPOINT_URL: ${{ secrets.LEARNING_ENDPOINT_URL }}
