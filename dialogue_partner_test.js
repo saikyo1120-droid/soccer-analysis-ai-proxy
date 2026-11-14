@@ -42,7 +42,9 @@ const documentStub = {
 };
 const windowStub = { navigator: { clipboard: { writeText: async () => {} } }, scrollTo() {} };
 const fn = new Function('document', 'window', 'navigator', 'fetch', code);
-const api = fn(documentStub, windowStub, windowStub.navigator, async () => { throw new Error('no network'); });
+// v104.1: どの宛先へ通信しようとしたかを記録する(「サーバーのAIへ渡したか」を確かめるため)。通信そのものは常に失敗させる。
+const fetchCalls = [];
+const api = fn(documentStub, windowStub, windowStub.navigator, async (u) => { fetchCalls.push(String(u && u.url ? u.url : u)); throw new Error('no network'); });
 
 let errors = [];
 const fail = (msg) => errors.push(msg);
@@ -116,11 +118,21 @@ if (someClub) {
 }
 
 // ---- 6) hero chat: match topic ----
-await api.heroAskAI('今日見るべき試合は？');
-{
+// v104.1(総点検)で仕様を変更: 「今日の試合」「どっちが勝つ」の質問は、画面内の固定の「おすすめカード」
+// (登録クラブどうしの仮の対戦)で答えて終わらせず、サーバーのAI(今日の予想・自信ランク・対戦分析の道具つき)へ渡す。
+// 旧仕様では「今日の自信のある試合は?」「今日のSランクの試合を教えて」などがAIに一度も届いていなかった。
+// (このテストは長く古い画面ファイルを読んでいたため、旧仕様のまま通っていた。)
+for (const q of ['今日見るべき試合は？', '今日の自信のある試合は？', '今日のSランクの試合を教えて', '明日の試合の予想は？']) {
+  const before = fetchCalls.length;
+  await api.heroAskAI(q);
+  const last = api.heroChatHistory[api.heroChatHistory.length - 1];
+  const text = (last && last.text) || '';
   const ex = extrasOf(api.heroChatHistory);
-  if (!ex || !ex.includes('dialogue-extra')) fail('hero chat (match): no dialogue-extra. Got: ' + JSON.stringify(ex));
-  if (ex && !ex.includes('5バック')) fail('hero chat (match): expected the "5バックで守ったら" follow-up question to be present');
+  const sent = fetchCalls.slice(before);
+  if (!sent.some((u) => /\/api\/discuss/.test(u))) fail(`hero chat (match): "${q}" がサーバーのAI(/api/discuss)へ渡っていない。通信先: ${JSON.stringify(sent)}`);
+  if (/具体的な対戦カードが分からなかった/.test(text)) fail(`hero chat (match): "${q}" に固定の「おすすめカード」で答えている(旧仕様)`);
+  if (ex && ex.includes('dialogue-extra')) fail(`hero chat (match): "${q}" に旧来の定型の続き(dialogue-extra)が付いている`);
+  if (!text || !text.length) fail(`hero chat (match): "${q}" の返答が空`);
 }
 
 // ---- 7) hero chat: comparison topic ----
@@ -186,7 +198,7 @@ if (errors.length) {
   errors.forEach(e => console.log(' -', e));
   process.exitCode = 1;
 } else {
-  console.log('Dialogue partner feature: all checks passed (player/club/match/comparison topics, beginner-omits-perspective, followup chips, level inference, unrecognized-question has no extras, and previously-unanswerable questions now escalate to the discuss engine instead of dead-ending).');
+  console.log('Dialogue partner feature: all checks passed (player/club/comparison topics, match questions escalate to the server AI, beginner-omits-perspective, followup chips, level inference, unrecognized-question has no extras, and previously-unanswerable questions now escalate to the discuss engine instead of dead-ending).');
 }
 
 })();

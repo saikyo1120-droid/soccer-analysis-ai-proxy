@@ -84,6 +84,10 @@
     background: var(--surface-0);
     color: var(--text-primary);
     line-height: 1.7;
+    /* v104.1: 空白のない長い文字列(URL・技術的な記録・長い英単語など)が、スマホの画面幅を
+       はみ出してページ全体が横に揺れるのを防ぐ。入りきらない時だけ途中で折り返す
+       (通常の文章の折り返し位置や、表・横並びの幅の計算は変えない)。 */
+    overflow-wrap: break-word;
   }
   .app { max-width: 1080px; margin: 0 auto; padding: 20px 16px 64px; }
 
@@ -481,6 +485,14 @@
   .dialogue-reflect { font-size: 12.5px; color: var(--text-primary); font-weight: 600; margin-bottom: 6px; }
   .dialogue-perspective { font-size: 12px; color: var(--text-secondary); font-style: italic; margin-bottom: 8px; }
   .followup-chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  /* v104.1 K: 自信ランクの小さな印(S=確信 / A=有力 / B=やや優勢 / 見送り) */
+  .tier-chip { display: inline-block; font-size: 11px; font-weight: 700; font-style: normal; line-height: 1.5; padding: 0 7px; border-radius: 999px; border: 1px solid var(--series-2); color: var(--series-2); vertical-align: 1px; margin-left: 6px; white-space: nowrap; }
+  .tier-chip.tier-s { background: var(--series-2); color: #fff; }
+  .tier-chip.tier-b { border-color: var(--text-muted); color: var(--text-muted); }
+  .tier-chip.tier-skip { border-style: dashed; border-color: var(--text-muted); color: var(--text-muted); font-weight: 600; }
+  .tier-table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 4px; }
+  .tier-table th, .tier-table td { padding: 4px 6px; border-bottom: 1px solid var(--border); text-align: right; }
+  .tier-table th:first-child, .tier-table td:first-child { text-align: left; }
   .chat-followup-btn { border: 1px solid var(--series-home); background: transparent; color: var(--series-home); padding: 5px 11px; border-radius: 999px; font-size: 12px; cursor: pointer; }
   .chat-followup-btn:hover { background: var(--series-home); color: #fff; }
 
@@ -537,7 +549,7 @@
   // ---- 型テンプレート(変数入り)。[正規表現, 英語, 中文, Español]($1〜$9で参照) ----
   var P = [];
 
-  function tr(s, depth) {
+  function tr(s, depth, noSeg) {
     if (appLang === "ja") return null;
     var d0 = depth || 0;
     var i = ORDER[appLang];
@@ -545,7 +557,15 @@
     if (typeof xl === "string" && xl) return xl;
     var e = X[s];
     if (e && e[i]) return e[i];
-    if (d0 >= 3) return null;
+    // v104.1(総点検): 辞書に無いクラブ名・登録選手名は、アプリ本体の対応表(日本語名 → アルファベット表記)で出す
+    var ln = latinNameOf(s);
+    if (ln !== null) return ln;
+    // 「2015年」のような4桁の年だけの文字列(契約の年など)。中国語は元の書き方のまま
+    var ym = YEAR_ONLY_RE.exec(s);
+    if (ym) return appLang === "zh" ? s : ym[1];
+    // v104.1(総点検・第2回): 入れ子の上限を 3 → 5 に。絵文字を剥がす → 文のまとまりに区切る → 型に当てる → スロットの
+    //   絵文字を剥がす、と重なると3段では足りず、選手比較の文などが訳せなかった(型の事前判定があるので速さは変わらない)。
+    if (d0 >= 5) return null;
     // 箇条書きの「・」は先に剥がして中身を翻訳する(質問チップなど)
     // v92(2026年9月18日): 中身の訳に日本語が残る(汎用型「⦿件」が半端に一致した等)ときは
     //   ここで確定せず、全文の型(例:「・ほかに親善試合など参考扱いが⦿件」)を先に探す。
@@ -566,6 +586,7 @@
     var firstMatchOut = null;
     for (var k = 0; k < P.length; k++) {
       var m = P[k][0].exec(s);
+      if (m && P[k][0].shortLit === true && !slotsAtomic(m)) m = null; // 短い型は「ひとかたまりの値」にだけ当てる
       if (m) {
         var tpl = P[k][1 + i];
         if (tpl) {
@@ -574,18 +595,279 @@
           var out = tpl.replace(/\$(?:\{(\d{1,2})\}|(\d))/g, function (_, d2, d1) {
             var v = m[+(d2 || d1)];
             if (v == null) return "";
-            // 入れ子の既知フレーズ(要素ラベル・注記など)も翻訳する(深さ3まで)
+            // 入れ子の既知フレーズ(要素ラベル・注記など)も翻訳する(深さ5まで)
             var sub = tr(String(v).trim(), d0 + 1);
-            if (sub === null && JA_LEFT_RE.test(String(v))) slotJaLeft = true;
+            // v104.1(総点検・第2回): 入れ子の訳が「半端な訳」(日本語が残ったまま)のときも、日本語が残ったと数える。
+            //   以前は「訳が返ってきたか」だけを見ていたため、入れ子が半端でも完訳として確定してしまい、
+            //   「avg rating age 7.64・川崎フロンターレ・21」のような崩れた訳が出ていた。
+            if (JA_LEFT_RE.test(sub === null ? String(v) : sub)) slotJaLeft = true;
             return sub === null ? v : sub;
           });
           if (!slotJaLeft) return out;
-          if (firstMatchOut === null) firstMatchOut = out;
+          // 「値+単位」の短い型は、値が訳せなかったら当てない(「今回」→「今」のように、単位を落とすだけの半端な訳を作らない)
+          if (firstMatchOut === null && P[k][0].shortLit !== true) firstMatchOut = out;
         }
       }
     }
+    // ---- v104.1(総点検): 先頭・末尾の絵文字や記号、全体を囲む括弧、複数の文を「剥がして」訳す ----
+    //   画面の文字は「🧠 今日のAIは昨日より賢くなったか?」「(本日の学習実行の実測値です。)」
+    //   「条件に合う選手が見つかりませんでした。条件をゆるめてお試しください。」のように、辞書の見出しに
+    //   絵文字・括弧・もう1文が付いた形で1つの文字列になっていることが多い。完全一致の辞書に当たらないため、
+    //   訳はあるのに日本語のまま残っていた(実データを入れた総点検で多数見つかった)。
+    //   剥がした残りが**すべて訳せたときだけ**採用する(半端な訳は作らない)。完訳できるので、
+    //   上の「半端な訳」(firstMatchOut / innerOut)より先に試す。
+    var pm = PEEL_PREFIX_RE.exec(s);
+    if (pm && pm[2] && pm[2] !== s) {
+      var bodyP = tr(pm[2].trim(), d0 + 1);
+      if (bodyP !== null && !JA_LEFT_RE.test(bodyP)) return pm[1] + bodyP;
+    }
+    var sm = PEEL_SUFFIX_RE.exec(s);
+    if (sm && sm[1] && sm[1] !== s) {
+      var bodyS = tr(sm[1].trim(), d0 + 1);
+      if (bodyS !== null && !JA_LEFT_RE.test(bodyS)) return bodyS + sm[2];
+    }
+    var c0 = s.charAt(0), c1 = s.charAt(s.length - 1);
+    var triedInner = null;
+    if (s.length > 2 && (c0 === "(" || c0 === "\uff08") && (c1 === ")" || c1 === "\uff09")) {
+      triedInner = s.slice(1, -1).trim();
+      var innerP = tr(triedInner, d0 + 1);
+      if (innerP !== null && !JA_LEFT_RE.test(innerP)) return c0 + innerP + c1;
+    }
+    // ---- v104.1(総点検・第2回): 文の前後に残った記号(片方だけの括弧・区切りの「/」「:」「、」)を剥がして訳す ----
+    //   画面の文字は、色付きの印や太字の前後で切れて「…展開です。(」「バイエルン・ミュンヘン /」「: このAI自身の予想…」
+    //   のような断片になる。中身は訳せるのに、端の記号のせいで辞書にも型にも当たらず日本語のまま残っていた。
+    //   剥がした中身が**すべて訳せたときだけ**採用する。
+    var pq = peelEdges(s);
+    if (pq && pq[1] !== triedInner) {
+      var bodyQ = tr(pq[1], d0 + 1);
+      if (bodyQ !== null && !JA_LEFT_RE.test(bodyQ)) return pq[0] + bodyQ + pq[2];
+    }
+    // ---- 複数の文でできた文字列を、訳せる「まとまり」に区切って訳す ----
+    //   v104.1(総点検)では1文ずつに割っていたが、型には「2〜3文で1つ」のものがある(端末内の簡易チャットの回答など)。
+    //   1文ずつでは当たらないため、回答がまるごと日本語のまま残っていた(総点検・第2回で分かった)。
+    //   先頭から「訳せるいちばん長い連なり」を1まとまりとして読み、最後まで**すべて訳せたときだけ**採用する。
+    //   (まとまりの中をさらに区切る処理は、この外側の繰り返しが受け持つので、内側では行わない= noSeg)
+    var cut = s.indexOf("\u3002");
+    if (!noSeg && cut !== -1 && cut < s.length - 1) {
+      var sentences = [], buf = "";
+      for (var ci = 0; ci < s.length; ci++) { buf += s.charAt(ci); if (s.charAt(ci) === "\u3002") { sentences.push(buf); buf = ""; } }
+      if (buf.trim()) sentences.push(buf);
+      var nS = sentences.length;
+      if (nS >= 2 && nS <= 8) {
+        var outS = [], okAll = true;
+        for (var si = 0; si < nS && okAll;) {
+          var tookS = false;
+          for (var sj = nS; sj > si; sj--) {
+            if (si === 0 && sj === nS) continue; // 全体は上でもう試した
+            var run = sentences.slice(si, sj).join("").trim();
+            if (!run) { si = sj; tookS = true; break; }
+            var one = tr(run, d0 + 1, true);
+            if (one === null && !JA_LEFT_RE.test(run)) one = run; // 日本語を含まない文(英字だけの文など)はそのまま
+            if (one !== null && !JA_LEFT_RE.test(one)) { outS.push(one); si = sj; tookS = true; break; }
+          }
+          if (!tookS) okAll = false;
+        }
+        if (okAll && outS.length) return outS.join(" ");
+      }
+    }
+    // ---- v104.1(総点検・第2回): 「・」で並べた項目を1つずつ訳す ----
+    //   「完全移籍(移籍金あり) ・ バレンシアCFより ・ 2025年7月」「平均評価 7.76・アトレティコ・マドリード・29歳」のような並びは、
+    //   全体の型が無いと、後ろの一部だけが別の型に当たって「7/完全移籍(移籍金あり) ・ バレンシアCFより ・ 2025」のような
+    //   崩れた訳になっていた。項目ごとに訳し、**すべての項目が訳せたときだけ**採用する。
+    //   「・」は名前の中にも入る(アトレティコ・マドリード)ので、先頭から「辞書や名前の対応表にある最も長い連なり」を1項目として読む。
+    if (innerOut === null && s.indexOf("・") > 0) {
+      // ① 空白つきの「 ・ 」が区切りのとき(契約欄・試合の見出しなど)は、それだけで割る(名前の中の「・」は割らない)
+      if (LIST_SEP_RE.test(s)) {
+        var partsL = s.split(LIST_SEP_RE);
+        if (partsL.length >= 2 && partsL.length <= 10) {
+          var outL = [], okL = true;
+          for (var la = 0; la < partsL.length; la++) {
+            var partL = partsL[la].trim();
+            var oneL = partL ? tr(partL, d0 + 1) : null;
+            if (oneL === null && partL && !JA_LEFT_RE.test(partL)) oneL = partL; // 日本語を含まない項目(大会名・会場名など)はそのまま
+            if (oneL === null || JA_LEFT_RE.test(oneL)) { okL = false; break; }
+            outL.push(oneL);
+          }
+          if (okL) return outL.join(" ・ ");
+        }
+      } else {
+        // ② 空白なしの「・」: 先頭から「辞書や名前の対応表にある最も長い連なり」を1項目として読む
+        var toksD = s.split("・");
+        if (toksD.length >= 2 && toksD.length <= 10) {
+          var outD = [], okD = true;
+          for (var da = 0; da < toksD.length && okD;) {
+            var tookD = false;
+            for (var db = toksD.length; db > da + 1; db--) {
+              var runD = toksD.slice(da, db).join("・").trim();
+              var exD = runD ? exactOf(runD) : null;
+              if (exD !== null) { outD.push(exD); da = db; tookD = true; break; }
+            }
+            if (tookD) continue;
+            var tokD = toksD[da].trim();
+            var oneD = tokD ? tr(tokD, d0 + 1) : null;
+            if (oneD === null) { if (!tokD || JA_LEFT_RE.test(tokD)) { okD = false; break; } oneD = tokD; }
+            if (JA_LEFT_RE.test(oneD)) { okD = false; break; }
+            outD.push(oneD);
+            da++;
+          }
+          // 区切りは各言語のふつうの並べ方(英語・スペイン語は「, 」、中国語は「、」)。文の中に入る並びでも不自然にならない
+          if (okD) return outD.join((typeof LIST_JOIN === "object" && LIST_JOIN && LIST_JOIN[appLang]) || ", ");
+        }
+      }
+    }
+    // ---- v104.1(総点検・第2回): 「、」で並べた名前(「ハリー・ケイン、ヨシュア・キミッヒ、ジャマル・ムシアラ」)を1つずつ訳す ----
+    //   文の中の読点と区別するため、**すべての項目が辞書か名前の対応表にそのまま載っている**ときだけ(型は使わない)。
+    if (s.indexOf(COMMA_JA) > 0) {
+      var itemsC = s.split(COMMA_JA);
+      if (itemsC.length >= 2 && itemsC.length <= 12) {
+        var outC = [], okC = true;
+        for (var ca = 0; ca < itemsC.length; ca++) {
+          var itC = itemsC[ca].trim();
+          var oneC = itC ? exactOf(itC) : null;
+          if (oneC === null && itC && !JA_LEFT_RE.test(itC)) oneC = itC;
+          if (oneC === null || JA_LEFT_RE.test(oneC)) { okC = false; break; }
+          outC.push(oneC);
+        }
+        if (okC) return outC.join((typeof LIST_JOIN === "object" && LIST_JOIN && LIST_JOIN[appLang]) || ", ");
+      }
+    }
+    // ---- v104.1(総点検・第2回): 空白つきの「 / 」で並べた項目(選手検索の候補の「クラブ / ポジション / 国」など)を1つずつ訳す ----
+    if (SLASH_SEP_RE.test(s)) {
+      var partsS = s.split(SLASH_SEP_RE);
+      if (partsS.length >= 2 && partsS.length <= 6) {
+        var outSl = [], okSl = true;
+        for (var sa = 0; sa < partsS.length; sa++) {
+          var partS = partsS[sa].trim();
+          var oneSl = partS ? tr(partS, d0 + 1) : null;
+          if (oneSl === null && partS && !JA_LEFT_RE.test(partS)) oneSl = partS;
+          if (oneSl === null || JA_LEFT_RE.test(oneSl)) { okSl = false; break; }
+          outSl.push(oneSl);
+        }
+        if (okSl) return outSl.join(" / ");
+      }
+    }
+    // ---- v104.1(総点検・第2回): 「A」「B」「C」の形で並ぶ値(長所・課題など)を1つずつ訳す ----
+    //   型のスロットには引用符の内側(A」「B」「C)が入る。まとめては訳せないため、長所や課題を2つ以上持つ選手の回答が
+    //   まるごと日本語のまま残っていた。1つずつ訳し、各言語の引用符でつなぐ(すべて訳せたときだけ)。
+    if (s.indexOf(QUOTE_SEP) > 0) {
+      var itemsQ = s.split(QUOTE_SEP);
+      if (itemsQ.length >= 2 && itemsQ.length <= 12) {
+        var outQ = [], okQ = true;
+        for (var qa = 0; qa < itemsQ.length; qa++) {
+          var itQ = itemsQ[qa].trim();
+          var oneQ = itQ ? tr(itQ, d0 + 1) : null;
+          if (oneQ === null && itQ && !JA_LEFT_RE.test(itQ)) oneQ = itQ;
+          if (oneQ === null || JA_LEFT_RE.test(oneQ)) { okQ = false; break; }
+          outQ.push(oneQ);
+        }
+        if (okQ) return outQ.join(appLang === "zh" ? QUOTE_SEP : appLang === "es" ? "», «" : '", "');
+      }
+    }
+    // どの方法でも完訳できないときだけ、半端な訳を最後の手段として使う(v83 / v92)
+    // v104.1(総点検・第2回): ただし、日本語が多く残る半端な訳は使わない(原文のまま出す)。
+    //   「⦿歳」「⦿年⦿月」「⦿勝ち」のような短い型が、理解していない文の端だけに当たって語順を崩し、
+    //   「7/完全移籍(移籍金あり) ・ バレンシアCFより ・ 2025」「一般に is 守備が安定した側が有利.」のような
+    //   意味の通らない混ざり方になっていた。「ほぼ訳せた」もの(半分以上が訳せて、残りが原文どおり1か所にまとまっている)だけを使う。
+    if (firstMatchOut !== null && !halfOk(s, firstMatchOut)) firstMatchOut = null;
+    if (innerOut !== null && !halfOk(s, innerOut)) innerOut = null;
     return firstMatchOut !== null ? firstMatchOut : innerOut;
   }
+  var LIST_SEP_RE = /\s+・\s+/;
+  var QUOTE_SEP = "」「";
+  var COMMA_JA = "、";
+  var SLASH_SEP_RE = /\s+\/\s+/;
+  var JA_COUNT_RE = new RegExp(JA_LEFT_RE.source, "g");
+  function jaCount(str) { var mm = String(str).match(JA_COUNT_RE); return mm ? mm.length : 0; }
+  /** 半端な訳を使ってよいか。使うのは「ほぼ訳せた」ものだけ:
+   *   ① 日本語の半分以上が訳せている(残りが元の5割以下)
+   *   ② 残った日本語が1か所にまとまっていて、原文のその部分と1文字も違わない(=訳せなかった値が1つ残っただけ)。
+   *      語順を入れ替えた混ざり方(「一般に is 守備が安定した側が有利.」)は、残りが原文と一致しないので使わない。 */
+  function halfOk(orig, out) {
+    var a = jaCount(orig);
+    if (!(a > 0) || jaCount(out) > a * 0.5) return false;
+    var o = String(out), first = -1, last = -1;
+    for (var hi = 0; hi < o.length; hi++) { if (JA_LEFT_RE.test(o.charAt(hi))) { if (first === -1) first = hi; last = hi; } }
+    if (first === -1) return true;
+    return String(orig).indexOf(o.slice(first, last + 1)) !== -1;
+  }
+  // 短い型(固定部分の日本語が3文字以下)は、スロットが「ひとかたまりの値」のときだけ当てる。
+  //   以前は「完全移籍(移籍金あり) ・ トッテナム・ホットスパーより ・ 2023年8月」の全体に「⦿年⦿月」が当たり、
+  //   「8/完全移籍… ・ 2023」のように文の端だけを動かして語順を崩していた。
+  //   スロットに「。」や「 ・ 」(項目の区切り)が入るとき、辞書にも名前の対応表にも無い「・」入りの並びのときは当てない。
+  function slotsAtomic(m) {
+    for (var q = 1; q < m.length; q++) {
+      var v = m[q];
+      if (v == null || v === "") continue;
+      if (v.indexOf("。") !== -1 || LIST_SEP_RE.test(v)) return false;
+      if (v.indexOf("・") !== -1 && exactOf(v.trim()) === null) return false;
+    }
+    return true;
+  }
+  /** 完全一致だけで引く(言語パック → 辞書 → 名前の対応表)。型は使わない */
+  function exactOf(s) {
+    var xl0 = XL[s];
+    if (typeof xl0 === "string" && xl0) return xl0;
+    var e0 = X[s];
+    if (e0 && e0[ORDER[appLang]]) return e0[ORDER[appLang]];
+    return latinNameOf(s);
+  }
+  // ---- v104.1(総点検・第2回): 名前の対応表(クラブ・登録選手)を辞書の代わりに使う ----
+  //   辞書に無いクラブ名・選手名は、アプリ本体が持っている対応表(日本語名 → アルファベット表記)で出す。
+  //   中国語の画面でも、かなのまま残すより読める(中国語の訳が辞書にあるものは辞書が先に使われる)。
+  //   対応表はこの後ろの script で定義されるため、まだ読み込まれていない間は何もしない(try で守る)。
+  var playerNameMap = null;
+  function latinNameOf(s) {
+    if (!s || s.length > 40) return null;
+    try {
+      if (typeof UNIVERSE_CLUB_JA_TO_EN === "object" && UNIVERSE_CLUB_JA_TO_EN && Object.prototype.hasOwnProperty.call(UNIVERSE_CLUB_JA_TO_EN, s) && typeof UNIVERSE_CLUB_JA_TO_EN[s] === "string") return UNIVERSE_CLUB_JA_TO_EN[s];
+    } catch (e1) {}
+    try {
+      if (typeof CLUB_JA_TO_EN === "object" && CLUB_JA_TO_EN && Object.prototype.hasOwnProperty.call(CLUB_JA_TO_EN, s) && typeof CLUB_JA_TO_EN[s] === "string") return CLUB_JA_TO_EN[s];
+    } catch (e2) {}
+    try {
+      if (playerNameMap === null && typeof PLAYERS === "object" && PLAYERS) {
+        var mp = {};
+        for (var pk in PLAYERS) {
+          var p0 = PLAYERS[pk];
+          if (p0 && typeof p0.nameJa === "string" && p0.nameJa && typeof p0.name === "string" && p0.name) mp[p0.nameJa] = p0.name;
+        }
+        playerNameMap = mp;
+      }
+      if (playerNameMap && Object.prototype.hasOwnProperty.call(playerNameMap, s)) return playerNameMap[s];
+    } catch (e3) {}
+    return null;
+  }
+  var YEAR_ONLY_RE = /^(\d{4})年$/;
+  // 文の前後に残る記号(空白・「/」「:」「、」「,」「|」と、相手のいない片方だけの括弧)を剥がす。
+  //   戻り値は [前の記号, 中身, 後ろの記号]。剥がすものが無ければ null。
+  //   括弧は対応を数える: 「…(予想スコア 1-0)」の閉じ括弧は中身の一部なので剥がさない。
+  //   「…展開です。(」の開き括弧、「…時間帯)」の閉じ括弧のように、相手がいないものだけを剥がす。
+  var EDGE_PUNCT = { " ": 1, "　": 1, "\t": 1, "\n": 1, "/": 1, ":": 1, "：": 1, "、": 1, ",": 1, "|": 1 };
+  function peelEdges(s) {
+    var a = 0, b = s.length, guard = 0;
+    while (guard++ < 12) {
+      var moved = false;
+      while (a < b && EDGE_PUNCT[s.charAt(a)] === 1) { a++; moved = true; }
+      while (b > a && EDGE_PUNCT[s.charAt(b - 1)] === 1) { b--; moved = true; }
+      if (b - a < 2) break;
+      var open = 0, close = 0;
+      for (var qi = a; qi < b; qi++) { var qc = s.charAt(qi); if (qc === "(" || qc === "（") open++; else if (qc === ")" || qc === "）") close++; }
+      var first = s.charAt(a), last = s.charAt(b - 1);
+      if (last === "(" || last === "（") { b--; moved = true; }
+      else if (first === ")" || first === "）") { a++; moved = true; }
+      else if ((first === "(" || first === "（") && open > close) { a++; moved = true; }
+      else if ((last === ")" || last === "）") && close > open) { b--; moved = true; }
+      if (!moved) break;
+    }
+    if (a === 0 && b === s.length) return null;
+    var body = s.slice(a, b);
+    if (!body) return null;
+    return [s.slice(0, a), body, s.slice(b)];
+  }
+  // 先頭/末尾の絵文字・記号(絵文字・矢印・囲み文字・異体字セレクタ・空白・一部の記号)
+  var PEEL_EMOJI = "(?:[\\u2190-\\u21FF\\u2300-\\u23FF\\u2460-\\u24FF\\u25A0-\\u27BF\\u2900-\\u297F\\u2B00-\\u2BFF\\u3030\\u303D\\u3297\\u3299\\uFE0F\\u200D]|\\uD83C[\\uDC00-\\uDFFF]|\\uD83D[\\uDC00-\\uDFFF]|\\uD83E[\\uDC00-\\uDFFF]|[\\s\\u25B8\\u203B\\u2022])";
+  var PEEL_PREFIX_RE = new RegExp("^(" + PEEL_EMOJI + "+)([\\s\\S]+)$");
+  var PEEL_SUFFIX_RE = new RegExp("^([\\s\\S]+?)(" + PEEL_EMOJI + "+)$");
   // どこからでも使える翻訳関数(辞書に無ければ原文のまま返す)
   window.t = function (s) {
     var str = String(s == null ? "" : s);
@@ -594,8 +876,13 @@
   };
 
   var seen = (typeof WeakSet === "function") ? new WeakSet() : null;
+  // v104.1(総点検・第2回): <script> や <style> の中身も「文字の節」として拾われ、プログラム本体(数十万字)を
+  //   丸ごと翻訳にかけていた(日本語以外の画面の起動時に、毎回 0.1〜0.3 秒の無駄)。入力欄の中身(textarea)も訳さない。
+  var SKIP_PARENT = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, TEMPLATE: 1, TEXTAREA: 1 };
   function translateTextNode(n) {
     if (seen) { if (seen.has(n)) return; seen.add(n); }
+    var pn = n.parentNode;
+    if (pn && pn.nodeType === 1 && SKIP_PARENT[pn.nodeName] === 1) return;
     var raw = n.nodeValue;
     if (!raw || !/[ぁ-んァ-ヶ一-龥]/.test(raw)) return;
     var s = raw.trim();
@@ -645,9 +932,14 @@
   // シェア画像まで選択言語で表示されるようになったため、注記は「残っている例外」
   // だけの正直な1文に縮めた(誇張しない・隠さない)。
   var HONEST_NOTE = {
-    en: "Fully available in your language, including analyses and the behind-the-scenes page. Small known exceptions: the app name on your home screen and the /match share pages remain Japanese.",
-    zh: "包括分析与幕后页面在内,均以你选择的语言显示。已知的少数例外: 主屏幕上的应用名称与 /match 分享页仍为日语。",
-    es: "Disponible por completo en tu idioma, incluidos los análisis y la página entre bastidores. Excepciones conocidas: el nombre de la app en tu pantalla de inicio y las páginas /match siguen en japonés.",
+    // v104.1: 会話の詳細に引用される「保存済みの知識」(関係・過去の考えの記録など、日本語で蓄えた文)は訳せない
+    //   ものがあるため、例外に加えた(v104.1 の会話の漏れ検査で分かった範囲を正直に書く)。
+    // v104.1(総点検): 模擬の実データを入れた画面を実際のブラウザで総当たりした結果、従来の文面
+    //   (「分析や舞台裏のページまで、すべてあなたの言語で」)は言い過ぎだった。保存済みの日本語の文
+    //   (毎日の自己点検の質問と答え・学習の記録・反省・一部のクラブ名や選手名)が多く残る。残る範囲を正直に書く。
+    en: "Menus, buttons, predictions and most explanations are shown in your language. Known exceptions that may still appear in Japanese: some club and player names, the daily self-check questions and answers, learning logs and reflections, parts of the detailed player analysis and the daily report, stored knowledge quoted in the AI chat's details, the app name on your home screen, and the /match share pages.",
+    zh: "菜单、按钮、预测和大部分说明会以你选择的语言显示。已知仍可能以日语显示的部分: 部分俱乐部名和球员名、每日自检的问题与回答、学习日志与反思、球员详细分析和每日报告的一部分、AI问答详情中引用的已存知识、主屏幕上的应用名称,以及 /match 分享页。",
+    es: "Los menús, botones, predicciones y la mayoría de las explicaciones se muestran en tu idioma. Excepciones conocidas que aún pueden aparecer en japonés: algunos nombres de clubes y jugadores, las preguntas y respuestas diarias de autocomprobación, los registros de aprendizaje y las reflexiones, partes del análisis detallado de jugadores y del informe diario, el conocimiento guardado que se cita en los detalles del chat de IA, el nombre de la app en tu pantalla de inicio y las páginas /match.",
   };
   function applyLangChoice(lang, wasFirst) {
     try { localStorage.setItem("appLang", lang); } catch (e) {}
@@ -1211,18 +1503,132 @@
     "と高めの試合です(予想は最も確率の高い勝敗のまま)": [" — relatively high for this match (the pick stays the most likely outcome)", ",本场偏高(预测仍为概率最高的结果)", ", alta para este partido (la predicción sigue siendo el resultado más probable)"],
     "モデル生値": ["raw model value", "模型原始值", "valor bruto del modelo"],
     "同じ自信帯の実測": ["measured results in the same confidence band: ", "同一置信区间的实测", "resultados medidos en la misma banda: "],
+    // v104.1: 補正は「その帯」と「隣の帯」の実測をなめらかにつないで行う(帯の境目で数字が逆転しないように)
+    "近い自信帯の実測": ["measured results in nearby confidence bands: ", "相近置信区间的实测", "resultados medidos en bandas cercanas: "],
+    // v104.1(総点検): 選手の詳しい分析(🔎 選手を探す → 選手を開く)で日本語のまま残っていた語と文
+    "ボール保持で崩す戦術(ポゼッション)": ["Possession play (breaking teams down with the ball)", "控球渗透战术(传控)", "Juego de posesión (desarmar con balón)"],
+    "速い攻め(カウンター)": ["Fast attacks (counter-attacking)", "快速进攻(反击)", "Ataques rápidos (contraataque)"],
+    "前から奪う戦術(ハイプレス)": ["Winning the ball high (high press)", "前场逼抢战术(高位压迫)", "Recuperar arriba (presión alta)"],
+    "引いて守る戦術(ローブロック)": ["Sitting deep (low block)", "回收防守战术(低位防守)", "Defender replegado (bloque bajo)"],
+    "個で違いを作る戦術(創造性重視)": ["Individual creativity (creator-centred play)", "依靠个人创造力的战术", "Creatividad individual (juego para el creador)"],
+    "パス成功率とキーパスがいずれも同ポジションの上位にあるため。": ["Because both pass accuracy and key passes rank high for his position.", "因为传球成功率和关键传球在同位置中都名列前茅。", "Porque tanto la precisión de pase como los pases clave están entre los mejores de su posición."],
+    "ドリブル成功率とゴール数がいずれも同ポジションの上位にあるため。": ["Because both dribble success rate and goals rank high for his position.", "因为过人成功率和进球数在同位置中都名列前茅。", "Porque tanto el éxito en el regate como los goles están entre los mejores de su posición."],
+    "守備アクションとデュエル勝率がいずれも同ポジションの上位にあるため。": ["Because both defensive actions and duel win rate rank high for his position.", "因为防守动作和对抗成功率在同位置中都名列前茅。", "Porque tanto las acciones defensivas como los duelos ganados están entre los mejores de su posición."],
+    "デュエル勝率が特に高く、守備アクションも平均以上のため。": ["Because his duel win rate is especially high and his defensive actions are above average.", "因为对抗成功率特别高,防守动作也高于平均。", "Porque gana muchísimos duelos y sus acciones defensivas superan la media."],
+    "アシストまたはキーパスが同ポジションの上位にあるため。": ["Because assists or key passes rank high for his position.", "因为助攻或关键传球在同位置中名列前茅。", "Porque las asistencias o los pases clave están entre los mejores de su posición."],
+    "ドリブルで運べる": ["Carries the ball forward", "能带球推进", "Conduce y progresa con balón"],
+    "決定機を作る": ["Creates chances", "创造得分机会", "Crea ocasiones"],
+    "パスを繋いで組み立てる": ["Builds play through passing", "以传球组织进攻", "Construye con el pase"],
+    "守備での貢献が多い": ["Contributes a lot defensively", "防守贡献大", "Aporta mucho en defensa"],
+    "1対1に強い": ["Strong in one-on-ones", "一对一能力强", "Fuerte en el uno contra uno"],
+    "得点を取り切る": ["Finishes his chances", "把握机会能力强", "Define sus ocasiones"],
+    "主力として使われ続けている": ["Used consistently as a regular", "持续作为主力出场", "Titular habitual"],
+    "ゴール数": ["Goals", "进球数", "Goles"],
+    "アシスト数": ["Assists", "助攻数", "Asistencias"],
+    "守備アクション(タックル+インターセプト)": ["Defensive actions (tackles + interceptions)", "防守动作(抢断+拦截)", "Acciones defensivas (entradas + intercepciones)"],
+    "スタメン出場数": ["Starts", "首发次数", "Titularidades"],
+    "背番号": ["No.", "球衣号码", "dorsal"],
+    "ポゼッション": ["Possession", "传控", "Posesión"],
+    "ロングボール主体": ["Long-ball oriented", "以长传为主", "Juego directo"],
+    "フリー移籍(移籍金なし)": ["Free transfer (no fee)", "自由转会(无转会费)", "Traspaso libre (sin coste)"],
+    "完全移籍(移籍金あり)": ["Permanent transfer (fee paid)", "永久转会(有转会费)", "Traspaso definitivo (con coste)"],
+    "CB(センターバック)": ["CB (centre-back)", "CB(中后卫)", "CB (central)"],
+    "SB(サイドバック)": ["SB (full-back)", "SB(边后卫)", "SB (lateral)"],
+    "DMF(守備的MF)": ["DMF (defensive midfielder)", "DMF(防守型中场)", "DMF (mediocentro defensivo)"],
+    "CMF(中央MF)": ["CMF (central midfielder)", "CMF(中前卫)", "CMF (centrocampista)"],
+    "AMF(攻撃的MF)": ["AMF (attacking midfielder)", "AMF(攻击型中场)", "AMF (mediapunta)"],
+    "WG(ウイング)": ["WG (winger)", "WG(边锋)", "WG (extremo)"],
+    "CF(センターフォワード)": ["CF (centre-forward)", "CF(中锋)", "CF (delantero centro)"],
+    "表示している数値は毎日の学習で作られた索引の実測値です(記録本体は ?withRecord=1 で取得できます)。": ["The figures shown are measured values from the index built by the daily learning run (the full record is available with ?withRecord=1).", "显示的数值是每日学习生成的索引中的实测值(完整记录可通过 ?withRecord=1 获取)。", "Las cifras mostradas son valores medidos del índice que genera el aprendizaje diario (el registro completo se obtiene con ?withRecord=1)."],
+    "新加入・移籍・怪我・成績・調子は毎日の学習の翌日に自動で反映されます。": ["New signings, transfers, injuries, stats and form are reflected automatically the day after each daily learning run.", "新加盟、转会、伤病、成绩、状态会在每日学习的次日自动更新。", "Fichajes, traspasos, lesiones, estadísticas y estado de forma se reflejan automáticamente al día siguiente de cada aprendizaje diario."],
+    // v104.1(総点検): モデル調整の「副次的な改善」(これまで一度も表示されていなかった行)
+    "副次的な改善": ["Secondary improvements", "次要指标的改善", "Mejoras secundarias"],
+    // v104.1(総点検): 型の中に入る語が辞書に無く、「weak spot is シュート」「— アウェイでの粘り強さ stands out」のように
+    //   英語と日本語が混ざって表示されていたもの(実データを入れた総点検で検出)
+    "シュート": ["Shooting", "射门", "Tiro"],
+    "パス": ["Passing", "传球", "Pase"],
+    "アウェイでの粘り強さ": ["its resilience away from home", "客场的韧性", "su solidez fuera de casa"],
+    "ホームでの強さ": ["its strength at home", "主场的强势", "su fortaleza en casa"],
+    "xG収集の周期(日)": ["xG collection cycle (days)", "xG采集周期(天)", "ciclo de recogida de xG (días)"],
+    "選手詳細の1日あたり取得上限(人)": ["daily cap on detailed player fetches (players)", "每日球员详情获取上限(人)", "límite diario de fichas detalladas de jugadores"],
+    "学習計画の優先クラブ数(上限)": ["number of priority clubs in the learning plan (cap)", "学习计划的优先俱乐部数(上限)", "número de clubes prioritarios del plan de aprendizaje (tope)"],
+    "AI予想": ["AI pick", "AI预测", "Pronóstico de la IA"],
+    "「今日の試合」と「注目選手・若手有望株の上位」は、性質上ふつうに入れ替わるため、増えた数にも減った数にも入れていません(何も学んでいない日でも「賢くなった」「後退した」と出てしまうため)。「怪我」「移籍」は新しく入ったぶんだけを数え、期間から外れたぶんは減少に数えていません。": ["\"Today's matches\" and \"top featured players / young prospects\" change naturally from day to day, so they are counted in neither the gains nor the losses (otherwise the AI would look \"smarter\" or \"worse\" on days it learned nothing). For \"injuries\" and \"transfers\", only newly added items are counted; items that simply dropped out of the period are not counted as losses.", "“今日比赛”和“关注球员·年轻新星榜单”本来就会自然更替,因此既不计入增加也不计入减少(否则即使什么都没学到,也会显示“变聪明了”或“退步了”)。“伤病”“转会”只统计新增的部分,超出统计期而消失的部分不计为减少。", "«Partidos de hoy» y «jugadores destacados / jóvenes promesas» cambian de forma natural, así que no se cuentan ni como avances ni como retrocesos (de lo contrario la IA parecería «más lista» o «peor» en días en que no aprendió nada). En «lesiones» y «traspasos» solo se cuentan los elementos nuevos; los que salen del periodo no se cuentan como pérdidas."],
     "件から補正": [" cases used for this correction", "场校正", " casos usados para esta corrección"],
     "この試合はモデルの推定が現実的な範囲を外れました(確率は割り引いて見てください)": ["The model's estimate for this match fell outside a realistic range — treat the probability with caution.", "本场比赛模型的估计超出了现实范围,请谨慎看待该概率。", "La estimación del modelo para este partido quedó fuera de un rango realista; toma la probabilidad con cautela."],
   });
   // ---- ⑪ 型テンプレート(実ソースから機械抽出・⦿=変数スロット) ----
+  // v104.1(総点検): 型は「固定の文字列」と「変数スロット(⦿)」が交互に並ぶだけの形なので、
+  //   「先頭の固定部分で始まり・末尾の固定部分で終わり・途中の固定部分が順番どおりに現れる」ときに限って一致する。
+  //   この条件を先に線形時間で確かめ、満たさない文字列では正規表現そのものを実行しない。
+  //   以前は約700個の正規表現をすべての文字列に実行していたため、読点や句点が何十回も続く長い文
+  //   (1,000文字級)では、一致しない型の「後戻り」が積み重なって1つの文字列に1秒以上かかり、
+  //   日本語以外の表示で画面が固まり得た(実測: 本番と同じ版で約1.0秒 → この判定で1ミリ秒未満)。
+  //   判定を通った文字列には必ず一致が存在するため、正規表現は後戻りなしで終わる。訳の結果は変わらない。
+  var LINE_BREAK_RE = /[\n\r\u2028\u2029]/;
   function pat(t) {
     var esc = t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp("^" + esc.replace(/⦿/g, "(.*?)") + "$");
+    var re = new RegExp("^" + esc.replace(/⦿/g, "(.*?)") + "$");
+    var lit = t.split("⦿");
+    if (lit.length === 1 || LINE_BREAK_RE.test(t)) return re; // スロット無し・改行入りの型は従来どおり
+    var first = lit[0], last = lit[lit.length - 1], mid = lit.slice(1, -1), minLen = 0;
+    for (var li = 0; li < lit.length; li++) minLen += lit[li].length;
+    // v104.1(総点検・第2回): 「値+単位」の形の短い型(スロットで始まり、固定部分の日本語が3文字以下:
+    //   「⦿歳」「⦿年⦿月」「⦿人」「⦿勝ち」「⦿より」など)の印。数字や名前1つのような「ひとかたまりの値」に付く型なので、
+    //   スロットに文や項目の並びが入るときは当てはめない(tr の slotsAtomic)。
+    //   「共通点: ⦿。」「理由: ⦿」のような見出しで始まる型は、スロットに文や並びが入るのが普通なので対象外。
+    var jaLit = t.match(/[ぁ-んァ-ヶ一-龥]/g);
+    return {
+      source: re.source,
+      shortLit: t.charAt(0) === "⦿" && (!jaLit || jaLit.length <= 3),
+      exec: function (s) {
+        if (s.length < minLen) return null;
+        if (first && s.lastIndexOf(first, 0) !== 0) return null;
+        var end = s.length - last.length;
+        if (last && s.indexOf(last, end) !== end) return null;
+        var pos = first.length;
+        for (var j = 0; j < mid.length; j++) {
+          if (!mid[j]) continue;
+          var at = s.indexOf(mid[j], pos);
+          if (at === -1 || at + mid[j].length > end) return null;
+          pos = at + mid[j].length;
+        }
+        if (LINE_BREAK_RE.test(s)) return null; // スロット(.)は改行をまたげない=一致しない
+        return re.exec(s);
+      }
+    };
   }
   var RAWP = [
     ["⚖️ この予想の判定: 市場⦿%+AI⦿%の合成(比率は実測で学習・毎日見直し)", "⚖️ This verdict blends market $1% + AI $2% (ratio learned from real results, reviewed daily)", "⚖️ 本预测为市场$1%+AI$2%的合成判定(比例由实测学习、每日复核)", "⚖️ Este veredicto combina mercado $1 % + IA $2 % (proporción aprendida de resultados reales, revisada a diario)"],
     ["🏦 市場(オッズ)比較: AIは市場より⦿(⦿pt)", "🏦 Market (odds) check: the AI is $1 than the market ($2pt)", "🏦 市场(赔率)对比: AI比市场$1($2pt)", "🏦 Frente al mercado (cuotas): la IA es $1 que el mercado ($2pt)"],
     ["(モデル生値⦿%・同じ自信帯の実測⦿件に基づく補正)", "(raw model $1% — corrected using $2 measured cases in the same confidence band)", "(模型原始值$1%——基于同置信区间$2场实测的校正)", "(valor bruto del modelo $1 %, corregido con $2 casos medidos de la misma banda de confianza)"],
+    ["横ばい(平均評価の前回比 ⦿)", "Steady (average rating $1 vs last time)", "持平(平均评分较上次 $1)", "Estable (nota media $1 respecto a la última vez)"],
+    ["上向き(平均評価が前回比 ⦿)", "Trending up (average rating $1 vs last time)", "上升(平均评分较上次 $1)", "Al alza (nota media $1 respecto a la última vez)"],
+    ["下向き(平均評価が前回比 ⦿)", "Trending down (average rating $1 vs last time)", "下降(平均评分较上次 $1)", "A la baja (nota media $1 respecto a la última vez)"],
+    ["同じGK(ゴールキーパー)⦿人の中で上位⦿%", "in the top $2% of $1 goalkeepers", "在$1名门将中位列前$2%", "en el $2 % superior de $1 porteros"],
+    ["同じGK(ゴールキーパー)⦿人の中で下位⦿%", "in the bottom $2% of $1 goalkeepers", "在$1名门将中位列后$2%", "en el $2 % inferior de $1 porteros"],
+    ["同じDF(ディフェンダー)⦿人の中で上位⦿%", "in the top $2% of $1 defenders", "在$1名后卫中位列前$2%", "en el $2 % superior de $1 defensas"],
+    ["同じDF(ディフェンダー)⦿人の中で下位⦿%", "in the bottom $2% of $1 defenders", "在$1名后卫中位列后$2%", "en el $2 % inferior de $1 defensas"],
+    ["同じMF(ミッドフィールダー)⦿人の中で上位⦿%", "in the top $2% of $1 midfielders", "在$1名中场中位列前$2%", "en el $2 % superior de $1 centrocampistas"],
+    ["同じMF(ミッドフィールダー)⦿人の中で下位⦿%", "in the bottom $2% of $1 midfielders", "在$1名中场中位列后$2%", "en el $2 % inferior de $1 centrocampistas"],
+    ["同じFW(フォワード)⦿人の中で上位⦿%", "in the top $2% of $1 forwards", "在$1名前锋中位列前$2%", "en el $2 % superior de $1 delanteros"],
+    ["同じFW(フォワード)⦿人の中で下位⦿%", "in the bottom $2% of $1 forwards", "在$1名前锋中位列后$2%", "en el $2 % inferior de $1 delanteros"],
+    ["同じGK(ゴールキーパー)⦿人のうち⦿人が同じ値のため、順位に意味がありません", "$2 of $1 goalkeepers share the same value, so a ranking is not meaningful", "$1名门将中有$2人数值相同,排名没有意义", "$2 de $1 porteros tienen el mismo valor, así que el puesto no significa nada"],
+    ["同じDF(ディフェンダー)⦿人のうち⦿人が同じ値のため、順位に意味がありません", "$2 of $1 defenders share the same value, so a ranking is not meaningful", "$1名后卫中有$2人数值相同,排名没有意义", "$2 de $1 defensas tienen el mismo valor, así que el puesto no significa nada"],
+    ["同じMF(ミッドフィールダー)⦿人のうち⦿人が同じ値のため、順位に意味がありません", "$2 of $1 midfielders share the same value, so a ranking is not meaningful", "$1名中场中有$2人数值相同,排名没有意义", "$2 de $1 centrocampistas tienen el mismo valor, así que el puesto no significa nada"],
+    ["同じFW(フォワード)⦿人のうち⦿人が同じ値のため、順位に意味がありません", "$2 of $1 forwards share the same value, so a ranking is not meaningful", "$1名前锋中有$2人数值相同,排名没有意义", "$2 de $1 delanteros tienen el mismo valor, así que el puesto no significa nada"],
+    ["⦿がまだ取得できていません。", "$1 has not been obtained yet.", "$1尚未获取。", "$1 aún no se ha obtenido."],
+    ["索引の最終更新: ⦿(UTC)。", "Index last updated: $1 (UTC).", "索引最后更新: $1(UTC)。", "Última actualización del índice: $1 (UTC)."],
+    ["毎日の学習で追跡172クラブ(欧州上位100+J1・5大リーグ全部)から収集した ⦿人 を、名前・国籍・クラブから探せます。", "Search $1 players — collected by the daily learning run from the 172 tracked clubs (Europe's top 100 plus all of J1 and the big five leagues) — by name, nationality or club.", "可按姓名、国籍、俱乐部搜索每日学习从172家追踪俱乐部(欧洲前100+J1及五大联赛全部)收集的$1名球员。", "Busca entre $1 jugadores —recogidos por el aprendizaje diario en los 172 clubes seguidos (los 100 mejores de Europa más toda la J1 y las cinco grandes ligas)— por nombre, nacionalidad o club."],
+    ["現在 ⦿/⦿クラブぶんが入っています(残りは収集中です)・国籍 ⦿種類。", "Currently $1 of $2 clubs are included (the rest are still being collected) · $3 nationalities.", "目前已收录$2家俱乐部中的$1家(其余仍在收集中)・国籍$3种。", "Ahora hay $1 de $2 clubes (el resto se sigue recogiendo) · $3 nacionalidades."],
+    ["現在 ⦿クラブすべてが入っています・国籍 ⦿種類。", "Currently all $1 clubs are included · $2 nationalities.", "目前$1家俱乐部已全部收录・国籍$2种。", "Ahora están los $1 clubes · $2 nacionalidades."],
+    ["成績(平均評価)まで取得できているのは ⦿人です。", "Performance data (average rating) is available for $1 of them.", "其中已获取成绩(平均评分)的有$1人。", "Hay datos de rendimiento (nota media) de $1 de ellos."],
+    ["⦿の勝利", "$1 to win", "$1获胜", "Gana $1"],
+    ["⦿問の", "$1 ", "$1个", "$1 "],
+    ["両チーム得点(BTTS) ⦿→⦿", "Both teams to score (BTTS) $1→$2", "双方进球(BTTS) $1→$2", "Ambos marcan (BTTS) $1→$2"],
+    ["Over/Under 2.5 ⦿→⦿", "Over/Under 2.5 $1→$2", "大小球 2.5 $1→$2", "Más/Menos de 2.5 $1→$2"],
+    ["スコア的中(Top3) ⦿→⦿", "Exact score in top 3 $1→$2", "比分命中(前3) $1→$2", "Marcador exacto (top 3) $1→$2"],
+    ["総得点の平均絶対誤差 ⦿→⦿", "Mean absolute error of total goals $1→$2", "总进球平均绝对误差 $1→$2", "Error absoluto medio de goles totales $1→$2"],
     ["(モデル生値⦿%・実測⦿件に基づく補正)", "(raw model $1% — corrected using $2 measured cases)", "(模型原始值$1%——基于$2场实测的校正)", "(valor bruto del modelo $1 %, corregido con $2 casos medidos)"],
     ["🕓 予想生成: ⦿(毎朝の学習時。フォーム・怪我などの材料もその時点の実測)", "🕓 Prediction generated: $1 (during the morning learning run; form, injuries etc. as measured then)", "🕓 预测生成: $1(每日早晨学习时。状态、伤病等材料也是当时的实测)", "🕓 Predicción generada: $1 (en el aprendizaje matinal; forma, lesiones, etc. medidos en ese momento)"],
     ["AIはいま公式戦⦿連続的中中", "The AI is on a $1-hit streak in competitive games", "AI正式比赛连续命中$1场", "La IA lleva $1 aciertos seguidos en partidos oficiales"],
@@ -1424,6 +1830,12 @@
     "⏸️ 今回は採用を見送りました(現状のモデルを維持)。": ["⏸️ Not adopted this time (keeping the current model).", "⏸️ 本次未采用(维持现有模型)。", "⏸️ No se adoptó esta vez (se mantiene el modelo actual)."],
     "▲ 閉じる": ["▲ Close", "▲ 收起", "▲ Cerrar"],
     "⚖️ 他の選手と比較する": ["⚖️ Compare with other players", "⚖️ 与其他球员比较", "⚖️ Comparar con otros jugadores"],
+    "重みの更新ごとの変化(新しい順・平均)": ["Change per weight update (newest first, averages)", "每次权重更新带来的变化(由新到旧・平均值)", "Cambio por cada actualización de pesos (más reciente primero, promedios)"],
+    "対象の試合数": ["Matches compared", "对比的比赛数", "Partidos comparados"],
+    "ホーム勝率": ["Home win rate", "主胜率", "Victoria local"],
+    "アウェイ勝率": ["Away win rate", "客胜率", "Victoria visitante"],
+    "期待得点(合計)": ["Expected goals (total)", "预期进球(合计)", "Goles esperados (total)"],
+    "予測の自信": ["Prediction confidence", "预测的自信度", "Confianza de la predicción"],
     "⚖️ 重みの変更が予測に与えた影響": ["⚖️ How weight changes affected predictions", "⚖️ 权重变更对预测的影响", "⚖️ Efecto de los cambios de pesos en las predicciones"],
     "⚠️ この端末には保存できませんでした(プライベートモード等)。参加にはニックネームの保存が必要です。": ["⚠️ Couldn't save on this device (private mode, etc.). Saving a nickname is required to take part.", "⚠️ 无法保存到本设备(隐私模式等)。参加需要保存昵称。", "⚠️ No se pudo guardar en este dispositivo (modo privado, etc.). Participar requiere guardar un apodo."],
     "⚠️ ランキング登録の通信に失敗しました(端末内の対戦成績には数えます)": ["⚠️ Leaderboard registration failed to send (it still counts in this device's record)", "⚠️ 排行榜登记通信失败(仍计入本设备的对战成绩)", "⚠️ Falló el envío al ranking (sí cuenta en el historial del dispositivo)"],
@@ -2971,6 +3383,8 @@
     ["うち⦿試合はライブ中・これからの試合です(同時開催が多い日は表示枠を超えます)", "$1 of them are live or upcoming (on busy days this exceeds the display limit)", "其中$1场正在进行或即将开始(同时开赛较多的日子会超出显示上限)", "$1 de ellos están en juego o por comenzar (en días cargados se supera el límite de la vista)"],
     ["両クラブ合わせて⦿名の負傷・出場停止者を抱える中、主力不在の穴をどう埋めるか。", "With $1 players injured or suspended across both clubs, the question is how to fill the gaps left by key absentees.", "两队合计有$1名伤停球员,如何填补主力缺阵的空缺是看点。", "Con $1 jugadores lesionados o sancionados entre ambos, la cuestión es cómo cubrir las ausencias clave."],
     ["AIは⦿がやや優勢と予想しますが、最も可能性が高い正確なスコアは⦿の接戦です。", "The AI sees $1 as slightly favoured, but the single most likely scoreline is a tight $2.", "AI认为$1稍占上风,但可能性最高的具体比分是$2的胶着战。", "La IA ve a $1 con ligera ventaja, pero el marcador exacto más probable es un ajustado $2."],
+    ["⦿の直近5試合の1試合平均得失点差が、その前の5試合と比べて上昇しました(⦿)。", "$1's average goal difference per match over the last 5 has risen compared with the previous 5 ($2).", "$1最近5场的场均净胜球较之前5场上升($2)。", "La diferencia de goles media de $1 en los últimos 5 partidos ha subido respecto a los 5 anteriores ($2)."],
+    ["⦿の直近5試合の1試合平均得失点差が、その前の5試合と比べて低下しました(⦿)。", "$1's average goal difference per match over the last 5 has fallen compared with the previous 5 ($2).", "$1最近5场的场均净胜球较之前5场下降($2)。", "La diferencia de goles media de $1 en los últimos 5 partidos ha bajado respecto a los 5 anteriores ($2)."],
     ["⦿の直近5試合の1試合平均得失点差が、その前の5試合と比べて⦿しました(⦿)。", "$1's average goal difference per match over the last 5 has $2 compared with the previous 5 ($3).", "$1最近5场的场均净胜球较之前5场$2($3)。", "La diferencia de goles media de $1 en los últimos 5 partidos $2 respecto a los 5 anteriores ($3)."],
     ["⦿歳とベテランの年代なので、一番良かった時期は数年前だった可能性が高いです。", "At $1, veteran territory, the very best years were most likely a few seasons back.", "$1岁已属老将年龄段,状态最好的时期很可能在几年前。", "A los $1 años, edad veterana, su mejor momento probablemente quedó unas temporadas atrás."],
     ["登録選手データの平均値では⦿がやや優勢と分析されます(AI確信度 ⦿%)。⦿", "By registered-player averages, $1 looks slightly favoured (AI confidence $2%). $3", "按已登记球员数据的平均值,$1略占上风(AI置信度$2%)。$3", "Por las medias de jugadores registrados, $1 parte con ligera ventaja (confianza IA $2 %). $3"],
@@ -3256,7 +3670,7 @@
     ["⦿が採用している布陣は⦿", "$1's current formation: $2", "$1采用的阵型是$2", "La formación que usa $1: $2"],
     ["⦿について分析したのは⦿", "Analysis on $1: $2", "关于$1的分析是$2", "Análisis sobre $1: $2"],
     ["⭐ マイクラブ: ⦿⦿", "⭐ My club: $1$2", "⭐ 我的俱乐部: $1$2", "⭐ Mi club: $1$2"],
-    ["を回答に使いました⦿⦿", "were used in the answer$1$2", "被用于回答$1$2", "se usaron en la respuesta$1$2"],
+    ["を回答に使いました⦿⦿", " were used in the answer $1$2", "被用于回答$1$2", " se usaron en la respuesta $1$2"],
     ["現在⦿歳(⦿生まれ)。", "Currently $1 (born $2).", "现年$1岁($2出生)。", "Actualmente $1 años (nacido en $2)."],
     ["[最近の変化 ⦿] ⦿", "[Recent change $1] $2", "[近期变化 $1] $2", "[Cambio reciente $1] $2"],
     ["実際は⦿でした(⦿)。", "It was actually $1 ($2).", "实际是$1($2)。", "En realidad fue $1 ($2)."],
@@ -3501,6 +3915,14 @@
       ["This club isn't tracked yet, so there's no player data (opening this card queued it for pickup — the nightly collection will fetch it from tomorrow).",
        "该俱乐部尚未纳入追踪,因此没有球员数据(打开此卡片后已登记为收录候选,夜间收集将从明天起自动获取)。",
        "Este club aún no está en seguimiento, así que no hay datos de jugadores (al abrir esta tarjeta quedó en cola; la recogida nocturna lo traerá a partir de mañana)."],
+    "2軍・女子・ユースのチームは収集の対象外のため、選手データはありません(このAIは男子のトップチームを対象にしています)。":
+      ["Reserve, women's and youth teams are outside the collection scope, so there's no player data (this AI covers men's first teams).",
+       "预备队、女足和青年队不在收集范围内,因此没有球员数据(本AI以男子一线队为对象)。",
+       "Los filiales, los equipos femeninos y los juveniles quedan fuera de la recogida, así que no hay datos de jugadores (esta IA cubre los primeros equipos masculinos)."],
+    "AIが追跡している別のクラブと同じ名前のチームのため、選手データは表示しません(別のクラブの情報を混ぜないための措置です)。":
+      ["This team shares its name with a different club the AI already tracks, so no player data is shown (to avoid mixing in another club's information).",
+       "该球队与AI已在跟踪的另一家俱乐部同名,因此不显示球员数据(以免混入其他俱乐部的信息)。",
+       "Este equipo se llama igual que otro club que la IA ya sigue, así que no se muestran datos de jugadores (para no mezclar información de otro club)."],
     "このクラブはまだ取り込み中です(選手成績は翌日以降の夜間収集で揃います)。":
       ["This club is still being imported (player stats will be complete after the next nightly collection).",
        "该俱乐部仍在收录中(球员成绩将在下次夜间收集后补齐)。",
@@ -3547,6 +3969,162 @@
     ["⦿のデータが予想時に取得できておらず、これらを考慮せずに予想していました(欠けていたデータは翌日の収集で優先的に取りに行きます)。", "$1 data wasn't available at prediction time, so it wasn't considered (missing data is fetched with priority in the next collection).", "预测时未能获取$1的数据,因此未予考虑(缺失的数据将在下次收集中优先获取)。", "Los datos de $1 no estaban disponibles al predecir, así que no se consideraron (los datos faltantes se obtienen con prioridad en la siguiente recogida)."],
   ];
   for (var rp5 = 0; rp5 < RAWP5.length; rp5++) P.push([pat(RAWP5[rp5][0]), RAWP5[rp5][1], RAWP5[rp5][2], RAWP5[rp5][3]]);
+  /* ==== v104.1(2026年11月14日): 会話の「🧭 この結論に至るまでの検討」(6段階の熟考)の文言 ====
+     v82 でこのパネルが描かれるようになって以来、中身(サーバーが規則で組み立てる日本語の文)に訳が無かった。
+     文の出どころは reasoning/deliberation.js と reasoning/hypothesisGenerator.js(v104_1_i18n_chat_test.js が全数を照らす)。 */
+  add({
+    "データ収集": ["Data gathering", "数据收集", "Recogida de datos"],
+    "仮説の列挙": ["Listing hypotheses", "列举假设", "Listado de hipótesis"],
+    "仮説の比較": ["Comparing hypotheses", "比较假设", "Comparación de hipótesis"],
+    "根拠の評価": ["Evaluating the evidence", "评估依据", "Evaluación de la evidencia"],
+    "最終結論": ["Final conclusion", "最终结论", "Conclusión final"],
+    "反論の検討:": ["Counter-argument check:", "反方观点的检讨:", "Revisión del contraargumento:"],
+    "対象クラブ": ["the club in question", "该球队", "el club en cuestión"],
+    "比較できる仮説がありません。": ["There are no hypotheses to compare.", "没有可比较的假设。", "No hay hipótesis que comparar."],
+    "そもそも実データが不足しているため、賛成・反対のどちらの材料も十分にありません。": ["Real data is lacking in the first place, so there is not enough material either for or against.", "由于实际数据本身不足,无论支持还是反对的材料都不充分。", "Faltan datos reales de partida, así que no hay material suficiente ni a favor ni en contra."],
+    "他の観点については、現時点で比較できるだけのデータが集まっていません。反対意見が見つからないことは、この見方が正しい証拠にはなりません。": ["For the other viewpoints, not enough data has been gathered yet to compare. Finding no counter-argument does not prove this view is right.", "其他观点目前还没有足够的数据可供比较。找不到反对意见,并不能证明这个观点正确。", "Para los demás puntos de vista aún no hay datos suficientes para comparar. No encontrar un contraargumento no demuestra que esta visión sea correcta."],
+    "私は、現時点では確かなことを申し上げられないと考えます。": ["I don't think I can say anything certain at this point.", "我认为目前无法给出确切的结论。", "Creo que por ahora no puedo afirmar nada con certeza."],
+    "この見方は前回から変わっていません。根拠も同じ方向を示し続けています。": ["This view has not changed since last time. The evidence keeps pointing the same way.", "这个观点与上次相比没有变化。依据仍指向同一方向。", "Esta visión no ha cambiado desde la última vez. La evidencia sigue apuntando en la misma dirección."],
+    // 仮説の名前(クラブの質問: 9つの観点)
+    "怪我・出場停止(守備陣・主力の状態)が原因という仮説": ["the hypothesis that injuries and suspensions (the state of the defence and key players) are the cause", "伤病・停赛(防线与主力的状态)是原因的假设", "la hipótesis de que la causa son las lesiones y sanciones (estado de la defensa y de los titulares)"],
+    "戦術・フォーメーションの変化が原因という仮説": ["the hypothesis that changes in tactics or formation are the cause", "战术・阵型变化是原因的假设", "la hipótesis de que la causa son los cambios de táctica o de formación"],
+    "移籍による戦力変化が原因という仮説": ["the hypothesis that squad changes through transfers are the cause", "转会带来的战力变化是原因的假设", "la hipótesis de que la causa son los cambios de plantilla por traspasos"],
+    "直近フォーム(得失点差の推移)が原因という仮説": ["the hypothesis that recent form (the trend in goal difference) is the cause", "近期状态(净胜球走势)是原因的假设", "la hipótesis de que la causa es la forma reciente (evolución de la diferencia de goles)"],
+    "監督(采配・就任時期)が原因という仮説": ["the hypothesis that the manager (decisions and time in charge) is the cause", "主教练(用人与上任时间)是原因的假设", "la hipótesis de que la causa es el entrenador (decisiones y tiempo en el cargo)"],
+    "ホーム/アウェイの違いが原因という仮説": ["the hypothesis that the home/away difference is the cause", "主客场差异是原因的假设", "la hipótesis de que la causa es la diferencia entre casa y fuera"],
+    "過密日程・疲労が原因という仮説": ["the hypothesis that fixture congestion and fatigue are the cause", "赛程密集・疲劳是原因的假设", "la hipótesis de que la causa son el calendario apretado y la fatiga"],
+    "勢い・メンタル面(連続結果)が原因という仮説": ["the hypothesis that momentum and mentality (runs of results) are the cause", "势头・心理层面(连续的结果)是原因的假设", "la hipótesis de que la causa son la dinámica y lo mental (rachas de resultados)"],
+    "リーグ順位・置かれた状況が原因という仮説": ["the hypothesis that league position and the club's situation are the cause", "联赛排名・所处形势是原因的假设", "la hipótesis de que la causa son la posición en la liga y la situación del club"],
+    // 仮説の名前(選手の質問: 6つの観点)
+    "得点関与(ゴール・アシスト)が評価の中心という見立て": ["the view that goal involvement (goals and assists) is at the heart of the player's standing", "进球参与(进球・助攻)是评价核心的看法", "la lectura de que la participación en goles (goles y asistencias) es el centro de su valoración"],
+    "チャンスメイク・ボール技術が持ち味という見立て": ["the view that chance creation and ball skills are the player's hallmark", "创造机会・控球技术是其特长的看法", "la lectura de que su sello es la creación de ocasiones y la técnica con el balón"],
+    "守備貢献・対人の強さが持ち味という見立て": ["the view that defensive contribution and strength in duels are the player's hallmark", "防守贡献・对抗能力是其特长的看法", "la lectura de que su sello es la aportación defensiva y la fuerza en los duelos"],
+    "試合ごとの安定感(平均評価)が評価を支えているという見立て": ["the view that match-to-match consistency (average rating) underpins the player's standing", "每场比赛的稳定性(平均评分)支撑其评价的看法", "la lectura de que la regularidad partido a partido (valoración media) sostiene su valoración"],
+    "出場機会・起用のされ方が現状を左右しているという見立て": ["the view that playing time and how the player is used shape the current situation", "出场机会・使用方式左右现状的看法", "la lectura de que los minutos y la forma de utilizarlo condicionan su situación actual"],
+    "所属クラブの状況が影響しているという見立て": ["the view that the situation at the player's club is having an effect", "所属球队的情况产生影响的看法", "la lectura de que influye la situación de su club"],
+  });
+  var RAWP9 = [
+    // (多段思考の注記2通りは v47/v82 の辞書に訳が既にある。訳されなかったのは「🔁 」と同じ文字の節に入っていたため=描画側で直した)
+    // 段階2〜6(「対抗する仮説が無いため、「⦿」が唯一の候補です。」「私は「⦿」がこの分析で最も重要だと考えます。」は以前からの辞書にある)
+    ["⦿本の仮説を検討(最有力: ⦿・根拠⦿件)", "$1 hypotheses considered (leading: $2; pieces of evidence: $3)", "检讨了$1个假设(最有力: $2・依据$3条)", "$1 hipótesis consideradas (principal: $2; evidencias: $3)"],
+    ["1位「⦿」(⦿)と2位「⦿」(⦿)は僅差です。単一要因と断定できません。", "No. 1 \"$1\" ($2) and No. 2 \"$3\" ($4) are close. No single cause can be asserted.", "第1位「$1」($2)与第2位「$3」($4)差距很小,无法断定为单一原因。", "La n.º 1 «$1» ($2) y la n.º 2 «$3» ($4) están muy igualadas. No se puede afirmar una causa única."],
+    ["1位「⦿」(⦿)が2位「⦿」(⦿)を明確に上回っています。", "No. 1 \"$1\" ($2) clearly outweighs No. 2 \"$3\" ($4).", "第1位「$1」($2)明显强于第2位「$3」($4)。", "La n.º 1 «$1» ($2) supera claramente a la n.º 2 «$3» ($4)."],
+    ["⦿ この見方も根拠の強さがほぼ同等のため、無視できません。", "$1 This view is backed by evidence of almost equal strength, so it cannot be ignored.", "$1 这一看法的依据强度几乎相同,因此不能忽视。", "$1 Esta visión cuenta con una evidencia casi igual de sólida, así que no puede ignorarse."],
+    // 仮説の文(クラブ: 根拠がある場合)
+    ["⦿の状態は、負傷・出場停止による選手の入れ替わりが影響している可能性がある。", "$1's condition may be affected by changes in personnel due to injuries and suspensions.", "$1的状态可能受到伤病・停赛造成的人员变动的影响。", "El estado de $1 puede estar condicionado por los cambios de jugadores debidos a lesiones y sanciones."],
+    ["⦿の結果は、フォーメーションや戦術的な方針(ビルドアップ・プレス・保持率等)が影響している可能性がある。", "$1's results may be affected by formation and tactical approach (build-up, pressing, possession, etc.).", "$1的战绩可能受到阵型与战术方针(出球组织・逼抢・控球率等)的影响。", "Los resultados de $1 pueden estar condicionados por la formación y el planteamiento táctico (salida de balón, presión, posesión, etc.)."],
+    ["⦿の状態は、直近の移籍(加入・退団)による戦力変化が影響している可能性がある。", "$1's condition may be affected by squad changes from recent transfers (arrivals and departures).", "$1的状态可能受到近期转会(加盟・离队)带来的战力变化的影响。", "El estado de $1 puede estar condicionado por los cambios de plantilla de los traspasos recientes (altas y bajas)."],
+    ["⦿の直近の試合結果の推移そのものが、現在の評価に直接影響している可能性がある。", "The trend in $1's recent results may itself be directly shaping the current assessment.", "$1近期比赛结果的走势本身,可能直接影响着目前的评价。", "La propia evolución de los resultados recientes de $1 puede estar influyendo directamente en la valoración actual."],
+    ["⦿の状態は、現在の監督の采配方針が影響している可能性がある。", "$1's condition may be affected by the current manager's approach.", "$1的状态可能受到现任主教练用人方针的影响。", "El estado de $1 puede estar condicionado por el planteamiento del entrenador actual."],
+    ["⦿はホームとアウェイで成績差が大きく、開催地が結果に影響している可能性がある。", "$1 show a large gap between home and away results, so the venue may be affecting outcomes.", "$1的主客场战绩差距较大,比赛场地可能影响着结果。", "$1 presenta una gran diferencia de resultados entre casa y fuera, así que el lugar del partido puede estar influyendo."],
+    ["⦿は直近の試合間隔が短く、疲労の蓄積が影響している可能性がある。", "$1 have had short gaps between recent matches, so accumulated fatigue may be a factor.", "$1近期比赛间隔较短,疲劳累积可能产生影响。", "$1 ha tenido poco descanso entre los últimos partidos, así que la fatiga acumulada puede estar influyendo."],
+    ["⦿は結果が連続しており、勢い(またはその逆の重圧)がメンタル面に影響している可能性がある。", "$1 are on a run of results, so momentum (or, conversely, pressure) may be affecting them mentally.", "$1的结果呈连续态势,势头(或相反的压力)可能影响着心理层面。", "$1 encadena resultados, así que la dinámica (o, al contrario, la presión) puede estar influyendo en lo mental."],
+    ["⦿の現在のリーグ順位が、モチベーションや戦い方の選択に影響している可能性がある。", "$1's current league position may be affecting motivation and tactical choices.", "$1目前的联赛排名可能影响着斗志与打法的选择。", "La posición actual de $1 en la liga puede estar influyendo en la motivación y en la forma de plantear los partidos."],
+    // 仮説の文(クラブ: 根拠が見つからなかった場合)
+    ["⦿について、負傷・出場停止に関する情報は見当たらなかった。", "No information on injuries or suspensions was found for $1.", "未找到关于$1伤病・停赛的信息。", "No se encontró información sobre lesiones o sanciones de $1."],
+    ["⦿について、戦術・フォーメーションに関する情報は見当たらなかった。", "No information on tactics or formation was found for $1.", "未找到关于$1战术・阵型的信息。", "No se encontró información sobre la táctica o la formación de $1."],
+    ["⦿について、直近の移籍に関する情報は見当たらなかった。", "No information on recent transfers was found for $1.", "未找到关于$1近期转会的信息。", "No se encontró información sobre traspasos recientes de $1."],
+    ["⦿について、直近の試合結果の推移に関する情報は見当たらなかった。", "No information on the trend in recent results was found for $1.", "未找到关于$1近期比赛结果走势的信息。", "No se encontró información sobre la evolución de los resultados recientes de $1."],
+    ["⦿について、監督に関する情報は見当たらなかった。", "No information on the manager was found for $1.", "未找到关于$1主教练的信息。", "No se encontró información sobre el entrenador de $1."],
+    ["⦿について、ホーム/アウェイの明確な成績差は確認できなかった。", "No clear home/away gap in results could be confirmed for $1.", "未能确认$1存在明显的主客场战绩差距。", "No se pudo confirmar una diferencia clara de resultados entre casa y fuera en $1."],
+    ["⦿について、過密日程を示す情報は見当たらなかった。", "No information pointing to fixture congestion was found for $1.", "未找到显示$1赛程密集的信息。", "No se encontró información que indique un calendario apretado para $1."],
+    ["⦿について、連続した結果(勢いの根拠になるもの)は確認できなかった。", "No run of results (the basis for momentum) could be confirmed for $1.", "未能确认$1有连续的结果(可作为势头依据的内容)。", "No se pudo confirmar una racha de resultados (la base de una dinámica) en $1."],
+    ["⦿について、現在の順位に関する情報は見当たらなかった(質問文に順位への言及が無かった可能性があります)。", "No information on the current league position was found for $1 (the question may not have mentioned the standings).", "未找到关于$1当前排名的信息(可能是提问中没有提到排名)。", "No se encontró información sobre la posición actual de $1 (puede que la pregunta no mencionara la clasificación)."],
+    // 仮説の文(選手: 根拠がある場合)
+    ["⦿の現在の評価は、今シーズンの得点・アシストという直接の数字に支えられている可能性が高い。", "$1's current standing is likely underpinned by the direct numbers of this season's goals and assists.", "$1目前的评价很可能由本赛季的进球・助攻这些直接数字支撑。", "Es probable que la valoración actual de $1 se apoye en las cifras directas de goles y asistencias de esta temporada."],
+    ["⦿はキーパス・パス精度・仕掛けなど、得点の一つ手前の貢献が持ち味である可能性がある。", "$1's hallmark may be the contribution one step before the goal: key passes, passing accuracy and taking players on.", "$1的特长可能在于进球前一步的贡献,如关键传球・传球精度・带球突破等。", "El sello de $1 puede ser la aportación previa al gol: pases clave, precisión en el pase y el regate."],
+    ["⦿はタックル・インターセプト・デュエルなど、守備側の実測が評価を支えている可能性がある。", "$1's standing may be underpinned by measured defensive work such as tackles, interceptions and duels.", "$1的评价可能由抢断・拦截・对抗等防守端的实测数据支撑。", "La valoración de $1 puede apoyarse en el trabajo defensivo medido: entradas, intercepciones y duelos."],
+    ["⦿は試合ごとの平均レーティングという「安定して計算できる働き」が評価につながっている可能性がある。", "$1's standing may come from dependable, consistent work, as shown by the average match rating.", "$1的评价可能来自以场均评分体现的「稳定可靠的表现」。", "La valoración de $1 puede deberse a un rendimiento fiable y constante, como muestra su valoración media por partido."],
+    ["⦿の現状は、出場機会(起用のされ方)そのものに左右されている可能性がある。", "$1's current situation may be shaped by playing time itself (how the player is used).", "$1的现状可能取决于出场机会本身(即使用方式)。", "La situación actual de $1 puede depender de los propios minutos de juego (de cómo se le utiliza)."],
+    ["⦿個人の数字だけでなく、所属クラブの現在の状況(調子・順位など)が影響している可能性がある。", "Beyond $1's individual numbers, the current situation at the club (form, league position, etc.) may be having an effect.", "除了$1个人的数据之外,所属球队目前的情况(状态・排名等)也可能产生影响。", "Más allá de las cifras individuales de $1, puede estar influyendo la situación actual de su club (forma, posición, etc.)."],
+    // 仮説の文(選手: 根拠が見つからなかった場合)
+    ["⦿の得点関与を示す実データは見当たらなかった。", "No real data showing $1's goal involvement was found.", "未找到显示$1进球参与的实际数据。", "No se encontraron datos reales sobre la participación en goles de $1."],
+    ["⦿のチャンスメイクに関する実データは見当たらなかった。", "No real data on $1's chance creation was found.", "未找到关于$1创造机会的实际数据。", "No se encontraron datos reales sobre la creación de ocasiones de $1."],
+    ["⦿の守備・対人に関する実データは見当たらなかった。", "No real data on $1's defending and duels was found.", "未找到关于$1防守・对抗的实际数据。", "No se encontraron datos reales sobre la defensa y los duelos de $1."],
+    ["⦿の試合評価(平均レーティング)は取得できなかった。", "$1's match rating (average) could not be retrieved.", "未能获取$1的比赛评分(平均)。", "No se pudo obtener la valoración por partido (media) de $1."],
+    ["⦿の出場機会に関する実データは見当たらなかった。", "No real data on $1's playing time was found.", "未找到关于$1出场机会的实际数据。", "No se encontraron datos reales sobre los minutos de $1."],
+    ["⦿の所属クラブの状況を示すデータは見当たらなかった。", "No data showing the situation at $1's club was found.", "未找到显示$1所属球队情况的数据。", "No se encontraron datos sobre la situación del club de $1."],
+  ];
+  for (var rp9 = 0; rp9 < RAWP9.length; rp9++) P.push([pat(RAWP9[rp9][0]), RAWP9[rp9][1], RAWP9[rp9][2], RAWP9[rp9][3]]);
+  /* ==== v104.1(総点検): 模擬の実データを入れた画面で、日本語のまま残っていた定型文 ==== */
+  add({
+    "条件をゆるめてお試しください。": ["Try loosening the filters.", "请放宽条件后再试。", "Prueba con filtros menos estrictos."],
+    "答え合わせ待ちの試合はすべて『まだ終わっていない』状態です。試合が終われば自動的に正答率へ反映されます(異常ではありません)。":
+      ["All matches awaiting scoring simply haven't finished yet. They'll be reflected in the accuracy automatically once they end (nothing is wrong).",
+       "所有等待核对的比赛都只是『尚未结束』。比赛结束后会自动计入正确率(并非异常)。",
+       "Todos los partidos pendientes de comprobación simplemente no han terminado. Se reflejarán en el acierto automáticamente cuando acaben (no es un fallo)."],
+    "自動照合の実行記録なし": ["no auto-check run on record", "无自动核对的执行记录", "sin registro de comprobación automática"],
+    "好調な若手": ["In-form youngster", "状态出色的年轻球员", "Joven en racha"],
+    "安定した主力": ["Reliable regular", "稳定的主力", "Titular fiable"],
+    "調子が急上昇": ["Form surging", "状态急升", "Forma en alza"],
+    "所属クラブが変わりました": ["Changed clubs", "所属俱乐部已变更", "Ha cambiado de club"],
+    "GK(ゴールキーパー)": ["GK (goalkeeper)", "GK(门将)", "GK (portero)"],
+    "DF(ディフェンダー)": ["DF (defender)", "DF(后卫)", "DF (defensa)"],
+    "MF(ミッドフィールダー)": ["MF (midfielder)", "MF(中场)", "MF (centrocampista)"],
+    "FW(フォワード)": ["FW (forward)", "FW(前锋)", "FW (delantero)"],
+    "若手有望株": ["Young prospect", "年轻潜力股", "Joven promesa"],
+    "フォーム急上昇": ["Form surging", "状态急升", "Forma en alza"],
+    "フォーム急下降": ["Form dropping", "状态急降", "Forma a la baja"],
+  });
+  var RAWP10 = [
+    ["ほか⦿試合の予想は「📡 本日の実際の試合」から見られます。", "Predictions for $1 more matches are available under \"📡 Today's Real Matches\".", "另外$1场比赛的预测可在「📡 今日实际比赛」中查看。", "Las predicciones de otros $1 partidos están en «📡 Partidos reales de hoy»."],
+    ["(まだ終わっていない ⦿件 / 終了済みで照合待ち ⦿件)", "(not finished yet: $1 / finished, awaiting check: $2)", "(尚未结束 $1场 / 已结束待核对 $2场)", "(sin terminar: $1 / terminados, pendientes de comprobar: $2)"],
+    ["最後の答え合わせ ⦿時間前", "last scored $1 h ago", "上次核对在$1小时前", "última comprobación hace $1 h"],
+    ["自動照合の最終実行 ⦿時間前", "last auto-check $1 h ago", "自动核对最近一次执行在$1小时前", "última comprobación automática hace $1 h"],
+    ["⦿歳・直近⦿試合の平均評価 ⦿", "Age $1 · avg rating $3 over the last $2 matches", "$1岁・最近$2场平均评分 $3", "$1 años · nota media $3 en los últimos $2 partidos"],
+    ["出場⦿分・平均評価 ⦿", "$1 min played · avg rating $2", "出场$1分钟・平均评分 $2", "$1 min jugados · nota media $2"],
+    ["平均評価が前回比 ⦿(現在 ⦿)", "Avg rating $1 vs last time (now $2)", "平均评分较上次 $1(现为 $2)", "Nota media $1 respecto a la vez anterior (ahora $2)"],
+    ["若手有望株: ⦿歳・出場⦿分・平均評価⦿", "Young prospect: age $1 · $2 min played · avg rating $3", "年轻潜力股: $1岁・出场$2分钟・平均评分$3", "Joven promesa: $1 años · $2 min jugados · nota media $3"],
+    ["⦿歳・出場⦿分・平均評価⦿", "Age $1 · $2 min played · avg rating $3", "$1岁・出场$2分钟・平均评分$3", "$1 años · $2 min jugados · nota media $3"],
+    ["平均評価が ⦿ → ⦿(⦿)", "Avg rating $1 → $2 ($3)", "平均评分 $1 → $2($3)", "Nota media $1 → $2 ($3)"],
+    ["フォーム急上昇: 平均評価が ⦿ → ⦿(⦿)", "Form surging: avg rating $1 → $2 ($3)", "状态急升: 平均评分 $1 → $2($3)", "Forma en alza: nota media $1 → $2 ($3)"],
+    ["フォーム急下降: 平均評価が ⦿ → ⦿(⦿)", "Form dropping: avg rating $1 → $2 ($3)", "状态急降: 平均评分 $1 → $2($3)", "Forma a la baja: nota media $1 → $2 ($3)"],
+  ];
+  for (var rp10 = 0; rp10 < RAWP10.length; rp10++) P.push([pat(RAWP10[rp10][0]), RAWP10[rp10][1], RAWP10[rp10][2], RAWP10[rp10][3]]);
+  /* ==== v104.1(2026年11月14日): 確信ピック(K・自信ランク)と数字の裏取り(M)の文言 ==== */
+  add({
+    "自信ランク": ["Confidence rank", "信心等级", "Nivel de confianza"],
+    "確信": ["high confidence", "把握大", "confianza alta"],
+    "有力": ["strong", "有把握", "sólido"],
+    "やや優勢": ["slight edge", "略占优", "ligera ventaja"],
+    "見送り": ["Pass", "观望", "Incierto"],
+    "自信が低い試合です(当たる見込みが5割未満)": ["a low-confidence match (less than a 50% chance of being right)", "信心较低的比赛(命中把握不到五成)", "partido de baja confianza (menos del 50 % de acierto esperado)"],
+    "このランクの実績": ["Track record of this rank", "该等级的实际战绩", "Historial de este nivel"],
+    "このランクの実績はまだ集計中です": ["the track record of this rank is still being compiled", "该等级的战绩仍在统计中", "el historial de este nivel aún se está recopilando"],
+    "直近30日": ["last 30 days", "最近30天", "últimos 30 días"],
+    "全期間": ["all stored data", "全部保存期间", "todo el periodo guardado"],
+    "予想時のランクのまま数えた実績": ["counted by the rank given when the prediction was made", "按预测当时给出的等级统计", "contado con el nivel asignado al hacer la predicción"],
+    "今の基準を過去の予想に当てはめた実測": ["measured by applying today's thresholds to past settled predictions", "把现在的标准套用到已核对的历史预测上得到的实测", "medido aplicando los umbrales actuales a predicciones pasadas ya resueltas"],
+    "自信ランク別の成績": ["Results by confidence rank", "各信心等级的战绩", "Resultados por nivel de confianza"],
+    "ランク": ["Rank", "等级", "Nivel"],
+    "ランク別の実績は、次回の毎日の学習のあとから表示されます。": ["Results by rank will appear after the next daily learning run.", "各等级的战绩将在下一次每日学习之后显示。", "Los resultados por nivel aparecerán tras el próximo aprendizaje diario."],
+    "ランクは予想カードに出している自信の数字で決めています。対象は公式戦で、AIが学習している大会の試合だけです。「見送り」は予想をやめる印ではなく、自信が低いことを正直に伝える印です。": ["Ranks are decided by the confidence figure shown on the prediction card. Only competitive matches in competitions the AI has learned are ranked. \"Pass\" does not mean the AI stops predicting — it is an honest sign that confidence is low.", "等级由预测卡片上显示的信心数字决定。仅对AI已学习赛事中的正式比赛评级。「观望」并不表示停止预测,而是如实告知信心较低。", "Los niveles se deciden con la cifra de confianza que muestra la tarjeta. Solo se clasifican partidos oficiales de competiciones que la IA ha aprendido. «Incierto» no significa que la IA deje de predecir: es una señal honesta de que la confianza es baja."],
+    // 「🧰 AIが確認したデータ」の各項目(道具の名前・取得できなかったとき)と、聞き返しの「(候補:」
+    "今日のAI予想": ["Today's AI predictions", "今日AI预测", "Predicciones de hoy"],
+    "予想の詳細": ["Prediction details", "预测详情", "Detalles del pronóstico"],
+    "クラブの現状": ["Club status", "球队现状", "Situación del club"],
+    "対戦分析": ["Head-to-head analysis", "对阵分析", "Análisis del enfrentamiento"],
+    "選手の今季成績": ["Player's season stats", "球员本赛季数据", "Estadísticas del jugador"],
+    "外した予想の反省": ["Review of missed predictions", "预测失误的反思", "Revisión de pronósticos fallidos"],
+    "取得できませんでした": ["could not be retrieved", "未能获取", "no se pudo obtener"],
+    "取得": ["retrieved", "已获取", "obtenido"],
+    "(候補:": [" (candidates:", "(候选:", " (candidatos:"],
+    "数字の裏取り": ["Number check", "数字核对", "Verificación de cifras"],
+    "この回答は取得したデータを使っていないため、数字はAIの一般知識にもとづくものです(最新の値と違う場合があります)": ["this answer did not use fetched data, so its numbers come from the AI's general knowledge (they may differ from the latest values)", "本回答未使用获取的数据,其中的数字来自AI的一般知识(可能与最新数值不同)", "esta respuesta no usó datos obtenidos, así que sus cifras provienen del conocimiento general de la IA (pueden diferir de los valores más recientes)"],
+  });
+  var RAWP8 = [
+    ["⦿件中⦿件的中", "$2 hits out of $1", "$1场中命中$2场", "$2 aciertos de $1"],
+    ["予想時の自信 ⦿%", "confidence when predicted: $1%", "预测当时的信心 $1%", "confianza al predecir: $1 %"],
+    ["S: 自信⦿%以上 / A: ⦿%以上 / B: ⦿%以上 / 見送り: ⦿%未満", "S: confidence $1%+ / A: $2%+ / B: $3%+ / Pass: under $4%", "S: 信心$1%以上 / A: $2%以上 / B: $3%以上 / 观望: 低于$4%", "S: confianza $1 %+ / A: $2 %+ / B: $3 %+ / Incierto: menos del $4 %"],
+    ["今日のAI予想: ⦿件(ランク⦿)", "Today's AI predictions: $1 (rank $2)", "今日AI预测: $1条(等级$2)", "Predicciones de hoy: $1 (nivel $2)"],
+    ["今日のAI予想: ⦿件(ランク⦿)(次の試合)", "Today's AI predictions: $1 (rank $2, next matches)", "今日AI预测: $1条(等级$2・下一场)", "Predicciones de hoy: $1 (nivel $2, próximos partidos)"],
+    ["「⦿」はどのクラブのことでしょうか?", "Which club do you mean by \"$1\"?", "「$1」指的是哪支球队?", "¿A qué club te refieres con \"$1\"?"],
+    ["照合した数字⦿個は、すべて取得したデータにある数字と一致しました", "all $1 checked numbers match numbers in the fetched data", "核对的$1个数字全部与获取的数据一致", "las $1 cifras comprobadas coinciden con los datos obtenidos"],
+    ["照合した数字⦿個のうち⦿個は取得したデータと一致しました。次の数字は、取得したデータに同じ値が見当たりません(AIが計算した値や、AIの推定・一般知識による値の場合があります)", "$2 of the $1 checked numbers match the fetched data. The following numbers have no identical value in the fetched data (they may be values the AI calculated or estimated, or taken from its general knowledge)", "核对的$1个数字中有$2个与获取的数据一致。以下数字在获取的数据中找不到相同的值(可能是AI计算得出的值,或来自AI的推测、一般知识)", "$2 de las $1 cifras comprobadas coinciden con los datos obtenidos. Las siguientes no tienen un valor idéntico en los datos obtenidos (pueden ser valores calculados o estimados por la IA, o de su conocimiento general)"],
+    ["この回答の数字⦿個は、これまでの回答に出てきた数字の繰り返しです(今回は照合していません)", "the $1 numbers in this answer repeat figures from earlier answers (not re-checked this time)", "本回答中的$1个数字是之前回答中出现过的数字(本次未核对)", "las $1 cifras de esta respuesta repiten cifras de respuestas anteriores (no se han comprobado esta vez)"],
+    ["ほかに⦿個は、これまでの回答に出てきた数字の繰り返しです(今回は照合していません)", "another $1 numbers repeat figures from earlier answers (not re-checked this time)", "另有$1个数字是之前回答中出现过的数字(本次未核对)", "otras $1 cifras repiten cifras de respuestas anteriores (no se han comprobado esta vez)"],
+  ];
+  for (var rp8 = 0; rp8 < RAWP8.length; rp8++) P.push([pat(RAWP8[rp8][0]), RAWP8[rp8][1], RAWP8[rp8][2], RAWP8[rp8][3]]);
   /* ==== v104(2026年11月12日): 会話の改良(1〜7)と試合内容の見立て(J)の文言 ==== */
   add({
     // 会話の進行状況(サーバーの status と画面の文言)
@@ -3627,6 +4205,50 @@
   // ---- v104: 確信度の内訳(「A、B、Cのデータが不足しているため。 別の一文。」)を断片ごとに訳す ----
   //   熟考の理由は断片を「、」で繋ぎ「ため。」で結ぶため、全文一致の辞書では訳せない。
   //   文ごと → 断片ごと(「・」の一覧は要素ごと)に辞書を引き、訳せない断片は原文のまま残す(でっち上げない)。
+  // v104.1: 一覧の読み方と断片の訳し方を部品に分け、検討の過程(6段階のパネル)でも同じ部品を使う。
+  var LIST_JOIN = { en: ", ", zh: "、", es: ", " };
+  /** 「A・B・C」の一覧を訳す。項目名そのものに「・」を含むもの(「得点力・失点率」「順位・勝点」
+   *  「怪我人・出場停止」「得点関与(ゴール・アシスト)の実績」など)があるため、単純に「・」で割らず、
+   *  先頭から「辞書にある最も長い連なり」を1項目として読む(v104 は単純に割っていて「失点率」などが残っていた)。 */
+  /** 辞書の完全一致だけで訳す(型は使わない)。連なりを1項目として読んでよいかの判定に使う:
+   *  型まで使うと、汎用の型(「⦿人」など)が長い連なりに半端に一致することがある。中国語は漢字を共有するため、
+   *  半端な訳に「かな」が無いと訳せたように見えてしまう(「得点力・失点率・順位・勝点・怪我名」)。 */
+  function trExact(s0) {
+    var xl = XL[s0];
+    if (typeof xl === "string" && xl) return xl;
+    var e = X[s0];
+    return (e && e[ORDER[appLang]]) ? e[ORDER[appLang]] : null;
+  }
+  function translateDotList(listStr) {
+    var toks = String(listStr).split("・").map(function (it) { return it.trim(); });
+    var items = [];
+    for (var a = 0; a < toks.length;) {
+      var taken = false;
+      for (var b = toks.length; b > a; b--) {
+        var tj = trExact(toks.slice(a, b).join("・"));
+        if (tj !== null) { items.push(tj); a = b; taken = true; break; }
+      }
+      if (!taken) { var t1 = tr(toks[a]); items.push(t1 === null ? toks[a] : t1); a++; }
+    }
+    return items.join(LIST_JOIN[appLang] || ", ");
+  }
+  /** 熟考の理由の断片1つ(「データが40%しか揃っていない」「A・Bのデータが不足している」など)を訳す */
+  function translateReasonFragment(frag) {
+    var f = String(frag).trim();
+    if (!f) return f;
+    var tf = tr(f);
+    if (tf !== null && !JA_LEFT_RE.test(tf)) return tf;
+    var lm = f.match(/^(.+)のデータが不足している$/);
+    if (lm) {
+      var listed = translateDotList(lm[1]);
+      return { en: listed + " data is lacking", zh: listed + "的数据不足", es: "faltan datos de " + listed }[appLang] || (listed + " data is lacking");
+    }
+    if (f.indexOf("、") >= 0) {
+      // 「他の見方にはそもそも根拠となるデータが無く、比較ができていない」のように、1つの理由が「、」を含むもの
+      return f.split("、").map(function (x) { var tx = tr(x.trim()); return tx === null ? x.trim() : tx; }).join(LIST_JOIN[appLang] === "、" ? "，" : ", ");
+    }
+    return tf !== null ? tf : f;
+  }
   window.translateReasonJa = function (text) {
     var str = String(text == null ? "" : text);
     if (appLang === "ja" || !str || !/[ぁ-んァ-ヶ一-龥]/.test(str)) return str;
@@ -3640,21 +4262,65 @@
       if (t1 !== null && !JA_LEFT_RE.test(t1)) return t1;
       var m = sent.trim().match(/^(.*)ため。$/);
       if (!m) return t1 !== null ? t1 : sent;
-      var parts = m[1].split("、").map(function (frag) {
-        var f = frag.trim();
-        var tf = tr(f);
-        if (tf !== null && !JA_LEFT_RE.test(tf)) return tf;
-        var lm = f.match(/^(.+)のデータが不足している$/);
-        if (lm) {
-          var items = lm[1].split("・").map(function (it) { var ti = tr(it.trim()); return ti === null ? it.trim() : ti; });
-          var listed = items.join(appLang === "zh" ? "、" : ", ");
-          return { en: listed + " data is lacking", zh: listed + "的数据不足", es: "faltan datos de " + listed }[appLang] || (listed + " data is lacking");
+      // 理由は「、」で繋がれているが、理由そのものに「、」を含むものがある(「採用した見方を裏づけるのは
+      //   AIによる推定のみで、実データが無い」など)。先頭から「辞書にある最も長い連なり」を1つの理由として読む。
+      var fr = m[1].split("、").map(function (x) { return x.trim(); });
+      var parts = [];
+      for (var a = 0; a < fr.length;) {
+        var took = false;
+        for (var b = fr.length; b > a + 1; b--) {
+          var tR = trExact(fr.slice(a, b).join("、")); // 連なりは辞書の完全一致だけで判定する(理由は translateDotList と同じ)
+          if (tR !== null) { parts.push(tR); a = b; took = true; break; }
         }
-        return tf !== null ? tf : f;
-      });
+        if (!took) { parts.push(translateReasonFragment(fr[a])); a++; }
+      }
       return parts.join(joinWord) + tail;
     });
     return out.join(" ");
+  };
+  // ---- v104.1: 検討の過程(「🧭 この結論に至るまでの検討」の各段階の要約と、反論の検討)を訳す ----
+  //   v82 でこのパネルが描かれるようになって以来、中身(サーバーが規則で組み立てる日本語の文)は訳されず、
+  //   英語・中国語・スペイン語の画面に日本語のまま出ていた(会話を通る漏れ検査が無かったため気づけなかった)。
+  //   文の型は reasoning/deliberation.js と hypothesisGenerator.js にあるものがすべて(テストで全数を照らす)。
+  //   一覧(「不足: A・B」)と、理由を「。」で繋いだ文は型では訳せないので、ここで組み立てる。
+  window.translateDelibJa = function (text) {
+    var str = String(text == null ? "" : text);
+    if (appLang === "ja" || !str || !/[ぁ-んァ-ヶ一-龥]/.test(str)) return str;
+    var s0 = str.trim();
+    var whole = tr(s0);
+    if (whole !== null && !JA_LEFT_RE.test(whole)) return whole;
+    // 段階1: 「3/5種類のデータが揃っています(不足: A・B)。」
+    var m1 = s0.match(/^(\d+)\/(\d+)種類のデータが揃っています\(不足: (.+)\)。$/);
+    if (m1) {
+      var miss = translateDotList(m1[3]);
+      return { en: m1[1] + " of the " + m1[2] + " kinds of data needed are available (missing: " + miss + ").",
+        zh: "所需的" + m1[2] + "类数据中已有" + m1[1] + "类(缺少: " + miss + ")。",
+        es: "Se dispone de " + m1[1] + " de los " + m1[2] + " tipos de datos necesarios (faltan: " + miss + ")." }[appLang];
+    }
+    // 段階1: 「この質問の分析に必要な5種類のデータがすべて揃っています。(今回の質問には必須ではありませんが、A・Bは取得していません。)」
+    var m2 = s0.match(/^この質問の分析に必要な(\d+)種類のデータがすべて揃っています。(?:\(今回の質問には必須ではありませんが、(.+)は取得していません。\))?$/);
+    if (m2) {
+      var base2 = { en: "All " + m2[1] + " kinds of data needed for this question are available.",
+        zh: "分析这个问题所需的" + m2[1] + "类数据全部齐备。",
+        es: "Están disponibles los " + m2[1] + " tipos de datos necesarios para esta pregunta." }[appLang];
+      if (!m2[2]) return base2;
+      var extra = translateDotList(m2[2]);
+      return base2 + { en: " (Not required for this question, but not fetched: " + extra + ".)",
+        zh: "(本次问题并非必需,但未获取: " + extra + "。)",
+        es: " (No son imprescindibles para esta pregunta, pero no se han obtenido: " + extra + ".)" }[appLang];
+    }
+    // 段階5 など: 文を「。」で区切り、文ごと(型)→ 理由の断片ごと、の順に訳す
+    var sentences = s0.split("。").map(function (x) { return x.trim(); }).filter(Boolean);
+    if (sentences.length > 1 || /。$/.test(s0)) {
+      var sep = { en: "; ", zh: ";", es: "; " }[appLang] || "; ";
+      var outParts = sentences.map(function (sent) {
+        var t1 = tr(sent + "。");
+        if (t1 !== null && !JA_LEFT_RE.test(t1)) return t1.replace(/[。.]\s*$/, "");
+        return translateReasonFragment(sent);
+      });
+      return outParts.join(sep) + (appLang === "zh" ? "。" : ".");
+    }
+    return whole !== null ? whole : str;
   };
   var RAWP6 = [
     ["対象: ⦿", "Subject: $1", "对象: $1", "Tema: $1"],
@@ -3673,6 +4339,213 @@
     ["予想の詳細: ⦿", "Prediction details: $1", "预测详情: $1", "Detalles del pronóstico: $1"],
   ];
   for (var rp6 = 0; rp6 < RAWP6.length; rp6++) P.push([pat(RAWP6[rp6][0]), RAWP6[rp6][1], RAWP6[rp6][2], RAWP6[rp6][3]]);
+  // ---- v104.1(総点検・第2回): 模擬の実データを入れた画面を実ブラウザで総当たりし、翻訳エンジンが受け取った原文を
+  //   すべて記録して調べた結果の追加ぶん(試合分析・選手詳細・会話の「根拠」・「賢くなったか」の質問と答え)。
+  //   既にある見出しは上書きしない(addNew)。型は一覧のいちばん後ろに足す(既存の型の当たり方を変えない)。
+  function addNew(map) { for (var k in map) if (!X[k]) X[k] = map[k]; }
+  addNew({
+    "今日の試合は？": ["What are today's matches?", "今天有哪些比赛?", "¿Qué partidos hay hoy?"],
+    "注目選手は？": ["Who are the players to watch?", "值得关注的球员有哪些?", "¿Qué jugadores hay que seguir?"],
+    "若手有望株は？": ["Who are the promising youngsters?", "有潜力的年轻球员有哪些?", "¿Quiénes son los jóvenes más prometedores?"],
+    "怪我情報は？": ["What is the injury news?", "伤病情况如何?", "¿Qué novedades hay de lesiones?"],
+    "移籍情報は？": ["What is the transfer news?", "转会消息有哪些?", "¿Qué novedades hay de fichajes?"],
+    "得点ランキングの上位は？": ["Who leads the scoring charts?", "射手榜前列是谁?", "¿Quién lidera la tabla de goleadores?"],
+    "アシストランキングの上位は？": ["Who leads the assist charts?", "助攻榜前列是谁?", "¿Quién lidera la tabla de asistencias?"],
+    "直近の1試合平均得点": ["Recent goals scored per match", "近期场均进球", "Goles a favor por partido (recientes)"],
+    "直近の1試合平均失点": ["Recent goals conceded per match", "近期场均失球", "Goles en contra por partido (recientes)"],
+    "直近7日間の試合数": ["Matches in the last 7 days", "最近7天的比赛场数", "Partidos en los últimos 7 días"],
+    "試合前の予想": ["pre-match prediction", "赛前预测", "pronóstico previo al partido"],
+    "API-Footballの実データに基づく、試合中の途中経過です。まだ結果は確定していません": ["in-play snapshot based on real API-Football data; the result is not final yet", "基于API-Football真实数据的比赛进行中情况,结果尚未确定", "situación en juego según datos reales de API-Football; el resultado aún no es definitivo"],
+    "生え抜き(移籍金なし)": ["Academy graduate (no fee)", "青训出身(无转会费)", "Canterano (sin traspaso)"],
+    "フリー移籍": ["Free transfer", "自由转会", "Traspaso libre"],
+    "非公表": ["Undisclosed", "未公开", "No revelado"],
+    "所属不明": ["club unknown", "所属不明", "club desconocido"],
+    "このAI自身の予想: 引き分け": ["This AI's own prediction: draw", "本AI自己的预测: 平局", "Pronóstico propio de esta IA: empate"],
+    "上位の並べ替えなので、増えた数にも減った数にも入れていません(順位が変わっただけで、その選手について答えられなくなったわけではありません)。": ["This is a top-of-the-list ranking, so changes are counted neither as gained nor as lost (only the order changed; the AI can still answer about those players).", "这是排名靠前者的排序,因此既不计入增加也不计入减少(只是名次变了,并不是无法回答这些球员的问题)。", "Es una clasificación de los primeros puestos, así que los cambios no se cuentan ni como ganados ni como perdidos (solo cambió el orden; la IA sigue pudiendo responder sobre esos jugadores)."],
+    "直近の期間で区切っているため、期間から外れたぶんは「言えなくなった」に数えていません。": ["This is limited to a recent window, so items that dropped out of the window are not counted as \"no longer answerable\".", "由于按最近一段时间截取,超出时间范围的部分不计入「无法再回答」。", "Se limita a un periodo reciente, así que lo que sale del periodo no se cuenta como «ya no se puede responder»."],
+    "この報告はすべて、保存されている実測値と実際の実行結果から機械的に作っています。": ["This whole report is produced mechanically from stored measurements and actual run results.", "本报告全部由已保存的实测值和实际运行结果机械生成。", "Todo este informe se genera mecánicamente a partir de las mediciones guardadas y de los resultados reales de ejecución."],
+    "予測の待ち行列を読み出せませんでした(保存先に接続できていません)。0件だったのではなく、測れていません。": ["The prediction queue could not be read (no connection to the store). This is not zero; it could not be measured.", "无法读取预测队列(未能连接到存储)。这不是0条,而是没能测量。", "No se pudo leer la cola de pronósticos (sin conexión con el almacén). No es cero: no se pudo medir."],
+    "学習の進捗が1件も記録されていません(学習が一度も走っていないか、進捗を記録する前に落ちています)。": ["No learning progress has been recorded at all (learning has never run, or it stopped before recording progress).", "没有任何学习进度记录(学习从未运行,或在记录进度之前就中断了)。", "No hay ningún progreso de aprendizaje registrado (el aprendizaje nunca se ejecutó o se detuvo antes de registrar el progreso)."],
+    "利き足は API-Football が提供していないため、検索条件にできません(推測で埋めることはしません)。": ["Preferred foot is not provided by API-Football, so it cannot be used as a filter (we do not fill it in by guessing).", "API-Football不提供惯用脚数据,因此无法作为搜索条件(不会凭推测填写)。", "API-Football no ofrece la pierna hábil, así que no puede usarse como filtro (no la rellenamos con suposiciones)."],
+    "市場価値は API-Football が提供していないため、検索条件にできません(Transfermarkt等の別ソースが必要です)。": ["Market value is not provided by API-Football, so it cannot be used as a filter (another source such as Transfermarkt would be needed).", "API-Football不提供身价数据,因此无法作为搜索条件(需要Transfermarkt等其他来源)。", "API-Football no ofrece el valor de mercado, así que no puede usarse como filtro (haría falta otra fuente como Transfermarkt)."],
+    "契約状況(契約満了年など)は API-Football が提供していないため、検索条件にできません。": ["Contract status (expiry year, etc.) is not provided by API-Football, so it cannot be used as a filter.", "API-Football不提供合同状况(到期年份等),因此无法作为搜索条件。", "API-Football no ofrece la situación contractual (año de vencimiento, etc.), así que no puede usarse como filtro."],
+  });
+  // 自己点検の質問・登録選手の契約欄に出る名前(選手・クラブ)。辞書に訳が無いものだけ、アルファベット表記で出す
+  var NAME_LATIN = {
+    "久保建英": "Takefusa Kubo", "ハーランド": "Haaland", "アーリング・ハーランド": "Erling Haaland", "エンバペ": "Mbappé", "キリアン・エンバペ": "Kylian Mbappé",
+    "ベリンガム": "Bellingham", "ジュード・ベリンガム": "Jude Bellingham", "サラー": "Salah", "モハメド・サラー": "Mohamed Salah", "ヤマル": "Yamal", "ラミン・ヤマル": "Lamine Yamal",
+    "ヴィニシウス": "Vinícius", "ヴィニシウス・ジュニオール": "Vinícius Júnior", "ハリー・ケイン": "Harry Kane", "サカ": "Saka", "ブカヨ・サカ": "Bukayo Saka",
+    "ムシアラ": "Musiala", "ジャマル・ムシアラ": "Jamal Musiala", "ヴィルツ": "Wirtz", "フロリアン・ヴィルツ": "Florian Wirtz", "ペドリ": "Pedri",
+    "グリーズマン": "Griezmann", "アントワーヌ・グリーズマン": "Antoine Griezmann", "クワラツヘリア": "Kvaratskhelia", "フビチャ・クワラツヘリア": "Khvicha Kvaratskhelia",
+    "バルベルデ": "Valverde", "フェデリコ・バルベルデ": "Federico Valverde", "フォーデン": "Foden", "フィル・フォーデン": "Phil Foden", "ウーデゴール": "Ødegaard", "マルティン・ウーデゴール": "Martin Ødegaard",
+    "三笘薫": "Kaoru Mitoma", "鎌田大地": "Daichi Kamada", "冨安健洋": "Takehiro Tomiyasu", "堂安律": "Ritsu Doan", "南野拓実": "Takumi Minamino",
+    "レヴァンドフスキ": "Lewandowski", "ロベルト・レヴァンドフスキ": "Robert Lewandowski", "ロドリゴ": "Rodrygo", "ラフィーニャ": "Raphinha", "ダニ・オルモ": "Dani Olmo",
+    "ヨケレス": "Gyökeres", "ヴィクトル・ヨケレス": "Viktor Gyökeres", "イサク": "Isak", "アレクサンデル・イサク": "Alexander Isak", "デクラン・ライス": "Declan Rice",
+    "コール・パーマー": "Cole Palmer", "ブルーノ・フェルナンデス": "Bruno Fernandes", "デンベレ": "Dembélé", "ウスマン・デンベレ": "Ousmane Dembélé", "ハキミ": "Hakimi", "アシュラフ・ハキミ": "Achraf Hakimi",
+    "ドンナルンマ": "Donnarumma", "ジャンルイジ・ドンナルンマ": "Gianluigi Donnarumma", "クルトワ": "Courtois", "ティボ・クルトワ": "Thibaut Courtois", "アリソン": "Alisson", "アリソン・ベッカー": "Alisson Becker",
+    "ファン・ダイク": "Van Dijk", "フィルジル・ファン・ダイク": "Virgil van Dijk", "モドリッチ": "Modrić", "ルカ・モドリッチ": "Luka Modrić",
+    "遠藤航": "Wataru Endo", "伊東純也": "Junya Ito", "板倉滉": "Ko Itakura", "菅原由勢": "Yukinari Sugawara",
+    "バイエルン": "Bayern", "ドルトムント": "Dortmund", "バルセロナ": "Barcelona", "レバークーゼン": "Leverkusen", "フランクフルト": "Frankfurt", "アーセナル": "Arsenal",
+    "1.FCケルン": "1. FC Köln", "FCシャルケ04": "FC Schalke 04", "VfBシュトゥットガルト": "VfB Stuttgart", "SSCナポリ": "SSC Napoli", "バイエル・レバークーゼン": "Bayer Leverkusen",
+    "ガラタサライ": "Galatasaray", "フラム": "Fulham", "グラナダCF": "Granada CF", "ホッフェンハイム": "Hoffenheim", "バイエルン下部組織": "Bayern academy", "ヴェルダー・ブレーメン": "Werder Bremen",
+    "トッテナム・ホットスパー": "Tottenham Hotspur", "クリスタル・パレス": "Crystal Palace", "ブレントフォード": "Brentford", "リーズ・ユナイテッド": "Leeds United", "サンテティエンヌ": "Saint-Étienne",
+    "バレンシアCF": "Valencia CF", "ブライトン": "Brighton", "リールOSC": "Lille OSC", "ボローニャ": "Bologna", "ストーク・シティ": "Stoke City", "ポルト": "Porto", "ウェストハム": "West Ham",
+    "イトゥアーノ": "Ituano", "クラブ・ブルージュ": "Club Brugge", "ゾーリャ・ルハンシク": "Zorya Luhansk", "リバプール": "Liverpool", "リヨン": "Lyon", "AFCボーンマス": "AFC Bournemouth",
+    "インテル・ミラン": "Inter Milan", "スタッド・レンヌ": "Stade Rennais", "ペニャロール": "Peñarol", "モナコ": "Monaco", "フェネルバフチェ": "Fenerbahçe", "フラメンゴ": "Flamengo",
+    "サントス": "Santos", "リベル・プレート": "River Plate", "パルメイラス": "Palmeiras",
+    "バンクーバー・ホワイトキャップスFC(MLS)": "Vancouver Whitecaps FC (MLS)", "クレモネーゼ(イタリア)": "Cremonese (Italy)", "リンフィールドFC(北アイルランド)": "Linfield FC (Northern Ireland)",
+  };
+  for (var nlk in NAME_LATIN) if (!X[nlk]) X[nlk] = [NAME_LATIN[nlk], NAME_LATIN[nlk], NAME_LATIN[nlk]];
+  var RAWP11 = [
+    // 会話の「根拠」に並ぶ直近の試合(サーバーが作る行: 日付 大会 相手(ホーム/アウェイ) スコア 勝ち/分け/負け)
+    ["⦿(ホーム) ⦿ 勝ち", "$1 (home) $2 win", "$1(主场)$2 胜", "$1 (local) $2 victoria"],
+    ["⦿(ホーム) ⦿ 分け", "$1 (home) $2 draw", "$1(主场)$2 平", "$1 (local) $2 empate"],
+    ["⦿(ホーム) ⦿ 負け", "$1 (home) $2 loss", "$1(主场)$2 负", "$1 (local) $2 derrota"],
+    ["⦿(アウェイ) ⦿ 勝ち", "$1 (away) $2 win", "$1(客场)$2 胜", "$1 (visitante) $2 victoria"],
+    ["⦿(アウェイ) ⦿ 分け", "$1 (away) $2 draw", "$1(客场)$2 平", "$1 (visitante) $2 empate"],
+    ["⦿(アウェイ) ⦿ 負け", "$1 (away) $2 loss", "$1(客场)$2 负", "$1 (visitante) $2 derrota"],
+    ["(⦿): ⦿", "($1): $2", "($1): $2", "($1): $2"],
+    // 選手詳細の質問チップ
+    ["なぜ評価⦿なの？", "Why is the rating $1?", "为什么评分是$1?", "¿Por qué la valoración es $1?"],
+    ["⦿代表なら？", "What about with the $1 national team?", "在$1国家队会怎样?", "¿Y con la selección de $1?"],
+    // 試合分析(登録クラブどうしの分析カード)
+    ["⦿ 予想フォーメーション", "$1 predicted formation", "$1 预测阵型", "$1: formación prevista"],
+    ["⦿(総合評価 ⦿)", "$1 (overall $2)", "$1(综合评价 $2)", "$1 (valoración global $2)"],
+    ["⦿がやや優勢という分析です。", "The analysis gives $1 a slight edge.", "分析认为$1略占优势。", "El análisis da una ligera ventaja a $1."],
+    // 選手検索のリーグ選択(名前の無いリーグ)
+    ["リーグID ⦿(⦿人)", "League ID $1 ($2 players)", "联赛ID $1($2人)", "Liga ID $1 ($2 jugadores)"],
+    ["リーグID ⦿", "League ID $1", "联赛ID $1", "Liga ID $1"],
+    ["検索条件にできない項目: ⦿", "Fields unavailable as filters: $1", "无法作为搜索条件的项目: $1", "Campos no disponibles como filtro: $1"],
+    // 登録選手の契約欄(移籍金・時期・移籍元)
+    ["約⦿", "approx. $1", "约$1", "aprox. $1"],
+    ["⦿(報道により幅あり)", "$1 (reports vary)", "$1(各报道有出入)", "$1 (las informaciones varían)"],
+    ["⦿(報道)", "$1 (reported)", "$1(据报道)", "$1 (según la prensa)"],
+    ["⦿(出来高含む、報道により幅あり)", "$1 (incl. add-ons; reports vary)", "$1(含浮动条款,各报道有出入)", "$1 (variables incluidas; las informaciones varían)"],
+    ["⦿(出来高込み)", "$1 (incl. add-ons)", "$1(含浮动条款)", "$1 (variables incluidas)"],
+    ["⦿+出来高", "$1 + add-ons", "$1+浮动条款", "$1 + variables"],
+    ["⦿+出来高(最大⦿)", "$1 + add-ons (up to $2)", "$1+浮动条款(最高$2)", "$1 + variables (hasta $2)"],
+    ["⦿+出来高(合計約⦿)", "$1 + add-ons (about $2 in total)", "$1+浮动条款(合计约$2)", "$1 + variables (unos $2 en total)"],
+    ["⦿(英報道では⦿とも)", "$1 (UK reports also say $2)", "$1(英国媒体亦称$2)", "$1 (la prensa inglesa también habla de $2)"],
+    ["⦿(完全移籍、レンタル移籍からの買取)", "$1 (permanent deal, bought after a loan)", "$1(永久转会,租借后买断)", "$1 (traspaso definitivo, compra tras cesión)"],
+    ["⦿(解放条項)", "$1 (release clause)", "$1(解约金条款)", "$1 (cláusula de rescisión)"],
+    ["⦿(レンタルからの完全移籍)", "$1 (loan made permanent)", "$1(租借转为永久转会)", "$1 (cesión convertida en traspaso)"],
+    ["⦿(約⦿)", "$1 (about $2)", "$1(约$2)", "$1 (unos $2)"],
+    ["⦿頃", "around $1", "$1前后", "hacia $1"],
+    ["⦿年夏", "summer $1", "$1年夏天", "verano de $1"],
+    ["⦿(加入後レンタルを経てトップチーム昇格)", "$1 (promoted to the first team after loans)", "$1(加盟后经租借升入一线队)", "$1 (ascendió al primer equipo tras cesiones)"],
+    ["⦿(⦿年加入)", "$1 (joined in $2)", "$1($2年加盟)", "$1 (llegó en $2)"],
+    ["⦿(下部組織)", "$1 (academy)", "$1(青训)", "$1 (cantera)"],
+    ["⦿経由⦿", "$2 via $1", "经$1自$2", "$2 vía $1"],
+    // 「賢くなったか」の質問と答え(サーバーが毎日作る自己点検。型は learning/autoQA.js にあるもの)
+    ["⦿はどんな選手ですか？", "What kind of player is $1?", "$1是什么样的球员?", "¿Qué tipo de jugador es $1?"],
+    ["「⦿」は選手索引にまだ入っていないため、答えられません。", "\"$1\" is not in the player index yet, so this cannot be answered.", "「$1」尚未收录到球员索引中,因此无法回答。", "«$1» aún no está en el índice de jugadores, así que no se puede responder."],
+    ["⦿の今の状態は？", "How is $1 doing right now?", "$1目前状态如何?", "¿Cómo está $1 ahora mismo?"],
+    ["⦿の調査ファイルがまだ作られていません。", "No dossier has been created for $1 yet.", "$1的调查档案尚未建立。", "Aún no se ha creado el dosier de $1."],
+    ["⦿の調査ファイルはありますが、中身がまだ空です。", "$1 has a dossier, but it is still empty.", "$1已有调查档案,但内容仍为空。", "$1 tiene dosier, pero aún está vacío."],
+    ["このAI自身の予想: ⦿勝利(予想スコア ⦿)", "This AI's own prediction: $1 win (predicted score $2)", "本AI自己的预测: $1获胜(预测比分 $2)", "Pronóstico propio de esta IA: victoria de $1 (marcador previsto $2)"],
+    ["このAI自身の予想: ⦿勝利", "This AI's own prediction: $1 win", "本AI自己的预测: $1获胜", "Pronóstico propio de esta IA: victoria de $1"],
+    ["このAI自身の予想: 引き分け(予想スコア ⦿)", "This AI's own prediction: draw (predicted score $1)", "本AI自己的预测: 平局(预测比分 $1)", "Pronóstico propio de esta IA: empate (marcador previsto $1)"],
+    ["平均評価 ⦿", "avg rating $1", "平均评分 $1", "nota media $1"],
+    // 見出し+値の型は、値の位置を動かさない訳にする(値のところに「11・ヴィッセル神戸・19歳」のような並びが入っても崩れない)
+    ["ゴール ⦿", "Goals $1", "进球 $1", "Goles $1"],
+    ["アシスト ⦿", "Assists $1", "助攻 $1", "Asistencias $1"],
+    ["⦿歳", "age $1", "$1岁", "$1 años"],
+    ["昨日と同じ内容です(⦿項目)。この質問については新しい情報が入っていません。", "Same as yesterday ($1 items). No new information has come in for this question.", "与昨天内容相同($1项)。关于这个问题没有新的信息。", "Igual que ayer ($1 elementos). No ha entrado información nueva para esta pregunta."],
+    ["本日(⦿)の学習は⦿段階すべてを通って完走しました(所要 ⦿分)。", "Today's ($1) learning run completed all $2 stages (took $3 min).", "今天($1)的学习已走完全部$2个阶段(用时$3分钟)。", "El aprendizaje de hoy ($1) completó las $2 etapas (duró $3 min)."],
+    ["最後に完了した学習は ⦿ 分です。本日(⦿)の学習はまだ完走していません。", "The last completed learning run is for $1. Today's ($2) run has not finished yet.", "最近一次完成的学习是 $1 的。今天($2)的学习尚未跑完。", "El último aprendizaje completado es el de $1. El de hoy ($2) aún no ha terminado."],
+    ["学習は「⦿」の段階で止まっています(⦿段階中 ⦿段階まで到達)。", "Learning has stopped at the \"$1\" stage (reached $3 of $2 stages).", "学习停在「$1」阶段(共$2个阶段,已到达$3个)。", "El aprendizaje se detuvo en la etapa «$1» (alcanzó $3 de $2 etapas)."],
+    ["待ち行列の⦿件を確認しましたが、今日キックオフの試合についてのAI自身の予測はまだ記録されていません。", "Checked $1 queued items, but no prediction by this AI has been recorded yet for matches kicking off today.", "已确认队列中的$1条,但尚未记录本AI对今天开球比赛的预测。", "Se revisaron $1 elementos de la cola, pero aún no hay pronósticos propios registrados para los partidos de hoy."],
+    ["⦿歳以下で平均評価まで取得できている選手がまだ1人もいません。", "There is not yet a single player aged $1 or under with an average rating available.", "尚无任何$1岁以下且已取得平均评分的球员。", "Todavía no hay ningún jugador de $1 años o menos con nota media disponible."],
+    ["⦿クラブぶんを確認しましたが、負傷・出場停止者は1件もありませんでした。", "Checked $1 clubs, but there were no injured or suspended players at all.", "已确认$1家俱乐部,但没有任何伤病或停赛球员。", "Se revisaron $1 clubes, pero no había ningún lesionado ni sancionado."],
+    ["⦿クラブぶんを確認しましたが、直近の移籍は1件もありませんでした。", "Checked $1 clubs, but there were no recent transfers at all.", "已确认$1家俱乐部,但近期没有任何转会。", "Se revisaron $1 clubes, pero no había ningún fichaje reciente."],
+    ["内部の処理でエラーが起きました(⦿)", "An internal processing error occurred ($1)", "内部处理发生错误($1)", "Se produjo un error interno de procesamiento ($1)"],
+  ];
+  // 調査ファイルの「変化」の文(knowledge/clubDossier.js の diffSection が作る型)。文末の「。」の有無の両方を受ける
+  var RAWP11B = [
+    ["⦿の監督が交代しました: ⦿ → ⦿", "$1 changed manager: $2 → $3", "$1更换了主教练: $2 → $3", "$1 cambió de entrenador: $2 → $3"],
+    ["⦿の基本布陣が変わりました: ⦿ → ⦿", "$1 changed its base formation: $2 → $3", "$1的基本阵型发生变化: $2 → $3", "$1 cambió su formación base: $2 → $3"],
+    ["⦿の負傷・出場停止者が⦿人から⦿人に増えました", "$1's injured/suspended players rose from $2 to $3", "$1的伤停人数从$2人增加到$3人", "Los lesionados/sancionados de $1 subieron de $2 a $3"],
+    ["⦿の負傷・出場停止者が⦿人から⦿人に減りました", "$1's injured/suspended players fell from $2 to $3", "$1的伤停人数从$2人减少到$3人", "Los lesionados/sancionados de $1 bajaron de $2 a $3"],
+    ["⦿の国内リーグ順位が⦿位から⦿位に上がりました", "$1 climbed from #$2 to #$3 in the domestic league", "$1的国内联赛排名从第$2名升至第$3名", "$1 subió del puesto $2 al $3 en la liga nacional"],
+    ["⦿の国内リーグ順位が⦿位から⦿位に下がりました", "$1 dropped from #$2 to #$3 in the domestic league", "$1的国内联赛排名从第$2名降至第$3名", "$1 bajó del puesto $2 al $3 en la liga nacional"],
+    ["⦿の直近フォーム(1試合平均得失点差)が⦿から⦿へ上向きました", "$1's recent form (average goal difference per match) improved from $2 to $3", "$1的近期状态(场均净胜球)从$2上升到$3", "La forma reciente de $1 (diferencia de goles media por partido) mejoró de $2 a $3"],
+    ["⦿の直近フォーム(1試合平均得失点差)が⦿から⦿へ下向きました", "$1's recent form (average goal difference per match) declined from $2 to $3", "$1的近期状态(场均净胜球)从$2下降到$3", "La forma reciente de $1 (diferencia de goles media por partido) empeoró de $2 a $3"],
+    ["⦿の登録選手数が⦿人から⦿人に変わりました", "$1's registered squad size changed from $2 to $3", "$1的注册球员数从$2人变为$3人", "La plantilla inscrita de $1 pasó de $2 a $3 jugadores"],
+    // 移籍の知識(learning/dailyJob.js が作る型)
+    ["⦿: ⦿が⦿から加入しました(⦿)", "$1: $2 joined from $3 ($4)", "$1: $2自$3加盟($4)", "$1: $2 llegó procedente de $3 ($4)"],
+    ["⦿: ⦿が⦿へ退団しました(⦿)", "$1: $2 left for $3 ($4)", "$1: $2离队前往$3($4)", "$1: $2 se marchó a $3 ($4)"],
+    ["⦿に⦿に⦿選手の加入が記録されました(移籍元: ⦿)", "$1: the arrival of $3 was recorded on $2 (from: $4)", "$1: 于$2记录到$3加盟(来自: $4)", "$1: se registró la llegada de $3 el $2 (procedente de: $4)"],
+    ["⦿に⦿に⦿選手の退団が記録されました(移籍先: ⦿)", "$1: the departure of $3 was recorded on $2 (to: $4)", "$1: 于$2记录到$3离队(去向: $4)", "$1: se registró la salida de $3 el $2 (destino: $4)"],
+    ["⦿に⦿に⦿選手の加入が記録されました", "$1: the arrival of $3 was recorded on $2", "$1: 于$2记录到$3加盟", "$1: se registró la llegada de $3 el $2"],
+    ["⦿に⦿に⦿選手の退団が記録されました", "$1: the departure of $3 was recorded on $2", "$1: 于$2记录到$3离队", "$1: se registró la salida de $3 el $2"],
+  ];
+  for (var rp11 = 0; rp11 < RAWP11.length; rp11++) P.push([pat(RAWP11[rp11][0]), RAWP11[rp11][1], RAWP11[rp11][2], RAWP11[rp11][3]]);
+  // 漢字だけの語(かなを含まないため、これまでの「日本語の残り」検査に掛からず、英語・スペイン語の画面に残っていたもの)
+  addNew({
+    "攻撃力": ["Attack", "进攻", "Ataque"],
+    "守備": ["Defence", "防守", "Defensa"],
+    "消化試合": ["Matches played", "已赛场次", "Partidos jugados"],
+    "勝点": ["Points", "积分", "Puntos"],
+    "xGA(期待失点)": ["xGA (expected goals against)", "xGA(预期失球)", "xGA (goles esperados en contra)"],
+    "市場価値": ["Market value", "身价", "Valor de mercado"],
+    "契約": ["Contract", "合同", "Contrato"],
+    "最重要": ["Top priority", "最重要", "Máxima prioridad"],
+    "完全移籍(移籍金非公開)": ["Permanent transfer (fee undisclosed)", "永久转会(转会费未公开)", "Traspaso definitivo (importe no revelado)"],
+    "参考・判定外": ["For reference (not counted)", "仅供参考(不计入)", "De referencia (no cuenta)"],
+    "怪我人数": ["Number of injured players", "伤病人数", "Número de lesionados"],
+    "日付不明": ["date unknown", "日期不明", "fecha desconocida"],
+    "守備職人": ["Defensive specialist", "防守专家", "Especialista defensivo"],
+    "解放条項を行使しての完全移籍": ["Permanent transfer via release clause", "行使解约金条款的永久转会", "Traspaso definitivo mediante cláusula de rescisión"],
+    "ペルー": ["Peru", "秘鲁", "Perú"],
+    "xG収支": ["xG balance", "xG净值", "Balance de xG"],
+    "毎晩更新の索引による機械的な判定": ["a mechanical judgement from an index updated every night", "由每晚更新的索引机械判定", "valoración mecánica a partir de un índice actualizado cada noche"],
+    "今シーズンの実成績データが取得できている": ["this season's real stats are available", "已取得本赛季的实际成绩数据", "hay estadísticas reales de esta temporada"],
+    "ただし直近の調子や怪我の詳細までは反映されていません。": ["Recent form and injury details, though, are not reflected.", "不过尚未反映近期状态和伤病详情。", "Eso sí, no se reflejan la forma reciente ni los detalles de lesiones."],
+    "AIが文章を作って「賢くなりました」と述べているのではありません。": ["It is not the AI writing prose to claim it \"got smarter\".", "这并不是AI自己写文章宣称「变聪明了」。", "No es la IA redactando un texto para afirmar que «es más lista»."],
+    "取得できていないものは、取得できていないと書いています。": ["Whatever could not be obtained is stated as not obtained.", "没有取得的内容,就如实写明没有取得。", "Lo que no se pudo obtener se indica como no obtenido."],
+  });
+  var RAWP12 = [
+    // 選手の成績表の単位(「18試合」「1200分」「3点」…)。値は数字1つのときだけ当たる(短い型)
+    ["⦿試合", "$1 matches", "$1场", "$1 partidos"],
+    ["⦿分", "$1 min", "$1分钟", "$1 min"],
+    ["⦿点", "$1", "$1球", "$1"],
+    ["⦿本", "$1", "$1次", "$1"],
+    ["⦿回", "$1", "$1次", "$1"],
+    ["⦿枚", "$1", "$1张", "$1"],
+    ["⦿項目", "$1 items", "$1项", "$1 elementos"],
+    ["…他⦿件", "…and $1 more", "…另有$1条", "…y $1 más"],
+    // 端末内の簡易チャット(選手カード)の回答で、型が無かったもの
+    ["⦿は⦿歳(⦿生まれ)です。", "$1 is $2 years old (born $3).", "$1现年$2岁($3出生)。", "$1 tiene $2 años (nació el $3)."],
+    ["⦿は⦿歳でキャリア後半に差し掛かっており、AIの将来性評価は⦿です。急激な能力向上より、経験を生かした活躍が期待される時期です。", "$1, at $2, is entering the later part of the career; the AI's potential rating is $3. Rather than a sharp rise in ability, this is a time for contributions built on experience.", "$1现年$2岁,已进入职业生涯后半段,AI潜力评价为$3。与其说能力会急剧提升,不如说这是凭借经验发挥作用的时期。", "$1, con $2 años, entra en la parte final de su carrera; proyección IA: $3. Más que una mejora brusca, es momento de aportar desde la experiencia."],
+    ["⦿はキャリア後半に差し掛かっており、AIの将来性評価は⦿です。急激な能力向上より、経験を生かした活躍が期待される時期です。", "$1 is entering the later part of the career; the AI's potential rating is $2. Rather than a sharp rise in ability, this is a time for contributions built on experience.", "$1已进入职业生涯后半段,AI潜力评价为$2。与其说能力会急剧提升,不如说这是凭借经验发挥作用的时期。", "$1 entra en la parte final de su carrera; proyección IA: $2. Más que una mejora brusca, es momento de aportar desde la experiencia."],
+    // 会話の「根拠」に出る「似たクラブ」(server.js と learning/similarityIndex.js が作る型)
+    ["[似たクラブ] 実測データ(⦿)の距離では、⦿が⦿に最も近い状態のクラブです。", "[Similar club] By distance on measured data ($1), $2 is the club whose current state is closest to $3.", "[相似球队] 按实测数据($1)的距离,$2是与$3状态最接近的球队。", "[Club parecido] Por distancia en datos medidos ($1), $2 es el club cuyo estado actual más se parece al de $3."],
+    ["共通点: ⦿。", "In common: $1.", "共同点: $1。", "En común: $1."],
+    ["監督は⦿。", "Manager: $1.", "主教练是$1。", "Entrenador: $1."],
+    ["同じ基本布陣(⦿)", "same base formation ($1)", "相同的基本阵型($1)", "misma formación base ($1)"],
+    ["怪我人数も同水準(⦿人)", "a similar number of injured players ($1)", "伤病人数也在同一水平($1人)", "un número parecido de lesionados ($1)"],
+    ["⦿時点・", "as of $1; ", "截至$1・", "a fecha de $1; "],
+    ["負傷・出場停止: ⦿", "Injured/suspended: $1", "伤病・停赛: $1", "Lesionados/sancionados: $1"],
+    ["🔴 LIVE ⦿", "🔴 LIVE $1", "🔴 直播 $1", "🔴 EN VIVO $1"],
+    ["🌱若手有望株 ⦿件 / 🆕新規登録 ⦿件", "🌱 Young prospects: $1 / 🆕 Newly registered: $2", "🌱潜力新星 $1条 / 🆕新登记 $2条", "🌱 Jóvenes promesas: $1 / 🆕 Nuevos registros: $2"],
+    ["前日比 — 知識: ⦿件 / 記憶: ⦿件 / 的中率: ⦿pt", "vs. yesterday — knowledge: $1 / memory: $2 / hit rate: $3pt", "较前一日 — 知识: $1条 / 记忆: $2条 / 命中率: $3pt", "frente a ayer — conocimiento: $1 / memoria: $2 / acierto: $3pt"],
+    ["推移: 直近7日 的中率⦿%(⦿件) ・ 直近30日 ⦿%(⦿件)", "Trend: last 7 days hit rate $1% ($2) ・ last 30 days $3% ($4)", "走势: 最近7天命中率$1%($2场) ・ 最近30天 $3%($4场)", "Tendencia: últimos 7 días acierto $1 % ($2) ・ últimos 30 días $3 % ($4)"],
+    ["スコア一致の推移: 直近7日 ⦿%(⦿件) ・ 直近30日 ⦿%(⦿件)", "Exact-score trend: last 7 days $1% ($2) ・ last 30 days $3% ($4)", "比分命中走势: 最近7天 $1%($2场) ・ 最近30天 $3%($4场)", "Tendencia de marcador exacto: últimos 7 días $1 % ($2) ・ últimos 30 días $3 % ($4)"],
+    // 会話の「根拠」に並ぶ選手の追加成績(サーバーが作る項目)
+    ["キーパス⦿本", "$1 key passes", "关键传球$1次", "$1 pases clave"],
+    ["パス成功率⦿%", "pass accuracy $1%", "传球成功率$1%", "precisión de pase $1 %"],
+    ["ドリブル成功率⦿%", "dribble success $1%", "过人成功率$1%", "regates completados $1 %"],
+    ["ドリブル成功率⦿%(⦿回試行)", "dribble success $1% ($2 attempts)", "过人成功率$1%(尝试$2次)", "regates completados $1 % ($2 intentos)"],
+    ["守備指標(タックル+インターセプト)⦿回", "defensive actions (tackles + interceptions): $1", "防守数据(抢断+拦截)$1次", "acciones defensivas (entradas + intercepciones): $1"],
+    ["デュエル(競り合い)勝率⦿%", "duel win rate $1%", "对抗成功率$1%", "duelos ganados $1 %"],
+    ["デュエル勝率⦿%", "duel win rate $1%", "对抗成功率$1%", "duelos ganados $1 %"],
+  ];
+  for (var rp12 = 0; rp12 < RAWP12.length; rp12++) P.push([pat(RAWP12[rp12][0]), RAWP12[rp12][1], RAWP12[rp12][2], RAWP12[rp12][3]]);
+  for (var rp11b = 0; rp11b < RAWP11B.length; rp11b++) {
+    var rb = RAWP11B[rp11b];
+    P.push([pat(rb[0] + "。"), rb[1] + ".", rb[2] + "。", rb[3] + "."]);
+    P.push([pat(rb[0]), rb[1], rb[2], rb[3]]);
+  }
   /* ==== 辞書ここまで ==== */
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
   else boot();
@@ -4123,7 +4996,7 @@
 //   v96で独立したスクリプトに分離: 本番で「開いたのに受信0」だったため、画面本体の長い
 //   スクリプトに依存せず、先頭近くで必ず動く形にした。
 //   ・開いたとき(land)と、45秒以上いた/何か操作したとき(engage)に、小さなJSONを
-//     POST /api/came-from へ送る(navigator.sendBeacon → 使えなければ fetch)。
+//     POST /api/came-from へ送る(v104.1: fetch(keepalive)→ 送れなければ navigator.sendBeacon)。
 //   ・個人を特定する情報・端末の印は送らない。「新規/再訪」はこの端末の localStorage
 //     (visitAttribution)で端末が自分で判断して申告する。同じ日に何度開いても再訪は1回。
 //   ・日付は日本時間(サーバーの集計と同じ)。サイト内の移動(参照元が自分のドメイン)は数えない。
@@ -4171,19 +5044,36 @@
       rec = next;
     }
     var remember = function (o) { try { localStorage.setItem("visitBeaconLast", JSON.stringify(Object.assign({ at: new Date().toISOString() }, o))); } catch (e) { /* noop */ } };
+    // v104.1: まず fetch(keepalive つき=ページを閉じても送信は続く)で送り、サーバーの応答(届いた/断られた)を
+    //   そのまま記録する。以前は sendBeacon を先に使っていたが、sendBeacon は「送信待ちに入れた」ことしか
+    //   分からず、端末側で止められていても気づけなかった(本番で受信0件の原因を切り分けられなかった)。
+    //   fetch が使えない・送れなかったときだけ、sendBeacon で1回だけ送り直す(その事実も記録する)。
     var send = function (payload) {
+      var body = "", target = apiBase + "/came-from", type = payload && payload.type;
+      try { body = JSON.stringify(payload); } catch (e) { remember({ type: type, via: "none", result: "exception", error: String(e && e.message || e).slice(0, 80) }); return; }
+      var viaBeacon = function (firstError) {
+        try {
+          if (navigator.sendBeacon && navigator.sendBeacon(target, new Blob([body], { type: "application/json" }))) {
+            remember(firstError ? { type: type, via: "sendBeacon", result: "failed_then_queued", error: firstError } : { type: type, via: "sendBeacon", result: "queued" });
+            return true;
+          }
+        } catch (e) { /* 下で「送れなかった」として記録する */ }
+        return false;
+      };
+      var errText = function (e) { return String(e && e.message || e).slice(0, 80); };
       try {
-        var body = JSON.stringify(payload);
-        var target = apiBase + "/came-from";
-        if (navigator.sendBeacon) {
-          // 同一オリジンなので application/json でもプリフライト無し。sendBeacon はページを閉じても届く
-          var queued = navigator.sendBeacon(target, new Blob([body], { type: "application/json" }));
-          if (queued) { remember({ type: payload.type, via: "sendBeacon", result: "queued" }); return; }
+        if (typeof fetch === "function") {
+          fetch(target, { method: "POST", headers: { "Content-Type": "application/json" }, body: body, keepalive: true, cache: "no-store" })
+            .then(function (r) { remember({ type: type, via: "fetch", result: r.ok ? "ok" : "http_error", status: r.status }); })
+            .catch(function (e) { var msg = errText(e); if (!viaBeacon(msg)) remember({ type: type, via: "fetch", result: "failed", error: msg }); });
+          return;
         }
-        fetch(target, { method: "POST", headers: { "Content-Type": "application/json" }, body: body, keepalive: true })
-          .then(function (r) { remember({ type: payload.type, via: "fetch", result: r.ok ? "ok" : "http_error", status: r.status }); })
-          .catch(function (e) { remember({ type: payload.type, via: "fetch", result: "failed", error: String(e && e.message || e).slice(0, 80) }); });
-      } catch (e) { remember({ type: payload && payload.type, via: "none", result: "exception", error: String(e && e.message || e).slice(0, 80) }); }
+      } catch (e) {
+        var syncMsg = errText(e);
+        if (!viaBeacon(syncMsg)) remember({ type: type, via: "fetch", result: "failed", error: syncMsg });
+        return;
+      }
+      if (!viaBeacon("")) remember({ type: type, via: "none", result: "failed", error: "no fetch / no sendBeacon" });
     };
     send({ type: "land", from: src, firstFrom: rec ? rec.from : null, firstDay: rec ? rec.first : null, isNew: isNew, returning: returning });
     var engaged = false;
@@ -6771,6 +7661,9 @@ function contractAnswerText(player) {
   if (!c) return `${player.name}の契約金データはまだ登録されていません。`;
   if (c.type === "homegrown") return `${player.name}は下部組織出身の生え抜き選手で、移籍金は発生していません。`;
   const headline = c.amount || CONTRACT_TYPE_LABEL[c.type] || "詳細不明";
+  // v104.1(総点検・第2回): 日本語以外の画面では、同じ内容を「項目の並び」で返す(選手詳細の契約欄と同じ形)。
+  //   文の形(「◯◯は△△から□□(時期)で加入しました。」)は、金額に括弧が入ると型で区切れず、回答がまるごと日本語のまま残っていた。
+  if (uiIsNonJa()) return [player.name, headline, c.fromClub ? c.fromClub + "より" : "", c.date || "", c.note || ""].filter(Boolean).join(" ・ ");
   return `${player.name}は${c.fromClub ? c.fromClub + "から" : ""}${headline}${c.date ? "(" + c.date + ")" : ""}で加入しました。${c.note || ""}`;
 }
 function buildPeakAnswer(player, level) {
@@ -8559,6 +9452,13 @@ function buildMostImportantFactorBanner(analysis) {
     const top = pred.keyFactors.filter((f) => f && f.stars > 0).sort((a2, b2) => b2.stars - a2.stars)[0];
     if (top) { factorJa = top.labelJa; evidenceJa = top.starsDisplay || null; }
   }
+  // v104.1(総点検): 試合カードの応答には prediction.keyFactors が無く(aiPrediction は勝率だけ)、この帯は
+  //   試合カードでは一度も表示されていなかった。AI自身の予想の根拠(ownBasis.factors=効いた要素と★)を
+  //   サーバーが返しているので、いちばん★の多い要素をここに出す(AI自身の予想が無い試合では出さない)。
+  if (!factorJa && a.ownBasis && Array.isArray(a.ownBasis.factors)) {
+    const top = a.ownBasis.factors.filter((f) => f && f.labelJa && Number(f.stars) > 0).sort((a2, b2) => Number(b2.stars) - Number(a2.stars))[0];
+    if (top) { const st = Math.max(0, Math.min(5, Math.round(Number(top.stars)))); factorJa = top.labelJa; evidenceJa = "★".repeat(st) + "☆".repeat(5 - st); }
+  }
   if (!factorJa) return "";
   return `
     <div class="card" style="margin-bottom:10px; border-left:4px solid #1e8449;">
@@ -8724,12 +9624,21 @@ function knowledgeRecentFormHtml(form) {
   const detail = rr.map((r) => `${r.homeAway === "H" ? "H" : "A"} ${Number.isFinite(Number(r.goalsFor)) ? r.goalsFor : "?"}-${Number.isFinite(Number(r.goalsAgainst)) ? r.goalsAgainst : "?"} ${escapeHtml(r.opponent || "")}`).join(" / ");
   return `<div class="value-note" style="margin-top:2px;"><span>直近5試合</span>: ${marks.join("")} <span style="opacity:.8;">(${detail})</span></div>`;
 }
-function buildKnowledgeSideHtml(teamName, side) {
+function buildKnowledgeSideHtml(teamName, side, opts) {
   const name = escapeHtml(teamName || "");
+  const indexUnavailable = !!(opts && opts.indexUnavailable); // v104.1(総点検): 選手索引を読み出せなかった(「取り込み中」とは言わない)
   if (!side) return `<div style="flex:1; min-width:220px;"><strong>${name}</strong><p class="value-note" style="margin:4px 0 0;"><span>取得できません</span></p></div>`;
   if (side.tracked === false) {
+    // v104.1(総点検): 追跡対象外の理由をサーバーが返す。「取り込み候補に登録しました」と言ってよいのは、
+    //   本当に候補に記録されるクラブ(reason: "untracked")だけ。2軍・女子・ユースと、追跡中の別クラブと
+    //   同じ名前のチームは候補にならないので、守れない約束を画面に書かない。
+    const why = side.reason === "secondary_team"
+      ? "2軍・女子・ユースのチームは収集の対象外のため、選手データはありません(このAIは男子のトップチームを対象にしています)。"
+      : side.reason === "same_name_other_club"
+        ? "AIが追跡している別のクラブと同じ名前のチームのため、選手データは表示しません(別のクラブの情報を混ぜないための措置です)。"
+        : "追跡対象外のクラブのため、選手データはありません(このカードが開かれたので取り込み候補に登録しました。翌日以降の夜間収集で自動的に取得します)。";
     return `<div style="flex:1; min-width:220px;"><strong>${name}</strong>
-      <p class="value-note" style="margin:4px 0 0;">追跡対象外のクラブのため、選手データはありません(このカードが開かれたので取り込み候補に登録しました。翌日以降の夜間収集で自動的に取得します)。</p></div>`;
+      <p class="value-note" style="margin:4px 0 0;">${why}</p></div>`;
   }
   const sq = side.squad || null;
   const d = side.dossier || null;
@@ -8738,6 +9647,8 @@ function buildKnowledgeSideHtml(teamName, side) {
     parts.push(`<div class="value-note" style="margin-top:2px;"><span>主力の平均評価点</span>: <strong>${sq.avgRating.toFixed(2)}</strong> <span style="opacity:.8;">(評価点のある主力 ${sq.ratedCount}人/索引 ${sq.playersIndexed}人)</span></div>`);
   } else if (sq && sq.playersIndexed > 0) {
     parts.push(`<div class="value-note" style="margin-top:2px;">評価点のある主力が少ないため、優劣の比較はしません。 <span style="opacity:.8;">(評価点のある主力 ${sq.ratedCount}人/索引 ${sq.playersIndexed}人)</span></div>`);
+  } else if (indexUnavailable && !side.importing) {
+    parts.push(`<div class="value-note" style="margin-top:2px;">保存先から選手データを読み出せませんでした(1分ほど待って開き直してください)。</div>`);
   } else {
     parts.push(`<div class="value-note" style="margin-top:2px;">このクラブはまだ取り込み中です(選手成績は翌日以降の夜間収集で揃います)。</div>`);
   }
@@ -8786,8 +9697,8 @@ function buildUpcomingPreviewHtml(analysis, level) {
   }
   const sidesHtml = `
       <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:8px;">
-        ${buildKnowledgeSideHtml(f.home.name, kh)}
-        ${buildKnowledgeSideHtml(f.away.name, ka)}
+        ${buildKnowledgeSideHtml(f.home.name, kh, { indexUnavailable: !!(k && k.indexUnavailable) })}
+        ${buildKnowledgeSideHtml(f.away.name, ka, { indexUnavailable: !!(k && k.indexUnavailable) })}
       </div>`;
 
   // UI/UX統一ラウンド: ホームと同じ「AIの予想(勝敗・勝率バー・根拠)」を
@@ -8950,8 +9861,8 @@ function buildLiveAnalysisHtml(analysis, level) {
   return `
     <div class="card" style="border:1.5px solid var(--critical);">
       <h2><span class="status-badge is-live" style="margin-right:6px;"><span class="live-dot"></span>LIVE</span>${escapeHtml(f.home.name)} ${scoreStr} ${escapeHtml(f.away.name)}</h2>
-      <p class="value-note">${escapeHtml(f.league || "")}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}${elapsedStr ? " ・ " + elapsedStr : ""}(API-Footballの実データに基づく、試合中の途中経過です。まだ結果は確定していません)</p>
-      ${(() => { const p = predsByFixtureId.get(String(f.id)); return p ? `<p class="value-note" style="margin:4px 0 0;">${predStripHtml(p)}(試合前の予想)</p>` : ""; })()}
+      <p class="value-note">${escapeHtml(f.league || "")}${f.venue ? " ・ " + escapeHtml(f.venue) : ""}${elapsedStr ? ` ・ <span>${elapsedStr}</span>` : ""}<span>(API-Footballの実データに基づく、試合中の途中経過です。まだ結果は確定していません)</span></p>
+      ${(() => { const p = predsByFixtureId.get(String(f.id)); return p ? `<p class="value-note" style="margin:4px 0 0;">${predStripHtml(p)}<span>(試合前の予想)</span></p>` : ""; })()}
       <div style="margin-top:8px;">${eventsTimelineVisualHtml(analysis.events, f.home.name)}</div>
       ${ratingBarHtml}
       <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:10px;">
@@ -9442,7 +10353,7 @@ async function renderScoutFeed() {
     .map((it) => `<li style="padding:6px 0;border-bottom:1px solid var(--border);list-style:none">
         <span style="font-size:15px">${SCOUT_TYPE_ICONS[it.type] || "•"}</span>
         <strong style="margin-left:4px">${esc(it.name || "-")}</strong>
-        <span class="muted" style="font-size:12px;margin-left:6px">${esc(it.teamJa || it.teamEn || "")}</span>
+        <span class="muted" style="font-size:12px;margin-left:6px">${esc(teamLabel(it))}</span>
         <div class="muted" style="font-size:13px;margin-left:24px">${esc(it.labelJa)}: ${esc(it.detailJa || "")}</div>
       </li>`).join("");
   const counts = data.counts || {};
@@ -9682,8 +10593,48 @@ function getDailyFeaturedMatchup() {
 // 必要な英語クラブ名を引くための対応表。実際の試合(API-Football)を登録クラブへ
 // 結びつけるREAL_FIXTURE_CLUB_EN_TO_JA(英→日)の向きを逆にしたもの。
 // ============================================================
+// v104.1(総点検・第2回): クラブ名が「別の語の一部」として含まれているだけのときは、クラブの話だと決めつけない。
+//   対応表を追跡172クラブぶんに広げると、短い名前(コモ・パルマ・アンジェ・レッチェ・ブレスト…)が
+//   「コモン」「パルマー」「アンジェ・ポステコグルー」「サンフレッチェ」「ブレストする」の中に見つかってしまう。
+//   (従来の100クラブでも「モナコグランプリ」がモナコ(クラブ)の話として扱われていた)
+//   ・名前の直前がカタカナ・長音なら、別の語の後ろ半分 → 数えない(サンフレッチェ ⊃ レッチェ)
+//   ・4文字以下の短い名前は、直後がカタカナ・長音・「・+カタカナ」なら、別の語の前半分 → 数えない
+//     (ただし「ナポリファン」「リヨン戦」のような、クラブ名に付く決まった語は数える)
+//   ・5文字以上の名前の直後のカタカナは「バルセロナサポーター」のような複合語なので、従来どおり数える
+//   読み取れなかった質問は、従来どおりサーバーの名寄せ・聞き返しに任される(誤った決めつけより安全)。
+// ============================================================
+const CLUB_NAME_SUFFIX_RE = /^(ファン|サポ|ダービー|ホーム|アウェイ|アウェー|イレブン|ユース|スタジアム|ユニ)/;
+function clubNameAppearsIn(q, ja) {
+  const text = String(q || "");
+  if (!text || !ja) return false;
+  const KATA = /[ァ-ヴー]/;
+  for (let from = 0; from <= text.length;) {
+    const idx = text.indexOf(ja, from);
+    if (idx === -1) return false;
+    const before = idx > 0 ? text.charAt(idx - 1) : "";
+    const before2 = idx > 1 ? text.charAt(idx - 2) : "";
+    const rest = text.slice(idx + ja.length);
+    const after = rest.charAt(0), after2 = rest.charAt(1);
+    let ok = true;
+    if (/^(する|して|した|しよ|しま)/.test(rest)) ok = false; // 「ブレストする」のような動詞(クラブ名+する、は無い)
+    if (ok && KATA.test(ja.charAt(0)) && (KATA.test(before) || (before === "・" && KATA.test(before2)))) ok = false;
+    if (ok && ja.length <= 4 && KATA.test(ja.charAt(ja.length - 1))) {
+      const continues = KATA.test(after) || (after === "・" && KATA.test(after2));
+      if (continues && !CLUB_NAME_SUFFIX_RE.test(rest)) ok = false;
+    }
+    if (ok) return true;
+    from = idx + 1;
+  }
+  return false;
+}
+
+// ============================================================
 // 2026年8月・知識拡張フェーズ(ご指示①): UEFAクラブランキングTOP100の対応表。
 // server/learning/clubUniverse.js のCLUB_UNIVERSE(日本語名→英語名)から生成。
+// v104.1(総点検・第2回): サーバーの対象は172クラブ(欧州上位100+J1・5大リーグ全部)に増えていたのに、この表は
+//   100クラブのまま残っていた(「推しクラブ」の選択肢が「予測対象172クラブ」と書きながら100件しか無く、J1の全クラブ・
+//   エヴァートンなどを選べなかった。質問文からのクラブの読み取りも、後から増えた72クラブぶんは効いていなかった)。
+//   サーバーの一覧から作り直した。今後ずれないよう、v104_1_audit_test.js がサーバーの一覧と1件ずつ照らす。
 // ローカルに選手データが無いクラブでも、サーバー側で毎日蓄積している
 // 調査ファイル(clubDossier)の知識を使って議論できるようにするための入口。
 // ============================================================
@@ -9788,6 +10739,78 @@ const UNIVERSE_CLUB_JA_TO_EN = {
   "ロイヤル・アントワープ": "Royal Antwerp",
   "スタンダール・リエージュ": "Standard Liege",
   "セルヴェット": "Servette",
+  "鹿島アントラーズ": "Kashima Antlers",
+  "水戸ホーリーホック": "Mito Hollyhock",
+  "浦和レッズ": "Urawa Red Diamonds",
+  "ジェフユナイテッド千葉": "JEF United Chiba",
+  "柏レイソル": "Kashiwa Reysol",
+  "FC東京": "FC Tokyo",
+  "東京ヴェルディ": "Tokyo Verdy",
+  "FC町田ゼルビア": "Machida Zelvia",
+  "川崎フロンターレ": "Kawasaki Frontale",
+  "横浜F・マリノス": "Yokohama F. Marinos",
+  "清水エスパルス": "Shimizu S-Pulse",
+  "名古屋グランパス": "Nagoya Grampus",
+  "京都サンガF.C.": "Kyoto Sanga",
+  "ガンバ大阪": "Gamba Osaka",
+  "セレッソ大阪": "Cerezo Osaka",
+  "ヴィッセル神戸": "Vissel Kobe",
+  "ファジアーノ岡山": "Fagiano Okayama",
+  "サンフレッチェ広島": "Sanfrecce Hiroshima",
+  "アビスパ福岡": "Avispa Fukuoka",
+  "V・ファーレン長崎": "V-Varen Nagasaki",
+  "ボーンマス": "Bournemouth",
+  "ブレントフォード": "Brentford",
+  "コヴェントリー・シティ": "Coventry",
+  "クリスタル・パレス": "Crystal Palace",
+  "エヴァートン": "Everton",
+  "フラム": "Fulham",
+  "ハル・シティ": "Hull City",
+  "イプスウィッチ・タウン": "Ipswich",
+  "リーズ・ユナイテッド": "Leeds",
+  "ノッティンガム・フォレスト": "Nottingham Forest",
+  "サンダーランド": "Sunderland",
+  "オサスナ": "Osasuna",
+  "アラベス": "Alaves",
+  "エルチェ": "Elche",
+  "ヘタフェ": "Getafe",
+  "レバンテ": "Levante",
+  "マラガ": "Malaga",
+  "ラシン・サンタンデール": "Racing Santander",
+  "ラージョ・バジェカーノ": "Rayo Vallecano",
+  "セルタ": "Celta Vigo",
+  "デポルティーボ・ラ・コルーニャ": "Deportivo La Coruna",
+  "エスパニョール": "Espanyol",
+  "ウディネーゼ": "Udinese",
+  "サッスオーロ": "Sassuolo",
+  "パルマ": "Parma",
+  "カリアリ": "Cagliari",
+  "ジェノア": "Genoa",
+  "レッチェ": "Lecce",
+  "コモ": "Como",
+  "フロジノーネ": "Frosinone",
+  "ヴェネツィア": "Venezia",
+  "モンツァ": "Monza",
+  "アウクスブルク": "FC Augsburg",
+  "ボルシアMG": "Borussia Monchengladbach",
+  "ヴェルダー・ブレーメン": "Werder Bremen",
+  "1.FCケルン": "FC Koln",
+  "エルフェアスベルク": "SV Elversberg",
+  "ハンブルガーSV": "Hamburger SV",
+  "マインツ": "FSV Mainz 05",
+  "パーダーボルン": "SC Paderborn 07",
+  "シャルケ": "Schalke 04",
+  "シュトゥットガルト": "VfB Stuttgart",
+  "RCランス": "Lens",
+  "ストラスブール": "Strasbourg",
+  "ロリアン": "Lorient",
+  "パリFC": "Paris FC",
+  "ブレスト": "Stade Brestois 29",
+  "アンジェ": "Angers",
+  "ル・アーヴル": "Le Havre",
+  "オセール": "Auxerre",
+  "トロワ": "Troyes",
+  "ル・マン": "Le Mans",
 };
 
 const CLUB_JA_TO_EN = {
@@ -9876,7 +10899,7 @@ function buildDiscussSubject(q, contextPlayer, forcedPlayerName) {
   // 調査ファイル(clubDossier)の実測知識で議論する。登録クラブ・選手の既存判定より
   // 後に置くことで、これまでの挙動は一切変えない。
   const universeHit = Object.keys(UNIVERSE_CLUB_JA_TO_EN)
-    .filter((ja) => q && q.includes(ja))
+    .filter((ja) => q && clubNameAppearsIn(q, ja))
     .sort((a, b) => b.length - a.length)[0];
   if (universeHit) {
     return {
@@ -10062,8 +11085,9 @@ function renderDiscussReplyHtml(resp) {
   //   AIの回答を6つの観点へ整えられなかった場合、これまでは「AI独自の意見」欄に
   //   全文が入り、残りの見出しが空のまま並んでいた。なぜ空なのかがどこにも
   //   書かれていなかったため、利用者には壊れているようにしか見えなかった。
+  // v104.1: 「※」と本文を別の要素にする(本文は辞書にあるのに、「※ 」が同じ文字の節にあって訳されていなかった)
   const formatNoteHtml = resp.formatNoteJa
-    ? `<p class="value-note" style="margin-bottom:6px; opacity:.9;">※ ${escapeHtml(resp.formatNoteJa)}</p>`
+    ? `<p class="value-note" style="margin-bottom:6px; opacity:.9;">※ <span>${escapeHtml(resp.formatNoteJa)}</span></p>`
     : "";
   // v51: 2回試しても文字数上限で切れた場合の正直な注記(黙って尻切れを見せない)
   const truncatedNoteHtml = resp.truncatedNoteJa
@@ -10139,8 +11163,9 @@ function renderDiscussReplyHtml(resp) {
     const s3 = st.step3_comparison;
     if (s3 && s3.marginJa) out.push({ labelJa: "仮説の比較", summaryJa: s3.marginJa });
     // step4(反対意見)は下の🔄行と同文のため一覧からは省く(情報過多の防止)
-    const s5 = st.step5_evidenceEvaluation;
-    if (s5 && Array.isArray(s5.reasons) && s5.reasons.length) out.push({ labelJa: "根拠の評価", summaryJa: `${s5.reasons.join("。")}。` });
+    // step5(根拠の評価=自信度とその理由)は、回答の下の自信度の行(★と理由)と同じ内容のため一覧からは省く。
+    //   v104.1(総点検): 旧コードは存在しない項目(step5_evidenceEvaluation.reasons)を読んでいて、この行は一度も出ていなかった
+    //   (サーバーが返すのは confidenceStars / confidenceReasonJa)。同じ理由を2か所に出さないよう、読む処理そのものを外した。
     const s6 = st.step6_finalConclusion;
     if (s6 && s6.headlineJa) out.push({ labelJa: "最終結論", summaryJa: s6.headlineJa });
     return out.length ? out : null;
@@ -10148,10 +11173,13 @@ function renderDiscussReplyHtml(resp) {
   // 同修正: changedFromPrevious は {changed, noteJa} のオブジェクトなので、
   // 「変わっていない」場合(changed:false)にも真になり誤表示になるところだった。
   const delChanged = !!(del && del.changedFromPrevious && del.changedFromPrevious.changed === true);
+  // v104.1: 各段階の要約と反論は、サーバーが規則で組み立てた日本語の文。日本語以外の画面では訳してから入れる
+  //   (v82 以来、英語・中国語・スペイン語の画面に日本語のまま出ていた)。見出しと本文は別の要素にする。
+  const trDelib = (t) => ((typeof window !== "undefined" && typeof window.translateDelibJa === "function") ? window.translateDelibJa(t) : t);
   const deliberationHtml = (delStagesArr && delStagesArr.length)
     ? `<details class="discuss-facts"><summary>🧭 この結論に至るまでの検討(${delStagesArr.length}段階)</summary><ol style="margin:4px 0 0 1.2em; padding:0;">${
-        delStagesArr.map((st) => `<li class="value-note"><strong>${escapeHtml(st.labelJa || st.name || "")}</strong>${st.summaryJa ? `: ${escapeHtml(st.summaryJa)}` : ""}</li>`).join("")
-      }</ol>${del.counterArgumentJa ? `<p class="value-note" style="margin-top:4px;">🔄 反論の検討: ${escapeHtml(del.counterArgumentJa)}</p>` : ""}${
+        delStagesArr.map((st) => `<li class="value-note"><strong>${escapeHtml(st.labelJa || st.name || "")}</strong>${st.summaryJa ? `: <span>${escapeHtml(trDelib(st.summaryJa))}</span>` : ""}</li>`).join("")
+      }</ol>${del.counterArgumentJa ? `<p class="value-note" style="margin-top:4px;">🔄 <span>反論の検討:</span> <span>${escapeHtml(trDelib(del.counterArgumentJa))}</span></p>` : ""}${
         delChanged ? `<p class="value-note">※ 前回の結論から変更しています。</p>` : ""}</details>`
     : "";
   // ---- 2026年8月18日・v47「多段思考」: AIが追加調査をしたことを正直に見せる ----
@@ -10159,14 +11187,20 @@ function renderDiscussReplyHtml(resp) {
   //   多段思考が走らなかった場合(計画失敗・予算節約・無効化)は何も出さない
   //   (通常の1段構成=従来どおりの回答であり、特別な注記は不要)。
   const msMeta = resp.meta && resp.meta.multiStep;
+  // v104.1: 注記(規則で組み立てた文)を別の要素にして訳せるようにする(従来は「🔁 」と同じ文字の節で、日本語以外の
+  //   画面に日本語のまま出ていた)。「論点」は調査計画AIが日本語で書く1文なので、日本語の画面でだけ出す
+  //   (他の言語では訳せない。論点そのものは、回答AIが利用者の言語で書く本文に反映されている)。
+  const nonJaUi = (typeof window !== "undefined" && window.appLang && window.appLang !== "ja");
   const multiStepHtml = (msMeta && msMeta.ran && msMeta.noteJa)
-    ? `<div class="value-note" style="margin-top:4px;">🔁 ${escapeHtml(msMeta.noteJa)}${
-        msMeta.focusJa ? ` 論点: ${escapeHtml(msMeta.focusJa)}` : ""}</div>`
+    ? `<div class="value-note" style="margin-top:4px;">🔁 <span>${escapeHtml(msMeta.noteJa)}</span>${
+        (msMeta.focusJa && !nonJaUi) ? ` <span>論点:</span> ${escapeHtml(msMeta.focusJa)}` : ""}</div>`
     : "";
   const ragU = resp.meta && resp.meta.intelligence && resp.meta.intelligence.ragUtilization;
   const ragNum = (v) => (Number.isFinite(Number(v)) ? Number(v) : "—");
   const ragHtml = ragU
-    ? `<div class="value-note" style="margin-top:4px;">🔍 根拠の利用: 候補${ragNum(ragU.candidates ?? ragU.retrieved)}件のうち <strong>${ragNum(ragU.used ?? ragU.usedCount)}件</strong>を回答に使いました${Number.isFinite(ragU.utilizationPct) ? `(${ragU.utilizationPct}%)` : ""}${ragU.noteJa ? ` — ${escapeHtml(ragU.noteJa)}` : ""}</div>`
+    // v104.1: 候補の件数は poolCount(サーバーが返している項目名)。従来は candidates / retrieved という
+    //   存在しない項目を読んでいたため、常に「候補—件のうち」と表示されていた(使った件数と割合は正しく出ていた)。
+    ? `<div class="value-note" style="margin-top:4px;">🔍 根拠の利用: 候補${ragNum(ragU.candidates ?? ragU.retrieved ?? ragU.poolCount)}件のうち <strong>${ragNum(ragU.used ?? ragU.usedCount)}件</strong>を回答に使いました${Number.isFinite(ragU.utilizationPct) ? `(${ragU.utilizationPct}%)` : ""}${ragU.noteJa ? ` — ${escapeHtml(ragU.noteJa)}` : ""}</div>`
     : "";
 
   // 監査(全ボタン走査)で実際に再現したクラッシュの修正:
@@ -10192,24 +11226,80 @@ function renderDiscussReplyHtml(resp) {
   const followupsHtml = resp.followUpQuestions && resp.followUpQuestions.length
     ? `<div class="followup-chip-row">${resp.followUpQuestions.map(q => `<button class="chat-followup-btn" data-q="${escapeHtml(q)}">・${escapeHtml(q)}</button>`).join("")}</div>`
     : "";
-  return { text: body + thoughtChangeHtml, extras: `${confidenceHtml}${multiStepHtml}${ragHtml}${deliberationHtml}${graphHtml}${timelineHtml}${factsHtml}${genInfoHtml}${followupsHtml}` };
+  // v104.1: 議論(7欄)の回答でも、AIが道具で確認したデータを開示する(v104 は事実・予想の回答にしか出していなかった)
+  return { text: body + thoughtChangeHtml, extras: `${confidenceHtml}${multiStepHtml}${ragHtml}${toolsLineHtml(resp)}${groundingNoteHtml(resp)}${deliberationHtml}${graphHtml}${timelineHtml}${factsHtml}${genInfoHtml}${followupsHtml}` };
 }
 
+// ---- v104.1 M「数字の裏取り」: 回答に出てくる数字が、AIに渡したデータにあるかをサーバーが機械的に照合した結果 ----
+//   all_supported     … すべて一致
+//   partial           … 一致しない数字がある(AIが差や平均を計算した値の場合がある、と必ず添える)
+//   general_knowledge … 実データを使っていない回答(一般知識の数字)
+//   それ以外(none・照合しない種類の回答・旧い応答)は何も出さない
+function groundingNoteHtml(resp) {
+  const g = resp && resp.grounding;
+  if (!g || !g.verdict) return "";
+  const checked = Number(g.checked) || 0, supported = Number(g.supported) || 0, repeated = Number(g.repeated) || 0;
+  // 前の回答の数字を繰り返した分(今回の取得データとは照合していない)は、一致・不一致と分けて必ず添える
+  const repeatedAlso = repeated > 0 ? ` ・ <span>ほかに${repeated}個は、これまでの回答に出てきた数字の繰り返しです(今回は照合していません)</span>` : "";
+  if (g.verdict === "all_supported" && checked > 0) {
+    return `<div class="value-note" style="margin-top:4px;">✅ <span>数字の裏取り</span>: <span>照合した数字${checked}個は、すべて取得したデータにある数字と一致しました</span>${repeatedAlso}</div>`;
+  }
+  if (g.verdict === "partial" && Array.isArray(g.unsupported) && g.unsupported.length) {
+    const list = g.unsupported.map((u) => escapeHtml(String(u.text))).join("、");
+    const more = Number(g.unsupportedCount) > g.unsupported.length ? ` <span>ほか</span>` : "";
+    return `<div class="value-note" style="margin-top:4px;">⚠️ <span>数字の裏取り</span>: <span>照合した数字${checked}個のうち${supported}個は取得したデータと一致しました。次の数字は、取得したデータに同じ値が見当たりません(AIが計算した値や、AIの推定・一般知識による値の場合があります)</span>: <strong>${list}</strong>${more}${repeatedAlso}</div>`;
+  }
+  if (g.verdict === "general_knowledge") {
+    return `<div class="value-note" style="margin-top:4px;">ℹ️ <span>数字の裏取り</span>: <span>この回答は取得したデータを使っていないため、数字はAIの一般知識にもとづくものです(最新の値と違う場合があります)</span></div>`;
+  }
+  if (g.verdict === "repeated_only" && repeated > 0) {
+    return `<div class="value-note" style="margin-top:4px;">ℹ️ <span>数字の裏取り</span>: <span>この回答の数字${repeated}個は、これまでの回答に出てきた数字の繰り返しです(今回は照合していません)</span></div>`;
+  }
+  return "";
+}
 // ---- v104 ①: 質問の種類ごとの描画(議論は従来の renderDiscussReplyHtml のまま) ----
+// ---- v104.1: 「🧰 AIが確認したデータ」の1行 ----
+//   v104 は見出し・各項目・絵文字を1つの文字の節に入れていたため、英語・中国語・スペイン語の画面で訳されず
+//   日本語のまま残っていた(実ブラウザ検査の盲点。v104.1 の検査で発見)。見出しと各項目を別々の要素にする。
+//   各項目は、サーバーが添える言語に依らない要約(c.summary)から組み立てる:
+//     ・クラブ名は、日本語以外の画面では英語名を使う(日本語名のままでは訳せない)
+//     ・取得できなかった理由(日本語の文)は日本語の画面でだけ出し、他の言語では「取得できませんでした」とだけ伝える
+//       (理由そのものは、回答AIが利用者の言語で本文に書く)
+//   c.summary の無い応答(v104 のサーバー)は、従来の1行(c.summaryJa)をそのまま要素に入れる。
+const DISCUSS_TOOL_LABELS_JA = {
+  get_today_predictions: "今日のAI予想", get_prediction_detail: "予想の詳細", get_team_snapshot: "クラブの現状",
+  get_match_analysis: "対戦分析", get_player_stats: "選手の今季成績", get_recent_misses: "外した予想の反省", get_accuracy_summary: "的中率の実測",
+};
+function toolCallSummaryHtml(c) {
+  if (!c) return "";
+  const s = c.summary;
+  const fallback = `<span>${escapeHtml(String(c.summaryJa || c.name || ""))}</span>`;
+  if (!s || !s.kind) return fallback;
+  const nonJa = (typeof window !== "undefined" && window.appLang && window.appLang !== "ja");
+  if (!nonJa) return fallback; // 日本語の画面は従来どおりの1行
+  const label = DISCUSS_TOOL_LABELS_JA[c.name] || DISCUSS_TOOL_LABELS_JA[s.tool] || null;
+  if (s.kind === "failed") return label ? `<span>${escapeHtml(label)}</span>: <span>取得できませんでした</span>` : `<span>取得できませんでした</span>`;
+  if (s.kind === "team_snapshot") return `<span>${escapeHtml(`クラブの現状: ${s.teamEn || s.teamJa || ""}(事実${Number(s.facts) || 0}件)`)}</span>`;
+  if (s.kind === "match_analysis") return `<span>${escapeHtml(`対戦分析: ${s.homeEn || s.home || ""} vs ${s.awayEn || s.away || ""}`)}</span>`;
+  if (s.kind === "ok") return label ? `<span>${escapeHtml(label)}</span>: <span>取得</span>` : fallback;
+  return fallback; // 件数・試合ID・選手名(提供元の表記)だけの項目は、従来の1行のまま型で訳せる
+}
+function toolsLineHtml(resp) {
+  const tools = resp && resp.meta && resp.meta.tools;
+  if (!(tools && Array.isArray(tools.calls_list) && tools.calls_list.length)) return "";
+  return `<div class="value-note" style="margin-top:4px;">🧰 <span>AIが確認したデータ:</span> ${tools.calls_list.map(toolCallSummaryHtml).join(" / ")}${tools.exhausted ? `<span>(確認回数の上限に達したため、ここまでの情報で回答)</span>` : ""}</div>`;
+}
 function discussCommonExtrasHtml(resp) {
   const factsHtml = resp.facts && resp.facts.length
     ? `<details class="discuss-facts"><summary>📊 根拠にした事実を見る(${resp.facts.length}件)</summary><ul>${resp.facts.map(f => `<li>${escapeHtml(f)}</li>`).join("")}</ul></details>`
     : "";
-  const tools = resp.meta && resp.meta.tools;
-  const toolsHtml = (tools && Array.isArray(tools.calls_list) && tools.calls_list.length)
-    ? `<div class="value-note" style="margin-top:4px;">🧰 AIが確認したデータ: ${tools.calls_list.map((c) => escapeHtml(c.summaryJa || c.name)).join(" / ")}${tools.exhausted ? "(確認回数の上限に達したため、ここまでの情報で回答)" : ""}</div>`
-    : "";
+  const toolsHtml = toolsLineHtml(resp);
   const genModelName = resp.meta && resp.meta.llmModel ? String(resp.meta.llmModel) : null;
   const genInfoHtml = genModelName ? `<div class="value-note" style="margin-top:4px; opacity:.75;">🏷️ 生成モデル: ${escapeHtml(genModelName)}</div>` : "";
   const followupsHtml = resp.followUpQuestions && resp.followUpQuestions.length
     ? `<div class="followup-chip-row">${resp.followUpQuestions.map(q => `<button class="chat-followup-btn" data-q="${escapeHtml(q)}">・${escapeHtml(q)}</button>`).join("")}</div>`
     : "";
-  return `${toolsHtml}${factsHtml}${genInfoHtml}${followupsHtml}`;
+  return `${toolsHtml}${groundingNoteHtml(resp)}${factsHtml}${genInfoHtml}${followupsHtml}`;
 }
 function textToParagraphsHtml(text) {
   const t = String(text || "").trim();
@@ -10217,18 +11307,19 @@ function textToParagraphsHtml(text) {
   return t.split(/\n{2,}/).map((para) => `<p>${escapeHtml(para).replace(/\n/g, "<br>")}</p>`).join("");
 }
 function renderPlainReplyHtml(resp) {
-  const note = resp.formatNoteJa ? `<p class="value-note">※ ${escapeHtml(resp.formatNoteJa)}</p>` : "";
+  const note = resp.formatNoteJa ? `<p class="value-note">※ <span>${escapeHtml(resp.formatNoteJa)}</span></p>` : "";
   const truncated = resp.truncatedNoteJa ? `<p class="value-note">${escapeHtml(resp.truncatedNoteJa)}</p>` : "";
   return { text: note + truncated + textToParagraphsHtml(resp.answerText || ""), extras: discussCommonExtrasHtml(resp) };
 }
 function renderPredictionReplyHtml(resp) {
   const p = resp.prediction || {};
-  const note = resp.formatNoteJa ? `<p class="value-note">※ ${escapeHtml(resp.formatNoteJa)}</p>` : "";
+  const note = resp.formatNoteJa ? `<p class="value-note">※ <span>${escapeHtml(resp.formatNoteJa)}</span></p>` : "";
   const truncated = resp.truncatedNoteJa ? `<p class="value-note">${escapeHtml(resp.truncatedNoteJa)}</p>` : "";
   let body = note + truncated;
   body += `<p>🔮 <strong>予想:</strong> ${escapeHtml(p.prediction || "(予想を生成できませんでした)")}</p>`;
   if (p.basis) body += `<p>📊 <strong>根拠:</strong> ${escapeHtml(p.basis)}</p>`;
-  if (p.caution && !/^特になし/.test(p.caution)) body += `<p class="value-note">⚠️ 注意: ${escapeHtml(p.caution)}</p>`;
+  // v104.1: 見出し「注意:」を別の要素にする(v104 は絵文字・見出し・AIの文が1つの文字の節で、見出しが訳されなかった)
+  if (p.caution && !/^特になし/.test(p.caution)) body += `<p class="value-note">⚠️ <span>注意:</span> ${escapeHtml(p.caution)}</p>`;
   // 予想の確信度は本文(予想欄の「確信度 高/中/低」と確率)に含まれる。6段階の熟考の星(クラブ知識の揃い具合)は
   //   「勝敗の予想の確からしさ」とは別物で、並べると矛盾して見える(実ブラウザ検査で確認)ため、予想モードでは出さない。
   return { text: body, extras: discussCommonExtrasHtml(resp) };
@@ -10236,7 +11327,14 @@ function renderPredictionReplyHtml(resp) {
 function renderClarifyHtml(resp, originalQuestion) {
   const opts = Array.isArray(resp.options) ? resp.options : [];
   const buttons = opts.map((o) => `<button class="chat-followup-btn chat-clarify-btn" data-q="${escapeHtml(originalQuestion)}" data-subject="${escapeHtml(JSON.stringify(o.subject || {}))}">・${escapeHtml(o.label)}</button>`).join("");
-  return { text: `<p>❓ ${escapeHtml(resp.question || "どのクラブのことでしょうか?")}</p>`, extras: `<div class="followup-chip-row">${buttons}</div>` };
+  // v104.1: 質問文・「(候補:」・候補のクラブ名を別々の要素にする(v104 は絵文字と全文が1つの文字の節で、
+  //   英語・中国語・スペイン語の画面で訳されなかった)。日本語の画面での見え方は従来と同じ1行。
+  const sr = resp.meta && resp.meta.subjectResolution;
+  const cands = (sr && Array.isArray(sr.candidates)) ? sr.candidates.filter(Boolean) : [];
+  const questionHtml = (sr && sr.token && cands.length)
+    ? `<span>${escapeHtml(`「${sr.token}」はどのクラブのことでしょうか?`)}</span><span>(候補:</span> ${cands.map((n) => `<span>${escapeHtml(String(n))}</span>`).join(" / ")})`
+    : `<span>${escapeHtml(resp.question || "どのクラブのことでしょうか?")}</span>`;
+  return { text: `<p>❓ ${questionHtml}</p>`, extras: `<div class="followup-chip-row">${buttons}</div>` };
 }
 function renderDiscussByMode(resp, originalQuestion) {
   const mode = resp && resp.mode;
@@ -10550,12 +11648,14 @@ async function heroAskAI(question) {
       reply = ruleAnswer;
       topicType = "club"; topicCtx = clubName;
     } else if (matchIntent) {
-      switchToMatchMode();
-      const m = getDailyFeaturedMatchup();
-      renderMatchAnalysis(m.id);
-      scrollToEl("matchAnalysisWrap");
-      reply = `具体的な対戦カードが分からなかったため、本日のAIおすすめカード「${m.homeLabel} vs ${m.awayLabel}」を表示しました。下に分析を表示しています。特定の対戦を知りたい場合は「(クラブ名)と(クラブ名)どっちが勝つ？」のようにクラブ名を含めて聞いてください。📡「本日の実際の試合」に実データがある場合は、そちらも合わせてチェックしてみてください。`;
-      topicType = "match"; topicCtx = m;
+      // ---- v104.1(総点検): 「今日の試合」「どっちが勝つ」の質問は、サーバーのAI(道具つき)へ渡す ----
+      //   旧コードはここで、画面内に固定で持っている「おすすめカード」(登録11クラブどうしの仮の対戦)を出して
+      //   「具体的な対戦カードが分からなかったため…」と答えて終わっていた。そのため
+      //   「今日の自信のある試合は?」「今日のSランクの試合を教えて」「今日のレアルの試合どう?」
+      //   「アーセナルとチェルシーどっちが勝つ?」(地力レーティングが無いとき)といった、いちばん自然な聞き方が
+      //   サーバーのAI(今日の予想・自信ランク・対戦分析の道具)に一度も届いていなかった。
+      await runDiscussFlow(q, dLevel, null, (msg) => heroChatHistory.push(msg), renderHeroChatUI, undefined, "hero");
+      return;
     } else {
       // クラブ名・登録選手名のどちらも検出できなかった場合。これまではここで
       // 諦めていたが、未登録選手名らしき語(カタカナ表記など)を推測できれば
@@ -10992,9 +12092,9 @@ async function renderAiAccuracyWidget() {
   const pd = stats.pendingDetail;
   const pendingLine = (Number.isFinite(stats.pending) && stats.pending > 0)
     ? `<div class="value-note" style="margin-top:4px;">答え合わせ待ち <strong>${stats.pending}件</strong>`
-      + (pd && Number.isFinite(pd.awaitingKickoff) ? `(まだ終わっていない ${pd.awaitingKickoff}件 / 終了済みで照合待ち ${pd.dueForCheck}件)` : "")
-      + (Number.isFinite(stats.hoursSinceLastResolved) ? ` ・ 最後の答え合わせ ${stats.hoursSinceLastResolved}時間前` : "")
-      + (Number.isFinite(stats.hoursSinceLastAutoCollect) ? ` ・ 自動照合の最終実行 ${stats.hoursSinceLastAutoCollect}時間前` : (stats.lastAutoCollect === null ? " ・ 自動照合の実行記録なし" : ""))
+      + (pd && Number.isFinite(pd.awaitingKickoff) ? `<span>(まだ終わっていない ${pd.awaitingKickoff}件 / 終了済みで照合待ち ${pd.dueForCheck}件)</span>` : "")
+      + (Number.isFinite(stats.hoursSinceLastResolved) ? ` ・ <span>最後の答え合わせ ${stats.hoursSinceLastResolved}時間前</span>` : "")
+      + (Number.isFinite(stats.hoursSinceLastAutoCollect) ? ` ・ <span>自動照合の最終実行 ${stats.hoursSinceLastAutoCollect}時間前</span>` : (stats.lastAutoCollect === null ? " ・ <span>自動照合の実行記録なし</span>" : ""))
       + `</div>`
     : "";
   summaryEl.innerHTML = `
@@ -11517,7 +12617,7 @@ function classifyLearnErrors(list, serverClassification) {
                <div class="value-note" style="margin:2px 0 0;">${escapeHtml(g.meaningJa)}</div>
                <div class="value-note" style="margin:1px 0 0;">→ ${escapeHtml(g.effectJa)}</div>
                <details style="margin-top:3px;"><summary class="value-note" style="cursor:pointer;">記録された内容を見る</summary>
-                 <ul style="margin:3px 0 0; padding-left:18px; font-size:11.5px; color:var(--text-muted);">
+                 <ul style="margin:3px 0 0; padding-left:18px; font-size:11.5px; color:var(--text-muted); overflow-wrap:anywhere;">
                    ${g.items.slice(0, 8).map((e) => `<li>${escapeHtml(String(e))}</li>`).join("")}
                  </ul>
                  ${g.items.length > 8 ? `<p class="value-note" style="margin:2px 0 0;">…他${g.items.length - 8}件</p>` : ""}
@@ -11757,10 +12857,10 @@ function predictionSummaryBlockHtml(p, titleJa) {
   const blendLine = predBlendLineHtml(p);
   return `
     <div style="margin:8px 0; padding:10px 12px; border-left:4px solid var(--series-2); background:rgba(0,0,0,.03); border-radius:6px;">
-      <div>${escapeHtml(titleJa || "🤖 AIの予想")}: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predResultBadgeHtml(p)}</div>
+      <div>${escapeHtml(titleJa || "🤖 AIの予想")}: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predTierChipHtml(p)}${predResultBadgeHtml(p)}</div>
       ${predBarHtml(p)}
       <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-      ${predUnlearnedLineHtml(p)}${predConfidenceLineHtml(p)}${predFactorsLineHtml(p)}${predBasisLineHtml(p)}${similarLine}${marketLine}${blendLine}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
+      ${predUnlearnedLineHtml(p)}${predTierLineHtml(p)}${predConfidenceLineHtml(p)}${predFactorsLineHtml(p)}${predBasisLineHtml(p)}${similarLine}${marketLine}${blendLine}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
     </div>`;
 }
 // ---- 2026年8月18日・v50「市場ブレンド」の開示 ----
@@ -11835,7 +12935,7 @@ function predConfidenceLineHtml(p) {
     lines.push(`<div class="value-note" style="margin-top:2px;">🎚️ <span>確信度(較正済み)</span>: <strong>${Number(c.displayPct)}%</strong>(<span>モデル生値</span> ${Number(c.rawPct)}%${gap !== null && gap !== 0 ? ` ・ ${gap > 0 ? "+" : ""}${gap}pt` : ""} ・ <span>実測で学習した較正</span>${Number.isFinite(c.temperature) ? ` T=${Number(c.temperature)}` : ""})</div>`);
   } else if (c.calibrated) {
     const big = Number.isFinite(c.gapPt) && Math.abs(c.gapPt) >= 15;
-    lines.push(`<div class="value-note" style="margin-top:2px;">🎚️ <span>確信度(実績で補正)</span>: <strong${big ? ' style="color:var(--series-2);"' : ""}>${Number(c.displayPct)}%</strong>(<span>モデル生値</span> ${Number(c.rawPct)}%${Number.isFinite(c.basisN) ? ` ・ <span>同じ自信帯の実測</span>${Number(c.basisN)}<span>件から補正</span>` : ""})</div>`);
+    lines.push(`<div class="value-note" style="margin-top:2px;">🎚️ <span>確信度(実績で補正)</span>: <strong${big ? ' style="color:var(--series-2);"' : ""}>${Number(c.displayPct)}%</strong>(<span>モデル生値</span> ${Number(c.rawPct)}%${Number.isFinite(c.basisN) ? ` ・ <span>近い自信帯の実測</span>${Number(c.basisN)}<span>件から補正</span>` : ""})</div>`);
   }
   if (c.outOfRange) {
     lines.push(`<div class="value-note" style="margin-top:2px;">⚠️ <span>この試合はモデルの推定が現実的な範囲を外れました(確率は割り引いて見てください)</span></div>`);
@@ -11854,6 +12954,65 @@ function predUnlearnedLineHtml(p) {
 //   すでに出している予想と**同じ確率分布**から取り出した数字。新しい推定は無い。
 //   利用者のご指示(情報が溢れて見にくくなるのを避ける)に従い、
 //   既定は折りたたみ1行。押した人にだけ中身を見せる。
+// ---- v104.1 K「確信ピック」: 自信ランク(S/A/B/見送り)と、そのランクの実績(実測) ----
+//   ランクはサーバーが予想時に記録へ刻んだもの(tier.stamped)。刻印の無い旧い予想は、今の基準で導いた参考値。
+//   公式戦・学習済みの大会以外は tier.rank が null(何も出さない。学習していない大会の断りは別の行が出す)。
+//   実績は「予想時のランクのまま数えた実績」か「今の基準を過去の予想に当てはめた実測」のどちらかを必ず明記する。
+function predTierChipHtml(p) {
+  const t = p && p.tier;
+  if (!t || !t.rank) return "";
+  const cls = { S: "tier-s", A: "tier-a", B: "tier-b", skip: "tier-skip" }[t.rank] || "tier-b";
+  return `<span class="tier-chip ${cls}">${t.rank === "skip" ? "<span>見送り</span>" : escapeHtml(String(t.rank))}</span>`;
+}
+function predTierLineHtml(p) {
+  const t = p && p.tier;
+  if (!t || !t.rank) return "";
+  const rankHtml = t.rank === "skip"
+    ? `<strong><span>見送り</span></strong>`
+    : `<strong>${escapeHtml(String(t.rank))}</strong>(<span>${escapeHtml(String(t.labelJa || ""))}</span>)`;
+  const lead = t.rank === "skip" ? ` ・ <span>自信が低い試合です(当たる見込みが5割未満)</span>` : "";
+  const r = t.record;
+  let rec;
+  if (r && Number.isFinite(Number(r.hitPct)) && Number(r.n) > 0) {
+    const win = r.window === "last30" ? "直近30日" : "全期間";
+    const basis = r.basis === "forward" ? "予想時のランクのまま数えた実績" : "今の基準を過去の予想に当てはめた実測";
+    rec = ` ・ <span>このランクの実績</span>: <strong>${Number(r.hitPct)}%</strong>(<span>${Number(r.n)}件中${Number(r.hits)}件的中</span> ・ <span>${win}</span> ・ <span>${basis}</span>)`;
+  } else {
+    rec = ` ・ <span>このランクの実績はまだ集計中です</span>`;
+  }
+  // 予想を立てた時点の自信と、今カードに出ている自信が違うとき(補正の実測が毎日更新されるため)は、その値も添える
+  const c = p.confidence;
+  const stampNote = (t.stamped && Number.isFinite(Number(t.confPct)) && c && Number.isFinite(Number(c.displayPct)) && Number(c.displayPct) !== Number(t.confPct))
+    ? ` ・ <span>予想時の自信 ${Number(t.confPct)}%</span>` : "";
+  return `<div class="value-note" style="margin-top:2px;">🏅 <span>自信ランク</span> ${rankHtml}${lead}${rec}${stampNote}</div>`;
+}
+/** 「🏅 自信ランク別の成績」(今日のAI予想カードの下に折りたたみで出す) */
+function tiersTableHtml(tiers) {
+  if (!tiers || !Array.isArray(tiers.ranks) || !tiers.thresholds) return "";
+  const th = tiers.thresholds;
+  const pick = (g) => {
+    if (!g) return null;
+    if (Array.isArray(g.last30) && Number(g.totalLast30) >= 80) return { rows: g.last30, win: "直近30日", total: Number(g.totalLast30) };
+    if (Array.isArray(g.all) && Number(g.totalAll) > 0) return { rows: g.all, win: "全期間", total: Number(g.totalAll) };
+    return null;
+  };
+  const table = (sel, titleJa) => {
+    if (!sel) return "";
+    const body = sel.rows.map((r) => `<tr><td>${r.rank === "skip" ? "<span>見送り</span>" : `<strong>${escapeHtml(String(r.rank))}</strong> <span>${escapeHtml(String(r.labelJa || ""))}</span>`}</td><td>${Number(r.n)}</td><td>${Number(r.n) > 0 && Number.isFinite(Number(r.hitPct)) ? `<strong>${Number(r.hitPct)}%</strong>` : "—"}</td></tr>`).join("");
+    return `<div class="value-note" style="margin-top:6px;"><span>${titleJa}</span>(<span>${sel.win}</span> ・ ${sel.total}<span>件</span>)</div>
+      <table class="tier-table"><thead><tr class="value-note"><th><span>ランク</span></th><th><span>件数</span></th><th><span>的中率</span></th></tr></thead><tbody>${body}</tbody></table>`;
+  };
+  const fw = pick(tiers.forward), bt = pick(tiers.backtest);
+  if (!fw && !bt) {
+    return `<details style="margin-top:8px;"><summary style="cursor:pointer; font-size:12.5px; color:var(--series-2);">🏅 <span>自信ランク別の成績</span></summary>
+      <div class="value-note" style="margin-top:4px;"><span>S: 自信${Number(th.sPct)}%以上 / A: ${Number(th.aPct)}%以上 / B: ${Number(th.skipPct)}%以上 / 見送り: ${Number(th.skipPct)}%未満</span></div>
+      <div class="value-note" style="margin-top:4px;"><span>ランク別の実績は、次回の毎日の学習のあとから表示されます。</span></div></details>`;
+  }
+  return `<details style="margin-top:8px;"><summary style="cursor:pointer; font-size:12.5px; color:var(--series-2);">🏅 <span>自信ランク別の成績</span></summary>
+    <div class="value-note" style="margin-top:4px;"><span>S: 自信${Number(th.sPct)}%以上 / A: ${Number(th.aPct)}%以上 / B: ${Number(th.skipPct)}%以上 / 見送り: ${Number(th.skipPct)}%未満</span></div>
+    ${table(fw, "予想時のランクのまま数えた実績")}${table(bt, "今の基準を過去の予想に当てはめた実測")}
+    <div class="value-note" style="margin-top:4px;"><span>ランクは予想カードに出している自信の数字で決めています。対象は公式戦で、AIが学習している大会の試合だけです。「見送り」は予想をやめる印ではなく、自信が低いことを正直に伝える印です。</span></div></details>`;
+}
 // ---- v104 J「試合内容の見立て」: 常時1行(合計得点の見込み・2.5点以上・両チーム得点・最有力スコア・一言) ----
 //   サーバーが記録ごとに保存した content(勝敗と同じスコア分布から機械的に導出・較正の状態つき)。
 //   v104 より前の記録には無い(その場合は何も出さない=でっち上げない)。
@@ -11893,7 +13052,7 @@ function predStripHtml(p) {
   const winPct = (p.confidence && Number.isFinite(p.confidence.displayPct))
     ? p.confidence.displayPct
     : (p.probs ? (p.predictedWinner === "home" ? p.probs.homeWinPct : p.predictedWinner === "away" ? p.probs.awayWinPct : p.probs.drawPct) : null);
-  return `🤖 AI予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${winPct !== null ? ` <span style="color:var(--series-2); font-weight:700;">${Number(winPct)}%</span>` : ""}${predResultBadgeHtml(p)}`;
+  return `🤖 AI予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${winPct !== null ? ` <span style="color:var(--series-2); font-weight:700;">${Number(winPct)}%</span>` : ""}${predTierChipHtml(p)}${predResultBadgeHtml(p)}`;
 }
 // 一覧描画後(または予想データ到着後)に、予想ストリップの空きスロットを埋める。
 // DOM走査は予想がある試合の件数ぶんだけ(数件)なので描画コストはごく小さい。
@@ -12264,11 +13423,11 @@ async function renderTodayPredictionsHero(reuseCached) {
       <div style="padding:10px 0; border-bottom:1px solid var(--border);">
         <div><strong>${homeName} vs ${awayName}</strong>${scoreStr}${predResultBadgeHtml(p)}
           <span class="value-note" style="margin-left:8px;">${escapeHtml(p.league || "")}${kickoffStr ? " ・ " + kickoffStr : ""}</span></div>
-        <div style="margin-top:2px;">🤖 AIの予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}</div>
+        <div style="margin-top:2px;">🤖 AIの予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predTierChipHtml(p)}</div>
         ${duelMyPickLineHtml(p)}
         ${predBarHtml(p)}
         <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-        ${predUnlearnedLineHtml(p)}${predConfidenceLineHtml(p)}${predFactorsLineHtml(p)}${predBasisLineHtml(p)}${similarLine}${marketLine}${predBlendLineHtml(p)}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
+        ${predUnlearnedLineHtml(p)}${predTierLineHtml(p)}${predConfidenceLineHtml(p)}${predFactorsLineHtml(p)}${predBasisLineHtml(p)}${similarLine}${marketLine}${predBlendLineHtml(p)}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
         <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;"><button class="ghost-btn pred-share-btn" type="button" data-share-idx="${todayPredShareItems.indexOf(p)}" style="padding:5px 12px; font-size:12px;">📸 画像でシェア</button>${
           /* v77(集客①): 検索エンジンにも載る試合個別ページへの導線(共有用URLにもなる) */
           Number.isFinite(Number(p.fixtureId)) ? `<a class="ghost-btn" href="/match/${Number(p.fixtureId)}" style="padding:5px 12px; font-size:12px; text-decoration:none; display:inline-block;">🔗 この試合のページ</a>` : ""}</div>
@@ -12293,6 +13452,7 @@ async function renderTodayPredictionsHero(reuseCached) {
     ${usingUpcoming ? `<p class="value-note" style="margin:0 0 6px; padding:6px 8px; background:rgba(0,0,0,.04); border-radius:6px;">📅 本日はAIが追跡しているクラブの試合がないため、<strong>AIが予想している「次の試合」</strong>を表示しています。</p>` : ""}
     ${rows.join("")}
     ${moreCount > 0 ? `<p class="value-note" style="margin-top:6px;">ほか${moreCount}試合の予想は「📡 本日の実際の試合」から見られます。</p>` : ""}
+    ${tiersTableHtml(data.tiers)}
     <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
       ${(() => { const c = document.getElementById("realFixturesCard"); return c && c.style.display !== "none"; })()
         ? `<button class="more-details-btn" type="button" id="jumpToFixturesBtn" style="display:inline-block; width:auto; padding:5px 12px;">📡 試合の詳しい分析を見る ▼</button>`
@@ -12733,9 +13893,20 @@ async function renderDailyReportWidget() {
   const weightsImpactHtml = wi
     ? `<div style="margin-top:8px;"><strong>⚖️ 重みの変更が予測に与えた影響</strong>
         <div class="value-note">${escapeHtml(wi.noteJa || wi.reasonJa || "")}</div>
-        ${Array.isArray(wi.changes) && wi.changes.length
-          ? `<ul style="margin:4px 0 0 1em; padding:0;">${wi.changes.slice(0, 6).map((c) => `<li class="value-note">${escapeHtml(c.labelJa || c.key || "")}: ${escapeHtml(String(c.before))} → <strong>${escapeHtml(String(c.after))}</strong></li>`).join("")}</ul>`
-          : ""}
+        ${(() => {
+          // v104.1(総点検): 記録の中身を表示する。旧コードは存在しない項目(changes)を読んでいたため、
+          //   サーバーが返している記録(items[].shift=重みの更新ごとに、過去の実試合の予測がどう変わったか)が
+          //   一度も画面に出ていなかった(説明の1文だけが出ていた)。数値はサーバーの実測のまま出す。
+          const items = Array.isArray(wi.items) ? wi.items.filter((it) => it && it.shift) : [];
+          if (!items.length) return "";
+          const sg = (v, unit) => (Number.isFinite(Number(v)) ? `${Number(v) > 0 ? "+" : ""}${Number(v)}${unit}` : "—");
+          const rows = items.slice(0, 3).map((it) => {
+            const sh = it.shift;
+            const ver = (Number.isFinite(it.weightsVersionFrom) && Number.isFinite(it.weightsVersionTo)) ? ` <span>学習v</span>${it.weightsVersionFrom}→${it.weightsVersionTo}` : "";
+            return `<li class="value-note">${escapeHtml(String(it.date || ""))}${ver}(<span>対象の試合数</span>: ${Number.isFinite(sh.sampleSize) ? sh.sampleSize : "—"}) <span>ホーム勝率</span> <strong>${sg(sh.homeWinPctDelta, "%")}</strong> ・ <span>引き分け</span> <strong>${sg(sh.drawPctDelta, "%")}</strong> ・ <span>アウェイ勝率</span> <strong>${sg(sh.awayWinPctDelta, "%")}</strong> ・ <span>期待得点(合計)</span> <strong>${sg(sh.expectedGoalsDelta, "")}</strong> ・ <span>予測の自信</span> <strong>${sg(sh.confidencePctDelta, "%")}</strong></li>`;
+          }).join("");
+          return `<div class="value-note" style="margin-top:4px;"><span>重みの更新ごとの変化(新しい順・平均)</span></div><ul style="margin:4px 0 0 1em; padding:0;">${rows}</ul>`;
+        })()}
       </div>`
     : "";
 
@@ -12746,7 +13917,7 @@ async function renderDailyReportWidget() {
         ${mt.datasetSize ? `<div class="value-note">学習に使った過去試合: <strong>${num(mt.datasetSize)}件</strong>${mt.datasetNoteJa ? `(${escapeHtml(mt.datasetNoteJa)})` : ""}</div>` : ""}
         ${mt.adopted === true ? `<div class="value-note" style="color:var(--good);">✅ 新しいパラメータを採用しました。</div>`
           : mt.adopted === false ? `<div class="value-note">⏸️ 今回は採用を見送りました(現状のモデルを維持)。</div>` : ""}
-        ${mt.secondaryGains && mt.secondaryGains.length ? `<div class="value-note">副次的な改善: ${mt.secondaryGains.map((g) => escapeHtml(g)).join("、")}</div>` : ""}
+        ${Array.isArray(mt.secondaryGains) && mt.secondaryGains.length ? `<div class="value-note"><span>副次的な改善</span>: ${mt.secondaryGains.map((g) => `<span>${escapeHtml(String(g))}</span>`).join("、")}</div>` : ""}
         ${mt.leagueTableJa ? `<pre class="value-note" style="white-space:pre-wrap; overflow-x:auto; margin:4px 0 0;">${escapeHtml(mt.leagueTableJa)}</pre>` : ""}
       </div>`
     : "";
@@ -13038,7 +14209,7 @@ async function renderDailyDiff() {
       + `(${pi.delta >= 0 ? "+" : ""}${pi.delta}人)・クラブ ${pi.clubsYesterday} → ${pi.clubsToday}</p>`);
     if (pi.newlySearchable && pi.newlySearchable.length) {
       parts.push(`<div class="chip-row" style="margin-top:4px;">`
-        + pi.newlySearchable.map((x) => `<button type="button" class="chip" data-diff-player="${esc(x.id)}">${esc(x.name)}<span style="opacity:.6;font-size:.85em;margin-left:4px">${esc(x.teamJa || "")}</span></button>`).join("")
+        + pi.newlySearchable.map((x) => `<button type="button" class="chip" data-diff-player="${esc(x.id)}">${esc(x.name)}<span style="opacity:.6;font-size:.85em;margin-left:4px">${esc(teamLabel(x))}</span></button>`).join("")
         + `</div><div class="value-note" style="margin-top:4px;">↑ 今日から新しく検索できるようになった選手です(押すと開きます)。</div>`);
     }
   } else {
@@ -13050,7 +14221,7 @@ async function renderDailyDiff() {
   parts.push(`<h3 class="sim-subhead" style="margin-top:14px;">📈 平均評価が動いた選手(実測)</h3>`);
   if (pf.available) {
     const row = (x, dir) => `<li><button type="button" class="ps-link" data-diff-player="${esc(x.id)}">${esc(x.name)}</button>
-      <span class="muted" style="font-size:12px">${esc(x.teamJa || "")} ${x.from} → ${x.to}
+      <span class="muted" style="font-size:12px">${esc(teamLabel(x))} ${x.from} → ${x.to}
       <b style="color:${dir > 0 ? "var(--good)" : "var(--critical)"}">${x.delta > 0 ? "+" : ""}${x.delta}</b>(${x.days}日間)</span></li>`;
     parts.push(`<div class="ps-two">
       <div><div class="value-note" style="font-weight:600;">上がった選手</div>
@@ -13067,7 +14238,7 @@ async function renderDailyDiff() {
   parts.push(`<h3 class="sim-subhead" style="margin-top:14px;">🔁 クラブ・選手に起きた変化</h3>`);
   if (cc.available) {
     parts.push(`<ul class="ps-list">${cc.items.map((it) => `<li>${esc(it.name || "")}
-      <span class="muted" style="font-size:12px">${esc(it.teamJa || "")} — ${esc(it.labelJa || "")}: ${esc(it.detailJa || "")}</span></li>`).join("")}</ul>`);
+      <span class="muted" style="font-size:12px"><span>${esc(teamLabel(it))}</span> — <span>${esc(it.labelJa || "")}</span>: <span>${esc(it.detailJa || "")}</span></span></li>`).join("")}</ul>`);
   } else {
     parts.push(`<p class="value-note">${esc(cc.reasonJa || "")}</p>`);
   }
@@ -13077,7 +14248,7 @@ async function renderDailyDiff() {
   parts.push(`<h3 class="sim-subhead" style="margin-top:14px;">🧠 AIのクラブ評価が変わったところ(AI自身の言葉)</h3>`);
   if (av.available) {
     parts.push(av.items.map((v) => `<div class="ps-sec" style="margin-bottom:10px;">
-        <div style="font-weight:600;">${esc(v.teamJa)}</div>
+        <div style="font-weight:600;">${esc(teamLabel(v))}</div>
         <div class="value-note" style="margin-top:2px;"><span style="opacity:.7">昨日まで:</span> ${esc(v.before)}</div>
         <div style="font-size:13px; margin-top:2px;"><span class="muted">今日:</span> <b>${esc(v.after)}</b></div>
         ${v.changeReasonJa ? `<div class="value-note" style="margin-top:2px;">変わった理由: ${esc(v.changeReasonJa)}</div>` : ""}
@@ -13111,10 +14282,26 @@ async function renderDailyDiff() {
    読み出しだけで、この画面は新しい計算を起こさない。
    理由は答え合わせ時に実測データから機械的に分類済み(作文ではない)。
    ================================================================ */
+// v104.1(総点検・第2回): 週間まとめの期間「11月9日(月)〜11月15日(日)」は、日本語以外の画面では「11/9 – 11/15」の形で出す
+//   (曜日の漢字1文字は辞書で訳せないため、期間がまるごと日本語のまま残っていた)。日本語の画面では元のまま。
+function digestPeriodLabel(periodJa) {
+  const s = String(periodJa || "");
+  if (!uiIsNonJa()) return s;
+  return s.replace(/(\d{1,2})月(\d{1,2})日(?:\([^)]*\))?/g, "$1/$2").replace(/〜/g, " – ");
+}
 function reflClubJa(en) {
   if (!en) return "";
+  // v104.1(総点検): 日本語以外の画面では英語名のまま出す。旧コードは言語に関係なく日本語名へ置き換えていたため、
+  //   英語・中国語・スペイン語の画面の反省・マイクラブ・週間まとめに日本語のクラブ名が残っていた。
+  if (uiIsNonJa()) return en;
   for (const [ja, e] of Object.entries(UNIVERSE_CLUB_JA_TO_EN)) { if (e === en) return ja; }
   return en;
+}
+function uiIsNonJa() { try { return !!(window.appLang && window.appLang !== "ja"); } catch (e) { return false; } }
+/** 表示するクラブ名: 日本語の画面は日本語名、それ以外の言語は英語名(サーバーは teamJa / teamEn の両方を返す) */
+function teamLabel(x, fallback) {
+  const ja = x && x.teamJa, en = x && x.teamEn;
+  return (uiIsNonJa() ? (en || ja) : (ja || en)) || fallback || "";
 }
 // ---- v76(利用者意見調査の還元B): 予想カードの実績リンクに実測値を差し込む ----
 //   renderReflectionsCard がページ読込時に取得する的中率(学習済み大会が主役、
@@ -13403,7 +14590,7 @@ function buildDigestShareImage(dg) {
   ctx.font = "bold 44px sans-serif";
   ctx.fillText(window.t("📰 今週のAIダイジェスト"), 60, 90);
   ctx.font = "26px sans-serif"; ctx.fillStyle = "#9fd6bd";
-  ctx.fillText(dg.periodJa || "", 60, 130);
+  ctx.fillText(digestPeriodLabel(dg.periodJa), 60, 130);
   ctx.fillStyle = "#ffffff"; ctx.font = "bold 34px sans-serif";
   const line = (t, y, color, font) => { ctx.fillStyle = color || "#ffffff"; ctx.font = font || "28px sans-serif"; ctx.fillText(String(t).slice(0, 40), 60, y); };
   line(window.t(dg.summary && dg.summary.n ? `今週の成績: ${dg.summary.hits}勝 / ${dg.summary.n}試合(${dg.summary.hitRatePct}%)` : "今週は答え合わせ対象の試合なし"), 200, "#ffffff", "bold 34px sans-serif");
@@ -13449,7 +14636,7 @@ async function renderDigestCard() {
   }
   const dg = d.digest;
   const parts = [];
-  parts.push(`<div class="value-note" style="margin-bottom:6px;">${esc(dg.periodJa || "")}のAIの1週間(実測記録からの自動生成・作文なし)</div>`);
+  parts.push(`<div class="value-note" style="margin-bottom:6px;">${esc(digestPeriodLabel(dg.periodJa))}のAIの1週間(実測記録からの自動生成・作文なし)</div>`);
   parts.push(`<div style="margin-bottom:6px;"><strong>${esc((dg.summary && dg.summary.lineJa) || "")}</strong></div>`);
   if (dg.bestHit) {
     parts.push(`<div style="margin-top:6px;">🎯 <strong>ベスト的中:</strong> ${esc(dg.bestHit.matchJa)}${dg.bestHit.official === false ? ' <span class="smarter-tag smarter-tag-ai">参考(親善など)</span>' : ""}<div class="value-note" style="margin:1px 0 0;">${esc(dg.bestHit.lineJa || "")}</div></div>`);
@@ -13467,7 +14654,12 @@ async function renderDigestCard() {
   if (dg.upcoming && dg.upcoming.length) {
     parts.push(`<div style="margin-top:6px;">📅 <strong>来週の注目:</strong>${dg.upcoming.map((u) => {
       const when = u.kickoff ? new Date(u.kickoff).toLocaleDateString("ja-JP", { timeZone: "Asia/Tokyo", month: "numeric", day: "numeric" }) : "";
-      return `<div class="value-note" style="margin:2px 0;">${esc(when)} ${esc(u.matchJa)} — AI予想: ${esc(u.predictedJa)}${u.official === false ? "(参考)" : ""}</div>`;
+      // v104.1(総点検): 以前は1つの文字列だったため、日本語以外の画面で「…— AI予想: レアル・ベティスの win」と
+      //   英語と日本語が混ざっていた。部品ごとに分け、クラブ名は英語名があればそれを使う(古い保存分は日本語名のまま)。
+      const nonJa = uiIsNonJa() && u.homeEn && u.awayEn;
+      const match = nonJa ? `${u.homeEn} vs ${u.awayEn}` : u.matchJa;
+      const pred = (nonJa && u.predictedWinner) ? (u.predictedWinner === "draw" ? "引き分け" : `${u.predictedWinner === "home" ? u.homeEn : u.awayEn}の勝利`) : u.predictedJa;
+      return `<div class="value-note" style="margin:2px 0;">${esc(when)} ${esc(match)} — <span>AI予想</span>: <span>${esc(pred)}</span>${u.official === false ? "<span>(参考)</span>" : ""}</div>`;
     }).join("")}</div>`);
   }
   parts.push(`<div style="margin-top:8px;"><button class="apply-btn pred-share-btn" id="digestShareBtn" style="margin-top:0; width:auto; padding:7px 14px;">📸 画像でシェア</button></div>`);
@@ -13715,6 +14907,19 @@ async function psLoadFacets() {
         const ratedNote = Number.isFinite(rated) && psState.indexedCount
           ? ` 成績(平均評価)まで取得できているのは ${rated.toLocaleString()}人です。`
           : "";
+        // v104.1(総点検): 日本語以外の画面では、太字で区切られた断片(「…から収集した」「を、名前・国籍・クラブから探せます。現在」)が
+        //   訳せず日本語のまま残っていた。日本語以外では、文ごとに1つの要素にして(数字は文の中に入れる)型で訳す。
+        //   日本語の画面は従来どおり(太字つき)。
+        if (uiIsNonJa()) {
+          const nNat = (data.nationalities || []).length;
+          const sents = [
+            `毎日の学習で追跡172クラブ(欧州上位100+J1・5大リーグ全部)から収集した ${psState.indexedCount.toLocaleString()}人 を、名前・国籍・クラブから探せます。`,
+            withPlayers < total ? `現在 ${withPlayers}/${total}クラブぶんが入っています(残りは収集中です)・国籍 ${nNat}種類。` : `現在 ${total}クラブすべてが入っています・国籍 ${nNat}種類。`,
+            ratedNote.trim(),
+            "新加入・移籍・怪我・成績・調子は毎日の学習の翌日に自動で反映されます。",
+          ].filter(Boolean);
+          return sents.map((x) => `<span>${psEsc(x)}</span>`).join(" ");
+        }
         return `毎日の学習で追跡172クラブ(欧州上位100+J1・5大リーグ全部)から収集した <b>${psState.indexedCount.toLocaleString()}人</b> を、名前・国籍・クラブから探せます。`
           + `現在 ${coverage}・国籍 ${(data.nationalities || []).length}種類。${ratedNote}`
           + ` 新加入・移籍・怪我・成績・調子は毎日の学習の翌日に自動で反映されます。`;
@@ -13844,7 +15049,7 @@ function psCard(p) {
       <img class="sd-photo" loading="lazy" alt="" src="${psEsc(p.photo || "")}" onerror="this.style.visibility='hidden'">
       <div style="min-width:0">
         <button class="sd-name" data-act="psDetail" data-id="${psEsc(p.id)}">${psEsc(p.name || "-")}</button>
-        <div><button class="sd-club" data-act="psClub" data-club="${psEsc(p.teamEn || "")}">${psEsc(p.teamJa || p.teamEn || "-")}</button>
+        <div><button class="sd-club" data-act="psClub" data-club="${psEsc(p.teamEn || "")}">${psEsc(teamLabel(p, "-"))}</button>
         <span class="muted" style="font-size:12px"> ${psEsc(p.positionJa || p.position || "")}</span></div>
       </div>
     </div>
@@ -13961,20 +15166,20 @@ async function psOpenDetail(id, opts) {
   // ここで同じことを繰り返さない(以前は同じ文が二重に出ていた)
   const rankLine = (s) =>
     `<li><b>${psEsc(s.labelJa)}</b> ${psEsc(s.displayValue != null ? s.displayValue : s.value)}${psEsc(s.unitJa || "")}
-      <span class="muted">— ${psEsc(s.noteJa || "")}</span></li>`;
+      <span class="muted">— <span>${psEsc(s.noteJa || "")}</span></span></li>`;
   const strengths = (a.strengths || []).map(rankLine);
   const weaknesses = (a.weaknesses || []).map(rankLine);
   const tactics = (a.tactics || []).map((t) => `<li><b>${psEsc(t.labelJa)}</b> <span class="muted">${psEsc(t.whyJa)}</span></li>`);
   const similar = a.similar && a.similar.available
     ? (a.similar.items || []).map((s) => `<li>
         <button class="ps-link" data-act="psDetail" data-id="${psEsc(s.id)}">${psEsc(s.name)}</button>
-        <span class="muted" style="font-size:12px">${psEsc(s.teamJa || s.teamEn || "")} / 近さ ${psEsc(s.distance)}(${s.comparedMetrics}項目で比較)</span>
+        <span class="muted" style="font-size:12px">${psEsc(teamLabel(s))} / 近さ ${psEsc(s.distance)}(${s.comparedMetrics}項目で比較)</span>
         <button class="ghost-btn" style="padding:2px 8px;font-size:11px" data-act="psCompareAdd" data-id="${psEsc(s.id)}" data-name="${psEsc(s.name)}">比較に追加</button>
       </li>`)
     : [];
   const fit = a.fitClubs && a.fitClubs.available
     ? (a.fitClubs.items || []).map((c) => `<li>
-        <button class="ps-link" data-act="psClub" data-club="${psEsc(c.teamEn)}">${psEsc(c.teamJa || c.teamEn)}</button>
+        <button class="ps-link" data-act="psClub" data-club="${psEsc(c.teamEn)}">${psEsc(teamLabel(c))}</button>
         <span class="muted" style="font-size:12px">${psEsc(c.noteJa)}</span></li>`)
     : [];
   const transfers = (data.transferHistory && data.transferHistory.available)
@@ -13984,7 +15189,7 @@ async function psOpenDetail(id, opts) {
     : [];
   const injuries = (data.injuryHistory && data.injuryHistory.available)
     ? (data.injuryHistory.items || []).map((t) => `<li>${psEsc(t.at || "日付未取得")} —
-        ${psEsc(t.typeJa || "種別未取得")} <span class="muted" style="font-size:12px">${psEsc(t.reasonJa || "")} / ${psEsc(t.teamJa || t.teamEn || "")}</span></li>`)
+        ${psEsc(t.typeJa || "種別未取得")} <span class="muted" style="font-size:12px">${psEsc(t.reasonJa || "")} / ${psEsc(teamLabel(t))}</span></li>`)
     : [];
 
   const cond = a.condition || {};
@@ -13997,8 +15202,8 @@ async function psOpenDetail(id, opts) {
       <div style="min-width:0;flex:1">
         <h2 style="margin:0">${psEsc(p.name || "-")}</h2>
         <div style="margin-top:2px">
-          <button class="ps-link" data-act="psClub" data-club="${psEsc(p.teamEn || "")}">${psEsc(p.teamJa || p.teamEn || "所属未取得")}</button>
-          <span class="muted" style="font-size:13px"> ${psEsc(p.positionJa || p.position || "")}${p.detailedPositionJa ? " / " + psEsc(p.detailedPositionJa) : ""}${p.number != null ? " / 背番号 " + psEsc(p.number) : ""}</span>
+          <button class="ps-link" data-act="psClub" data-club="${psEsc(p.teamEn || "")}">${psEsc(teamLabel(p, "所属未取得"))}</button>
+          <span class="muted" style="font-size:13px"> <span>${psEsc(p.positionJa || p.position || "")}</span>${p.detailedPositionJa ? " / <span>" + psEsc(p.detailedPositionJa) + "</span>" : ""}${p.number != null ? " / <span>背番号</span> " + psEsc(p.number) : ""}</span>
         </div>
         <div class="sd-stats" style="margin-top:6px">
           <span class="sd-badge ${condClass}">${psEsc(cond.labelJa || "調子は未測定")}</span>
@@ -14023,7 +15228,7 @@ async function psOpenDetail(id, opts) {
           ${psMetricRow("身長", p.heightCm, "cm")}
           ${psMetricRow("ポジション", p.positionJa || p.position)}
           ${psMetricRow("細かいポジション", p.detailedPositionJa)}
-          ${psMetricRow("所属クラブ", p.teamJa || p.teamEn)}
+          ${psMetricRow("所属クラブ", teamLabel(p))}
           <tr><th>最終更新</th><td>${p.updatedAt ? psEsc(String(p.updatedAt).slice(0, 10)) : '<span class="muted">未取得</span>'}</td></tr>
         </table>
       </div>
@@ -14118,9 +15323,9 @@ async function psOpenDetail(id, opts) {
         : `<p class="muted" style="font-size:13px">${psEsc((a.fitClubs && a.fitClubs.reasonJa) || "")}</p>`}
     </div>
 
-    <p class="muted" style="font-size:12px;margin-top:12px">${psEsc(data.recordNoteJa || "")}
-      ${data.indexBuiltAt ? `索引の最終更新: ${psEsc(String(data.indexBuiltAt).slice(0, 16).replace("T", " "))}(UTC)。` : ""}
-      サーバー側の処理 ${psEsc(data.tookMs)}ミリ秒。</p>
+    <p class="muted" style="font-size:12px;margin-top:12px"><span>${psEsc(data.recordNoteJa || "")}</span>
+      ${data.indexBuiltAt ? `<span>索引の最終更新: ${psEsc(String(data.indexBuiltAt).slice(0, 16).replace("T", " "))}(UTC)。</span>` : ""}
+      <span>サーバー側の処理 ${psEsc(data.tookMs)}ミリ秒。</span></p>
     <div id="psCuratedWrap"></div>
   </div>`;
   // 手作業で整備した107人ぶんの詳しいカード(能力値・ヒートマップ・解説)は
@@ -14172,7 +15377,7 @@ async function psRunCompare() {
   const players = data.players || [];
   const head = players.map((p, i) => `<th>
       <button class="ps-link" data-act="psDetail" data-id="${psEsc(p.id)}">${psEsc(p.name)}</button>
-      <div class="muted" style="font-weight:400;font-size:12px">${psEsc(p.teamJa || p.teamEn || "")}<br>${psEsc(p.positionJa || p.position || "")}</div>
+      <div class="muted" style="font-weight:400;font-size:12px">${psEsc(teamLabel(p))}<br>${psEsc(p.positionJa || p.position || "")}</div>
       <div class="muted" style="font-weight:400;font-size:12px">項目で上回った回数: ${psEsc((data.winCounts || [])[i] != null ? data.winCounts[i] : 0)}</div>
     </th>`).join("");
   const rows = (data.metrics || []).map((m) => `<tr>
@@ -14235,7 +15440,7 @@ async function psOpenClub(clubEn) {
   const unknown = (data.unknownPosition || []);
   wrap.innerHTML = `<div class="card" style="margin-top:14px">
     <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap">
-      <h2 style="margin:0">🏟️ ${psEsc(club.teamJa || club.teamEn || clubEn)}</h2>
+      <h2 style="margin:0">🏟️ ${psEsc(teamLabel(club, clubEn))}</h2>
       <div style="display:flex;gap:6px">
         <button class="ghost-btn" type="button" data-act="psClubToSearch" data-club="${psEsc(club.teamEn || clubEn)}">このクラブで絞り込んで検索する</button>
         <button class="ghost-btn" type="button" data-act="psCloseDetail">閉じる</button>
@@ -14323,7 +15528,7 @@ async function psLoadHighlights() {
       ? `<div class="ps-picks">${picks.map((p) => `<button type="button" class="ps-pick" data-act="psDetail" data-id="${psEsc(p.id)}">
             <img loading="lazy" alt="" src="${psEsc(p.photo || "")}" onerror="this.style.visibility='hidden'">
             <span class="nm">${psEsc(p.name)}</span>
-            <span class="sub">${psEsc(p.teamJa || p.teamEn || "")}</span>
+            <span class="sub">${psEsc(teamLabel(p))}</span>
             <span class="kind">${psEsc(p.kindJa || "")}</span>
             <span class="ps-why">${psEsc(p.whyJa || "")}</span>
           </button>`).join("")}</div>

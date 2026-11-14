@@ -335,9 +335,18 @@ const req = (method, p) => new Promise((resolve, reject) => {
     const fixture = { id: 1, date: new Date(now + 3600000).toISOString(), status: "NS", league: "Serie A", home: { name: "A" }, away: { name: "B" } };
     const calMap = { available: true, minN: 20, bins: { "55-70%": { n: 50, avgConfPct: 60, actualHitPct: 70 } } };
     const base = { fixtureId: 1, predictedWinner: "home", homeLambda: 1.5, awayLambda: 1.0, finalProbs: { homeWin: 0.62, draw: 0.22, awayWin: 0.16, source: "market_blend" }, factorImportance: [] };
-    // 較正なしの記録 → 従来どおり帯補正(60→70)
+    // 較正なしの記録 → 帯の実測で補正(55-70% の帯: 申告60% → 実際70%)。
+    //   v104.1(総点検): 帯の境目で数字が逆転しないよう、帯ごとの実測を点としてつないだ曲線で読み替える。
+    //   62% は (60→70) と、実測の無い 70%以上の帯の点 (80→80・モデルの値のまま) のあいだ: 70 + (2/20)×10 = 71%
+    //   (旧方式は帯の中で一律 +10pt の 72%。ただし 69% → 79% / 70% → 70% と境目で逆転していた)
     const e1 = V.buildTodayPredictionEntry(fixture, base, calMap);
-    assert.strictEqual(e1.confidence.calibrated, true); assert.strictEqual(e1.confidence.method, "bin"); assert.strictEqual(e1.confidence.displayPct, 72); assert.strictEqual(e1.confidence.rawPct, 62);
+    assert.strictEqual(e1.confidence.calibrated, true); assert.strictEqual(e1.confidence.method, "bin"); assert.strictEqual(e1.confidence.displayPct, 71); assert.strictEqual(e1.confidence.rawPct, 62);
+    assert.strictEqual(e1.confidence.basisN, 50);
+    {
+      const at = (p) => V.buildTodayPredictionEntry(fixture, { ...base, finalProbs: { homeWin: p, draw: (1 - p) * 0.6, awayWin: (1 - p) * 0.4, source: "x" } }, calMap).confidence.displayPct;
+      assert.ok(at(0.69) <= at(0.70) && at(0.70) <= at(0.71), `境目(70%)で逆転: ${at(0.69)} / ${at(0.70)} / ${at(0.71)}`);
+      assert.strictEqual(at(0.60), 70, "実測の点そのものでは、実測の的中率どおり");
+    }
     // 温度較正済みの記録 → 帯補正は掛けない。表示=較正後(62)、生値=較正前(55)
     const e2 = V.buildTodayPredictionEntry(fixture, { ...base, rawFinalProbs: { homeWin: 0.55, draw: 0.25, awayWin: 0.2 }, probCalibration: { applied: true, regime: "odds", T: 0.8 } }, calMap);
     assert.strictEqual(e2.confidence.calibrated, true); assert.strictEqual(e2.confidence.method, "temperature"); assert.strictEqual(e2.confidence.displayPct, 62); assert.strictEqual(e2.confidence.rawPct, 55); assert.strictEqual(e2.confidence.gapPt, 7); assert.strictEqual(e2.confidence.temperature, 0.8);

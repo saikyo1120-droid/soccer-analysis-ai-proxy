@@ -29,9 +29,9 @@ const strip = (o) => { const c = JSON.parse(JSON.stringify(o)); delete c.readMod
 
 /** MGET対応/非対応を切り替えられる保存先モック。呼び出しを記録する。 */
 function mockStore({ mget = true, mgetThrowOnCall = null } = {}) {
-  const store = new Map(); const calls = []; let mgetCalls = 0;
+  const store = new Map(); const calls = []; const keyCalls = []; let mgetCalls = 0;
   async function upstashCmd(cmd) {
-    const [op, ...a] = cmd; calls.push(op);
+    const [op, ...a] = cmd; calls.push(op); keyCalls.push({ op, keys: a.map(String) });
     if (op === "GET") return store.has(a[0]) ? store.get(a[0]) : null;
     if (op === "MGET") {
       mgetCalls++;
@@ -47,7 +47,7 @@ function mockStore({ mget = true, mgetThrowOnCall = null } = {}) {
   const upstashGetJSON = async (k) => { const r = await upstashCmd(["GET", k]); return r === null ? null : JSON.parse(r); };
   const upstashSetJSON = async (k, v) => { await upstashCmd(["SET", k, JSON.stringify(v)]); return true; };
   const count = (op) => calls.filter((x) => x === op).length;
-  return { store, calls, count, upstashCmd, upstashGetJSON, upstashSetJSON, upstashEnabled: true };
+  return { store, calls, keyCalls, count, upstashCmd, upstashGetJSON, upstashSetJSON, upstashEnabled: true };
 }
 
 const { getAccuracyTrend, buildDailyAccuracy, ACCURACY_KEY_PREFIX } = require("./learning/accuracyTracker");
@@ -348,7 +348,7 @@ function seedClubs(m, n) {
     if (!m.store.has(`${ACCURACY_KEY_PREFIX}${jstToday}`)) m.store.set(`${ACCURACY_KEY_PREFIX}${jstToday}`, m.store.get(`${ACCURACY_KEY_PREFIX}${new Date().toISOString().slice(0, 10)}`));
     try {
       await new Promise((r) => setTimeout(r, 300));
-      m.calls.length = 0;
+      m.calls.length = 0; m.keyCalls.length = 0;
       const body = await new Promise((resolve, reject) => {
         http.get("http://127.0.0.1:8905/api/learning/daily-report", (res) => { let d = ""; res.on("data", (c) => d += c); res.on("end", () => resolve(JSON.parse(d))); }).on("error", reject);
       });
@@ -362,9 +362,18 @@ function seedClubs(m, n) {
       assert.strictEqual(body.updates.silentFailures.count, 3);
       assert.strictEqual(body.updates.silentFailures.items.length, 3);
       assert.strictEqual(body.updates.failures, 1, "従来の errors 件数が変わった");
-      // 往復回数: 従来なら 30(GET) + 41(GET) = 71回以上。いまは MGET 4回 + GET 少数
-      assert.strictEqual(m.count("MGET"), 1 + 3, "MGET回数: " + m.count("MGET"));
-      assert.ok(m.count("GET") <= 15, "GETが多すぎる(直列読みが残っている): " + m.count("GET") + " ops=" + JSON.stringify(m.calls));
+      // 往復回数: 従来なら 30(GET) + 41(GET) = 71回以上。いまは MGET 5回 + GET 少数
+      //   v104.1: 精度トレンド 1 + 網羅率 3 に、「保存済みモデル3つ(較正・試合内容・自信ランク)+数字の裏取り8日ぶん」を
+      //   束ねた MGET 1回が加わった。代わりに、モデルを1つずつ読んでいた GET 2回(v101・v104)が無くなったので、
+      //   往復の合計は v104 より1回少ない(下の GET の上限も 15 → 13 に詰める)。
+      assert.strictEqual(m.count("MGET"), 1 + 3 + 1, "MGET回数: " + m.count("MGET"));
+      assert.ok(m.count("GET") <= 13, "GETが多すぎる(直列読みが残っている): " + m.count("GET") + " ops=" + JSON.stringify(m.calls));
+      const MODEL_RE = /^learn:(calibration:model|content:model|tiers:model)$/;
+      const modelGets = m.keyCalls.filter((c) => c.op === "GET" && MODEL_RE.test(c.keys[0]));
+      assert.strictEqual(modelGets.length, 0, "保存済みモデルを GET で1つずつ読んでいる: " + JSON.stringify(modelGets));
+      const bundled = m.keyCalls.filter((c) => c.op === "MGET" && c.keys.filter((k) => MODEL_RE.test(k)).length === 3);
+      assert.strictEqual(bundled.length, 1, "モデル3つを束ねた MGET が1回でない: " + bundled.length);
+      assert.strictEqual(bundled[0].keys.filter((k) => /^learn:intel:\d{4}-\d{2}-\d{2}$/.test(k)).length, 8, "数字の裏取りの8日ぶんが同じ MGET に入っていない");
     } finally {
       srvMod.server.close();
     }

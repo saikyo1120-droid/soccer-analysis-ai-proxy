@@ -266,7 +266,7 @@ const jst = (offsetDays) => new Date(Date.now() + 9 * 3600000 + (offsetDays || 0
     assert.strictEqual(r3.status, 200);
   });
 
-  await t("⑬ 画面(index.html): 計測は独立スクリプト(v96)・sendBeacon→fetch・/api/came-from・?from= と参照元・端末側の新規/再訪・45秒/操作・ローカルでは送らない / sw.js は v96以上", () => {
+  await t("⑬ 画面(index.html): 計測は独立スクリプト(v96)・fetch(keepalive)→送れなければ sendBeacon(v104.1)・/api/came-from・?from= と参照元・端末側の新規/再訪・45秒/操作・ローカルでは送らない / sw.js は v96以上", () => {
     const html = fs.readFileSync(INDEX_HTML, "utf8");
     assert.ok(html.includes("(function trackVisitSourceV96()"), "v96の計測スクリプトが無い");
     assert.strictEqual((html.match(/function trackVisitSource\(\)/g) || []).length, 0, "旧 trackVisitSource が残っている(二重送信)");
@@ -275,7 +275,16 @@ const jst = (offsetDays) => new Date(Date.now() + 9 * 3600000 + (offsetDays || 0
     assert.ok(idx > 0 && idx < mainIdx, "計測スクリプトが画面本体のスクリプトより前に無い");
     const fnSrc = html.slice(idx, html.indexOf("</script>", idx));
     assert.ok(fnSrc.includes('apiBase + "/came-from"'), "送り先が /api/came-from でない");
-    assert.ok(fnSrc.includes("navigator.sendBeacon(") && fnSrc.includes("keepalive: true"), "sendBeacon→fetch の順になっていない");
+    assert.ok(fnSrc.includes("navigator.sendBeacon(") && fnSrc.includes("keepalive: true"), "fetch(keepalive)と sendBeacon の両方が必要");
+    // v104.1: 先に fetch で送り、サーバーの応答(届いた/断られた)をそのまま記録する。sendBeacon は「送れなかったとき」の送り直しだけ。
+    //   (sendBeacon が先だと「送信待ちに入れた」ことしか分からず、端末側で止められていても気づけない)
+    const sendSrc = fnSrc.slice(fnSrc.indexOf("var send = function (payload)"), fnSrc.indexOf('send({ type: "land"'));
+    assert.ok(sendSrc.length > 200, "send 関数が見つからない");
+    assert.ok(/fetch\(target, \{ method: "POST"[^}]*\}, body: body, keepalive: true/.test(sendSrc), "fetch(keepalive)で送っていない");
+    assert.ok(sendSrc.includes('result: r.ok ? "ok" : "http_error", status: r.status'), "サーバーの応答(HTTP ステータス)を記録していない");
+    assert.ok(/\.catch\(function \(e\) \{ var msg = errText\(e\); if \(!viaBeacon\(msg\)\)/.test(sendSrc), "fetch が失敗したときの送り直し(sendBeacon)が無い");
+    assert.ok(sendSrc.includes('"failed_then_queued"') && sendSrc.includes('result: "failed"'), "送れなかった事実を記録していない");
+    assert.strictEqual((sendSrc.match(/navigator\.sendBeacon\(target/g) || []).length, 1, "sendBeacon の呼び出しは送り直しの1か所だけ");
     assert.ok(fnSrc.includes('url.searchParams.get("from")'), "?from= を読んでいない");
     assert.ok(fnSrc.includes('localStorage.getItem("visitAttribution")') && fnSrc.includes('"visitBeaconLast"'), "端末側の記録が無い");
     assert.ok(fnSrc.includes('type: "land"') && fnSrc.includes('type: "engage"'));
@@ -358,6 +367,11 @@ const jst = (offsetDays) => new Date(Date.now() + 9 * 3600000 + (offsetDays || 0
     assert.strictEqual(r.headers["cache-control"], "no-cache", "index.html に no-cache が付いていない: " + r.headers["cache-control"]);
     const g = await request("GET", "/growth");
     assert.ok(g.raw.includes("届いているかの確認") && g.raw.includes('"visitBeaconLast"') && g.raw.includes("counters.http"), "/growth に受信内訳の表示が無い");
+    // v104.1: /growth の埋め込みスクリプトが構文として正しい(テンプレート内の引用符の崩れを検出)+送信結果を言葉で出す
+    const growthScripts = [...g.raw.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+    assert.ok(growthScripts.length >= 1, "/growth にスクリプトが無い");
+    for (const src of growthScripts) new Function(src); // 構文エラーならここで例外
+    for (const w of ["届きました", "サーバーが受け取りを断りました", "送れませんでした", "別の方法で送り直しました"]) assert.ok(g.raw.includes(w), "/growth に送信結果の説明が無い: " + w);
   });
 
   srvMod.server.close();

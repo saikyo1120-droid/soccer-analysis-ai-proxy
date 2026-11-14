@@ -39,6 +39,17 @@ const STUB = {
     ok: true, found: true,
     noteJa: "AI自身の予測モデル(実データで毎日学習した重み)による予想です。予想は毎朝の学習時に生成・保存され、試合終了後に必ず答え合わせされて学習に使われます。",
     bestPick: { fixtureId: 9101, reasonJa: "本日のAI予想の中で補正後の勝率が最も高い試合です(51%・最重要要素: 直近フォーム)。" },
+    // v104.1 K: 自信ランクの境とランク別の実績(サーバー buildTiersPayload の形)
+    tiers: {
+      available: true, thresholds: { sPct: 70, aPct: 60, skipPct: 50 },
+      ranks: [{ rank: "S", labelJa: "確信" }, { rank: "A", labelJa: "有力" }, { rank: "B", labelJa: "やや優勢" }, { rank: "skip", labelJa: "見送り" }],
+      backtest: { totalLast30: 412, totalAll: 980,
+        last30: [{ rank: "S", labelJa: "確信", n: 61, hits: 46, hitPct: 75.4 }, { rank: "A", labelJa: "有力", n: 120, hits: 76, hitPct: 63.3 }, { rank: "B", labelJa: "やや優勢", n: 131, hits: 71, hitPct: 54.2 }, { rank: "skip", labelJa: "見送り", n: 100, hits: 46, hitPct: 46 }],
+        all: [{ rank: "S", labelJa: "確信", n: 150, hits: 112, hitPct: 74.7 }, { rank: "A", labelJa: "有力", n: 290, hits: 181, hitPct: 62.4 }, { rank: "B", labelJa: "やや優勢", n: 300, hits: 160, hitPct: 53.3 }, { rank: "skip", labelJa: "見送り", n: 240, hits: 110, hitPct: 45.8 }] },
+      forward: { totalLast30: 0, totalAll: 36,
+        last30: [{ rank: "S", labelJa: "確信", n: 0, hits: 0, hitPct: null }, { rank: "A", labelJa: "有力", n: 0, hits: 0, hitPct: null }, { rank: "B", labelJa: "やや優勢", n: 0, hits: 0, hitPct: null }, { rank: "skip", labelJa: "見送り", n: 0, hits: 0, hitPct: null }],
+        all: [{ rank: "S", labelJa: "確信", n: 5, hits: 4, hitPct: 80 }, { rank: "A", labelJa: "有力", n: 12, hits: 8, hitPct: 66.7 }, { rank: "B", labelJa: "やや優勢", n: 10, hits: 5, hitPct: 50 }, { rank: "skip", labelJa: "見送り", n: 9, hits: 4, hitPct: 44.4 }] },
+    },
     predictions: [
       {
         fixtureId: 9101, kickoff: "2026-09-08T11:30:00Z", status: "FT", resolved: true, correct: true,
@@ -69,6 +80,8 @@ const STUB = {
         market: { edgePt: -0.8 }, oddsSource: { kind: "consensus", nBooks: 10 },
         blend: { marketPct: 35, aiPct: 65 },
         confidence: { displayPct: 41, rawPct: 55, calibrated: true, basisN: 88, gapPt: -14, outOfRange: true },
+        // v104.1 K: 自信ランク(見送り・刻印あり・予想時の自信が今の表示と違う場合の注記つき)
+        tier: { rank: "skip", labelJa: "見送り", meaningJa: "AIの見立てでも当たる見込みが5割に届かない試合(予想は出しますが、自信はありません)", confPct: 43, stamped: true, record: { basis: "backtest", window: "last30", n: 100, hits: 46, hitPct: 46 } },
         preKick: {
           confirmed: true, oddsSource: { kind: "consensus", nBooks: 10 },
           blended: { predictedWinner: "home", probsPct: { homeWinPct: 44, drawPct: 31, awayWinPct: 25 }, changedFromMorning: true },
@@ -86,6 +99,20 @@ const STUB = {
         predictedWinner: "away", predictedScoreline: "0-1",
         probs: { homeWinPct: 28, drawPct: 30, awayWinPct: 42 },
         topFactorJa: "怪我人", weightsVersion: 12,
+        confidence: { displayPct: 72, rawPct: 76, calibrated: true, basisN: 98, gapPt: -4, outOfRange: false },
+        // v104.1 K: 自信ランク(S・前向きの実績)。もう1件は実績が未集計の A
+        tier: { rank: "S", labelJa: "確信", meaningJa: "AIの自信がいちばん高い試合", confPct: 72, stamped: true, record: { basis: "forward", window: "all", n: 24, hits: 19, hitPct: 79.2 } },
+        loggedAt: "2026-09-08T04:35:00Z",
+      },
+      {
+        fixtureId: 9104, kickoff: "2026-09-08T18:00:00Z", status: "NS", resolved: false,
+        home: { name: "Brighton" }, away: { name: "Fulham" },
+        league: "Premier League", official: true, learnedCompetition: true,
+        predictedWinner: "home", predictedScoreline: "2-1",
+        probs: { homeWinPct: 62, drawPct: 21, awayWinPct: 17 },
+        topFactorJa: "直近フォーム", weightsVersion: 12,
+        confidence: { displayPct: 62, rawPct: 62, calibrated: false, basisN: null, gapPt: null, outOfRange: false },
+        tier: { rank: "A", labelJa: "有力", meaningJa: "AIの自信が高めの試合", confPct: 62, stamped: false, record: null },
         loggedAt: "2026-09-08T04:35:00Z",
       },
     ],

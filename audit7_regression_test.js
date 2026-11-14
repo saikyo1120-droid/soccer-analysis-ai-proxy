@@ -86,6 +86,10 @@ test("★欠陥59: 戦術用語やリーグ名を選手名として検索しな�
   const code = extractConst("NON_PLAYER_KATAKANA") + "\n"
     + extractFn("isLikelyPlayerName") + "\n"
     + 'const KNOWN_JP_SURNAMES = ["久保建英", "久保", "三笘薫", "三笘"];\n'
+    // v104 で guessUnregisteredPlayerName が「既知のクラブ名の先頭」を除外するようになり、画面の normalizeName を使う。
+    //   (v104.1 総点検: このテストは長く古い画面ファイルを読んでいて、この依存の追加に気づけていなかった)
+    + extractFn("normalizeName") + "\n"
+    + 'const UNIVERSE_CLUB_JA_TO_EN = { "マンチェスター・シティ": "Manchester City", "ボルシア・ドルトムント": "Borussia Dortmund" };\n'
     + extractFn("guessUnregisteredPlayerName")
     + "\nmodule.exports = { guessUnregisteredPlayerName };";
   const mod = { exports: {} };
@@ -99,6 +103,9 @@ test("★欠陥59: 戦術用語やリーグ名を選手名として検索しな�
   // 本物の選手名はこれまで通り拾えること
   assert.strictEqual(guessUnregisteredPlayerName("ムバッペはどんな選手？"), "ムバッペ");
   assert.strictEqual(guessUnregisteredPlayerName("久保建英はどう？"), "久保建英");
+  // v104: クラブ名の先頭(「マンチェスター」「ボルシア」)は選手名と推測しない(サーバーの名寄せ・聞き返しに任せる)
+  assert.strictEqual(guessUnregisteredPlayerName("マンチェスターはどう？"), null);
+  assert.strictEqual(guessUnregisteredPlayerName("ボルシアの調子は？"), null);
 });
 
 // =====================================================================
