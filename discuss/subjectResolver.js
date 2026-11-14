@@ -156,7 +156,10 @@ function resolveSubjectFromQuestion(question, ctx) {
   const addClub = (r, nameJaHint) => {
     if (!r || !r.ok || seenIds.has(r.id)) return false;
     seenIds.add(r.id);
-    clubs.push({ labelJa: r.nameJa || nameJaHint || null, labelEn: r.name, teamId: r.id });
+    // v104.1(総点検): 追跡中クラブは、このアプリでの名前(調査ファイル・蓄積した知識の保存名)で渡す。
+    //   名前の索引にあるのは提供元の表記("FC Porto" "Bayern München")で、そのまま対象にすると
+    //   毎晩蓄積している知識(保存名は "Porto" "Bayern Munich")を引けず、チームIDも検索し直していた。
+    clubs.push({ labelJa: r.nameJa || nameJaHint || r.trackedNameJa || null, labelEn: r.trackedNameEn || r.name, teamId: r.id });
     return true;
   };
   let method = "none";

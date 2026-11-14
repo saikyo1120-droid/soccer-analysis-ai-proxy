@@ -95,7 +95,7 @@ async function runToolLoop(p) {
       calls++;
       emit({ t: "status", key: "tool", tool: tu.name, ja: `${toolLabel(tu.name)}を確認しています…` });
       const r = await p.execute(tu.name, tu.input || {});
-      toolCalls.push({ name: tu.name, input: tu.input || {}, ok: !!r.ok, elapsedMs: r.elapsedMs, summaryJa: r.summaryJa });
+      toolCalls.push({ name: tu.name, input: tu.input || {}, ok: !!r.ok, elapsedMs: r.elapsedMs, summaryJa: r.summaryJa, summary: r.summary || null });
       results.push({ type: "tool_result", tool_use_id: tu.id, content: r.resultJson });
     }
     messages.push({ role: "user", content: results });
