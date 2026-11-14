@@ -14,6 +14,13 @@
  *     「総合力」のような架空の能力値は作らない。母数(評価点のある選手数)を必ず添える。
  *   ・チームの照合は teamId(API-Footballの数値ID)で行う。名前の部分一致は使わない
  *     (「Inter」と「Inter Miami」のような誤照合を防ぐ)。
+ *   ・v104.1(総点検): 名前が完全に一致しても、チームIDが違えば別のクラブとして扱う。
+ *     調査ファイル(kb:club:<slug>)と選手索引は「クラブ名」で1冊にまとめているため、同じ名前の
+ *     別クラブ(例: 追跡中の FC Porto と、ブラジルの州リーグの「Porto」)に、追跡中クラブの選手や
+ *     主力評価点を見せてしまう経路があった。次の3段で防ぐ:
+ *       ① 照合表は「調査ファイルの slug ひとつにつきチームIDひとつ」だけを載せる
+ *       ② 名前だけで拾った候補は、追跡中クラブの保存済みIDと試合のチームIDが違えば使わない
+ *       ③ 試合カードは、読み出した調査ファイルのチームIDが試合のチームIDと違えば出さない
  *
  * ■ teamId → クラブ の対応表
  *   固定名簿(clubUniverse)のクラブは調査ファイルに teamId が保存されている。
@@ -26,8 +33,12 @@ const SQUAD_TOP_N = 14;            // 「主力」= 出場時間上位14人(先�
 const SQUAD_MIN_RATED = 7;         // 評価点のある主力がこれ未満なら「比較しない」
 const SQUAD_MIN_MINUTES = 90;      // 90分未満しか出ていない選手は主力に数えない
 const KEY_PLAYER_MIN_MINUTES = 270; // 注目選手は270分(フル3試合)以上出ている選手から選ぶ(v98.1: 180分=2試合の評価点は偶然に左右されやすい)
+const { slugOf } = require("./clubDossier"); // 調査ファイルの保存キーと同じ slug(同名の判定をここと保存先で食い違わせない)
 
-function normalizeName(s) { return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, ""); }
+// v104.1(総点検): アクセント記号を畳んでから比べる。旧コードは英数字以外を削るだけだったため、
+//   提供元の表記「Bayern München」が "bayernmnchen" になり、固定名簿の「Bayern Munchen」と一致しなかった
+//   (固定名簿のクラブを名前で見分けられず、追跡対象外として扱ったり、動的クラブの候補に入れたりし得た)。
+function normalizeName(s) { return String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, ""); }
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
 
 /**
@@ -68,6 +79,7 @@ function createTeamKnowledge(deps) {
     CLUB_UNIVERSE, clubDossier, dynamicUniverse,
     getPlayerRows,          // () => { rows: Array<fromIndexRow済み|null>, builtAt }  (プロセス内の選手索引)
     upstashEnabled, upstashCmd, upstashGetJSON,
+    isSecondaryName,        // (name) => boolean  2軍・女子・ユースの名前か(候補にしない理由を正直に返すため。省略可)
     nowMs = () => Date.now(),
   } = deps || {};
   const universe = Array.isArray(CLUB_UNIVERSE) ? CLUB_UNIVERSE : [];
@@ -77,7 +89,17 @@ function createTeamKnowledge(deps) {
     if (c.searchAs) byNormName.set(normalizeName(c.searchAs), c);
   }
 
-  const state = { byTeamId: new Map(), builtAt: 0, building: null, source: null, dynamicCount: 0, staticCount: 0 };
+  // 固定名簿のクラブ名は、チームIDが未保存でも slug を予約する(同名の動的クラブに調査ファイルを共有させない)
+  const staticSlugs = new Set();
+  for (const c of universe) { staticSlugs.add(slugOf(c.nameEn)); if (c.searchAs) staticSlugs.add(slugOf(c.searchAs)); }
+
+  const state = {
+    byTeamId: new Map(), builtAt: 0, building: null, source: null, dynamicCount: 0, staticCount: 0,
+    staticIdByName: new Map(),   // 固定名簿: nameEn -> 保存済みチームID
+    slugOwner: new Map(),        // 調査ファイルの slug -> そのファイルの持ち主のチームID(固定名簿で未保存なら null)
+    nameCollisions: [],          // 同じ slug を別のチームIDが使おうとして、照合表に載せなかったクラブ(開示用・最大20件)
+    unverifiedDynamic: 0,
+  };
 
   async function readTeamMapFromStore() {
     if (!upstashEnabled || typeof upstashGetJSON !== "function") return null;
@@ -111,19 +133,57 @@ function createTeamKnowledge(deps) {
       source = "dossiers";
       staticEntries = await buildFromDossiers();
     }
-    for (const e of staticEntries) if (!e.dynamic) map.set(e.teamId, e);
-    let dynamicCount = 0;
+    // ---- 「調査ファイルの slug ひとつにつきチームIDひとつ」だけを載せる ----
+    const slugOwner = new Map();
+    const staticIdByName = new Map();
+    const nameCollisions = [];
+    for (const sl of staticSlugs) slugOwner.set(sl, null);
+    for (const e of staticEntries) {
+      if (e.dynamic) continue;
+      map.set(e.teamId, e);
+      staticIdByName.set(e.nameEn, e.teamId);
+      slugOwner.set(slugOf(e.nameEn), e.teamId);
+    }
+    // 毎晩の収集が保存した対応表の「動的クラブ」の行(このIDで実際に収集したか= idVerified)
+    const storedDynamic = new Map();
+    if (stored && Array.isArray(stored.clubs)) {
+      for (const e of stored.clubs) if (e && e.dynamic && Number.isFinite(Number(e.teamId)) && e.nameEn) storedDynamic.set(Number(e.teamId), e);
+    }
+    let dynamicCount = 0, unverifiedDynamic = 0;
     if (dynamicUniverse && typeof dynamicUniverse.loadAdopted === "function") {
       const ad = await dynamicUniverse.loadAdopted();
       if (ad && ad.ok) {
-        for (const [id, v] of ad.map) {
-          const teamId = Number(id);
-          if (!Number.isFinite(teamId) || !v || !v.nameEn) continue;
-          if (!map.has(teamId)) { map.set(teamId, { teamId, nameEn: v.nameEn, nameJa: v.nameJa || v.nameEn, tier: "C", dynamic: true, leagueId: v.leagueId || null, adoptedAt: v.adoptedAt || null }); dynamicCount++; }
+        // 採用日の古い順(同じ日ならチームIDの小さい順)= 採用側(adoptForToday)の「残す側」と同じ決め方
+        const adopted = [...ad.map.entries()]
+          .map(([id, v]) => ({ teamId: Number(id), v }))
+          .filter((x) => Number.isFinite(x.teamId) && x.v && x.v.nameEn)
+          .sort((a, b) => String(a.v.adoptedAt || "").localeCompare(String(b.v.adoptedAt || "")) || (a.teamId - b.teamId));
+        for (const { teamId, v } of adopted) {
+          if (map.has(teamId)) continue;
+          const slug = slugOf(v.nameEn);
+          if (slugOwner.has(slug) && slugOwner.get(slug) !== teamId) {
+            // 同じ名前の別クラブが先に載っている(固定名簿、または先に採用された動的クラブ)。
+            // 調査ファイル・選手索引は名前で1冊なので、こちらは載せない(別クラブの情報を見せない)。
+            if (nameCollisions.length < 20) nameCollisions.push({ teamId, nameEn: v.nameEn, ownerTeamId: slugOwner.get(slug) });
+            continue;
+          }
+          slugOwner.set(slug, teamId);
+          // idVerified: 毎晩の収集が「このチームIDで実際に集めた」と記録したか。
+          //   旗の無い行(この修正より前に保存された対応表)は従来どおり信頼する。
+          //   対応表に行が無い(採用されたが、まだ一度も収集されていない)クラブは未確認として扱う。
+          const st = storedDynamic.get(teamId);
+          const unverified = !(st && st.nameEn === v.nameEn && st.idVerified !== false);
+          if (unverified) unverifiedDynamic++;
+          map.set(teamId, { teamId, nameEn: v.nameEn, nameJa: v.nameJa || v.nameEn, tier: "C", dynamic: true, leagueId: v.leagueId || null, adoptedAt: v.adoptedAt || null, ...(unverified ? { unverified: true } : {}) });
+          dynamicCount++;
         }
       }
     }
     state.byTeamId = map;
+    state.staticIdByName = staticIdByName;
+    state.slugOwner = slugOwner;
+    state.nameCollisions = nameCollisions;
+    state.unverifiedDynamic = unverifiedDynamic;
     state.builtAt = nowMs();
     state.source = source;
     state.dynamicCount = dynamicCount;
@@ -140,15 +200,22 @@ function createTeamKnowledge(deps) {
   }
   function invalidate() { state.builtAt = 0; }
 
-  /** 試合のチーム({id, name})を知識上のクラブへ解決する(teamId 優先・名前は完全一致のみ) */
+  /**
+   * 試合のチーム({id, name})を知識上のクラブへ解決する(teamId 優先・名前は完全一致のみ)。
+   * 名前だけで拾った候補には teamIdUnconfirmed を付ける。さらに、その追跡中クラブの保存済みIDが
+   * 試合のチームIDと違うときは idConflict を付ける(=同じ名前の別クラブの疑い。呼び出し側は
+   * 調査ファイルのチームIDで確かめられない限り、このクラブの情報を使わない)。
+   */
   async function resolveTeam(team) {
     const map = await ensureMap(false);
-    const id = team && Number(team.id);
+    const id = (team && team.id !== null && team.id !== undefined && team.id !== "") ? Number(team.id) : NaN;
     if (Number.isFinite(id) && map.has(id)) return map.get(id);
     const uni = byNormName.get(normalizeName(team && team.name));
     if (uni) {
-      // 固定名簿にあるが teamId が未保存(収集が一度も成功していない)クラブ
-      return { teamId: Number.isFinite(id) ? id : null, nameEn: uni.nameEn, nameJa: uni.nameJa, tier: null, dynamic: false, leagueId: uni.leagueId || null, teamIdUnconfirmed: true };
+      const savedId = state.staticIdByName.get(uni.nameEn);
+      const idConflict = Number.isFinite(id) && Number.isFinite(savedId) && savedId !== id;
+      // 固定名簿にあるが teamId が未保存(収集が一度も成功していない)クラブ、または名前だけが一致したチーム
+      return { teamId: Number.isFinite(id) ? id : null, nameEn: uni.nameEn, nameJa: uni.nameJa, tier: null, dynamic: false, leagueId: uni.leagueId || null, teamIdUnconfirmed: true, ...(idConflict ? { idConflict: true, savedTeamId: savedId } : {}) };
     }
     return null;
   }
@@ -175,6 +242,10 @@ function createTeamKnowledge(deps) {
   async function squadRatingForFeature(teamId, nameHint) {
     const club = await resolveTeam({ id: teamId, name: nameHint });
     if (!club) return null;
+    // v104.1(総点検): 同じ名前の別クラブの疑い(idConflict)、または「このチームIDで収集した」と
+    //   まだ確かめられていない動的クラブ(unverified)には、選手索引の評価点を使わない
+    //   (索引は名前でまとめているため、別クラブの主力の評価点が特徴量に入ってしまう)。null=特徴量なし。
+    if (club.idConflict || club.unverified) return null;
     const s = squadStrengthOf(club);
     return s && s.reliable ? s.avgRating : null;
   }
@@ -204,7 +275,9 @@ function createTeamKnowledge(deps) {
         computedAt: inj.computedAt || null,
       } : null,
       coach: coach ? { name: coach.coachName || null, formation: coach.formation || null, computedAt: coach.computedAt || null } : null,
-      standings: standings ? { rank: num(standings.rank), points: num(standings.points), played: num(standings.played), computedAt: standings.computedAt || null } : null,
+      // v104.1(総点検): 順位の保存名は position(universeCollector が書く名前)。旧コードは存在しない rank を
+      //   読んでいたため、順位が常に null で返っていた(画面では未使用だったので表示の誤りは無い)。
+      standings: standings ? { rank: num(standings.position ?? standings.rank), points: num(standings.points), played: num(standings.played), computedAt: standings.computedAt || null } : null,
       recentChanges: Array.isArray(d.lastChangesJa) ? d.lastChangesJa.slice(0, 3) : [],
     };
   }
@@ -224,9 +297,39 @@ function createTeamKnowledge(deps) {
         byName = r.byName; readFailed = !!r.readFailed;
       } catch (e) { readFailed = true; }
     }
+    const fixtureIdOf = (team) => (team && team.id !== null && team.id !== undefined && team.id !== "" && Number.isFinite(Number(team.id))) ? Number(team.id) : null;
+    // 追跡対象外の理由(画面が「取り込み候補に登録しました」と言ってよいのは untracked だけ)
+    //   secondary_team       … 2軍・女子・ユース(候補にしない)
+    //   same_name_other_club … 追跡中の別クラブと同じ名前(調査ファイルを共有してしまうため候補にしない)
+    //   untracked            … まだ追跡していないクラブ(このカードが開かれたので候補に記録する)
+    const untrackedPack = (team, reason) => ({ tracked: false, teamId: fixtureIdOf(team), nameEn: (team && team.name) || null, reason });
+    const reasonForUnknown = (team) => {
+      const nm = team && team.name;
+      if (typeof isSecondaryName === "function" && isSecondaryName(nm)) return "secondary_team";
+      const tid = fixtureIdOf(team);
+      const sl = slugOf(nm);
+      if (byNormName.has(normalizeName(nm))) return "same_name_other_club";
+      if (sl && state.slugOwner.has(sl) && state.slugOwner.get(sl) !== tid) return "same_name_other_club";
+      return "untracked";
+    };
     const pack = (team, club) => {
-      if (!club) return { tracked: false, teamId: (team && Number(team.id)) || null, nameEn: (team && team.name) || null, reason: "untracked" };
+      if (!club) return untrackedPack(team, reasonForUnknown(team));
       const d = byName.get(club.nameEn) || null;
+      // ③ 調査ファイルの持ち主(チームID)が、この試合のチームと違う = 同じ名前の別クラブ。情報は出さない。
+      const tid = fixtureIdOf(team);
+      const ownerId = (d && d.teamId !== null && d.teamId !== undefined && Number.isFinite(Number(d.teamId))) ? Number(d.teamId) : null;
+      if (tid !== null && ownerId !== null && ownerId !== tid) return untrackedPack(team, "same_name_other_club");
+      // ② 名前だけで拾った候補で、追跡中クラブの保存済みIDが違い、調査ファイルでも確かめられない
+      if (club.idConflict && !(ownerId !== null && ownerId === tid)) return untrackedPack(team, "same_name_other_club");
+      // 動的クラブで、まだこのチームIDで収集されていない(調査ファイルが無い/持ち主を確かめられない)→ 取り込み中として出す
+      const importing = !!club.unverified && !(ownerId !== null && ownerId === tid);
+      if (importing) {
+        return {
+          tracked: true, teamId: club.teamId ?? null, nameEn: club.nameEn, nameJa: club.nameJa || null,
+          tier: club.tier || null, dynamic: !!club.dynamic, adoptedAt: club.adoptedAt || null,
+          squad: null, dossier: null, dossierMissing: true, importing: true,
+        };
+      }
       return {
         tracked: true, teamId: club.teamId ?? null, nameEn: club.nameEn, nameJa: club.nameJa || null,
         tier: club.tier || (d && d.tier) || null, dynamic: !!club.dynamic, adoptedAt: club.adoptedAt || null,
@@ -235,21 +338,38 @@ function createTeamKnowledge(deps) {
         dossierMissing: !d,
       };
     };
-    return { home: pack(home, hc), away: pack(away, ac), readFailed, mapSource: state.source, mapBuiltAt: state.builtAt ? new Date(state.builtAt).toISOString() : null };
+    // v104.1(総点検): 選手索引をまだ読み込めていない/読み出せなかった(=「選手がいない」のではなく「分からない」)
+    const idxNow = typeof getPlayerRows === "function" ? getPlayerRows() : null;
+    const indexUnavailable = !idxNow || !Array.isArray(idxNow.players);
+    return { home: pack(home, hc), away: pack(away, ac), readFailed, indexUnavailable, mapSource: state.source, mapBuiltAt: state.builtAt ? new Date(state.builtAt).toISOString() : null };
   }
 
-  /** 同期版: 固定名簿(静的)のチームか(候補記録の除外判定用。表が未構築なら名前だけで判定) */
+  /**
+   * 同期版: 固定名簿(静的)のチームか(候補記録の除外判定用。表が未構築なら名前だけで判定)。
+   * 名前が固定名簿のクラブと同じ(調査ファイルの slug が同じ)チームも true を返す:
+   * 動的クラブとして採用すると、固定名簿のクラブと調査ファイルを共有してしまうため。
+   */
   function isStaticTeamSync(teamId, name) {
     const id = Number(teamId);
     if (Number.isFinite(id) && state.byTeamId.has(id) && !state.byTeamId.get(id).dynamic) return true;
-    return byNormName.has(normalizeName(name));
+    return byNormName.has(normalizeName(name)) || staticSlugs.has(slugOf(name));
+  }
+
+  /** 固定名簿のクラブ(nameEn)の保存済みチームID(照合表が未構築・未保存なら null)。記録の照合をIDで行うため */
+  function staticTeamIdOf(nameEn) {
+    const v = state.staticIdByName.get(String(nameEn || ""));
+    return Number.isFinite(v) ? v : null;
   }
 
   function snapshot() {
-    return { clubsMapped: state.byTeamId.size, staticCount: state.staticCount, dynamicCount: state.dynamicCount, source: state.source, builtAt: state.builtAt ? new Date(state.builtAt).toISOString() : null };
+    return {
+      clubsMapped: state.byTeamId.size, staticCount: state.staticCount, dynamicCount: state.dynamicCount, source: state.source, builtAt: state.builtAt ? new Date(state.builtAt).toISOString() : null,
+      // v104.1(総点検): 同じ名前のため照合表に載せなかった動的クラブ・まだ収集で確かめられていない動的クラブ
+      nameCollisions: state.nameCollisions.slice(0, 20), unverifiedDynamic: state.unverifiedDynamic,
+    };
   }
 
-  return { ensureMap, invalidate, resolveTeam, squadStrengthOf, squadRatingForFeature, knowledgeForFixture, snapshot, isStaticTeamSync, TEAM_MAP_KEY };
+  return { ensureMap, invalidate, resolveTeam, squadStrengthOf, squadRatingForFeature, knowledgeForFixture, snapshot, isStaticTeamSync, staticTeamIdOf, TEAM_MAP_KEY };
 }
 
 module.exports = { createTeamKnowledge, squadStrengthFromPlayers, normalizeName, TEAM_MAP_KEY, SQUAD_TOP_N, SQUAD_MIN_RATED };

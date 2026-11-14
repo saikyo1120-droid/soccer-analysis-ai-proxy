@@ -253,6 +253,40 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
   }
 
   /**
+   * v104.1(2026年11月14日): あるクラブの知識のうち、条件に合うものを一覧と本体から消す。
+   *   用途: チームIDの取り違え(別チームのIDで収集していた)が見つかったとき、そのIDで集めた
+   *   実測から作った知識(「監督が交代」「負傷者が増えた」など)は**別チームの出来事**なので、
+   *   失効を待たずに根拠から外す。条件(predicate)は呼び出し側が渡す(消しすぎを防ぐ)。
+   *   読めなかったときは何も消さない(読めないまま消すと、正しい知識まで巻き込むため)。
+   *   1件ずつ消す途中で失敗したものは failed に数えて返す(黙って「残した」ことにしない。呼び出し側が記録に残す)。
+   * @returns {{ok:boolean, removed:number, kept:number, failed?:number, reasonJa?:string}}
+   */
+  async function purgeKnowledgeForEntity(teamEn, predicate) {
+    if (!upstashEnabled || !teamEn || typeof predicate !== "function") return { ok: false, removed: 0, kept: 0, reasonJa: "条件が不足しています。" };
+    let hashes = [];
+    try { hashes = (await upstashCmd(["LRANGE", `knowledge:byTeam:${teamEn}`, "0", "-1"])) || []; }
+    catch (e) { return { ok: false, removed: 0, kept: 0, reasonJa: "知識の一覧を読み出せなかったため、掃除を見送りました。" }; }
+    if (!hashes.length) return { ok: true, removed: 0, kept: 0 };
+    const { items, readFailed } = await readItemsByHashes(hashes);
+    if (readFailed) return { ok: false, removed: 0, kept: 0, reasonJa: "知識の本体を読み切れなかったため、掃除を見送りました。" };
+    let removed = 0, failed = 0;
+    for (const it of items) {
+      let hit = false;
+      try { hit = !!predicate(it); } catch (e) { hit = false; }
+      if (!hit || !it.hash) continue;
+      try {
+        await upstashCmd(["LREM", `knowledge:byTeam:${teamEn}`, "0", it.hash]);
+        await upstashCmd(["DEL", `knowledge:item:${it.hash}`]);
+        removed++;
+      } catch (e) {
+        // 1件消せなくても残りを続ける(消せなかった分は失効で外れる)。件数は必ず返す
+        failed++;
+      }
+    }
+    return { ok: true, removed, kept: items.length - removed - failed, failed };
+  }
+
+  /**
    * このクラブについて現在「有効」な知識(失効していないもの)を、事実/分析/意見に
    * 分けて返す。失効した知識は除外される(=削除はされないが、以後のRAG・推論には
    * もう使われない、という設計)。
@@ -380,6 +414,7 @@ function createKnowledgeStore({ upstashEnabled, upstashCmd, upstashGetJSON, upst
     saveKnowledgeItem, getActiveKnowledge, getKnowledgeDiffForTeam,
     flushUsageCounters, getTopUsedKnowledge, flushCategoryCounters,
     getActiveKnowledgeForLeague, getKnowledgeDiffForLeague,
+    purgeKnowledgeForEntity, // v104.1: 取り違えたチームIDで集めた知識の掃除
   };
 }
 

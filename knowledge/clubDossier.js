@@ -125,6 +125,18 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
     if (m.teamId) dossier.teamId = m.teamId;
     if (m.uefaRankSnapshot) dossier.uefaRankSnapshot = m.uefaRankSnapshot;
     if (m.tier) dossier.tier = m.tier;
+    // v104.1: 毎日のコア更新が「このチームIDは本当にそのクラブの男子トップチームか」を確かめた結果。
+    //   セクション更新と同じ1回の書き込みに相乗りする(保存先コマンドは増えない)。
+    //   確かめたIDと保存されるIDが同じときだけ記録する(取り違えの上書きを防ぐ)。
+    if (m.identityVerified && m.identityVerified.teamId && Number(m.identityVerified.teamId) === Number(dossier.teamId)) {
+      const prevId = dossier.identity && typeof dossier.identity === "object" ? dossier.identity : {};
+      dossier.identity = {
+        ...prevId,
+        teamId: Number(dossier.teamId),
+        apiName: m.identityVerified.apiName || prevId.apiName || null,
+        verifiedAt: m.identityVerified.at || now,
+      };
+    }
 
     const prev = dossier.sections[section] || null;
     const changes = diffSection(section, prev, data, dossier.nameJa);
@@ -147,6 +159,57 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
       } catch (e) { /* 一覧に載らなくても本体は保存済み */ }
     }
     return { saved: true, changesJa: changes };
+  }
+
+  /**
+   * v104.1(2026年11月14日): チームIDの取り違えを直す。
+   * ----------------------------------------------------------------------------
+   * 調査ファイルのチームIDは一度保存されると再照合されないため、昔の照合ロジックが取り違えた
+   * ID(実例: バイエルン → 女子チーム)がずっと使われ、フォーム・怪我・名簿・移籍のすべてが
+   * 「別チームの実測」になっていた。取り違えが確認できたら:
+   *   ・teamId を正しいもの(見つからなければ null)へ差し替える
+   *   ・取り違えたIDで集めたセクションと差分履歴を**すべて捨てる**(別チームの実測を残さない)
+   *   ・取り違えたIDを identity.rejected に覚える(同じIDを二度と採用しない)
+   * @param {string} nameEn
+   * @param {{teamId:number|null, apiName?:string, previousTeamId?:number, previousApiName?:string,
+   *          evidenceJa?:string, viaJa?:string, at?:string}} info
+   */
+  async function resetIdentity(nameEn, info) {
+    if (!upstashEnabled || !nameEn) return { saved: false, reasonJa: "保存先が未設定です。" };
+    const i = info || {};
+    const read = await getDossierStrict(nameEn);
+    if (!read.ok) return { saved: false, readFailed: true, reasonJa: `保存先から調査ファイルを読み出せなかったため、差し替えを見送りました(${read.error})` };
+    const dossier = read.dossier;
+    if (!dossier) return { saved: false, reasonJa: "調査ファイルがまだありません。" };
+    const now = i.at || new Date().toISOString();
+    const prevIdentity = dossier.identity && typeof dossier.identity === "object" ? dossier.identity : {};
+    const rejected = (Array.isArray(prevIdentity.rejected) ? prevIdentity.rejected : []).filter((x) => x && Number.isFinite(Number(x.teamId)));
+    const prevTeamId = Number.isFinite(Number(i.previousTeamId)) ? Number(i.previousTeamId) : (Number.isFinite(Number(dossier.teamId)) ? Number(dossier.teamId) : null);
+    if (prevTeamId !== null && prevTeamId !== Number(i.teamId) && !rejected.some((x) => Number(x.teamId) === prevTeamId)) {
+      rejected.push({ teamId: prevTeamId, apiName: i.previousApiName || null, at: now, evidenceJa: i.evidenceJa ? String(i.evidenceJa).slice(0, 160) : null });
+    }
+    const purgedSections = Object.keys(dossier.sections || {});
+    const newTeamId = Number.isFinite(Number(i.teamId)) && Number(i.teamId) > 0 ? Number(i.teamId) : null;
+    dossier.teamId = newTeamId;
+    dossier.sections = {};
+    dossier.identity = {
+      teamId: newTeamId,
+      apiName: newTeamId ? (i.apiName || null) : null,
+      verifiedAt: newTeamId ? now : null,
+      correctedAt: now,
+      viaJa: i.viaJa || null,
+      rejected: rejected.slice(-10),
+    };
+    const nameJa = dossier.nameJa || nameEn;
+    dossier.lastChangesJa = [{
+      date: now.slice(0, 10),
+      changeJa: newTeamId
+        ? `${nameJa}のデータ提供元での照合先が誤っていた(${i.evidenceJa || "別チームのIDでした"})ため、正しいチーム${i.apiName ? `「${i.apiName}」` : ""}へ照合し直し、誤ったチームで集めた情報を破棄しました`
+        : `${nameJa}のデータ提供元での照合先が誤っていた(${i.evidenceJa || "別チームのIDでした"})ため、誤ったチームで集めた情報を破棄しました(正しいチームはまだ特定できていません)`,
+    }];
+    dossier.updatedAt = now;
+    const ok = await upstashSetJSON(keyFor(nameEn), dossier);
+    return { saved: ok !== false, purgedSections, rejected: dossier.identity.rejected, teamId: newTeamId };
   }
 
   /**
@@ -487,6 +550,8 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
     const sectionCounts = {};
     let staleClubs = 0;
     const now = Date.now();
+    // v104.1: チームIDの本人確認の状況(verified=毎晩の収集で確認済み / corrected=取り違えを直したクラブ)
+    const identity = { verified: 0, unverified: 0, noTeamId: 0, corrected: [] };
     // ---- v92(2026年9月18日): 全クラブの読み出しを「1クラブ1往復」から「まとめ読み」へ ----
     //   v90でクラブが100→172になり、この一覧はキャッシュ切れのたびに最大172往復していた
     //   (ホーム画面と /api/learning/daily-report の両方がこれを読む)。
@@ -501,6 +566,18 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
       const updatedMs = new Date(d.updatedAt || 0).getTime();
       const ageHours = Number.isFinite(updatedMs) ? Math.round((now - updatedMs) / 3600000) : null;
       if (ageHours === null || ageHours > 72) staleClubs++;
+      const idn = d.identity && typeof d.identity === "object" ? d.identity : null;
+      if (d.teamId) {
+        if (idn && idn.verifiedAt && Number(idn.teamId) === Number(d.teamId)) identity.verified++;
+        else identity.unverified++;
+      } else identity.noTeamId++;
+      if (idn && idn.correctedAt) {
+        identity.corrected.push({
+          nameJa: d.nameJa, nameEn: d.nameEn, teamId: d.teamId ?? null, apiName: idn.apiName || null,
+          correctedAt: idn.correctedAt, viaJa: idn.viaJa || null,
+          rejected: (Array.isArray(idn.rejected) ? idn.rejected : []).slice(-3).map((x) => ({ teamId: x.teamId, apiName: x.apiName || null, evidenceJa: x.evidenceJa || null })),
+        });
+      }
       clubs.push({
         nameJa: d.nameJa, nameEn: d.nameEn, tier: d.tier,
         sectionsStored: sections.length, lastUpdatedHoursAgo: ageHours,
@@ -514,6 +591,11 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
       sectionCounts,
       staleClubs,
       staleNoteJa: staleClubs > 0 ? `${staleClubs}クラブは72時間以上更新されていません(輪番の周期内であれば正常です)。` : null,
+      identity: {
+        ...identity,
+        corrected: identity.corrected.slice(0, 30),
+        noteJa: "verified=毎晩の収集が「提供元での登録名が男子トップチームで、直近試合が女子大会ではない」ことを確かめたクラブ数。unverified=まだ輪番が回っていない、または直近試合の情報が無く確かめられていないクラブ数。corrected=保存されていた照合先の誤りを直したクラブ(誤っていたIDと根拠つき)。",
+      },
       clubs: clubs.sort((a, b) => (b.sectionsStored - a.sectionsStored)),
       unavailableFieldsJa: UNAVAILABLE_FIELDS_JA,
       readMode: dossiers.readMode || "per-key", // v92: "mget"(まとめ読み) / "mixed" / "per-key"(従来)。中身は同一
@@ -524,6 +606,7 @@ function createClubDossier({ upstashEnabled, upstashCmd, upstashGetJSON, upstash
     getDossier, getDossiers, updateSection, savePlayer, getPlayer, getPlayers, getStatsIndex, saveStatsIndex, getCoverageSummary, slugOf,
     getSearchIndex, saveSearchIndex, searchPlayers, getScoutFeed,
     getStatsIndexStrict, getSearchIndexStrict, // v97: 「読めなかった」を区別する版(更新で使う)
+    resetIdentity, // v104.1: チームIDの取り違えを直す
   };
 }
 
