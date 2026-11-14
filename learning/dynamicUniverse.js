@@ -31,6 +31,8 @@
  *                               adoptedAt, lastSeen, lastCollectedAt, reasonJa}
  */
 const { noteWarning } = require("./warnings"); // v92方針: 黙って続行しない(痕跡を残す)
+const { looksSecondaryTeamName } = require("./clubUniverse"); // 2軍・女子・ユースの名前の判定は1か所に揃える
+const { slugOf } = require("../knowledge/clubDossier");       // 調査ファイルの保存キー(同名の判定を保存先と食い違わせない)
 const SEEN_KEY = "kb:universe:dyn:seen";
 const ADOPTED_KEY = "kb:universe:dyn:adopted";
 const DEFAULT_PER_DAY = Number(process.env.UNIVERSE_DYNAMIC_PER_DAY) || 20;
@@ -63,7 +65,10 @@ function parseHash(raw) {
   parsed.corrupt = corrupt;
   return parsed;
 }
-function isSecondaryName(name) { return SECONDARY_RE.test(String(name || "")); }
+// v104.1(総点検): 固定名簿の照合(clubUniverse.looksSecondaryTeamName)と同じ判定も使う。
+//   SECONDARY_RE だけでは "(W)" や独語・伊語・蘭語の女子チーム表記("Frauen" "Femminile" "Vrouwen")を
+//   拾えず、女子チームが候補に入り得た(このアプリは男子サッカー専用)。
+function isSecondaryName(name) { const n = String(name || ""); return SECONDARY_RE.test(n) || looksSecondaryTeamName(n); }
 
 const SEEN_CACHE_MS = Number(process.env.UNIVERSE_DYNAMIC_SEEN_CACHE_MS) || 60 * 60 * 1000;
 
@@ -182,9 +187,48 @@ function createDynamicUniverse(deps) {
       if (daysBetween(last, today) > ADOPTED_IDLE_DAYS) retire.push(id);
     }
     if (retire.length) { try { await upstashCmd(["HDEL", ADOPTED_KEY, ...retire]); } catch (e) { noteWarning(out, "dyn_retire_failed", e); } for (const id of retire) adopted.map.delete(id); }
-    // ③ 候補の優先順位
+    // ---- v104.1(総点検): 採用したあとで「固定名簿のクラブ自身」と分かったチームは、動的クラブから外す ----
+    //   固定名簿のクラブのチームIDがまだ保存されていない時期(初回・照合し直しの途中)に、同じチームが
+    //   提供元の表記で試合一覧に現れると、動的クラブとして採用され得る。チームIDが分かった後もそのままだと、
+    //   同じチームを2つの名前で収集し続ける(選手が索引に二重に載る)。
+    const staticNow = [];
+    for (const [id, v] of adopted.map) if (v && isStaticTeam(Number(id), v.nameEn)) staticNow.push(id);
+    if (staticNow.length) {
+      try { await upstashCmd(["HDEL", ADOPTED_KEY, ...staticNow]); for (const id of staticNow) adopted.map.delete(id); }
+      catch (e) { noteWarning(out, "dyn_static_retire_failed", e); }
+    }
+    // ---- v104.1(総点検): 同じ名前(調査ファイルの slug)を、複数のチームIDに使わせない ----
+    //   調査ファイル(kb:club:<slug>)と選手索引はクラブ名で1冊にまとめている。チーム名は世界で一意では
+    //   ない(例: 国の違う2つの「Nacional」、"Al-Ahli" と "Al Ahli")ため、同じ slug の2チームを両方
+    //   採用すると、片方の試合カードにもう片方の選手・怪我・監督が出てしまう。
+    //   ②-b すでに両方採用されている組(この修正より前の採用)は、採用日の古い側だけを残す。
+    //        残した側の調査ファイルが別チームのものだった場合は、収集側(universeCollector)が作り直す。
+    const ownerOfSlug = new Map(); // slug -> teamId(文字列)
+    const duplicateRetired = [];
+    const adoptedOrdered = [...adopted.map.entries()]
+      .filter(([, v]) => v && v.nameEn)
+      .sort((a, b) => String(a[1].adoptedAt || "").localeCompare(String(b[1].adoptedAt || "")) || (Number(a[0]) - Number(b[0])));
+    for (const [id, v] of adoptedOrdered) {
+      const slug = slugOf(v.nameEn);
+      if (!slug) continue;
+      if (ownerOfSlug.has(slug)) duplicateRetired.push({ teamId: Number(id), nameEn: v.nameEn, keptTeamId: Number(ownerOfSlug.get(slug)) });
+      else ownerOfSlug.set(slug, id);
+    }
+    if (duplicateRetired.length) {
+      try {
+        await upstashCmd(["HDEL", ADOPTED_KEY, ...duplicateRetired.map((d) => String(d.teamId))]);
+        for (const d of duplicateRetired) adopted.map.delete(String(d.teamId));
+      } catch (e) { noteWarning(out, "dyn_duplicate_retire_failed", e); }
+    }
+    // ③ 候補の優先順位(採用済みの別チームと同じ名前の候補は、採用できないので候補から外して数える)
+    const nameCollisionSkipped = [];
     const candidates = [...seen.map.entries()]
       .filter(([id]) => !adopted.map.has(id))
+      .filter(([id, v]) => {
+        const slug = slugOf(v && v.nameEn);
+        if (slug && ownerOfSlug.has(slug) && ownerOfSlug.get(slug) !== id) { nameCollisionSkipped.push({ teamId: Number(id), nameEn: v.nameEn, ownerTeamId: Number(ownerOfSlug.get(slug)) }); return false; }
+        return true;
+      })
       .map(([id, v]) => ({ id, ...v }))
       .sort((a, b) =>
         (b.missing || 0) - (a.missing || 0)
@@ -199,7 +243,16 @@ function createDynamicUniverse(deps) {
     let adoptedTodayBefore = 0;
     for (const v of adopted.map.values()) if (v && v.adoptedAt === today) adoptedTodayBefore++;
     const remainingToday = Math.max(0, perDay - adoptedTodayBefore);
-    const pick = candidates.slice(0, Math.min(remainingToday, room));
+    // 同じ回の候補どうしが同じ名前のときは、優先度の高い側だけを採用する(もう片方は明日以降も候補のまま数える)
+    const pick = [];
+    const pickLimit = Math.min(remainingToday, room);
+    for (const c of candidates) {
+      if (pick.length >= pickLimit) break;
+      const slug = slugOf(c.nameEn);
+      if (slug && ownerOfSlug.has(slug) && ownerOfSlug.get(slug) !== c.id) { nameCollisionSkipped.push({ teamId: Number(c.id), nameEn: c.nameEn, ownerTeamId: Number(ownerOfSlug.get(slug)) }); continue; }
+      if (slug) ownerOfSlug.set(slug, c.id);
+      pick.push(c);
+    }
     const adoptedNow = [];
     if (pick.length) {
       const args = ["HSET", ADOPTED_KEY];
@@ -230,6 +283,10 @@ function createDynamicUniverse(deps) {
     const result = {
       ...out, ok: true, adoptedNow, adoptedAll, candidates: candidates.length, prunedSeen: toDelete.length, retired: retire.length,
       adoptedTodayBefore, perDay, // v99: 同日の合計上限の根拠(呼ばれた時点で何件すでに採用済みだったか)
+      // v104.1(総点検): 同じ名前のため採用しなかった候補・採用から外した重複(件数と先頭10件)
+      nameCollisionSkipped: nameCollisionSkipped.length, nameCollisionSkippedSample: nameCollisionSkipped.slice(0, 10),
+      duplicateRetired: duplicateRetired.length, duplicateRetiredSample: duplicateRetired.slice(0, 10),
+      retiredAsStatic: staticNow.length,
     };
     if (adoptedTodayBefore >= perDay && candidates.length) {
       result.reasonJa = `本日はすでに${adoptedTodayBefore}件採用済みのため(1日${perDay}件まで)、今回の採用は見送りました(候補${candidates.length}件は明日以降)。`;

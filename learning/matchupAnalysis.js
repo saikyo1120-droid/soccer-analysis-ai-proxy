@@ -185,6 +185,56 @@ function buildJaMap(universe) {
  * @param {...object} sources - { [id]: "name" } の形のオブジェクト(後勝ち)
  * @returns {Array<{id:number,name:string}>}
  */
+/**
+ * v104.1(総点検): 追跡中クラブ(固定名簿+動的クラブ)の「名前 → 保存済みチームID」を作る。
+ * @param {Array<{teamId:number, nameEn:string, dynamic?:boolean, idVerified?:boolean}>} teamMapClubs - kb:universe:teammap の clubs
+ * @param {Array<{nameEn:string, searchAs?:string}>} [universe] - 固定名簿(提供元での表記 searchAs も同じIDへ)
+ * @returns {Map<string, number>} 正規化した名前 → チームID(固定名簿を優先。未確認の動的クラブは載せない)
+ */
+function buildTrackedIdMap(teamMapClubs, universe) {
+  const map = new Map();
+  const list = Array.isArray(teamMapClubs) ? teamMapClubs : [];
+  const searchAsByEn = new Map();
+  for (const c of (universe || CLUB_UNIVERSE)) if (c && c.nameEn && c.searchAs) searchAsByEn.set(c.nameEn, c.searchAs);
+  for (const pass of ["static", "dynamic"]) {
+    for (const e of list) {
+      if (!e || !e.nameEn || !Number.isFinite(Number(e.teamId))) continue;
+      if ((pass === "static") === !!e.dynamic) continue;
+      if (e.dynamic && e.idVerified === false) continue;
+      const id = Number(e.teamId);
+      const keys = [normName(e.nameEn)];
+      if (!e.dynamic && searchAsByEn.has(e.nameEn)) keys.push(normName(searchAsByEn.get(e.nameEn)));
+      for (const k of keys) if (k && !map.has(k)) map.set(k, id);
+    }
+  }
+  return map;
+}
+
+/**
+ * v104.1(総点検): 追跡中クラブの「チームID → このアプリでの名前」を作る。
+ *   名前の索引(learn:teamnames)に入っているのは提供元の表記(例: "FC Porto" "Bayern München")。
+ *   このアプリの知識(調査ファイル kb:club:<slug>・蓄積した知識・選手索引)は、このアプリの表記
+ *   (固定名簿の nameEn。例: "Porto" "Bayern Munich")で保存されている。会話の対象や道具のクラブを
+ *   提供元の表記のまま渡すと、調査ファイルを引けず(順位・xG などの蓄積が回答AIに届かない)、
+ *   チームIDも毎回検索し直すことになる。IDが分かった時点で、このアプリの表記へ引き直せるようにする。
+ * @param {Array<{teamId:number, nameEn:string, nameJa?:string, dynamic?:boolean, idVerified?:boolean}>} teamMapClubs - kb:universe:teammap の clubs
+ * @returns {Map<number, {nameEn:string, nameJa:string|null}>} 固定名簿を優先。未確認の動的クラブは載せない
+ */
+function buildTrackedNameMap(teamMapClubs) {
+  const map = new Map();
+  const list = Array.isArray(teamMapClubs) ? teamMapClubs : [];
+  for (const pass of ["static", "dynamic"]) {
+    for (const e of list) {
+      if (!e || !e.nameEn || !Number.isFinite(Number(e.teamId))) continue;
+      if ((pass === "static") === !!e.dynamic) continue;
+      if (e.dynamic && e.idVerified === false) continue;
+      const id = Number(e.teamId);
+      if (!map.has(id)) map.set(id, { nameEn: String(e.nameEn), nameJa: e.nameJa && e.nameJa !== e.nameEn ? String(e.nameJa) : null });
+    }
+  }
+  return map;
+}
+
 function buildNameIndex(...sources) {
   const merged = new Map();
   for (const src of sources) {
@@ -220,6 +270,16 @@ function queryWantsVariant(q) {
  * @returns {{ok:true, id, name, nameJa}|{ok:false, reason, candidates?, queryRaw}}
  */
 function resolveClub(raw, ctx) {
+  const r = resolveClubByIndex(raw, ctx);
+  // v104.1(総点検): 解決できたチームが追跡中クラブなら、このアプリでの名前(調査ファイル・知識の保存名)を添える。
+  //   name(提供元の表記)と nameJa は従来のまま(対戦分析の表示を変えない)。
+  if (r && r.ok && ctx && ctx.trackedNameById instanceof Map) {
+    const tk = ctx.trackedNameById.get(Number(r.id));
+    if (tk) { r.trackedNameEn = tk.nameEn; r.trackedNameJa = tk.nameJa || null; }
+  }
+  return r;
+}
+function resolveClubByIndex(raw, ctx) {
   const q = String(raw || "").trim();
   if (!q) return { ok: false, reason: "empty", queryRaw: q };
   if (q.length > MAX_SIDE_LEN) return { ok: false, reason: "too_long", queryRaw: q };
@@ -231,6 +291,20 @@ function resolveClub(raw, ctx) {
   const uni = jaMap.get(jaKey(q));
   const target = uni ? uni.nameEn : q;
   const nameJa = uni ? uni.nameJa : null;
+
+  // ①' v104.1(総点検): AIが追跡しているクラブで、保存済みのチームIDが分かるものは、そのIDで決める。
+  //    名前の索引には毎日の学習で見かけた世界中のチームが入るため、同じ名前の別クラブ
+  //    (例: FC Porto とブラジルの州リーグの「Porto」)が加わると、名前の一致だけでは
+  //    「候補が複数」になって有名クラブを照合できなくなる(v67 の「Bayern Munich W」と同じ種類の事故)。
+  //    追跡中クラブのチームIDは、毎晩の収集が本人確認して保存している(ctx.trackedIdByNorm)。
+  //    索引にそのIDが無い(まだ名前を採集していない)ときは、従来の名前照合へ進む。
+  if (ctx && ctx.trackedIdByNorm instanceof Map) {
+    const tid = ctx.trackedIdByNorm.get(normName(target));
+    if (Number.isFinite(tid)) {
+      const hit = index.find((e) => e.id === tid);
+      if (hit) return { ok: true, id: hit.id, name: hit.name, nameJa };
+    }
+  }
 
   // ② 正規化した完全一致
   const tNorm = normName(target);
@@ -384,5 +458,5 @@ function buildMatchup(p) {
 module.exports = {
   SQUAD_VARIANT_RE, isSquadVariantName,
   MAX_SIDE_LEN, JA_ALIASES,
-  cleanSide, parseMatchupText, jaKey, buildJaMap, buildNameIndex, resolveClub, buildMatchup,
+  cleanSide, parseMatchupText, jaKey, buildJaMap, buildNameIndex, buildTrackedIdMap, buildTrackedNameMap, resolveClub, buildMatchup,
 };

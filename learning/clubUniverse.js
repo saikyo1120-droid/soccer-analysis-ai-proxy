@@ -47,7 +47,9 @@
 const CLUB_UNIVERSE = [
   { rank: 1, nameEn: "Real Madrid", nameJa: "レアル・マドリード", country: "スペイン", leagueId: 140 },
   { rank: 2, nameEn: "Manchester City", nameJa: "マンチェスター・シティ", country: "イングランド", leagueId: 39 },
-  { rank: 3, nameEn: "Bayern Munich", nameJa: "バイエルン・ミュンヘン", country: "ドイツ", leagueId: 78 },
+  // v104.1: 提供元(API-Football)の表記は "Bayern München"。"Bayern Munich" で検索すると男子トップチームが
+  //   返らず(女子・2軍だけが返る)、女子チームのIDが調査ファイルに保存されたままになっていた(本番実測 2026-11-14)。
+  { rank: 3, nameEn: "Bayern Munich", nameJa: "バイエルン・ミュンヘン", country: "ドイツ", leagueId: 78, searchAs: "Bayern Munchen" },
   { rank: 4, nameEn: "Paris Saint Germain", nameJa: "パリ・サンジェルマン", country: "フランス", leagueId: 61 },
   { rank: 5, nameEn: "Liverpool", nameJa: "リヴァプール", country: "イングランド", leagueId: 39 },
   { rank: 6, nameEn: "Inter", nameJa: "インテル", country: "イタリア", leagueId: 135 },
@@ -379,29 +381,266 @@ function searchVariantsOf(club) {
   return out.slice(0, 3); // 1クラブあたりの再試行を上限3回に制限(予算保護)
 }
 
+// v104.1: 発音記号を外してから比べる("München"→"munchen"、"Köln"→"koln")。
+//   従来は記号つきの文字を丸ごと捨てていたため "Bayern München" が "bayernmnchen" になり、
+//   別名(searchAs)との完全一致が成立しなかった。
+function foldDiacritics(s) {
+  return String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/ß/g, "ss").replace(/[øØ]/g, "o").replace(/[đĐ]/g, "d").replace(/[łŁ]/g, "l").replace(/[æÆ]/g, "ae").replace(/[œŒ]/g, "oe");
+}
 function normalizeTeamName(s) {
-  return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return foldDiacritics(s).toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 // B チーム・女子・ユース(例: "Porto B" "Basel W" "Gent U21")を表す語。
 // 検索語を短くするほどこれらが結果に混ざるため、本チームを選ぶために除外する。
 const SECONDARY_SQUAD_RE = /(^|[\s.-])(b|ii|iii|u1[5-9]|u2[0-3]|w|women|fem|femenino|feminin|reserves?|academy|youth|jr|junior|sub\d+)([\s.-]|$)/i;
+// v104.1: 女子チームを示す表記("〜 W" "〜 (W)" "Frauen" "Femminile" など)。SECONDARY_SQUAD_RE は "(W)" と
+//   独語・伊語・蘭語の語を拾えないため、チーム名の判定には両方を使う(looksSecondaryTeamName)。
+const WOMENS_TEAM_NAME_RE = /(\s|\()W\)?$|\bwomen'?s?\b|\bfrauen\b|f[ée]min|femmin|femen|\bladies\b|\bdames\b|vrouwen|kvinne|kvinde|kobiet|naisten|女子|レディース/i;
+function looksSecondaryTeamName(name) {
+  const n = String(name || "").trim();
+  if (!n) return false;
+  return SECONDARY_SQUAD_RE.test(n) || WOMENS_TEAM_NAME_RE.test(n);
+}
+// v104.1(総点検): 「本日の実際の試合」から女子・年代別の試合を外すための判定(チーム名)。
+//   2軍("II" "B")は男子の下部リーグに普通に参加しているので、ここでは見ない(片方が2軍の試合は残す)。
+function looksWomensTeamName(name) {
+  const n = String(name || "").trim();
+  return !!n && WOMENS_TEAM_NAME_RE.test(n);
+}
+const YOUTH_TEAM_NAME_RE = /(^|[\s.-])u-?(1[4-9]|2[0-3])([\s.-]|$)|\bunder[\s-]?(1[4-9]|2[0-3])\b|\bsub[\s-]?(1[4-9]|2[0-3])\b|\byouth\b|\bjuvenil(es)?\b|\bprimavera\b/i;
+function looksYouthTeamName(name) {
+  const n = String(name || "").trim();
+  return !!n && YOUTH_TEAM_NAME_RE.test(n);
+}
 
 // 検索結果から「本当にそのクラブ」を選ぶ。
 //   ①B/女子/ユースと分かるものを除外 → ②正規化した完全一致 → ③先頭(従来の挙動)
 // 監査での指摘: 前方一致による選択は "Porto" が "Porto B" を、"Basel" が "Basel W" を
 // 掴む危険があり(しかもteamIdは調査ファイルに恒久保存されるため再解決されない)、
 // 従来より悪化する。前方一致は採用せず、除外+完全一致だけを足す。
-function pickBestTeamMatch(rows, club) {
-  const all = (rows || []).filter((r) => r && r.team && r.team.id && r.team.name);
+// ---- v104.1(2026年11月14日・本番実測で判明した取り違えの根治) ----
+//   従来は「除外した結果が0件なら、除外前の全候補に戻して先頭を採用」していた。
+//   検索結果が女子・2軍・ユース**だけ**のとき(例: "Bayern Munich" の検索。男子は "Bayern München" 表記のため
+//   返らない)、女子チームを「そのクラブ」として採用し、そのIDが調査ファイルに恒久保存されていた。
+//   本チームを探しているのに本チームの候補が1件も無いときは、採用せず null を返す
+//   (呼び出し側は次の検索語を試し、全滅なら「照合できないクラブ」として正直に開示する)。
+//   opts.rejectTeamIds: 過去に「取り違え」と判定したチームID(二度と採用しない)。
+// ---- v104.1(総点検): 「先頭の検索結果をそのまま採用する」をやめ、名前の証拠があるチームだけを採用する ----
+//   旧コードは、名前が完全一致するチームが検索結果に無いと、**先頭の結果**を無条件に採用していた。
+//   検索は部分一致なので、「Como」で検索して「Comoros」(コモロ代表)しか返らなければ代表チームを、
+//   「Koln」で「Fortuna Köln」が先頭なら別クラブを、そのクラブのIDとして恒久保存していた。
+//   また、完全一致が複数あるとき(ポルトガルの FC Porto と、ブラジルの州リーグの「Porto」など)は
+//   国を見ずに先に並んだ側を採っていた。採用の基準を次のとおりにする:
+//     名前の証拠  3=正規化した名前が一致(提供元での表記 searchAs を優先) / 2=特徴語の集合が一致
+//                 1=どちらかの特徴語がもう一方に完全に含まれる(短縮形)   / 0=証拠なし(採用しない)
+//     国          固定名簿の国(日本語)と提供元の国名が 一致=2 / 不明=1 / 不一致=0
+//   並べ方: 国の一致 → 名前の証拠 → 検索結果の順。国が不一致のチームは、名前の証拠が2以上のときだけ候補に残す
+//   (国名の対応表の漏れで正しいチームを落とさないため)。証拠1で「相手の名前のほうが長い」候補
+//   (例: 「Brest」に対する「Dinamo Brest」)は、同じ条件の候補が1つだけのときに限り採用する。
+const COUNTRY_API_NAMES = {
+  "スペイン": ["spain"], "イングランド": ["england", "wales"], "ドイツ": ["germany"], "フランス": ["france", "monaco"], "イタリア": ["italy"],
+  "ポルトガル": ["portugal"], "オランダ": ["netherlands"], "ベルギー": ["belgium"], "ウクライナ": ["ukraine"], "スコットランド": ["scotland"],
+  "オーストリア": ["austria"], "ギリシャ": ["greece"], "トルコ": ["turkey", "turkiye"], "チェコ": ["czechrepublic", "czechia"], "クロアチア": ["croatia"],
+  "スイス": ["switzerland", "liechtenstein"], "デンマーク": ["denmark"], "セルビア": ["serbia"], "ハンガリー": ["hungary"], "ノルウェー": ["norway"],
+  "スロバキア": ["slovakia"], "ポーランド": ["poland"], "アゼルバイジャン": ["azerbaijan", "azerbaidjan"], "スウェーデン": ["sweden"], "ブルガリア": ["bulgaria"],
+  "キプロス": ["cyprus"], "モルドバ": ["moldova"], "イスラエル": ["israel"], "日本": ["japan"],
+};
+/** 国の一致: 2=一致 / 1=分からない(どちらかの国が不明・対応表に無い) / 0=不一致 */
+function countryScoreOf(club, apiCountry) {
+  const got = normalizeTeamName(apiCountry);
+  const raw = club && club.country ? String(club.country) : "";
+  if (!got || !raw) return 1;
+  const want = COUNTRY_API_NAMES[raw] || (/^[\x20-\x7E]+$/.test(raw) ? [normalizeTeamName(raw)] : null);
+  if (!want || !want.length) return 1;
+  return want.includes(got) ? 2 : 0;
+}
+/** 名前の証拠: { cls: 0..3, viaSearchAs: boolean, longer: boolean(相手の名前のほうが特徴語が多い) } */
+function nameEvidenceOf(club, apiName) {
+  const names = [club && club.searchAs, club && club.nameEn].filter(Boolean);
+  const an = normalizeTeamName(apiName);
+  for (let i = 0; i < names.length; i++) {
+    if (an && normalizeTeamName(names[i]) === an) return { cls: 3, viaSearchAs: !!(club && club.searchAs) && i === 0, longer: false };
+  }
+  const at = distinctiveTokens(apiName);
+  if (!at.length) return { cls: 0, viaSearchAs: false, longer: false };
+  let best = { cls: 0, viaSearchAs: false, longer: false };
+  for (const n of names) {
+    const mt = distinctiveTokens(n);
+    if (!mt.length) continue;
+    const apiInMine = at.every((w) => mt.includes(w));
+    const mineInApi = mt.every((w) => at.includes(w));
+    if (apiInMine && mineInApi) return { cls: 2, viaSearchAs: false, longer: false };
+    if (apiInMine && best.cls < 1) best = { cls: 1, viaSearchAs: false, longer: false };       // 相手は自分の短縮形(例: Kashima ⊂ Kashima Antlers)
+    else if (mineInApi && best.cls < 1) best = { cls: 1, viaSearchAs: false, longer: true };   // 相手のほうが長い(例: Dinamo Brest ⊃ Brest)
+  }
+  return best;
+}
+function pickBestTeamMatch(rows, club, opts) {
+  const o = opts || {};
+  const rejected = new Set((o.rejectTeamIds || []).map(Number).filter(Number.isFinite));
+  const all = (rows || []).filter((r) => r && r.team && r.team.id && r.team.name && !rejected.has(Number(r.team.id)));
   if (!all.length) return null;
   const names = [club && club.nameEn, club && club.searchAs].filter(Boolean);
-  const clubItselfLooksSecondary = names.some((n) => SECONDARY_SQUAD_RE.test(n));
-  const primaryOnly = all.filter((r) => !SECONDARY_SQUAD_RE.test(r.team.name));
-  const cands = (!clubItselfLooksSecondary && primaryOnly.length) ? primaryOnly : all;
-  const targets = names.map(normalizeTeamName);
-  const exact = cands.find((r) => targets.includes(normalizeTeamName(r.team.name)));
-  return exact || cands[0];
+  const clubItselfLooksSecondary = names.some((n) => looksSecondaryTeamName(n));
+  const primaryOnly = all.filter((r) => !looksSecondaryTeamName(r.team.name));
+  if (!clubItselfLooksSecondary && !primaryOnly.length) return null;
+  const cands = clubItselfLooksSecondary ? all : primaryOnly;
+  const minCls = Number.isFinite(o.minNameClass) ? o.minNameClass : 1;
+  const scored = cands.map((r, i) => {
+    const ev = nameEvidenceOf(club, r.team.name);
+    return { r, i, cls: ev.cls, viaSearchAs: ev.viaSearchAs, longer: ev.longer, country: countryScoreOf(club, r.team.country) };
+  }).filter((x) => x.cls >= minCls && !(x.country === 0 && x.cls < 2) && !(o.requireCountryOk && x.country === 0));
+  if (!scored.length) return null;
+  // 別名(searchAs=提供元での表記が分かっているクラブ)との完全一致を、アプリ側の表記との完全一致より優先する。
+  //   同じ検索結果に「アプリ側の表記と同名の別チーム」と「提供元表記の本チーム」が並ぶことがあるため。
+  scored.sort((a, b) => (b.country - a.country) || (b.cls - a.cls) || (Number(b.viaSearchAs) - Number(a.viaSearchAs)) || (Number(a.longer) - Number(b.longer)) || (a.i - b.i));
+  const top = scored[0];
+  if (top.cls === 1 && top.longer) {
+    // 相手の名前のほうが長い短縮形の一致は、同じ条件の候補が複数あると特定できない(Fortuna Köln / Viktoria Köln)
+    const same = scored.filter((x) => x.country === top.country && x.cls === 1 && x.longer);
+    if (same.length > 1) return null;
+  }
+  return top.r;
+}
+
+// ---- v104.1: 保存済みチームIDの「本人確認」(追加のAPI呼び出し 0 回) ----
+//   チームIDは一度照合すると調査ファイルに保存され、以後は再照合されない。昔の照合ロジックが
+//   取り違えたIDは、照合ロジックを直しても**残り続ける**(実際にバイエルンが女子チームのIDのまま
+//   3か月間収集されていた)。毎日のコア更新が必ず取得している直近試合(/fixtures?team=&last=10)の
+//   応答には「そのIDのチームの提供元での登録名」と「出場している大会名」が入っているので、
+//   それだけで取り違えを検出できる。
+//     wrong   … 強い証拠(登録名が女子/2軍/ユース、または直近試合の過半が女子大会)。必ず照合し直す。
+//     suspect … 弱い証拠(所属リーグが分かっているのに、直近試合に1つもそのリーグが無い)。
+//               順位表で「同じ名前の別チーム」が見つかったときだけ直す(降格・昇格では直さない)。
+const GENERIC_TOKEN_RE = /^(fc|cf|sc|ac|as|ss|sv|rb|bk|fk|sk|if|ik|cd|ud|sd|rc|rcd|ca|club|de|del|la|le|los|las|el|the|of|vfb|vfl|tsg|fsv|tsv|1|04|05|07|09|29|96|98|1899|1860)$/;
+const EXONYMS = {
+  munich: "munchen", cologne: "koln", milan: "milano", turin: "torino", rome: "roma", naples: "napoli", genoa: "genova",
+  florence: "firenze", seville: "sevilla", lisbon: "lisboa", vienna: "wien", prague: "praha", moscow: "moskva",
+  belgrade: "beograd", copenhagen: "kobenhavn", marseilles: "marseille", antwerp: "antwerpen", bruges: "brugge", athens: "athina",
+};
+function distinctiveTokens(name) {
+  const out = [];
+  for (const w of foldDiacritics(name).toLowerCase().split(/[^a-z0-9]+/)) {
+    // 数字だけの語(創設年など: "FC Basel 1893" "Heidenheim 1846")はクラブを区別する語として数えない
+    if (!w || w.length < 3 || /^\d+$/.test(w) || GENERIC_CLUB_WORDS.has(w) || GENERIC_TOKEN_RE.test(w)) continue;
+    const t = EXONYMS[w] || w;
+    if (!out.includes(t)) out.push(t);
+  }
+  return out;
+}
+function womensCompetitionName(name) {
+  const n = String(name || "").trim();
+  if (!n) return false;
+  // アクセント記号つきの表記("Féminine" "Femenil")も同じ判定に通す
+  const folded = foldDiacritics(n);
+  return WOMENS_TEAM_NAME_RE.test(n) || WOMENS_TEAM_NAME_RE.test(folded)
+    // 名前に「女子」を示す語が入らない女子リーグ(提供元の表記): イングランド FA WSL・米 NWSL・スウェーデン・ノルウェー・
+    // 日本(WE League・なでしこ)・豪 W-League・デンマーク・仏 D1 Arkema
+    || /\bwsl\b|\bnwsl\b|damallsvenskan|elitettan|toppserien|kvindeliga|\bwe league\b|nadeshiko|\bw[- ]league\b|\bd1 arkema\b/i.test(folded)
+    || /^liga f$/i.test(folded);
+}
+function assessTeamIdentity(club, teamId, fixtures) {
+  const tid = Number(teamId);
+  let apiName = null, withLeague = 0, womens = 0, inStaticLeague = 0, withLeagueId = 0;
+  const womensLeagues = [];
+  for (const f of Array.isArray(fixtures) ? fixtures : []) {
+    const t = f && f.teams;
+    const mine = t && t.home && Number(t.home.id) === tid ? t.home : (t && t.away && Number(t.away.id) === tid ? t.away : null);
+    if (mine && mine.name && !apiName) apiName = String(mine.name);
+    const lg = f && f.league;
+    if (lg && lg.name) {
+      withLeague++;
+      if (womensCompetitionName(lg.name)) { womens++; if (!womensLeagues.includes(lg.name)) womensLeagues.push(String(lg.name)); }
+    }
+    if (lg && Number.isFinite(Number(lg.id)) && lg.id !== null) {
+      withLeagueId++;
+      if (club && club.leagueId && Number(lg.id) === Number(club.leagueId)) inStaticLeague++;
+    }
+  }
+  const out = { apiName, checkedFixtures: withLeague, womensFixtures: womens, wrong: false, suspect: false, kind: null, evidenceJa: null };
+  const names = [club && club.nameEn, club && club.searchAs].filter(Boolean);
+  if (names.some((n) => looksSecondaryTeamName(n))) return out; // クラブ自身が女子/2軍として登録されている場合は対象外
+  if (apiName && looksSecondaryTeamName(apiName)) {
+    out.wrong = true; out.kind = "secondary_name";
+    out.evidenceJa = `提供元での登録名が「${apiName}」(女子・2軍・ユースを示す表記)でした`;
+    return out;
+  }
+  if (withLeague >= 3 && womens / withLeague >= 0.6) {
+    out.wrong = true; out.kind = "womens_competitions";
+    out.evidenceJa = `直近${withLeague}試合のうち${womens}試合が女子大会(${womensLeagues.slice(0, 2).join("・")})でした`;
+    return out;
+  }
+  // 弱い証拠: 所属リーグが設定されているのに、直近試合(5試合以上)に1つもそのリーグが無い
+  if (club && club.leagueId && !club.dynamic && withLeagueId >= 5 && inStaticLeague === 0) {
+    out.suspect = true; out.kind = "league_absent";
+    out.evidenceJa = `直近${withLeagueId}試合に、設定上の所属リーグ(ID ${club.leagueId})の試合が1つもありません`;
+  }
+  // v104.1(総点検)弱い証拠: 提供元での登録名に、このクラブの名前と共通する特徴語が1つも無い
+  //   (例: 固定名簿の「Como」に「Comoros」のIDが保存されている)。旧い照合ロジック(先頭の検索結果を採用)の
+  //   取り違えを検出する。名前だけでは決めつけず(綴りの違う正しいチームを消さないため)、順位表に同名の
+  //   チームが見つかったときだけ直し、見つからなければ「疑いあり」として日次レポートに開示する。
+  if (club && !club.dynamic && apiName && nameEvidenceOf(club, apiName).cls === 0) {
+    const at = distinctiveTokens(apiName);
+    const mine = names.map(distinctiveTokens).filter((a) => a.length);
+    // 「共通する特徴語が1つも無い」ときだけ(「Bayern Hof」と「Bayern Munich」のように一部が重なる名前は、名前だけでは疑わない)
+    if (at.length && mine.length && !mine.some((set) => set.some((w) => at.includes(w)))) {
+      out.nameMismatch = true;
+      const ev = `提供元での登録名が「${apiName}」で、このクラブの名前(${names.join(" / ")})と共通する語がありません`;
+      if (!out.suspect) { out.suspect = true; out.kind = "name_mismatch"; out.evidenceJa = ev; }
+      else { out.kind = "league_absent+name_mismatch"; out.evidenceJa = `${out.evidenceJa}。${ev}`; }
+    }
+  }
+  return out;
+}
+
+/** /standings の応答から {id, name} の一覧を取り出す(グループ分けされた大会にも対応) */
+function listStandingsTeams(standingsResponse) {
+  const out = [];
+  for (const row of Array.isArray(standingsResponse) ? standingsResponse : []) {
+    const groups = row && row.league && Array.isArray(row.league.standings) ? row.league.standings : [];
+    for (const g of groups) {
+      for (const e of Array.isArray(g) ? g : []) {
+        if (e && e.team && e.team.id && e.team.name && !out.some((x) => Number(x.id) === Number(e.team.id))) {
+          out.push({ id: Number(e.team.id), name: String(e.team.name) });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 順位表の中から「そのクラブ」を名前で探す。
+ *   strict=true  … 特徴語の集合が完全に一致する1チームだけを返す(弱い証拠のときに使う。取り違えの二次被害を防ぐ)
+ *   strict=false … 特徴語の一致数が単独1位のチームを返す(強い証拠=今のIDが明らかに誤りのときに使う)
+ * 女子・2軍の表記を持つチームと rejectTeamIds は候補から外す。
+ */
+function findClubInStandings(club, standingsResponse, opts) {
+  const o = opts || {};
+  const rejected = new Set((o.rejectTeamIds || []).map(Number).filter(Number.isFinite));
+  const teams = listStandingsTeams(standingsResponse).filter((t) => !rejected.has(Number(t.id)) && !looksSecondaryTeamName(t.name));
+  if (!teams.length) return null;
+  const nameSets = [club && club.nameEn, club && club.searchAs].filter(Boolean).map(distinctiveTokens).filter((a) => a.length);
+  if (!nameSets.length) return null;
+  const scored = teams.map((t) => {
+    const tk = distinctiveTokens(t.name);
+    let best = 0, equal = false;
+    for (const mine of nameSets) {
+      const hit = mine.filter((w) => tk.includes(w)).length;
+      if (hit > best) best = hit;
+      if (hit === mine.length && tk.length === mine.length) equal = true;
+    }
+    return { ...t, score: best, equal };
+  }).sort((a, b) => (Number(b.equal) - Number(a.equal)) || (b.score - a.score));
+  const equals = scored.filter((x) => x.equal);
+  if (equals.length === 1) return { id: equals[0].id, name: equals[0].name, match: "equal" };
+  if (o.strict || equals.length > 1) return null;
+  const top = scored[0];
+  if (!top || top.score < 1) return null;
+  if (scored[1] && scored[1].score === top.score) return null; // 同点が複数=特定できない
+  return { id: top.id, name: top.name, match: "best" };
 }
 
 function findClub(nameEn) {
@@ -423,4 +662,9 @@ module.exports = {
   findClub,
   dayNumberOf,
   searchVariantsOf, pickBestTeamMatch, normalizeTeamName, sanitizeSearchTerm,
+  // v104.1: 保存済みチームIDの本人確認と照合し直し
+  foldDiacritics, looksSecondaryTeamName, assessTeamIdentity, listStandingsTeams, findClubInStandings, distinctiveTokens,
+  // v104.1(総点検): 試合一覧の女子・年代別の除外
+  looksWomensTeamName, looksYouthTeamName, womensCompetitionName,
+  nameEvidenceOf, countryScoreOf, COUNTRY_API_NAMES,
 };

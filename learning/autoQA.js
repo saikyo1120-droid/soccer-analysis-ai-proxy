@@ -35,6 +35,13 @@
  *   qa:answers:<日付> … 定点質問の答え(翌日の比較材料)
  */
 
+// v104.1: 「一覧」の事実と、その対になる「件数」の事実。一覧だけが消えて件数が言えている日は、
+//   該当者が0になっただけ(負傷者が治った・移籍が30日の窓から外れた)なので後退に数えない。
+const LIST_FACT_COMPANION = {
+  "負傷・出場停止の選手": "負傷・出場停止の人数",
+  "直近の移籍": "直近30日の移籍件数",
+};
+
 /** 定点質問。毎日まったく同じ質問を投げる(最初の8問はご指示で挙げられたもの。v71④で49問、同日v72で89問へ拡張)。 */
 const FIXED_QUESTIONS = [
   { id: "player_kubo", kind: "player", questionJa: "久保建英はどんな選手ですか？", targetJa: "久保建英", match: ["kubo", "久保"] },
@@ -68,8 +75,8 @@ const FIXED_QUESTIONS = [
   { id: "player_salah", kind: "player", questionJa: "サラーはどんな選手ですか？", targetJa: "モハメド・サラー", match: ["m. salah", "salah"] },
   { id: "player_yamal", kind: "player", questionJa: "ヤマルはどんな選手ですか？", targetJa: "ラミン・ヤマル", match: ["yamal"] },
   { id: "player_vinicius", kind: "player", questionJa: "ヴィニシウスはどんな選手ですか？", targetJa: "ヴィニシウス・ジュニオール", match: ["vinicius junior", "vinicius"] },
-  { id: "player_kane", kind: "player", questionJa: "ハリー・ケインはどんな選手ですか？", targetJa: "ハリー・ケイン", match: ["h. kane"] },
-  { id: "player_saka", kind: "player", questionJa: "サカはどんな選手ですか？", targetJa: "ブカヨ・サカ", match: ["b. saka"] },
+  { id: "player_kane", kind: "player", questionJa: "ハリー・ケインはどんな選手ですか？", targetJa: "ハリー・ケイン", match: ["h. kane", "harry kane"] },
+  { id: "player_saka", kind: "player", questionJa: "サカはどんな選手ですか？", targetJa: "ブカヨ・サカ", match: ["b. saka", "bukayo saka"] },
   { id: "player_musiala", kind: "player", questionJa: "ムシアラはどんな選手ですか？", targetJa: "ジャマル・ムシアラ", match: ["musiala"] },
   { id: "player_wirtz", kind: "player", questionJa: "ヴィルツはどんな選手ですか？", targetJa: "フロリアン・ヴィルツ", match: ["f. wirtz", "wirtz"] },
   { id: "player_pedri", kind: "player", questionJa: "ペドリはどんな選手ですか？", targetJa: "ペドリ", match: ["pedri"] },
@@ -130,21 +137,21 @@ const FIXED_QUESTIONS = [
   { id: "player_lewandowski", kind: "player", questionJa: "レヴァンドフスキはどんな選手ですか？", targetJa: "ロベルト・レヴァンドフスキ", match: ["lewandowski"] },
   { id: "player_rodrygo", kind: "player", questionJa: "ロドリゴはどんな選手ですか？", targetJa: "ロドリゴ", match: ["rodrygo"] },
   { id: "player_raphinha", kind: "player", questionJa: "ラフィーニャはどんな選手ですか？", targetJa: "ラフィーニャ", match: ["raphinha"] },
-  { id: "player_olmo", kind: "player", questionJa: "ダニ・オルモはどんな選手ですか？", targetJa: "ダニ・オルモ", match: ["d. olmo"] },
+  { id: "player_olmo", kind: "player", questionJa: "ダニ・オルモはどんな選手ですか？", targetJa: "ダニ・オルモ", match: ["d. olmo", "dani olmo", "daniel olmo"] },
   { id: "player_gyokeres", kind: "player", questionJa: "ヨケレスはどんな選手ですか？", targetJa: "ヴィクトル・ヨケレス", match: ["gyokeres", "gyökeres"] },
-  { id: "player_isak", kind: "player", questionJa: "イサクはどんな選手ですか？", targetJa: "アレクサンデル・イサク", match: ["a. isak"] },
-  { id: "player_rice", kind: "player", questionJa: "デクラン・ライスはどんな選手ですか？", targetJa: "デクラン・ライス", match: ["d. rice"] },
-  { id: "player_palmer", kind: "player", questionJa: "コール・パーマーはどんな選手ですか？", targetJa: "コール・パーマー", match: ["c. palmer"] },
-  { id: "player_bfernandes", kind: "player", questionJa: "ブルーノ・フェルナンデスはどんな選手ですか？", targetJa: "ブルーノ・フェルナンデス", match: ["b. fernandes"] },
-  { id: "player_odembele", kind: "player", questionJa: "デンベレはどんな選手ですか？", targetJa: "ウスマン・デンベレ", match: ["o. demb"] },
+  { id: "player_isak", kind: "player", questionJa: "イサクはどんな選手ですか？", targetJa: "アレクサンデル・イサク", match: ["a. isak", "alexander isak"] },
+  { id: "player_rice", kind: "player", questionJa: "デクラン・ライスはどんな選手ですか？", targetJa: "デクラン・ライス", match: ["d. rice", "declan rice"] },
+  { id: "player_palmer", kind: "player", questionJa: "コール・パーマーはどんな選手ですか？", targetJa: "コール・パーマー", match: ["c. palmer", "cole palmer"] },
+  { id: "player_bfernandes", kind: "player", questionJa: "ブルーノ・フェルナンデスはどんな選手ですか？", targetJa: "ブルーノ・フェルナンデス", match: ["b. fernandes", "bruno fernandes"] },
+  { id: "player_odembele", kind: "player", questionJa: "デンベレはどんな選手ですか？", targetJa: "ウスマン・デンベレ", match: ["o. demb", "ousmane demb"] },
   { id: "player_hakimi", kind: "player", questionJa: "ハキミはどんな選手ですか？", targetJa: "アシュラフ・ハキミ", match: ["hakimi"] },
   { id: "player_donnarumma", kind: "player", questionJa: "ドンナルンマはどんな選手ですか？", targetJa: "ジャンルイジ・ドンナルンマ", match: ["donnarumma"] },
   { id: "player_courtois", kind: "player", questionJa: "クルトワはどんな選手ですか？", targetJa: "ティボ・クルトワ", match: ["courtois"] },
   { id: "player_alisson", kind: "player", questionJa: "アリソンはどんな選手ですか？", targetJa: "アリソン・ベッカー", match: ["alisson"] },
   { id: "player_vandijk", kind: "player", questionJa: "ファン・ダイクはどんな選手ですか？", targetJa: "フィルジル・ファン・ダイク", match: ["van dijk"] },
   { id: "player_modric", kind: "player", questionJa: "モドリッチはどんな選手ですか？", targetJa: "ルカ・モドリッチ", match: ["modric", "modrić"] },
-  { id: "player_endo", kind: "player", questionJa: "遠藤航はどんな選手ですか？", targetJa: "遠藤航", match: ["w. endo", "遠藤"] },
-  { id: "player_jito", kind: "player", questionJa: "伊東純也はどんな選手ですか？", targetJa: "伊東純也", match: ["j. ito", "伊東"] },
+  { id: "player_endo", kind: "player", questionJa: "遠藤航はどんな選手ですか？", targetJa: "遠藤航", match: ["w. endo", "wataru endo", "遠藤"] },
+  { id: "player_jito", kind: "player", questionJa: "伊東純也はどんな選手ですか？", targetJa: "伊東純也", match: ["j. ito", "junya ito", "伊東"] },
   { id: "player_itakura", kind: "player", questionJa: "板倉滉はどんな選手ですか？", targetJa: "板倉滉", match: ["itakura", "板倉"] },
   { id: "player_sugawara", kind: "player", questionJa: "菅原由勢はどんな選手ですか？", targetJa: "菅原由勢", match: ["sugawara", "菅原"] },
 ];
@@ -324,6 +331,37 @@ function createAutoQA(deps) {
     return c && c.statement ? { statementJa: c.statement, computedAt: c.computedAt || null } : null;
   }
 
+  // ---- v104.1(2026年11月14日・本番実測): 選手の照合が「提供元の名前の書き方」に依存していた ----
+  //   索引の名前は提供元の表記そのままで、同じ選手でも書き方が変わる
+  //   (実測: "Bruno Fernandes"・"Dani Olmo"・"R. Dōan")。定点質問は "b. fernandes"・"d. olmo"・"doan" の
+  //   文字列がそのまま含まれるかだけを見ていたため、**索引に居る選手を「索引に居ない」と答えていた**。
+  //   ①フルネームの書き方も照合語に加える ②発音記号・句読点を畳んだ表記でも照合する(語の先頭一致。
+  //   "josh kane" が "h kane" に当たるような語の途中からの一致は認めない)。
+  function foldName(v) {
+    if (playerSearch && typeof playerSearch.normalizeForSearch === "function") return playerSearch.normalizeForSearch(v);
+    return String(v || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+  }
+  function playerNameMatches(rawName, patterns) {
+    const raw = String(rawName || "").toLowerCase();
+    if (!raw) return false;
+    const folded = foldName(rawName);
+    for (const m of patterns || []) {
+      const pm = String(m || "").toLowerCase();
+      if (!pm) continue;
+      if (raw.includes(pm)) return true;              // 従来どおりの照合(劣化させない)
+      const fm = foldName(m);
+      if (!fm || !folded) continue;
+      let from = 0;
+      for (;;) {
+        const i = folded.indexOf(fm, from);
+        if (i === -1) break;
+        if (i === 0 || folded[i - 1] === " ") return true; // 語の先頭から一致したときだけ
+        from = i + 1;
+      }
+    }
+    return false;
+  }
+
   async function buildAnswers() {
     const C = (playerSearch && playerSearch.COL) || {};
     const { rows, available: idxAvailable } = await loadIndexRows();
@@ -333,10 +371,7 @@ function createAutoQA(deps) {
     for (const q of FIXED_QUESTIONS) {
       try {
         if (q.kind === "player") {
-          const hit = rows.find((r) => {
-            const n = String(r[C.name] || "").toLowerCase();
-            return q.match.some((m) => n.includes(String(m).toLowerCase()));
-          });
+          const hit = rows.find((r) => playerNameMatches(r[C.name], q.match));
           if (!hit) {
             push(q, { canAnswer: false, facts: [], aiWordsJa: null,
               reasonJa: idxAvailable
@@ -496,7 +531,7 @@ function createAutoQA(deps) {
   function diffAnswers(todaySet, yesterdaySet) {
     const yMap = new Map(((yesterdaySet && yesterdaySet.answers) || []).map((a) => [a.id, a]));
     const items = [];
-    let newFactTotal = 0, changedFactTotal = 0, lostFactTotal = 0, newlyAnswerableCount = 0;
+    let newFactTotal = 0, changedFactTotal = 0, lostFactTotal = 0, newlyAnswerableCount = 0, stateChangedTotal = 0;
 
     for (const t of (todaySet.answers || [])) {
       const y = yMap.get(t.id) || null;
@@ -513,12 +548,24 @@ function createAutoQA(deps) {
       const yFacts = new Map(((y && y.facts) || []).map((f) => [f.k, f.v]));
       const tFacts = new Map((t.facts || []).map((f) => [f.k, f.v]));
 
-      const newFacts = [], changedFacts = [], lostFacts = [];
+      const newFacts = [], changedFacts = [], lostFacts = [], stateChangedFacts = [];
       for (const [k, v] of tFacts) {
         if (!yFacts.has(k)) newFacts.push({ k, v });
         else if (yFacts.get(k) !== v) changedFacts.push({ k, from: yFacts.get(k), to: v });
       }
-      for (const [k, v] of yFacts) if (!tFacts.has(k)) lostFacts.push({ k, v });
+      for (const [k, v] of yFacts) {
+        if (tFacts.has(k)) continue;
+        // ---- v104.1(2026年11月14日・本番で毎日 ANSWER_REGRESSION が出ていた原因) ----
+        //   「負傷・出場停止の選手」(名前の一覧)は、該当者が0人になった日には事実として作られない。
+        //   従来はこれを「昨日は言えたのに今日は言えなくなった」と数えていた(実測: 11/14 の8件は
+        //   すべてこれ=7クラブの負傷者一覧と1クラブの移籍一覧)。負傷者が治った・移籍が30日の窓から
+        //   外れたのは**世界の状態が変わっただけ**で、知識が減ったのではない。
+        //   対になる「件数」の事実が今日も言えている(=その欄は今日も確認できている)ときは、
+        //   後退ではなく状態の変化として別に記録する。欄ごと消えた(件数も言えない)ときは従来どおり後退。
+        const companion = LIST_FACT_COMPANION[k];
+        if (companion && tFacts.has(companion)) stateChangedFacts.push({ k, v, nowJa: `${companion}は${tFacts.get(companion)}` });
+        else lostFacts.push({ k, v });
+      }
 
       const newlyAnswerable = !!(t.canAnswer && y && !y.canAnswer);
       // v71④: 昨日この質問を聞いていない(質問集の拡張直後など)場合は、
@@ -531,6 +578,7 @@ function createAutoQA(deps) {
         changedFactTotal += changedFacts.length;
       }
       if (countLoss) lostFactTotal += lostFacts.length;
+      if (countLoss) stateChangedTotal += stateChangedFacts.length;
 
       // AI自身の言葉(クラブの見解)の変化
       const aiChanged = !!(t.aiWordsJa && y && y.aiWordsJa && t.aiWordsJa !== y.aiWordsJa);
@@ -550,6 +598,7 @@ function createAutoQA(deps) {
         newFacts: newFacts.slice(0, 10),
         changedFacts: changedFacts.slice(0, 10),
         lostFacts: lostFacts.slice(0, 6),
+        stateChangedFacts: stateChangedFacts.slice(0, 6), // v104.1: 一覧が空になっただけ(後退に数えない)
         sameCount: [...tFacts.keys()].filter((k) => yFacts.get(k) === tFacts.get(k)).length,
         aiWordsToday: t.aiWordsJa || null,
         aiWordsYesterday: y ? (y.aiWordsJa || null) : null,
@@ -571,6 +620,10 @@ function createAutoQA(deps) {
       hasYesterday,
       items,
       newFactTotal, changedFactTotal, lostFactTotal, newlyAnswerableCount,
+      stateChangedTotal, // v104.1: 一覧が空になっただけの件数(負傷者0人・直近の移籍0件。後退には数えない)
+      // v104.1: 何が言えなくなったかの内訳(異常の説明と、修復手段の選び分けに使う)
+      lostBreakdown: items.filter((it) => !it.volatile && it.churn === null && (it.lostFacts || []).length)
+        .slice(0, 12).map((it) => ({ id: it.id, subjectJa: it.subjectJa || it.questionJa, keys: it.lostFacts.map((f) => f.k) })),
       questionCount: (todaySet.answers || []).length, // v71④: 定点質問の現在数(8→49→89に拡張)
       grew: hasYesterday ? grew : null,
       countingNoteJa: "「今日の試合」と「注目選手・若手有望株の上位」は、性質上ふつうに入れ替わるため、増えた数にも減った数にも入れていません(何も学んでいない日でも「賢くなった」「後退した」と出てしまうため)。「怪我」「移籍」は新しく入ったぶんだけを数え、期間から外れたぶんは減少に数えていません。",
@@ -790,7 +843,7 @@ function createAutoQA(deps) {
    * ==================================================================== */
   function detectAnomalies(ctx) {
     const list = [];
-    const add = (code, labelJa, detailJa, repairKey) => list.push({ code, labelJa, detailJa, repairKey: repairKey || null, repaired: false, repairNoteJa: null });
+    const add = (code, labelJa, detailJa, repairKey, noRepairNoteJa) => list.push({ code, labelJa, detailJa, repairKey: repairKey || null, repaired: false, repairNoteJa: null, noRepairNoteJa: noRepairNoteJa || null });
 
     if (!ctx.learning.available || !ctx.learning.finished || !ctx.learning.isToday) {
       add("LEARNING_STOPPED", "学習が完走していない", ctx.learning.reasonJa, "runDailyLearning");
@@ -817,8 +870,18 @@ function createAutoQA(deps) {
       add("DATA_REGRESSION", "昨日より大きく減ったものがある", ctx.growth.dropReasonJa, "rebuildPlayerIndex");
     }
     if (ctx.answersDiff.hasYesterday && ctx.answersDiff.lostFactTotal > 0) {
+      // v104.1: 何が言えなくなったかを書き、直し方を中身で選ぶ。
+      //   選手の質問で減ったとき … 選手索引の作り直し(従来どおり)
+      //   クラブの質問だけで減ったとき … 索引を作り直しても戻らない(クラブの調査ファイルの欄が消えている)。
+      //     無関係な修復を走らせて「直しました」と書かないよう、自動修復は付けず次回の収集に任せる。
+      const breakdown = Array.isArray(ctx.answersDiff.lostBreakdown) ? ctx.answersDiff.lostBreakdown : [];
+      const playerLoss = breakdown.some((b) => String(b.id || "").startsWith("player_"));
+      const detail = breakdown.slice(0, 5).map((b) => `${b.subjectJa}(${b.keys.slice(0, 3).join("・")})`).join("、");
       add("ANSWER_REGRESSION", "昨日は言えたのに今日は言えなくなったことがある",
-        `${ctx.answersDiff.lostFactTotal}件が答えられなくなっています。`, "rebuildPlayerIndex");
+        `${ctx.answersDiff.lostFactTotal}件が答えられなくなっています。${detail ? `内訳: ${detail}${breakdown.length > 5 ? " ほか" : ""}。` : ""}`
+          + ((!playerLoss && breakdown.length) ? "クラブの調査ファイルから欄が消えたもので、次回の毎日の収集で取り直します。" : ""),
+        (playerLoss || !breakdown.length) ? "rebuildPlayerIndex" : null,
+        "選手索引の作り直しでは戻らない内容のため、自動修復は行っていません。次回の毎日の収集で取り直し、戻ったかどうかを翌日の検証で確かめます。");
     }
     if (ctx.growth.hasYesterday && ctx.growth.increasedCount === 0) {
       add("NO_GROWTH", "昨日から1つも増えていない", ctx.growth.reasonJa, "collectPlayers");
@@ -840,7 +903,7 @@ function createAutoQA(deps) {
     const r = repair || {};
     for (const a of anomalies) {
       const note = (txt) => { a.repairNoteJa = txt; if (noteByCode) noteByCode.set(a.code, txt); };
-      if (!a.repairKey) { note("この異常は自動では直せません(人による修正が必要です)。"); continue; }
+      if (!a.repairKey) { note(a.noRepairNoteJa || "この異常は自動では直せません(人による修正が必要です)。"); continue; }
       // 監査で判明: この Set は selfRepair の中で作られていたため
       // 「1回のQAで各1回まで」になっておらず、2巡すれば同じ修復が2回走っていた
       // (API-Footballの二重消費・索引の二重再構築)。呼び出し側から渡す。

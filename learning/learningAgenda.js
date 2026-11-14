@@ -44,28 +44,48 @@ function buildLearningAgenda(resolvedRecords, topFailureReasons, opts) {
 
   // ---- ① 苦手クラブ(実測: そのクラブが絡む試合の的中率が全体より15pt以上低い) ----
   if (overall !== null && records.length >= MIN_SAMPLE_FOR_WEAKNESS) {
+    // v104.1(総点検): チームIDがある記録(v98以降)は、名前ではなくチームIDで数える。
+    //   名前だけで数えると、同じ名前の別クラブ(例: FC Porto と、ブラジルの州リーグの「Porto」)が1つに合算され、
+    //   しかも日本語名は固定名簿から引くため「FCポルトが絡む試合の的中率が…」と別クラブの成績を表示し得た。
+    //   日本語名を付けるのは、このアプリの表記で記録された側(originTeamEn=追跡中クラブ自身)が含まれる場合と、
+    //   チームIDの無い旧記録(従来どおり名前で照合)だけにする。
     const byClub = new Map();
     for (const r of records) {
-      for (const teamEn of [r.homeTeamEn, r.awayTeamEn]) {
+      for (const side of ["home", "away"]) {
+        const teamEn = side === "home" ? r.homeTeamEn : r.awayTeamEn;
         if (!teamEn) continue;
-        const cur = byClub.get(teamEn) || { n: 0, hits: 0 };
+        const tidRaw = side === "home" ? r.homeTeamId : r.awayTeamId;
+        const hasId = tidRaw !== null && tidRaw !== undefined && tidRaw !== "" && Number.isFinite(Number(tidRaw));
+        const key = hasId ? `id:${Number(tidRaw)}` : `name:${teamEn}`;
+        const cur = byClub.get(key) || { n: 0, hits: 0, hasId, originName: null, names: new Map() };
         cur.n++; if (r.correct) cur.hits++;
-        byClub.set(teamEn, cur);
+        cur.names.set(teamEn, (cur.names.get(teamEn) || 0) + 1);
+        if (r.originTeamEn && r.originTeamEn === teamEn) cur.originName = teamEn;
+        byClub.set(key, cur);
       }
     }
-    const weak = [...byClub.entries()]
-      .map(([teamEn, v]) => ({ teamEn, n: v.n, accPct: (v.hits / v.n) * 100 }))
+    const weak = [...byClub.values()]
+      .map((v) => {
+        const commonName = [...v.names.entries()].sort((a, b) => b[1] - a[1])[0][0];
+        return { teamEn: v.originName || commonName, n: v.n, accPct: (v.hits / v.n) * 100, labelFromUniverse: !v.hasId || !!v.originName };
+      })
       .filter((c) => c.n >= MIN_SAMPLE_FOR_WEAKNESS && c.accPct <= overall - WEAKNESS_GAP_PCT)
       .sort((a, b) => a.accPct - b.accPct)
       .slice(0, 3);
     for (const c of weak) {
-      const uni = findClub(c.teamEn);
+      const uni = c.labelFromUniverse ? findClub(c.teamEn) : null;
       items.push({
         kind: "club",
         targetEn: c.teamEn,
         targetJa: (uni && uni.nameJa) || c.teamEn,
+        // v104.1(総点検): 追跡名簿(固定の172クラブ)のクラブかどうか。優先更新(翌日の収集で輪番を待たずに取得)が
+        //   できるのは名簿のクラブだけ。名簿の外のクラブ(対戦相手として現れただけのクラブ・同じ名前の別クラブ)に
+        //   「優先更新します」と書いたり、同じ名前の名簿クラブを代わりに優先したりしない。
+        tracked: !!uni,
         reasonJa: `${(uni && uni.nameJa) || c.teamEn}が絡む直近${c.n}試合の的中率が${round1(c.accPct)}%で、全体(${round1(overall)}%)より${round1(overall - c.accPct)}ポイント低いため。`,
-        actionJa: "明日の収集でこのクラブを優先更新します(フォーム・怪我・布陣・xGを輪番を待たずに取得)。",
+        actionJa: uni
+          ? "明日の収集でこのクラブを優先更新します(フォーム・怪我・布陣・xGを輪番を待たずに取得)。"
+          : "追跡名簿の外のクラブのため、優先更新の対象にはなりません(試合で見かけたクラブは、候補として記録し、順番に取り込んで情報を増やします)。",
       });
     }
   }
@@ -151,7 +171,10 @@ function buildLearningAgenda(resolvedRecords, topFailureReasons, opts) {
 /** 学習計画から「明日優先的に収集するクラブ」の英語名一覧を取り出す */
 function priorityClubsOf(agenda) {
   if (!agenda || !Array.isArray(agenda.items)) return [];
-  return agenda.items.filter((it) => it.kind === "club" && it.targetEn).map((it) => it.targetEn);
+  // v104.1(総点検): 追跡名簿のクラブだけを返す(tracked:false=名簿の外。旗の無い旧い計画は、名簿に名前があるものだけ)
+  return agenda.items
+    .filter((it) => it.kind === "club" && it.targetEn && it.tracked !== false && !!findClub(it.targetEn))
+    .map((it) => it.targetEn);
 }
 
 async function saveAgenda(deps, dateKey, agenda) {

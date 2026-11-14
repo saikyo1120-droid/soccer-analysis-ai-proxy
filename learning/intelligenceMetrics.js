@@ -99,11 +99,18 @@ function matchUsedKnowledge(answerText, statements) {
 // 2. 考察の質スコア(ご指示③・Reasoning Quality): 機械的ルーブリック 0〜100点
 // ---------------------------------------------------------------
 
-/** 「実データの事実」かどうかの機械判定(正直な断り書きやAI推定は数えない) */
+/**
+ * 「実データの事実」かどうかの機械判定(正直な断り書きやAI推定は数えない)
+ *   v104.1: AI推定の見分け方を直した。知識として保存している推定プロフィールの実際の書き出しは
+ *   「【AIによる推定・戦術傾向】」「【AIによる推定・プレースタイル】」(clubProfileEngine / playerProfileEngine)で、
+ *   前に「[似たクラブ ◯◯ の知識] 」の見出しが付くこともある。従来の startsWith("【AIによる推定】") は
+ *   このどれにも一致せず、AIの推定が「実データの事実」として数えられていた(数字の裏取りの出どころを
+ *   仕分ける作業で発見)。「【AIによる推定」を含む項目はすべて推定として扱う。
+ */
 function isRealDataFact(fact) {
   const f = String(fact || "");
   if (!f) return false;
-  if (f.startsWith("【AIによる推定】") || f.includes("【AIの結論】")) return false;
+  if (f.includes("【AIによる推定") || f.includes("【AIの結論】")) return false;
   const HONESTY_MARKERS = ["取得できません", "見つかりませんでした", "基づかない", "省略しました", "取得できなかった"];
   return !HONESTY_MARKERS.some((m) => f.includes(m));
 }
@@ -182,6 +189,63 @@ function recordDiscussSample(sample) {
 
 function pendingSampleCount() { return discussSampleBuffer.length; }
 
+// ---------------------------------------------------------------
+// v104.1 M「数字の裏取り」の集計(質問時はメモリの加算だけ。日次フラッシュで learn:intel:<date> に合流)
+// ---------------------------------------------------------------
+//   answers            … 照合の対象になった回答の数(挨拶・雑談は対象外)
+//   withNumbers        … 照合できる数字(割合・小数・10以上の整数)を1個以上含んでいた回答
+//   numbersChecked     … 照合した数字の総数 / numbersSupported … 取得データに同じ値があった数
+//   allSupported       … 数字がすべて一致した回答 / withUnsupported … 一致しない数字を含んだ回答
+//   generalKnowledge   … 実データを使わず、一般知識の数字を含んだ回答
+function emptyGrounding() {
+  return { answers: 0, withNumbers: 0, numbersChecked: 0, numbersSupported: 0, allSupported: 0, withUnsupported: 0, generalKnowledge: 0, numbersRepeated: 0 };
+}
+let groundingTally = emptyGrounding();
+function recordGroundingSample(g) {
+  if (!g || typeof g !== "object") return false;
+  groundingTally.answers++;
+  // 前の回答の数字を繰り返した個数(今回は照合していない数字)。裏取り率の分母には入れない
+  if (g.repeated > 0) groundingTally.numbersRepeated += Math.floor(g.repeated);
+  if (g.verdict === "general_knowledge") { groundingTally.generalKnowledge++; return true; }
+  if (!(g.checked > 0) || g.dataUsed !== true) return true;
+  groundingTally.withNumbers++;
+  groundingTally.numbersChecked += g.checked;
+  groundingTally.numbersSupported += Math.max(0, Math.min(g.checked, g.supported || 0));
+  if (g.verdict === "all_supported") groundingTally.allSupported++;
+  else if (g.verdict === "partial") groundingTally.withUnsupported++;
+  return true;
+}
+function mergeGrounding(a, b) {
+  if (!a && !b) return null;
+  const out = emptyGrounding();
+  for (const src of [a, b]) {
+    if (!src || typeof src !== "object") continue;
+    for (const k of Object.keys(out)) out[k] += Number(src[k]) || 0;
+  }
+  return out;
+}
+function summarizeGrounding(agg) {
+  if (!agg || !agg.answers) return { measurable: false, answers: 0, reasonJa: "この期間に、数字の裏取りの対象になる回答がありませんでした(会話が使われなかっただけで異常ではありません)。" };
+  return {
+    measurable: agg.numbersChecked > 0,
+    answers: agg.answers,
+    withNumbers: agg.withNumbers,
+    numbersChecked: agg.numbersChecked,
+    numbersSupported: agg.numbersSupported,
+    // 裏取り率 = 照合した数字のうち、取得データに同じ値があった割合
+    groundedRatePct: agg.numbersChecked > 0 ? round1((agg.numbersSupported / agg.numbersChecked) * 100) : null,
+    // 数字を含んだ回答のうち、すべて一致した回答の割合
+    cleanAnswerRatePct: agg.withNumbers > 0 ? round1((agg.allSupported / agg.withNumbers) * 100) : null,
+    allSupported: agg.allSupported,
+    withUnsupported: agg.withUnsupported,
+    generalKnowledge: agg.generalKnowledge,
+    // 前の回答の数字を繰り返した個数(今回の取得データとは照合していない数字。裏取り率には入れない)
+    numbersRepeated: Number(agg.numbersRepeated) || 0,
+    reasonJa: agg.numbersChecked > 0 ? null : "照合できる数字(割合・小数・10以上の整数)を含む回答がまだありません。",
+  };
+}
+function pendingGrounding() { return { ...groundingTally }; }
+
 function emptyIntelDaily() {
   return {
     samples: 0, droppedSamples: 0, clubSamples: 0, parsedOkCount: 0,
@@ -202,6 +266,9 @@ function mergeIntelDaily(a, b) {
   for (const c of Object.keys(out.compSums)) {
     out.compSums[c] = round1(((a.compSums && a.compSums[c]) || 0) + ((b.compSums && b.compSums[c]) || 0));
   }
+  // v104.1 M: 数字の裏取りの集計(古い保存形式には無い → 片方だけでも合算)
+  const g = mergeGrounding(a.grounding, b.grounding);
+  if (g) out.grounding = g;
   return out;
 }
 
@@ -213,8 +280,11 @@ async function flushIntelDaily(deps, dateKey) {
   const { upstashEnabled, upstashGetJSON, upstashSetJSON, upstashCmd } = deps || {};
   const pending = discussSampleBuffer.length;
   if (!upstashEnabled || !dateKey) return { flushed: 0, reasonJa: "Upstash未設定または日付なし" };
-  if (!pending && !droppedSamples) return { flushed: 0 };
+  const groundingPending = groundingTally.answers > 0; // v104.1 M
+  if (!pending && !droppedSamples && !groundingPending) return { flushed: 0 };
   const agg = emptyIntelDaily();
+  const groundingSnapshot = { ...groundingTally };
+  if (groundingPending) agg.grounding = groundingSnapshot;
   for (const s of discussSampleBuffer) {
     agg.samples++;
     if (s.subjectType === "club") agg.clubSamples++;
@@ -251,7 +321,9 @@ async function flushIntelDaily(deps, dateKey) {
     if (ok === false) return { flushed: 0, error: "write_failed" }; // 保存できていないのにバッファを消さない
     discussSampleBuffer = [];
     droppedSamples = 0;
-    return { flushed: pending };
+    // v104.1 M: 保存できたぶんだけ引く(保存中に増えた分は次回へ残す)
+    for (const k of Object.keys(groundingTally)) groundingTally[k] = Math.max(0, groundingTally[k] - (groundingSnapshot[k] || 0));
+    return { flushed: pending, groundingFlushed: groundingSnapshot.answers };
   } catch (e) {
     // 保存に失敗したらバッファは消さない(次回の実行で再度保存を試みる)
     return { flushed: 0, error: e.message };
@@ -261,10 +333,14 @@ async function flushIntelDaily(deps, dateKey) {
 /** 日次集計を人間が読む形に変換する */
 function summarizeIntelDaily(agg) {
   if (!agg || !agg.samples) {
-    return { measurable: false, samples: 0, reasonJa: "この日は考察(議論する機能)が使われなかったため、考察の質は測定できません(利用が無かっただけで異常ではありません)。" };
+    return {
+      measurable: false, samples: 0, reasonJa: "この日は考察(議論する機能)が使われなかったため、考察の質は測定できません(利用が無かっただけで異常ではありません)。",
+      grounding: summarizeGrounding(agg && agg.grounding), // v104.1 M: 裏取りは議論以外の回答も対象なので別に返す
+    };
   }
   return {
     measurable: true,
+    grounding: summarizeGrounding(agg.grounding), // v104.1 M
     samples: agg.samples,
     droppedSamples: agg.droppedSamples || 0,
     avgReasoningScore: round1(agg.scoreSum / agg.samples),
@@ -309,6 +385,52 @@ async function getIntelTrend(deps, todayDateKey) {
       }
       : { noteJa: "今日か昨日のどちらかに考察の利用記録が無いため、前日比は測定できません。" },
   };
+}
+
+/**
+ * v104.1 M: 数字の裏取りの推移(今日・その前の7日間)と、まだ保存していない分(このプロセスのメモリ)。
+ *   保存は日次学習のときに1回(質問時に保存先へ書かない=最終方針⑥)。再起動するとメモリの分は消える(近似値)。
+ *   窓の数え方は精度トレンド(getAccuracyTrend)・考察の質(getIntelTrend)と同じ:
+ *     today=今日の日付で保存した分 / last7Days=その前の7日間(今日を含まない) / pending=未保存分。
+ *   読み出しは「キーの一覧」と「値からの組み立て」に分けてある(日次レポートは、他のモデルの読み出しと
+ *   同じ MGET に相乗りさせて往復を増やさない)。
+ */
+const GROUNDING_NOTE_JA = "回答に出てくる数字(割合・小数・10以上の整数)が、今回AIに渡した実データ(取得できた事実・道具の結果・実成績)にあるかを機械的に照合した結果です。利用者が質問に書いた数字の引用は対象外、AIが前の回答の数字を繰り返した分は numbersRepeated に数えます(どちらも裏取り率には入れません)。一致しない数字には、AIが差や平均を計算した値や、AIの推定・一般知識による値も含まれます。today=今日の学習で保存した分、last7Days=その前の7日間(今日を含みません)、pending=まだ保存していない分。質問時はメモリ集計のみで、毎日の学習のときに保存します(再起動するとその日の未保存分は数に入りません)。";
+const GROUNDING_TREND_DAYS = 8; // 今日+その前の7日
+
+/** 推移に使う日次キー(今日から新しい順に8日ぶん) */
+function groundingTrendKeys(todayDateKey) {
+  return dateKeysBack(todayDateKey, GROUNDING_TREND_DAYS).map((dk) => `${INTEL_KEY_PREFIX}${dk}`);
+}
+
+/**
+ * groundingTrendKeys と同じ並びで読んだ値から、推移を組み立てる。
+ *   read = { upstashEnabled, values, readFailed, firstError }(values は日次の集計。無かった日は null)
+ */
+function groundingTrendFromValues(todayDateKey, read) {
+  const pending = summarizeGrounding(groundingTally);
+  const noteJa = GROUNDING_NOTE_JA;
+  const r = read || {};
+  if (r.upstashEnabled === false) return { available: false, pending, noteJa, reasonJa: "Upstash未設定のため保存済みの集計を読み出せません。" };
+  if (r.readFailed) return { available: false, readFailed: true, pending, noteJa, reasonJa: `保存先(Upstash)から集計を読み出せませんでした${r.firstError ? `(${r.firstError})` : ""}。記録が無いという意味ではありません。` };
+  const values = Array.isArray(r.values) ? r.values : [];
+  const dks = dateKeysBack(todayDateKey, GROUNDING_TREND_DAYS);
+  let today = null, last7 = null, recordedDays = 0;
+  dks.forEach((dk, i) => {
+    const g = values[i] && values[i].grounding;
+    if (!g) return;
+    recordedDays++;
+    if (dk === todayDateKey) today = g;
+    else last7 = mergeGrounding(last7, g);
+  });
+  return { available: true, recordedDays, today: summarizeGrounding(today), last7Days: summarizeGrounding(last7), pending, noteJa };
+}
+
+async function getGroundingTrend(deps, todayDateKey) {
+  const { upstashEnabled } = deps || {};
+  if (!upstashEnabled) return groundingTrendFromValues(todayDateKey, { upstashEnabled: false });
+  const r = await readManyJSON(deps, groundingTrendKeys(todayDateKey));
+  return groundingTrendFromValues(todayDateKey, { values: r.values, readFailed: r.readFailed, firstError: r.firstError });
 }
 
 // ---------------------------------------------------------------
@@ -772,6 +894,9 @@ module.exports = {
   normalizeForMatch, matchUsedKnowledge, isRealDataFact,
   scoreReasoningQuality,
   recordDiscussSample, pendingSampleCount, flushIntelDaily,
+  // v104.1 M: 数字の裏取りの集計
+  recordGroundingSample, pendingGrounding, emptyGrounding, mergeGrounding, summarizeGrounding, getGroundingTrend,
+  groundingTrendKeys, groundingTrendFromValues,
   emptyIntelDaily, mergeIntelDaily, summarizeIntelDaily, getIntelTrend,
   computeHypothesisStats, buildEngineGrowth,
   buildKnowledgeContributionRanking, buildAccuracyDiagnosis, buildSelfAssessment,

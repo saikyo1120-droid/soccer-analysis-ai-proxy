@@ -99,7 +99,7 @@ const { createApiBudget, DEFAULT_DAILY_BUDGET, DEFAULT_USER_RESERVE } = require(
 const { assessImportance, summarizeImportance } = require("./importanceEngine");
 // 2026年8月・「知識量を大幅に増やす」フェーズ: UEFA上位100クラブの日次収集
 const { collectUniverse } = require("./universeCollector");
-const { createClubDossier } = require("../knowledge/clubDossier");
+const { createClubDossier, slugOf: dossierSlugOf } = require("../knowledge/clubDossier");
 const { buildDailySnapshot, saveDailyMetrics, compareSnapshots, METRICS_KEY_PREFIX } = require("./dailyMetrics");
 const {
   computeGoalRateFeatures, computeFatigueFeature,
@@ -143,6 +143,7 @@ const { buildCalibrationMap } = require("./calibrationCorrection");
 const probCalibration = require("./probCalibration");
 // v104 J: 試合内容の予測(勝敗確率と整合するスコア分布・2.5点以上/両チーム得点の較正・表示元の関門)
 const matchContent = require("./matchContent");
+const confidenceTiers = require("./confidenceTiers"); // v104.1 K: 確信ピック(自信ランクの刻印と実績)
 // ⑤ オッズ比較・ROI(市場という最も厳しい採点者との毎日比較)
 const { extractMatchWinnerOdds, impliedProbsPct, scoreRoiForRecord, emptyRoiDaily, saveDailyRoi, getRoiTrend, ROI_KEY_PREFIX } = require("./roiTracker");
 // ① RAG強化(似たクラブ索引・似た試合の検索)
@@ -499,6 +500,18 @@ function mergeGrowthLogs(previous, current) {
     // v104 J: 試合内容モデルの学習結果も同じ規則(今日作った件数は合算・学習結果は記録のある方)
     matchContent: (current.matchContent && current.matchContent.fitted) ? { ...current.matchContent, builtToday: (previous.matchContent && previous.matchContent.builtToday || 0) + (current.matchContent.builtToday || 0) }
       : (previous.matchContent || current.matchContent || null),
+    // v104.1 K: 確信ピックも同じ規則(今日刻印した件数はランクごとに合算・学習結果は記録のある方)
+    confidenceTiers: (() => {
+      const p = previous.confidenceTiers || null, c = current.confidenceTiers || null;
+      const sumStamped = (a, b) => {
+        if (!a && !b) return null;
+        const out = {};
+        for (const k of ["S", "A", "B", "skip", "none"]) out[k] = ((a && a[k]) || 0) + ((b && b[k]) || 0);
+        return out;
+      };
+      const base = (c && c.fitted) ? c : (p || c);
+      return base ? { ...base, stampedToday: sumStamped(p && p.stampedToday, c && c.stampedToday) } : null;
+    })(),
     // v98 の採用記録: 2回目の実行で採用が0件でも、1回目の採用(名前つき)を消さない
     dynamicUniverse: (current.dynamicUniverse && Array.isArray(current.dynamicUniverse.adoptedNow) && current.dynamicUniverse.adoptedNow.length)
       ? current.dynamicUniverse
@@ -611,6 +624,26 @@ function mergeGrowthLogs(previous, current) {
           }
           return out;
         })(),
+        // v104.1: チームIDの本人確認。件数は実行ごとの合算、差し替えの記録はクラブごとに最後のものを残す
+        identity: (p.identity || c.identity) ? (() => {
+          const a = p.identity || {}, b = c.identity || {};
+          const out = {};
+          for (const k of ["checked", "verified", "healed", "cleared", "deferred", "suspectKept", "replaced"]) out[k] = (a[k] || 0) + (b[k] || 0);
+          return out;
+        })() : null,
+        identityFixes: (() => {
+          const byName = new Map();
+          for (const f of [...(p.identityFixes || []), ...(c.identityFixes || [])]) if (f && f.nameEn) byName.set(f.nameEn, f);
+          return [...byName.values()].slice(0, 30);
+        })(),
+        // v104.1(総点検): 名前が合わない疑い(直してはいない。クラブごとに最後のものを残す)・対応表の動的クラブの確認状況
+        identitySuspects: (() => {
+          const byName = new Map();
+          for (const f of [...(p.identitySuspects || []), ...(c.identitySuspects || [])]) if (f && f.nameEn) byName.set(f.nameEn, f);
+          return [...byName.values()].slice(0, 20);
+        })(),
+        teamMapDynamic: c.teamMapDynamic || p.teamMapDynamic || null,
+        playerIndex: c.playerIndex || p.playerIndex || null,
       };
     })(),
     // ---- 2026年8月・「本当に毎日賢くなるAI」フェーズの項目の合算規則 ----
@@ -1461,6 +1494,8 @@ async function runDailyLearning(deps) {
             : (record.leagueId ? learnedComp.classifyLearnedCompetition(record.leagueId, record.league).learned : null);
           // v101①: 市場オッズと合成できた予想か(オッズなし=自前モデル単独)。予想時の実測から機械的に決まる
           record.marketScores.oddsPresent = !!(record.marketImplied && Number.isFinite(record.marketImplied.homePct) && Number.isFinite(record.marketImplied.awayPct));
+          // v104.1 K: 予想時に刻んだ自信ランク(刻印のある記録だけ。無い旧記録を後から分類しない)
+          record.marketScores.tier = (record.tier && confidenceTiers.RANKS.includes(record.tier.rank)) ? record.tier.rank : null;
           resolvedScoredToday.push(record.marketScores);
         }
       } catch (e) { errors.push(`accuracy_scoring_failed:${fixtureIdStr}:${e.message}`); }
@@ -1915,6 +1950,34 @@ async function runDailyLearning(deps) {
       contentModelOnce = rawCm ? JSON.parse(rawCm) : null;
     } catch (e) { warn("content_model_read_failed", e); contentModelOnce = null; }
   }
+  // ---- v104.1 K「確信ピック」: ランクの境(前夜の学習が保存。無ければ既定)も1回だけ読む ----
+  //   読めなかった日は既定の境で刻印する(ランクは見せ方と計測だけで、予想の可否・中身を左右しない)。
+  //   自信は「予想カードに出す数字」と同じ計算にするため、表示用の較正マップも用意する。
+  let tierModelOnce = null;
+  let displayCalibrationMapOnce = null;
+  const tiersStampedToday = { S: 0, A: 0, B: 0, skip: 0, none: 0 };
+  if (upstashEnabled && !storedWeightsReadError) {
+    try {
+      const rawTm = await upstashCmd(["GET", confidenceTiers.MODEL_KEY]);
+      tierModelOnce = rawTm ? JSON.parse(rawTm) : null;
+    } catch (e) { warn("tier_model_read_failed", e); tierModelOnce = null; }
+    // 画面は「今夜の学習の最後(⑥)に作り直される較正マップ」で自信を表示する。予想時に刻む自信が
+    // 画面の数字と食い違わないよう、⑥と同じ材料(直近30日の実測・当日を含まない)から、ここで先に同じマップを組み立てる。
+    // 材料を読み切れなかった日だけ、保存済みのマップ(前夜のもの)で代用する。
+    try {
+      const trendForMap = await getAccuracyTrend({ upstashEnabled, upstashCmd, upstashGetJSON }, dateKey);
+      if (trendForMap && trendForMap.available === true && !trendForMap.partial) {
+        const o1 = trendForMap.last30Days && trendForMap.last30Days.markets && trendForMap.last30Days.markets.oneX2;
+        displayCalibrationMapOnce = buildCalibrationMap(o1 && o1.ece, runAt.toISOString());
+      }
+    } catch (e) { warn("display_calibration_map_build_failed", e); displayCalibrationMapOnce = null; }
+    if (!displayCalibrationMapOnce) {
+      try {
+        const rawMap = await upstashCmd(["GET", "learn:calibration:map"]);
+        displayCalibrationMapOnce = rawMap ? JSON.parse(rawMap) : null;
+      } catch (e) { warn("display_calibration_map_read_failed", e); displayCalibrationMapOnce = null; }
+    }
+  }
   for (const team of (storedWeightsReadError ? [] : predictionPool)) {
     if (newPredictionsLogged >= OWN_PREDICT_LOG_CAP) { predictionStoppedReason = "cap"; break; }
     // 予算が尽きかけている日は、ここで打ち切って利用者向けの余力を守る
@@ -2363,6 +2426,12 @@ async function runDailyLearning(deps) {
           capturedAt: runAt.toISOString(),
         },
       };
+      // ---- v104.1 K「確信ピック」: 予想を立てた時点の自信ランクを記録に刻む(後出しで変えない) ----
+      //   自信=予想カードに出す数字(予想した勝敗の最終確率を、実測で補正した値)。公式戦かつ学習済みの大会だけが対象。
+      //   対象外・確率なしのときは rank:null と理由を残す(ランクを付けなかったことも記録)。
+      try {
+        record.tier = confidenceTiers.stampFor(record, tierModelOnce, displayCalibrationMapOnce);
+      } catch (e) { warn(`tier_stamp_failed:${fixtureId}`, e); record.tier = null; }
       // v97(全体監査): 本体が保存できていないのに保留リスト・累計だけ増やさない
       //   (旧実装は SET の結果を見ずに進み、累計 total が水増しされ、保留に幽霊IDが残っていた)
       const savedPred = await upstashSetJSON(`learn:ownpred:${fixtureId}`, record);
@@ -2372,6 +2441,7 @@ async function runDailyLearning(deps) {
       // v77(集客①): 検索エンジン用サイトマップの軽量索引に1行追記(失敗しても予測処理は続行)
       await seoPages.recordMatchIndexEntry({ upstashCmd }, record).catch(() => {});
       newPredictionsLogged++;
+      tiersStampedToday[(record.tier && record.tier.rank) || "none"]++; // v104.1 K
       predictionClubsSeen.push(team.nameEn);
       // 「どのクラブがいつ予測されたか」を残し、TOP100のカバー率を後から実測できるようにする
       // (説明責任: 「漏れていないか」を推測ではなく数字で答えられるようにするため)
@@ -2470,7 +2540,16 @@ async function runDailyLearning(deps) {
         for (const d of dr.byName.values()) if (d && Number.isFinite(Number(d.teamId))) staticIds.add(Number(d.teamId));
       } catch (e) { warn("dynamic_static_ids_failed", e); }
       const staticNames = new Set(CLUB_UNIVERSE.map((c) => c.nameEn.toLowerCase()));
-      const isStaticTeam = (id, name) => staticIds.has(Number(id)) || staticNames.has(String(name || "").toLowerCase());
+      // v104.1(総点検): 調査ファイルの保存キー(slug)が固定名簿のクラブと同じになる名前も除外する
+      //   (大文字小文字だけでなく、記号や空白の違い "Al-Ahli" / "Al Ahli" でも同じファイルを共有してしまう)。
+      //   提供元での表記(searchAs)も固定名簿のクラブ自身なので除外する。
+      const staticSlugs = new Set();
+      for (const c of CLUB_UNIVERSE) { staticSlugs.add(dossierSlugOf(c.nameEn)); if (c.searchAs) { staticSlugs.add(dossierSlugOf(c.searchAs)); staticNames.add(String(c.searchAs).toLowerCase()); } }
+      // アクセント記号つきの提供元表記("Bayern München")も、固定名簿の表記("Bayern Munchen")と同じクラブとして扱う
+      const foldName = (n) => String(n || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      const staticFolded = new Set();
+      for (const c of CLUB_UNIVERSE) { staticFolded.add(foldName(c.nameEn)); if (c.searchAs) staticFolded.add(foldName(c.searchAs)); }
+      const isStaticTeam = (id, name) => staticIds.has(Number(id)) || staticNames.has(String(name || "").toLowerCase()) || staticSlugs.has(dossierSlugOf(name)) || staticFolded.has(foldName(name));
       if (dataMissingTeams.length) {
         const r = await dynamicUniverse.recordSeen(dataMissingTeams, { source: "data_missing", nowMs: runAt.getTime(), isStaticTeam });
         if (r && r.ok === false) warn("dynamic_record_missing_failed", new Error(r.reasonJa || "unknown"));
@@ -2486,6 +2565,11 @@ async function runDailyLearning(deps) {
           candidates: adopt.candidates, adoptedToday: adopt.adoptedNow.map((a) => ({ teamId: a.teamId, nameEn: a.nameEn, reasonJa: a.reasonJa })),
           adoptedTotal: adopt.adoptedAll.length, dueToday: objs.due.length, skippedByCap: objs.skippedByCap,
           prunedSeen: adopt.prunedSeen, retired: adopt.retired, dataMissingTeams: dataMissingTeams.length,
+          adoptedTodayBefore: adopt.adoptedTodayBefore ?? null, // v99 の同日上限の根拠(日次レポートが読む)
+          // v104.1(総点検): 同じ名前の別クラブを採用しない(件数と先頭10件)
+          nameCollisionSkipped: adopt.nameCollisionSkipped ?? 0, nameCollisionSkippedSample: adopt.nameCollisionSkippedSample || [],
+          duplicateRetired: adopt.duplicateRetired ?? 0, duplicateRetiredSample: adopt.duplicateRetiredSample || [],
+          retiredAsStatic: adopt.retiredAsStatic ?? 0,
           perDay: perDay ?? dynamicUniverse.DEFAULT_PER_DAY,
         };
       } else {
@@ -2508,6 +2592,19 @@ async function runDailyLearning(deps) {
     // v92: 収集側で黙って続行した失敗も、成長ログの warnings に合流させる(内訳は universe: を前置)
     if (Array.isArray(universeStats.warnings)) for (const w of universeStats.warnings) warn(`universe:${w}`);
     if (Number.isFinite(universeStats.warningsDropped) && universeStats.warningsDropped > 0) warn(`universe:warnings_dropped:${universeStats.warningsDropped}`);
+    // ---- v104.1: 照合先(チームID)の取り違えを直したクラブについて、別チームの実測から作った知識を根拠から外す ----
+    //   調査ファイルは収集側で破棄済み。ここでは「日次の宇宙収集」が出典の知識(順位・フォーム・怪我・
+    //   監督・移籍の変化)だけを消す(登録クラブの分析など、他の出典の知識には触らない)。
+    for (const fix of (universeStats.identityFixes || [])) {
+      // replaced = 動的クラブの調査ファイルが「同じ名前の別チーム」のものだったので作り直した(v104.1 総点検)
+      if (!fix || !fix.nameEn || (fix.status !== "healed" && fix.status !== "cleared" && fix.status !== "replaced")) continue;
+      try {
+        const purged = await knowledgeStore.purgeKnowledgeForEntity(fix.nameEn, (it) => /日次の宇宙収集/.test(String((it && it.source) || "")));
+        fix.knowledgePurged = purged.ok ? purged.removed : null;
+        if (!purged.ok) warn(`identity_knowledge_purge_skipped:${fix.nameEn}`, new Error(purged.reasonJa || "unknown"));
+        else if (purged.failed > 0) warn(`identity_knowledge_purge_partial:${fix.nameEn}`, new Error(`${purged.failed}件を消せませんでした(失効で外れます)`));
+      } catch (e) { warn(`identity_knowledge_purge_failed:${fix.nameEn}`, e); }
+    }
   } catch (e) {
     errors.push(`universe_collection_failed:${e.message}`);
   }
@@ -2909,7 +3006,7 @@ async function runDailyLearning(deps) {
       }
       modelTuning = await tuneModelOnHistory(
         { upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON, callApiFootball, apiBudget, clubEloLookup, xgLookup, noteWarning: warn },
-        baseForTune, runAt
+        baseForTune, runAt, { dateKey }
       );
       if (upstashEnabled) {
         await upstashCmd(["SET", tunedKey, JSON.stringify({
@@ -3047,6 +3144,33 @@ async function runDailyLearning(deps) {
   } catch (e) {
     errors.push(`content_fit_failed:${e && (e.code || e.message)}`);
     matchContentToday = { fitted: false, saved: false, builtToday: contentBuiltToday, available: false, reasonJa: `試合内容モデルの学習に失敗しました(${String((e && e.message) || e).slice(0, 80)})。` };
+  }
+
+  // ---- v104.1 K「確信ピック」の学習 ----
+  //   答え合わせ済み・対象内(公式戦かつ学習済みの大会)の記録から、S の境(その境以上の予想の的中率が
+  //   目標75%に届く、いちばん低い境)を時系列ホールドアウトで選び、翌日の予測(③)が読む
+  //   learn:tiers:model に保存する。境が動かなくても、今の境を過去に当てはめたランク別の実測(表)は毎晩更新する。
+  let confidenceTiersToday = null;
+  try {
+    const recentForTiers = await loadRecentRecordsOnce();
+    let prevTierModel = tierModelOnce;
+    if (upstashEnabled) {
+      try {
+        const rawPrev = await upstashCmd(["GET", confidenceTiers.MODEL_KEY]);
+        prevTierModel = rawPrev ? JSON.parse(rawPrev) : null;
+      } catch (e) { warn("tier_model_prev_read_failed", e); prevTierModel = tierModelOnce; }
+    }
+    const tm = confidenceTiers.fitTierModel(recentForTiers, { prevModel: prevTierModel, nowIso: runAt.toISOString(), calibrationMap: displayCalibrationMapOnce });
+    let saved = false;
+    if (upstashEnabled) {
+      const okSave = await upstashSetJSON(confidenceTiers.MODEL_KEY, tm);
+      saved = okSave !== false;
+      if (!saved) errors.push("tier_model_save_failed");
+    }
+    confidenceTiersToday = { fitted: true, saved, stampedToday: { ...tiersStampedToday }, ...confidenceTiers.summarizeModel(tm) };
+  } catch (e) {
+    errors.push(`tier_fit_failed:${e && (e.code || e.message)}`);
+    confidenceTiersToday = { fitted: false, saved: false, stampedToday: { ...tiersStampedToday }, available: false, reasonJa: `自信ランクの学習に失敗しました(${String((e && e.message) || e).slice(0, 80)})。` };
   }
 
   await stage("⑤ 知識ベース更新と成長ログ");
@@ -3241,6 +3365,7 @@ async function runDailyLearning(deps) {
     // v101 ★4: 最終確率の較正(温度)の学習結果と、今日の予想への適用件数(実測のまま)
     probCalibration: probCalibrationToday,
     matchContent: matchContentToday, // v104 J
+    confidenceTiers: confidenceTiersToday, // v104.1 K
     // v79(案6): 「2つ目の意見」(API-Football予想)ブレンドの学習結果(実測のまま)
     apifbBlendFit: apifbBlendFitToday ? {
       adopted: !!apifbBlendFitToday.adopted, w: apifbBlendFitToday.w ?? 0,
@@ -3308,6 +3433,7 @@ async function runDailyLearning(deps) {
     // 過去試合を使ったモデル調整の結果(採用/不採用と、その理由・比較表)
     modelTuning: modelTuning ? {
       ran: modelTuning.ran, adopted: modelTuning.adopted, reasonJa: modelTuning.reasonJa,
+      secondaryGains: modelTuning.secondaryGains ?? null, // v104.1(総点検): 副次的な予測の改善幅(日次レポートが表示する)
       datasetSize: modelTuning.datasetSize ?? null,
       datasetNoteJa: modelTuning.datasetNoteJa ?? null,
       trainSize: modelTuning.trainSize ?? null, testSize: modelTuning.testSize ?? null,
@@ -3379,6 +3505,21 @@ async function runDailyLearning(deps) {
       // v98: 動的クラブ(見た試合のクラブ)の収集実績
       dynamic: universeStats.dynamic || null,
       teamMapSaved: universeStats.teamMapSaved ?? null,
+      // v104.1: 保存済みチームIDの本人確認(取り違えの検出・照合し直し)と、選手索引の内訳
+      identity: universeStats.identity || null,
+      identityFixes: (universeStats.identityFixes || []).slice(0, 30),
+      // v104.1(総点検): 提供元での登録名がクラブ名と合わない疑い(名前だけでは直さないので、開示して人が確かめられるようにする)
+      identitySuspects: (universeStats.identitySuspects || []).slice(0, 20),
+      teamMapDynamic: universeStats.teamMapDynamic || null,
+      playerIndex: universeStats.playerIndex ? {
+        built: universeStats.playerIndex.built ?? null,
+        count: universeStats.playerIndex.count ?? null,
+        newRows: universeStats.playerIndex.newRows ?? null,
+        carriedOver: universeStats.playerIndex.carriedOver ?? null,
+        droppedStale: universeStats.playerIndex.droppedStale ?? null,
+        droppedWrongTeam: universeStats.playerIndex.droppedWrongTeam ?? null,
+        reasonJa: universeStats.playerIndex.reasonJa || universeStats.playerIndex.saveReasonJa || null,
+      } : null,
     } : null,
     // v98: 動的クラブ宇宙の今日の採用(候補数・採用・上限)。固定名簿の外のクラブがどれだけ増えたか
     dynamicUniverse: dynamicUniverseToday,

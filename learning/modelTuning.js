@@ -245,8 +245,12 @@ function fitHistoryWeights(trainRows, initialWeights, runAt) {
   }
 }
 
-async function tuneModelOnHistory(deps, currentWeights, runAt) {
+async function tuneModelOnHistory(deps, currentWeights, runAt, opts) {
   const { upstashEnabled, upstashCmd, upstashSetJSON } = deps;
+  // v104.1: 履歴に残す日付は、学習の「今日」(日本時間の日付。呼び出し側が渡す)に揃える。
+  //   従来は実行時刻の UTC 日付だったため、日本時間の早朝(UTC では前日)に動く毎日の学習では、
+  //   成長ログ・精度の集計(日本時間の日付)より1日前の日付で記録されていた(中身の計算には影響なし。表示上の日付のずれ)。
+  const recordDateKey = (opts && typeof opts.dateKey === "string" && /^\d{4}-\d{2}-\d{2}$/.test(opts.dateKey)) ? opts.dateKey : runAt.toISOString().slice(0, 10);
   const ds = await ensureDataset(deps, runAt);
 
   // ---- v57: クラブElo(clubelo.com)の履歴を各試合の文脈へ付与 ----
@@ -610,7 +614,7 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
   const vsBaselineConsistency = consistencyReport(test, baseline, adoptedWeights, LEAGUE_NAMES_JA);
 
   const record = {
-    date: runAt.toISOString().slice(0, 10),
+    date: recordDateKey,
     ranAt: runAt.toISOString(),
     datasetSize: ds.rows.length,
       clubEloRows: clubEloRowsCount, // v57: Elo付きで学習に使えた試合数(実測)
@@ -624,6 +628,10 @@ async function tuneModelOnHistory(deps, currentWeights, runAt) {
     adopted: decision.adopt,
     consistencyChecked: decision.consistencyChecked,
     reasonJa: decision.reasonJa,
+    // v104.1(総点検): 副次的な予測(両チーム得点・Over/Under・スコア・総得点の誤差)の改善幅。
+    //   採否の判断(modelBacktest)は毎回これを計算していたが、ここで結果から落としていたため、
+    //   日次レポートの「副次的な改善」の行が一度も表示されなかった。実測の文字列のまま渡す。
+    secondaryGains: Array.isArray(decision.secondaryGains) ? decision.secondaryGains.slice(0, 6) : null,
     oldEval, newEval,
     comparisonJa: formatComparisonJa(cmp),
     leagueTableJa: formatLeagueTableJa(consistency),

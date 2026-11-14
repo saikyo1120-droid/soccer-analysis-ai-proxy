@@ -53,6 +53,7 @@ const BY_LEAGUE_OTHER_KEY = "__other__"; // 上限を超えたリーグの受け
 const LN3 = Math.log(3);
 // v104 J: 試合内容の予測(2.5点以上・両チーム得点・スコア上位)の採点と集計
 const matchContent = require("./matchContent");
+const confidenceTiers = require("./confidenceTiers"); // v104.1 K: 自信ランク別の実績
 const UNIFORM_BRIER_3WAY = 2 / 3;
 
 /**
@@ -323,6 +324,10 @@ function buildDailyAccuracy(scoredList) {
           ob.brierSum = round4(ob.brierSum + mk.brier);
           ob.logLossSum = round4(ob.logLossSum + mk.logLoss);
         }
+        // v104.1 K: 予想時に刻んだ自信ランク別の実績(刻印のある記録だけ)
+        if (s.tier && confidenceTiers.RANKS.includes(s.tier)) {
+          a.byTier = confidenceTiers.addTierScore(a.byTier || confidenceTiers.emptyByTier(), s.tier, mk.hit === true, mk.confidence);
+        }
         // v101③: 朝版 vs 直前版(直前版の判定がある記録だけ。両方とも同じ試合で採点)
         const lc = s.lineupCompare;
         if (lc && Number.isFinite(lc.morningBrier) && Number.isFinite(lc.preKickBrier)) {
@@ -435,6 +440,9 @@ function mergeDailyAccuracy(a, b) {
       }
     }
   }
+  // v104.1 K: 自信ランク別の合算(古い保存形式には無い → 片方だけでも合算)
+  const tierMerged = confidenceTiers.mergeByTier(a.oneX2?.byTier, b.oneX2?.byTier);
+  if (tierMerged) out.oneX2.byTier = tierMerged;
   // v101③: 朝版 vs 直前版の合算
   const lineupMaps = [a.oneX2?.lineup, b.oneX2?.lineup].filter((x) => x && typeof x === "object");
   if (lineupMaps.length) {
@@ -673,6 +681,8 @@ function summarizeAccuracy(agg) {
       // v101: オッズあり/なし別・朝版 vs 直前版
       out.markets.oneX2.byOdds = summarizeByOdds(a.byOdds);
       out.markets.oneX2.lineupCompare = summarizeLineupCompare(a.lineup);
+      // v104.1 K: 予想時に刻んだ自信ランク別の実績(刻印のある記録だけ)
+      out.markets.oneX2.byTier = confidenceTiers.summarizeByTier(a.byTier);
     }
   }
   if (agg.scoreline && agg.scoreline.n) {

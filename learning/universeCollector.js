@@ -34,6 +34,7 @@ const {
   CLUB_UNIVERSE, tierOf, clubsForCoreUpdate, clubsForSquadSync,
   clubsForXgUpdate, clubsForBasicInfo, UEFA_SNAPSHOT_NOTE_JA,
   searchVariantsOf, pickBestTeamMatch, dayNumberOf, // v98: 動的クラブの7日周期に使う
+  assessTeamIdentity, findClubInStandings, listStandingsTeams, // v104.1: 保存済みチームIDの本人確認
 } = require("./clubUniverse");
 const {
   computeGoalRateFeatures, computeFatigueFeature, computeHomeAwaySplit,
@@ -134,6 +135,10 @@ async function collectUniverse(deps, runAt, dateKey) {
     agendaClubsApplied: priorityClubs.map((c) => c.nameEn), // 学習計画で優先したクラブ(実行の証拠)
     errors: [],
     warnings: [], warningsDropped: 0, // v92: 黙って続行した付加処理の失敗(成長ログへ合流)
+    // v104.1: 保存済みチームIDの本人確認(取り違えの検出と照合し直し)。checked=今日確かめたクラブ数
+    identity: { checked: 0, verified: 0, healed: 0, cleared: 0, deferred: 0, suspectKept: 0, replaced: 0 },
+    identityFixes: [], // { nameEn, nameJa, status, previousTeamId, previousApiName, teamId, apiName, evidenceJa, viaJa }
+    identitySuspects: [], // v104.1(総点検): 名前が合わない疑い(直していない) { nameEn, nameJa, teamId, apiName, kind, evidenceJa }
   };
   const canSpend = (n) => (apiBudget ? apiBudget.remainingForJob() >= BUDGET_FLOOR + n : true);
   const skip = (stage, reasonJa) => { stats.skipped.push({ stage, reasonJa }); };
@@ -242,14 +247,54 @@ async function collectUniverse(deps, runAt, dateKey) {
     const memo = teamResolveMemo.get(club.nameEn);
     if (memo) return memo;
     const dossier = await clubDossier.getDossier(club.nameEn);
-    if (dossier && dossier.teamId) {
-      const hit = { teamId: dossier.teamId, dossier };
+    // v98: 動的クラブは試合一覧が返した teamId をそのまま使う(名前検索をしない=誤照合しない・予算0)
+    // ---- v104.1(総点検): 動的クラブの調査ファイルが「同じ名前の別チーム」のものだった場合は作り直す ----
+    //   調査ファイルはクラブ名(slug)で1冊。旧コードは「ファイルに teamId があればそれを使う」を先に
+    //   判定していたため、以前に採用して外れた同名の別クラブのファイルが残っていると、
+    //   新しく採用したクラブを**別チームのID**で収集し続けていた(試合カードに別クラブの選手が出る)。
+    //   動的クラブの正しいIDは、試合一覧が返した apiTeamId だけ。食い違うファイルは破棄して作り直す。
+    if (club.dynamic && Number.isFinite(Number(club.apiTeamId))) {
+      const want = Number(club.apiTeamId);
+      const have = (dossier && dossier.teamId !== null && dossier.teamId !== undefined && Number.isFinite(Number(dossier.teamId))) ? Number(dossier.teamId) : null;
+      if (have !== null && have !== want) {
+        const fix = {
+          nameEn: club.nameEn, nameJa: club.nameJa || club.nameEn, status: "replaced",
+          previousTeamId: have, previousApiName: (dossier.identity && dossier.identity.apiName) || null,
+          teamId: want, apiName: club.nameEn,
+          evidenceJa: `調査ファイルが同じ名前の別のチーム(チームID ${have})のものでした`,
+          viaJa: "試合一覧が返したチームID",
+        };
+        let reset = null;
+        if (typeof clubDossier.resetIdentity === "function") {
+          reset = await clubDossier.resetIdentity(club.nameEn, {
+            teamId: want, apiName: club.nameEn, previousTeamId: have, previousApiName: fix.previousApiName,
+            evidenceJa: fix.evidenceJa, viaJa: fix.viaJa, at: runAt.toISOString(),
+          }).catch((e) => ({ saved: false, reasonJa: String((e && e.message) || e).slice(0, 120) }));
+        }
+        if (!reset || !reset.saved) {
+          // 作り直しを保存できなかった: 別チームのファイルにこのチームの実測を混ぜない(今日は見送り、次回やり直す)
+          fix.status = "deferred";
+          stats.identity.deferred++;
+          stats.identityFixes.push(fix);
+          skip("teamIdentity", `${club.nameJa || club.nameEn}の調査ファイルは同じ名前の別のチームのものでしたが、作り直しを保存できませんでした(${(reset && reset.reasonJa) || "保存先の書き込みに失敗"})。今日はこのクラブの収集を見送り、次回やり直します。`);
+          const miss = { teamId: null, dossier, identityBlocked: true };
+          teamResolveMemo.set(club.nameEn, miss);
+          return miss;
+        }
+        identityReset.add(club.nameEn); // 選手索引の旧行(別チームの選手)を持ち越さない
+        stats.identity.replaced = (stats.identity.replaced || 0) + 1;
+        stats.identityFixes.push(fix);
+        skip("teamIdentity", `${club.nameJa || club.nameEn}の調査ファイルは同じ名前の別のチーム(チームID ${have})のものだったため、破棄して作り直しました。`);
+        const hit = { teamId: want, dossier: null, identityReplaced: true };
+        teamResolveMemo.set(club.nameEn, hit);
+        return hit;
+      }
+      const hit = { teamId: want, dossier };
       teamResolveMemo.set(club.nameEn, hit);
       return hit;
     }
-    // v98: 動的クラブは試合一覧が返した teamId をそのまま使う(名前検索をしない=誤照合しない・予算0)
-    if (club.dynamic && Number.isFinite(Number(club.apiTeamId))) {
-      const hit = { teamId: Number(club.apiTeamId), dossier };
+    if (dossier && dossier.teamId) {
+      const hit = { teamId: dossier.teamId, dossier };
       teamResolveMemo.set(club.nameEn, hit);
       return hit;
     }
@@ -277,7 +322,8 @@ async function collectUniverse(deps, runAt, dateKey) {
       try {
         const data = await callApiFootball("/teams", { search: term });
         sawSuccessfulSearch = true;
-        const row = pickBestTeamMatch(data.response, club);
+        // v104.1: 過去に「取り違え」と判定したチームIDは二度と採用しない
+        const row = pickBestTeamMatch(data.response, club, { rejectTeamIds: rejectedTeamIdsOf(dossier) });
         if (!row) continue; // この表記では見つからなかった → 次の候補へ
         // /teams の応答には基本情報も含まれるので、同じ1リクエストで保存する
         await clubDossier.updateSection(club.nameEn, "basic", {
@@ -287,6 +333,7 @@ async function collectUniverse(deps, runAt, dateKey) {
           venueCity: (row.venue && row.venue.city) || null,
           venueCapacity: (row.venue && row.venue.capacity) || null,
           logo: row.team.logo || null,
+          apiTeamName: row.team.name || null, // v104.1: 提供元での登録名(照合先の確認用)
         }, metaOf(club, row.team.id, runAt));
         const hit = { teamId: row.team.id, dossier };
         teamResolveMemo.set(club.nameEn, hit);
@@ -329,6 +376,181 @@ async function collectUniverse(deps, runAt, dateKey) {
   }
 
   // ============================================================
+  // v104.1(2026年11月14日): 保存済みチームIDの本人確認と、取り違えの照合し直し
+  // ============================================================
+  //   本番実測: バイエルン・ミュンヘンの調査ファイルに**女子チームのID**が保存されたまま3か月間
+  //   収集が続き、選手索引にケイン・ムシアラ・キミッヒら男子選手が1人も入っていなかった
+  //   (順位表は取れず、フォーム・怪我・名簿・移籍はすべて女子チームの実測だった)。
+  //   原因は2つ: ①昔の照合(検索結果が1件ならそれを採用/除外後に0件なら全候補へ戻す)が女子チームを
+  //   掴んだ ②チームIDは一度保存すると再照合されないため、照合ロジックを直しても残り続けた。
+  //   対策: 毎日のコア更新が必ず取得している直近試合の応答で本人確認し(追加API 0回)、
+  //   取り違えが確認できたら 順位表→名前検索 の順に正しいチームを探して差し替える。
+  //   差し替えの際は、誤ったIDで集めた調査ファイルの中身を捨て、索引からそのクラブの旧選手を外す。
+  function rejectedTeamIdsOf(dossier) {
+    const list = dossier && dossier.identity && Array.isArray(dossier.identity.rejected) ? dossier.identity.rejected : [];
+    return list.map((x) => Number(x && x.teamId)).filter(Number.isFinite);
+  }
+  const standingsMemo = new Map(); // leagueId -> /standings の応答(②と共有=同じリーグを二度取らない)
+  async function getStandingsCached(leagueId) {
+    const key = Number(leagueId);
+    if (standingsMemo.has(key)) return standingsMemo.get(key);
+    const data = await callApiFootball("/standings", { league: leagueId, season });
+    standingsMemo.set(key, data);
+    return data;
+  }
+  const identityReset = new Set();   // 今日、照合先を差し替えた/取り消したクラブ(nameEn)。索引の旧行を持ち越さない
+  const identityHealedClubs = [];    // 今日、正しいチームへ差し替えたクラブ(名簿を今日のうちに取り直す)
+  async function healTeamIdentity(club, wrongTeamId, idCheck) {
+    const memo = teamResolveMemo.get(club.nameEn) || {};
+    const dossier = memo.dossier || null;
+    const wrongId = Number(wrongTeamId);
+    const rejectIds = [wrongId, ...rejectedTeamIdsOf(dossier)];
+    const fix = {
+      nameEn: club.nameEn, nameJa: club.nameJa, status: null,
+      previousTeamId: wrongId, previousApiName: idCheck.apiName || null,
+      teamId: null, apiName: null, evidenceJa: idCheck.evidenceJa || null, viaJa: null,
+    };
+    // 動的クラブ(試合一覧のIDをそのまま使う=名前検索の取り違えは起きない)は、差し替えずに今日の収集だけ見送る
+    if (club.dynamic) {
+      if (!idCheck.wrong) return { status: "kept" };
+      fix.status = "deferred";
+      stats.identity.deferred++;
+      stats.identityFixes.push(fix);
+      skip("teamIdentity", `${club.nameJa}は男子トップチームではない可能性があるため(${idCheck.evidenceJa})、今日の収集を見送りました。`);
+      teamResolveMemo.set(club.nameEn, { teamId: null, dossier, identityBlocked: true });
+      return { status: "deferred" };
+    }
+    // v104.1(総点検): 名前が合わない疑いを「直さずに残した」ときは、日次レポートに開示する(黙って残さない)
+    const noteNameSuspect = () => {
+      if (idCheck.nameMismatch && stats.identitySuspects.length < 20 && !stats.identitySuspects.some((x) => x.nameEn === club.nameEn)) {
+        stats.identitySuspects.push({ nameEn: club.nameEn, nameJa: club.nameJa, teamId: wrongId, apiName: idCheck.apiName || null, kind: idCheck.kind || null, evidenceJa: idCheck.evidenceJa || null });
+      }
+    };
+    let cand = null;
+    let transient = false; // 通信・予算など一時的な理由で確かめ切れなかった(=捨てずに明日やり直す)
+    // (1) 所属リーグの順位表から探す(②でも使う応答。同じリーグを二度取らない)
+    if (club.leagueId) {
+      if (!canSpend(1)) transient = true;
+      else {
+        try {
+          const st = await getStandingsCached(club.leagueId);
+          const teams = listStandingsTeams(st && st.response);
+          if (teams.some((t) => Number(t.id) === wrongId)) {
+            // 男子リーグの順位表に載っている=そのリーグのトップチーム。表記だけで取り違えと決めつけない。
+            stats.identity.suspectKept++;
+            return { status: "kept", inLeagueStandings: true };
+          }
+          const hit = findClubInStandings(club, st && st.response, { strict: !idCheck.wrong, rejectTeamIds: rejectIds });
+          if (hit) { cand = { id: Number(hit.id), name: hit.name, row: null }; fix.viaJa = `所属リーグの順位表(リーグID ${club.leagueId})`; }
+        } catch (e) {
+          if (e && e.code === "BUDGET_EXHAUSTED") transient = true;
+          else { transient = true; noteWarning(stats, `identity_standings_failed:${club.nameEn}`, e); }
+        }
+      }
+    }
+    // 弱い証拠(所属リーグの試合が無いだけ)は、順位表に同名の別チームがいたときだけ直す(降格・昇格では直さない)
+    if (!cand && !idCheck.wrong) { stats.identity.suspectKept++; noteNameSuspect(); return { status: "kept" }; }
+    // (2) 名前で検索し直す(女子・2軍・ユースと、過去に取り違えたIDは採用しない)
+    if (!cand) {
+      let sawSearch = false;
+      for (const term of searchVariantsOf(club)) {
+        if (!canSpend(1)) { transient = true; break; }
+        try {
+          const data = await callApiFootball("/teams", { search: term });
+          sawSearch = true;
+          const row = pickBestTeamMatch(data.response, club, { rejectTeamIds: rejectIds });
+          if (row) { cand = { id: Number(row.team.id), name: row.team.name, row }; fix.viaJa = `名前の検索(${term})`; break; }
+        } catch (e) {
+          if (e && e.code === "BUDGET_EXHAUSTED") { transient = true; break; }
+          noteWarning(stats, `identity_search_failed:${club.nameEn}`, e);
+        }
+      }
+      if (!cand && !sawSearch) transient = true;
+    }
+    // (3) 候補の本人確認(直近試合)。この応答は、そのまま今日のコア更新に使う(無駄にしない)
+    let candFixtures = null;
+    let candCheck = null;
+    if (cand) {
+      if (!canSpend(1)) { transient = true; cand = null; }
+      else {
+        try {
+          const fx = await callApiFootball("/fixtures", { team: cand.id, last: 10 });
+          candFixtures = fx.response || [];
+          candCheck = assessTeamIdentity(club, cand.id, candFixtures);
+          if (candCheck.wrong) cand = null; // 候補も女子・2軍だった → 採用しない
+        } catch (e) {
+          transient = true; cand = null;
+          if (!(e && e.code === "BUDGET_EXHAUSTED")) noteWarning(stats, `identity_candidate_check_failed:${club.nameEn}`, e);
+        }
+      }
+    }
+    if (!cand && transient) {
+      // 一時的な理由で確かめ切れなかった: 調査ファイルは触らず、誤ったチームのデータを今日は足さない
+      fix.status = "deferred";
+      stats.identity.deferred++;
+      stats.identityFixes.push(fix);
+      skip("teamIdentity", `${club.nameJa}の照合先が誤っている可能性があります(${idCheck.evidenceJa})。正しいチームを確かめ切れなかったため、今日はこのクラブの収集を見送り、次回もう一度確かめます。`);
+      teamResolveMemo.set(club.nameEn, { teamId: null, dossier, identityBlocked: true });
+      return { status: "deferred" };
+    }
+    if (typeof clubDossier.resetIdentity !== "function") {
+      fix.status = "deferred";
+      stats.identity.deferred++;
+      stats.identityFixes.push(fix);
+      teamResolveMemo.set(club.nameEn, { teamId: null, dossier, identityBlocked: true });
+      return { status: "deferred" };
+    }
+    const apiName = cand ? ((candCheck && candCheck.apiName) || cand.name || null) : null;
+    const reset = await clubDossier.resetIdentity(club.nameEn, {
+      teamId: cand ? cand.id : null, apiName,
+      previousTeamId: wrongId, previousApiName: idCheck.apiName || null,
+      evidenceJa: idCheck.evidenceJa || null, viaJa: fix.viaJa, at: runAt.toISOString(),
+    }).catch((e) => ({ saved: false, reasonJa: String((e && e.message) || e) }));
+    if (!reset || !reset.saved) {
+      fix.status = "deferred";
+      stats.identity.deferred++;
+      stats.identityFixes.push(fix);
+      skip("teamIdentity", `${club.nameJa}の照合先の差し替えを保存できませんでした(${(reset && reset.reasonJa) || "保存先の書き込みに失敗"})。今日はこのクラブの収集を見送り、次回やり直します。`);
+      teamResolveMemo.set(club.nameEn, { teamId: null, dossier, identityBlocked: true });
+      return { status: "deferred" };
+    }
+    identityReset.add(club.nameEn);
+    if (!cand) {
+      // 強い証拠で誤りと分かったが、正しいチームが見つからない: 誤ったデータを捨て、照合できないクラブとして開示する
+      fix.status = "cleared";
+      stats.identity.cleared++;
+      stats.identityFixes.push(fix);
+      skip("teamIdentity", `${club.nameJa}の照合先が誤っていました(${idCheck.evidenceJa})。誤ったチームで集めた情報を破棄しましたが、正しいチームをまだ特定できていません(次回の収集で照合し直します)。`);
+      markUnresolved(club, `保存されていた照合先が誤っていたため取り消しました(${idCheck.evidenceJa})。次回の収集で照合し直します。`);
+      teamResolveMemo.set(club.nameEn, { teamId: null, dossier: null, identityBlocked: true });
+      return { status: "cleared" };
+    }
+    // 基本情報(本拠地・創設年・ロゴ)も正しいチームのものへ(検索の応答に入っていればそれを使う。無ければ1回だけ取得)
+    try {
+      let row = cand.row;
+      if (!row && canSpend(1)) {
+        const t = await callApiFootball("/teams", { id: cand.id });
+        row = (t.response || [])[0] || null;
+      }
+      if (row && row.team) {
+        await clubDossier.updateSection(club.nameEn, "basic", {
+          founded: row.team.founded ?? null, countryEn: row.team.country ?? null,
+          venueName: (row.venue && row.venue.name) || null, venueCity: (row.venue && row.venue.city) || null,
+          venueCapacity: (row.venue && row.venue.capacity) || null, logo: row.team.logo || null,
+          apiTeamName: row.team.name || apiName || null,
+        }, metaOf(club, cand.id, runAt));
+      }
+    } catch (e) { noteWarning(stats, `identity_basic_failed:${club.nameEn}`, e); }
+    fix.status = "healed"; fix.teamId = cand.id; fix.apiName = apiName;
+    stats.identity.healed++;
+    stats.identityFixes.push(fix);
+    identityHealedClubs.push(club);
+    skip("teamIdentity", `${club.nameJa}の照合先が誤っていた(${idCheck.evidenceJa})ため、${fix.viaJa}から正しいチーム${apiName ? `「${apiName}」` : ""}へ照合し直しました。誤ったチームで集めた情報は破棄し、今日から正しいチームのフォーム・怪我・名簿・選手成績を集め直します。`);
+    teamResolveMemo.set(club.nameEn, { teamId: cand.id, dossier: null });
+    return { status: "healed", teamId: cand.id, fixtures: candFixtures || [], apiName };
+  }
+
+  // ============================================================
   // ① コア更新(フォーム・怪我・監督/布陣・移籍)
   // ============================================================
   // 優先クラブを先頭に置く(予算切れで打ち切られる場合も優先クラブは必ず処理される)。
@@ -349,12 +571,14 @@ async function collectUniverse(deps, runAt, dateKey) {
   for (const club of coreClubs) {
     if (!canSpend(4)) { skip("core", `予算残量が安全ラインを下回ったため、${club.nameJa}以降のコア更新を見送りました。`); break; }
     try {
-      const { teamId } = await resolveTeam(club);
+      let { teamId } = await resolveTeam(club);
       // 未解決(表記差)・予算切れは resolveTeam 側で正直に記録済みのため、
       // ここで重ねてエラーにはしない(同じ事象が二重に「エラー」と数えられ、
       // 「エラーが原因で件数が少ない」という誤った表示につながっていた)。
       if (!teamId) continue;
-      const meta = metaOf(club, teamId, runAt);
+      let meta = metaOf(club, teamId, runAt);
+      let identityAbort = false;      // v104.1: 照合先が誤り(かつ今日は直せなかった)=このクラブの収集を見送る
+      let identityVerified = null;    // v104.1: 本人確認できたら、フォーム保存に相乗りして記録する
       if (club.dynamic) {
         stats.dynamic.coreUpdated++;
         // 新規採用の動的クラブは基本情報(本拠地・創設年・ロゴ)を1回だけ取得する(/teams?id=)
@@ -379,6 +603,27 @@ async function collectUniverse(deps, runAt, dateKey) {
       try {
         const fx = await callApiFootball("/fixtures", { team: teamId, last: 10 });
         fixtures = fx.response || [];
+        // ---- v104.1: 保存済みチームIDの本人確認(この応答だけで判定=追加API 0回) ----
+        const idCheck = assessTeamIdentity(club, teamId, fixtures);
+        stats.identity.checked++;
+        if (idCheck.wrong || idCheck.suspect) {
+          const healed = await healTeamIdentity(club, teamId, idCheck);
+          if (healed.status === "healed") {
+            teamId = healed.teamId;
+            meta = metaOf(club, teamId, runAt);
+            fixtures = healed.fixtures;
+            identityVerified = { teamId, apiName: healed.apiName || null, at: runAt.toISOString() };
+          } else if (healed.status === "kept") {
+            // 名前が合わない疑いを残したときは「確認済み」とは刻まない(所属リーグの順位表に載っていた場合は別)
+            if (idCheck.apiName && (!idCheck.nameMismatch || healed.inLeagueStandings)) identityVerified = { teamId, apiName: idCheck.apiName, at: runAt.toISOString() };
+          } else {
+            identityAbort = true; // deferred / cleared: 誤ったチームのデータを足さない
+          }
+        } else if (idCheck.apiName) {
+          identityVerified = { teamId, apiName: idCheck.apiName, at: runAt.toISOString() };
+        }
+        if (identityAbort) throw Object.assign(new Error("IDENTITY_ABORT"), { identityAbort: true });
+        if (identityVerified) stats.identity.verified++;
         fixturesCache.set(teamId, fixtures); // xGステージが再利用(同一実行内の二度取り防止)
         const form = computeFormScore(fixtures, teamId);
         const goals = computeGoalRateFeatures(fixtures, teamId);
@@ -405,7 +650,7 @@ async function collectUniverse(deps, runAt, dateKey) {
           homeWinRate: ha.home.winRate, awayWinRate: ha.away.winRate,
           homeSample: ha.home.sampleSize, awaySample: ha.away.sampleSize,
           recentResults,
-        }, meta);
+        }, identityVerified ? { ...meta, identityVerified } : meta);
         await noteChanges(club, r.changesJa, "recentFormTrend", { formDelta: form.delta });
         // リーグID(静的に持っていなければ直近試合から逆算)
         const leagueId = club.leagueId || inferLeagueIdFromFixtures(fixtures);
@@ -413,7 +658,10 @@ async function collectUniverse(deps, runAt, dateKey) {
           if (!leagueTeams.has(leagueId)) leagueTeams.set(leagueId, []);
           leagueTeams.get(leagueId).push({ club, teamId });
         }
-      } catch (e) { stats.errors.push(`universe_form_failed:${club.nameEn}:${e.code || e.message}`); }
+      } catch (e) {
+        if (!(e && e.identityAbort)) stats.errors.push(`universe_form_failed:${club.nameEn}:${e.code || e.message}`);
+      }
+      if (identityAbort) continue; // v104.1: 理由は healTeamIdentity が開示済み(skip "teamIdentity")
 
       // --- 怪我・出場停止 ---
       try {
@@ -541,7 +789,7 @@ async function collectUniverse(deps, runAt, dateKey) {
   for (const [leagueId, entries] of leagueTeams) {
     if (!canSpend(1)) { skip("standings", "予算残量が安全ラインを下回ったため、残りのリーグの順位表更新を見送りました。"); break; }
     try {
-      const data = await callApiFootball("/standings", { league: leagueId, season });
+      const data = await getStandingsCached(leagueId); // v104.1: 本人確認で取得済みならそれを使う(二度取らない)
       for (const { club, teamId } of entries) {
         const st = computeStandingsFeature(data.response, teamId);
         if (st && st.position !== null) {
@@ -565,6 +813,9 @@ async function collectUniverse(deps, runAt, dateKey) {
     // v98: 動的クラブは新規採用の日と、その後は7日周期で名簿を更新する
     ...dynamicDue.filter((c) => c.isNew || (c.rank % 7) === (dayNumberOf(dateKey) % 7)),
   ];
+  // v104.1: 今日、照合先を正しいチームへ差し替えたクラブは、輪番を待たずに名簿を取り直す
+  //   (誤ったチームの名簿は破棄済み。取り直さないと、そのクラブの選手が輪番の日まで名簿から消える)
+  for (const c of identityHealedClubs) if (!squadClubs.includes(c)) squadClubs.push(c);
   stats.squadsPlanned = squadClubs.length;
   for (const club of squadClubs) {
     if (!canSpend(1)) { skip("squad", `予算残量が安全ラインを下回ったため、${club.nameJa}以降の名簿更新を見送りました。`); break; }
@@ -1167,7 +1418,7 @@ async function collectUniverse(deps, runAt, dateKey) {
       // 今日どの情報源にも現れなかった選手は、前回の行をそのまま残す
       // (クラブの名簿更新が輪番待ちのときに、索引から人が消えないようにする)。
       // ただし60日以上更新が無い行は退団などとみなして落とす。
-      let carried = 0, dropped = 0, droppedWomens = 0;
+      let carried = 0, dropped = 0, droppedWomens = 0, droppedWrongTeam = 0;
       for (const [id, prev] of prevMap) {
         if (merged.has(id)) continue;
         // v89/v91: 女子と判定した選手は、過去に混入した索引行も持ち越さずここで削除する
@@ -1175,6 +1426,8 @@ async function collectUniverse(deps, runAt, dateKey) {
         //  選手だけ残す」刈り込みで同時に消える)。v91で判定を「今日の分」から
         // 「記憶を含む有効集合」へ広げた=成績が返ってこない日でも確実に消える。
         if (womensEffective.has(id)) { droppedWomens++; continue; }
+        // v104.1: 今日、照合先を差し替えた/取り消したクラブの旧行は「別チームの選手」なので持ち越さない
+        if (identityReset.has(String(prev[playerSearch.COL.teamEn] || ""))) { droppedWrongTeam++; continue; }
         const age = playerSearch.daysBetweenKeys(prev[playerSearch.COL.updatedAt], todayKey);
         if (age !== null && age > 60) { dropped++; continue; }
         rows.push(prev); carried++;
@@ -1206,7 +1459,7 @@ async function collectUniverse(deps, runAt, dateKey) {
           count: womensExcluded.size, droppedFromIndex: droppedWomens,
           knownRemembered: womensKnown.size, restoredAsMens: womensCleared.size, samples,
         };
-        skip("womensFilter", `男子サッカー専用の方針により、女子大会の成績しか持たない選手を収集・索引から除外しました(本日の新規判定${womensExcluded.size}人・記憶済み${womensKnown.size}人・索引から削除${droppedWomens}人${womensCleared.size ? `・男子成績が確認できて復帰${womensCleared.size}人` : ""})。提供元がクラブの男子チームIDに女子部門の成績を紐づけているための混入です。${samples.length ? `例: ${samples.slice(0, 3).join("、")}` : ""}`);
+        skip("womensFilter", `男子サッカー専用の方針により、女子大会の成績しか持たない選手を収集・索引から除外しました(本日の新規判定${womensExcluded.size}人・記憶済み${womensKnown.size}人・索引から削除${droppedWomens}人${womensCleared.size ? `・男子成績が確認できて復帰${womensCleared.size}人` : ""})。クラブの照合先が女子チームになっていた場合や、提供元が男子チームに女子部門の成績を紐づけている場合に起きる混入です(照合先の誤りは、毎日の本人確認で検出して自動で照合し直します)。${samples.length ? `例: ${samples.slice(0, 3).join("、")}` : ""}`);
       }
 
       const C = playerSearch.COL;
@@ -1328,6 +1581,7 @@ async function collectUniverse(deps, runAt, dateKey) {
         newRows: rows.filter((r) => !prevMap.has(Number(r[C.id]))).length,
         carriedOver: carried,
         droppedStale: dropped,
+        droppedWrongTeam, // v104.1: 照合先を直したクラブの「別チームの選手」を外した数
         changedToday: changed.filter((x) => x.prev).length,
         savedPlayerRecords: savedFromBulk,
         deferredPlayerRecords: savableDeferred,
@@ -1425,15 +1679,57 @@ async function collectUniverse(deps, runAt, dateKey) {
       if (tid) clubsForMap.push({ teamId: Number(tid), nameEn: c.nameEn, nameJa: c.nameJa, tier: tierOf(c), dynamic: false, leagueId: c.leagueId || null });
     }
     // 今日解決しなかった固定クラブは、前回の表から引き継ぐ(表が日ごとに欠けないように)
+    let prevTeamMap = null; // 前回の表(下の動的クラブの確認でも使う。読むのは1回だけ)
     if (deps.upstashGetJSON) {
       const prev = await deps.upstashGetJSON("kb:universe:teammap").catch(() => null);
+      prevTeamMap = prev;
       const have = new Set(clubsForMap.map((c) => c.nameEn));
       for (const e of (prev && Array.isArray(prev.clubs)) ? prev.clubs : []) {
-        if (e && !e.dynamic && e.nameEn && !have.has(e.nameEn) && CLUB_UNIVERSE.some((c) => c.nameEn === e.nameEn)) clubsForMap.push(e);
+        // v104.1: 今日、照合先を取り消したクラブの旧ID(=別チームのID)は引き継がない
+        if (e && !e.dynamic && e.nameEn && !have.has(e.nameEn) && !identityReset.has(e.nameEn) && CLUB_UNIVERSE.some((c) => c.nameEn === e.nameEn)) clubsForMap.push(e);
       }
     }
-    for (const c of dynamicAll) {
-      if (Number.isFinite(Number(c.apiTeamId))) clubsForMap.push({ teamId: Number(c.apiTeamId), nameEn: c.nameEn, nameJa: c.nameJa || c.nameEn, tier: "C", dynamic: true, leagueId: c.leagueId || null });
+    // ---- v104.1(総点検): 動的クラブの行に「このチームIDで実際に収集したか(idVerified)」を付ける ----
+    //   試合カード・主力評価点の特徴量は、この旗が true の動的クラブだけ選手索引を使う
+    //   (索引はクラブ名でまとめているため、未確認のまま使うと同名の別クラブの選手が混ざり得る)。
+    //     true  … 今日このIDで収集した / 前回の表で確認済み / 調査ファイルのチームIDが一致
+    //     false … まだ一度も収集できていない(予算切れ等)、または調査ファイルが別チームのもの
+    //   同じ名前(調査ファイルの slug)の行は、先に載った1チームだけにする。
+    {
+      const { slugOf } = require("../knowledge/clubDossier");
+      const slugTaken = new Map(); // slug -> teamId
+      for (const e of clubsForMap) slugTaken.set(slugOf(e.nameEn), Number(e.teamId));
+      for (const c of CLUB_UNIVERSE) { if (!slugTaken.has(slugOf(c.nameEn))) slugTaken.set(slugOf(c.nameEn), null); }
+      const prevDynamic = new Map();
+      for (const e of (prevTeamMap && Array.isArray(prevTeamMap.clubs)) ? prevTeamMap.clubs : []) if (e && e.dynamic && Number.isFinite(Number(e.teamId))) prevDynamic.set(Number(e.teamId), e);
+      const dynRows = [];
+      let slugSkipped = 0;
+      for (const c of dynamicAll) {
+        const id = Number(c.apiTeamId);
+        if (!Number.isFinite(id)) continue;
+        const slug = slugOf(c.nameEn);
+        if (slugTaken.has(slug) && slugTaken.get(slug) !== id) { slugSkipped++; continue; }
+        slugTaken.set(slug, id);
+        const m = teamResolveMemo.get(c.nameEn);
+        const p = prevDynamic.get(id);
+        let idVerified = false;
+        if (m && Number(m.teamId) === id && !m.identityBlocked) idVerified = true;                 // 今日このIDで収集した
+        else if (p && p.nameEn === c.nameEn && p.idVerified === true) idVerified = true;            // 前回の表で確認済み
+        dynRows.push({ teamId: id, nameEn: c.nameEn, nameJa: c.nameJa || c.nameEn, tier: "C", dynamic: true, leagueId: c.leagueId || null, idVerified });
+      }
+      // まだ確認できていない行は、調査ファイルのチームIDで確かめる(まとめ読み。初回だけ件数が多い)
+      const pending = dynRows.filter((r) => !r.idVerified);
+      if (pending.length && typeof clubDossier.getDossiers === "function") {
+        try {
+          const got = await clubDossier.getDossiers(pending.map((r) => r.nameEn));
+          for (const r of pending) {
+            const d = got && got.byName ? got.byName.get(r.nameEn) : null;
+            if (d && d.teamId !== null && d.teamId !== undefined && Number(d.teamId) === r.teamId) r.idVerified = true;
+          }
+        } catch (e) { noteWarning(stats, "universe_teammap_verify_failed", e); }
+      }
+      for (const r of dynRows) clubsForMap.push(r);
+      stats.teamMapDynamic = { total: dynRows.length, verified: dynRows.filter((r) => r.idVerified).length, sameNameSkipped: slugSkipped };
     }
     if (deps.upstashSetJSON && clubsForMap.length) {
       await deps.upstashSetJSON("kb:universe:teammap", { at: runAt.toISOString(), count: clubsForMap.length, clubs: clubsForMap });
@@ -1569,20 +1865,29 @@ async function collectClubPlayersBatch(deps, opts) {
         continue;
       }
       try {
-        const found = await callApiFootball("/teams", { search: club.nameEn });
-        stats.apiRequests++;
+        // ---- v104.1(2026年11月14日): 取り違えの発生源だった照合を、宇宙収集と同じ選び方へ統一 ----
+        //   従来は「完全一致が無くても、検索結果が1件ならそれを採用」していた。
+        //   "Bayern Munich" の検索は男子(提供元の表記は Bayern München)を返さず女子チーム1件だけを返すため、
+        //   女子チームのIDが保存され、以後ずっと使われていた(保存済みIDは再照合されない)。
+        //   女子・2軍・ユースは採用しない/別名(searchAs)と発音記号を畳んだ表記で照合する/
+        //   過去に取り違えと判定したIDは採用しない。見つからなければ正直に「照合できない」とする。
         resolvedThisRun++;
-        const list = (found && found.response) || [];
-        const exact = list.find((x) => x && x.team && String(x.team.name).toLowerCase() === club.nameEn.toLowerCase())
-          || list.find((x) => x && x.team && String(x.team.name).toLowerCase().replace(/[^a-z0-9]/g, "")
-            === club.nameEn.toLowerCase().replace(/[^a-z0-9]/g, ""))
-          || (list.length === 1 ? list[0] : null);
-        if (exact && exact.team && exact.team.id) {
-          teamId = exact.team.id;
+        const rejectTeamIds = ((dossier && dossier.identity && Array.isArray(dossier.identity.rejected)) ? dossier.identity.rejected : [])
+          .map((x) => Number(x && x.teamId)).filter(Number.isFinite);
+        let picked = null;
+        for (const term of searchVariantsOf(club)) {
+          if (!canSpend(2)) break;
+          const found = await callApiFootball("/teams", { search: term });
+          stats.apiRequests++;
+          picked = pickBestTeamMatch((found && found.response) || [], club, { rejectTeamIds });
+          if (picked) break;
+        }
+        if (picked && picked.team && picked.team.id) {
+          teamId = picked.team.id;
           stats.resolvedNow++;
           // 次回からはAPIを使わずに済むよう保存する
           await clubDossier.updateSection(club.nameEn, "basic",
-            (dossier && dossier.sections && dossier.sections.basic) || { note: "teamId resolved" },
+            { ...((dossier && dossier.sections && dossier.sections.basic) || { note: "teamId resolved" }), apiTeamName: picked.team.name || null },
             { nameJa: club.nameJa, teamId, uefaRankSnapshot: club.rank }).catch(() => {});
         }
       } catch (e) {

@@ -222,6 +222,9 @@ function buildWeeklyDigest(p) {
       kickoff: r.kickoff,
       matchJa: `${clubJa(r.homeTeamEn)} vs ${clubJa(r.awayTeamEn)}`,
       predictedJa: winnerJa(r, r.predictedWinner),
+      // v104.1(総点検): 日本語以外の画面用(クラブの英語名と予想の向き。画面側で各言語の文に組み立てる)
+      homeEn: r.homeTeamEn || null, awayEn: r.awayTeamEn || null,
+      predictedWinner: ["home", "away", "draw"].includes(r.predictedWinner) ? r.predictedWinner : null,
       official: isOfficialRec(r),
     }));
 
