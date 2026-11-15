@@ -12,7 +12,7 @@ const inlineScripts = [];
 }
 if (!inlineScripts.length) throw new Error('no inline <script> blocks found in index.html');
 let code = inlineScripts.reduce((a, b) => (b.length >= a.length ? b : a), '');
-code += `\nreturn { PLAYERS, renderPlayerCard, computeScoutStars, computePlaystyleTag, getTrivia, answerPlayerQuestion, answerClubQuestion, buildClubAnswer, guessUnregisteredPlayerName, NO_RULE_MATCH, buildFallbackPlayer, simulatePerformance, wirePlayerExtras, renderComparison, findPlayer, sendChatMessage, chatHistories, photoCache, state, MATCHUPS, playersForSide, renderMatchList, renderMatchAnalysis, teamAvg, pickLikelyXI };`;
+code += `\nreturn { PLAYERS, renderPlayerCard, computeScoutStars, computePlaystyleTag, getTrivia, answerPlayerQuestion, answerClubQuestion, buildClubAnswer, guessUnregisteredPlayerName, NO_RULE_MATCH, buildFallbackPlayer, simulatePerformance, wirePlayerExtras, renderComparison, findPlayer, sendChatMessage, chatHistories, photoCache, state, teamAvg };`;
 
 function makeEl(id) {
   const listeners = {};
@@ -89,21 +89,21 @@ try {
   errors.push('fallback player: ' + e.message);
 }
 
-// match analysis AI
-// NOTE: renderMatchAnalysis() is now async (Stage B: it awaits /api/predict-match,
-// falling back to the identical local calculation when the fetch fails — which it
-// always does here, since the stubbed fetch above throws "no network"). It must be
-// awaited so any error thrown inside it is actually caught by this try/catch.
+// v104.2(利用者のご要望「仮の対戦は全部消す」): ここで検査していた「注目の試合カード」
+// (登録選手のデータから作る仮の対戦 MATCHUPS と、その AI 試合プレビュー renderMatchAnalysis)は
+// 画面ごと外した。外したものが本体のスクリプトに残っていないことと、実際の試合の分析などが
+// 引き続き使う平均の計算(teamAvg)が「選手0人なら null」を返すことを確かめる。
 (async () => {
   try {
-    api.renderMatchList();
-    for (const m of api.MATCHUPS) {
-      const homeN = api.playersForSide(m, 'home').length, awayN = api.playersForSide(m, 'away').length;
-      console.log(`matchup ${m.id}: home=${homeN} registered, away=${awayN} registered`);
-      for (let i = 0; i < 3; i++) await api.renderMatchAnalysis(m.id); // run a few times since it's randomized
+    for (const gone of ['MATCHUPS', 'renderMatchList', 'renderMatchAnalysis', 'playersForSide', 'pickLikelyXI', 'computeMatchAnalysisLocally', 'getDailyFeaturedMatchup', 'renderRankingsTab', 'initMatchAnalysisWidget']) {
+      if (new RegExp('(?:function|const|let|var)\\s+' + gone + '\\b').test(code)) throw new Error('外したはずの ' + gone + ' が本体のスクリプトに残っています');
     }
+    if (api.teamAvg([], 'overall') !== null) throw new Error('teamAvg([]) が null ではありません');
+    const somePlayers = Object.keys(api.PLAYERS).slice(0, 3).map((k) => api.PLAYERS[k]);
+    const avg = api.teamAvg(somePlayers, 'overall');
+    if (!(typeof avg === 'number' && avg > 0)) throw new Error('teamAvg が数値を返しません: ' + avg);
   } catch (e) {
-    errors.push('match analysis: ' + e.message + '\n' + e.stack);
+    errors.push('removed simulated-match code: ' + e.message + '\n' + e.stack);
   }
 
   if (errors.length) {

@@ -481,7 +481,9 @@ function mockStore(opts) {
   await t("E1 index.html: 待ち時間の救済・専用の分析待ち時間・二重送信防止・IME・自動読み直し・日付つき時刻", () => {
     const html = fs.readFileSync(INDEX_HTML, "utf8");
     assert.ok(html.includes("return fetchJsonWithTimeout(url, COLD_START_TIMEOUT_MS, fetchOptions, true);"), "短い待ち時間で中断したGETの起床待ち再試行が無い");
-    assert.ok(html.includes("const MATCH_ANALYSIS_TIMEOUT_MS = 45000;"), "マッチ分析の専用待ち時間が無い");
+    // v104.2(利用者のご要望「仮の対戦は全部消す」): 専用の待ち時間(45秒)を使っていた「AIマッチ分析」カードは
+    //   画面から外した。待ち時間の定数ごと残っていないこと(使われない設定を残さない)を確かめる。
+    assert.ok(!html.includes("MATCH_ANALYSIS_TIMEOUT_MS") && !html.includes('id="aiMatchAnalysisCard"'), "外したはずのAIマッチ分析カード(と専用の待ち時間)が残っている");
     assert.ok(html.includes("const discussInFlightKeys = new Set();") && html.includes("runDiscussFlowInner("), "考察の二重送信防止が無い");
     assert.ok((html.match(/e\.isComposing/g) || []).length >= 3, "IME変換中の Enter 対策が3箇所に無い");
     assert.ok(html.includes("function scheduleDegradedRetry(key, fn)") && (html.match(/scheduleDegradedRetry\(/g) || []).length >= 5, "読めなかった表示の自動読み直しが無い");

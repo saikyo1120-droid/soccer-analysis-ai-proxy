@@ -41,7 +41,8 @@ async function newAppPage(browser, lang) {
 }
 
 (async () => {
-  const browser = await chromium.launch({ executablePath: "/opt/pw-browsers/chromium" });
+  // v104.2: 実行環境に /opt/pw-browsers/chromium が無い場合は、Playwright の既定のブラウザを使う
+  const browser = await chromium.launch(require("fs").existsSync("/opt/pw-browsers/chromium") ? { executablePath: "/opt/pw-browsers/chromium" } : {});
   const results = [];
   const ck = (label, ok, detail) => { results.push([label, ok]); console.log(`  [${ok ? "OK" : "FAIL"}] ${label}${ok ? "" : detail ? " — " + detail : ""}`); };
 
@@ -68,13 +69,20 @@ async function newAppPage(browser, lang) {
   // タップで反省タブへ切り替わる
   await page.click("#predsToReflectionsLink");
   await page.waitForTimeout(300);
+  // v104.2: 「⚽ 試合分析AI」タブ(matchSection)は画面から外した。ほかの項目(選手検索)が閉じたままであることを見る
   const tabState = await page.evaluate(() => ({
     refl: document.getElementById("reflectionsSection").style.display,
-    match: document.getElementById("matchSection").style.display,
+    player: document.getElementById("playerSection").style.display,
+    matchGone: !document.getElementById("matchSection"),
     activeBtn: (document.querySelector("#modeSwitch button.active") || {}).dataset ? document.querySelector("#modeSwitch button.active").dataset.mode : null,
   }));
-  ck("B: リンクのタップで反省タブが開く", tabState.refl === "block" && tabState.match === "none" && tabState.activeBtn === "reflections",
+  ck("B: リンクのタップで反省タブが開く", tabState.refl === "block" && tabState.player === "none" && tabState.matchGone && tabState.activeBtn === "reflections",
     JSON.stringify(tabState));
+  // v104.2: もう一度リンクを押しても閉じない(タブのボタンは「もう一度押すと閉じる」が、リンクは開く専用)
+  await page.click("#predsToReflectionsLink");
+  await page.waitForTimeout(200);
+  const stillOpen = await page.evaluate(() => document.getElementById("reflectionsSection").style.display);
+  ck("B: リンクをもう一度押しても反省は閉じない", stillOpen === "block", stillOpen);
 
   // ---- 還元C: 生成情報の開示行 ----
   const withMeta = await page.evaluate(() => renderDiscussReplyHtml({

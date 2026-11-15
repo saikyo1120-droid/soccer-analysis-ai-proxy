@@ -532,15 +532,20 @@ test("★欠陥23: 実データが1件も無いクラブのプロフィールを
   assert.strictEqual(r2.generated, true);
 });
 
-test("★欠陥24: 怪我人情報が取れなかったときに「負傷者なし」と断言しない(index.htmlの実装検査)", () => {
+test("★欠陥24: 怪我人情報が取れなかったときに「負傷者なし」と断言しない(v104.2: 画面のカードは外した。サーバーの申告を検査)", () => {
   // count が null(取得失敗)でも `!side.count` が真になるため、
   // 「負傷・出場停止者なし」と断言していた。同じ画面の下部には
   // 「負傷者情報の取得に失敗しました」と出るので、回答が自己矛盾していた。
+  // v104.2(利用者のご要望「仮の対戦は全部消す」): この表示があった「AIマッチ分析」カードは画面から外した。
+  //   同じ応答(/api/match-analysis)は会話の道具「対戦分析」が回答AIへ渡すので、
+  //   ・画面側に「負傷・出場停止者なし」と断言する描画が残っていないこと
+  //   ・サーバーが「取得に失敗した」ことを申告し続けていること(回答AIが 0人 と誤解しない)
+  //   を確かめる。
   const html = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");
-  assert.ok(/side\.count === null \|\| side\.count === undefined/.test(html),
-    "0人だった場合と、取得できなかった場合を区別していない");
-  assert.ok(/負傷・出場停止の情報を取得できませんでした/.test(html),
-    "取得できなかったことを伝える文言が無い");
+  const src = fs.readFileSync(path.join(ROOT, "server/server.js"), "utf8");
+  assert.ok(!/id="maResultWrap"/.test(html) && !/function renderMatchAnalysisResult\(/.test(html), "外したはずのAIマッチ分析カードが画面に残っている");
+  assert.ok(!/負傷・出場停止者なし<\/div>/.test(html), "「負傷・出場停止者なし」と断言する描画が画面に残っている");
+  assert.ok(/の負傷者情報の取得に失敗しました。/.test(src), "サーバーが取得失敗を申告していない");
 });
 
 test("★欠陥25: 学習済みの重みが読めなかったことを利用者に伝える(server.jsの実装検査)", () => {

@@ -478,7 +478,10 @@
   .chat-msg.user .chat-bubble { background: var(--series-home); color: #fff; border-bottom-right-radius: 3px; }
   .chat-msg.ai .chat-bubble { background: var(--surface-2); color: var(--text-primary); border: 1px solid var(--border); border-bottom-left-radius: 3px; }
   .chat-input-row { display: flex; gap: 8px; }
-  .chat-input-row input { flex: 1; padding: 9px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text-primary); font-size: 13.5px; }
+  /* v104.2: 入力欄は min-width:0 で縮められるようにする(入力欄は既定では約20文字ぶんより狭くなれず、幅320pxの画面で
+     ボタンの文字が長い言語(スペイン語「Preguntar ▶」)のとき、行が画面の右へはみ出していた)。ボタンは縮めず折り返さない。 */
+  .chat-input-row input { flex: 1 1 0; min-width: 0; padding: 9px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text-primary); font-size: 13.5px; }
+  .chat-input-row button { flex: 0 0 auto; white-space: nowrap; }
 
   /* AI対話パートナー: 回答の後に「一緒に考える」ための要素(振り返り質問・別の視点・深掘り質問) */
   .dialogue-extra { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border); }
@@ -493,6 +496,62 @@
   .tier-table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 4px; }
   .tier-table th, .tier-table td { padding: 4px 6px; border-bottom: 1px solid var(--border); text-align: right; }
   .tier-table th:first-child, .tier-table td:first-child { text-align: left; }
+  /* ==== v104.2「見やすさの整理」(ご指摘: 自信ランクが分かりにくい・情報が多すぎて見にくい) ==== */
+  /* たためるカード: 見出しがボタン。閉じているあいだは見出しと一言の要約だけが見える */
+  .card.fold-card > h2.fold-h { display: block; margin: 0; }
+  .fold-btn { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; width: 100%; margin: 0; padding: 0; border: none; background: none; color: inherit; font: inherit; font-weight: 700; text-align: left; cursor: pointer; }
+  .fold-btn .fold-title { flex: 1 1 auto; min-width: 0; }
+  .fold-btn .fold-chev { flex: 0 0 auto; font-size: 12px; font-weight: 600; color: var(--text-secondary); background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; white-space: nowrap; }
+  .fold-btn:hover .fold-chev { color: var(--text-primary); border-color: var(--text-muted); }
+  .fold-btn .fold-meta { flex: 1 0 100%; font-size: 12px; font-weight: 400; color: var(--text-muted); line-height: 1.5; }
+  .fold-btn .fold-meta:empty { display: none; }
+  .fold-card.is-open .fold-btn .fold-meta { display: none; } /* 開いているあいだは中身に同じことが書いてあるので要約は隠す */
+  .fold-btn:focus-visible { outline: 2px solid var(--series-home); outline-offset: 4px; border-radius: 6px; }
+  .fold-card .fold-body { margin-top: 12px; }
+  .fold-card .fold-body[hidden] { display: none; }
+  .more-menu-title { font-size: 15px; margin: 22px 0 4px; }
+  /* 「もっと見る」の4つは、押しやすい大きさで均等に並べる(スマホは2列×2段・広い画面は横に4つ)。
+     以前は文字の幅なりに折り返していたため、スマホでは3つ+1つの不ぞろいな並びになっていた。 */
+  #modeSwitch { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; width: 100%; box-sizing: border-box; padding: 4px; }
+  #modeSwitch button { white-space: normal; overflow-wrap: anywhere; min-height: 44px; padding: 9px 8px; font-size: 13.5px; line-height: 1.35; text-align: center; }
+  #modeSwitch button:focus-visible { outline: 2px solid var(--series-home); outline-offset: 1px; }
+  @media (max-width: 640px) { #modeSwitch { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  /* 予想1件: いちばん上に自信ランクの帯、その下は 対戦・AIの予想・勝率の帯・決め手 だけ。根拠は「くわしく見る」の中 */
+  .pred-item { border: 1px solid var(--border); border-radius: 10px; margin: 0 0 10px; overflow: hidden; background: var(--surface-1); }
+  .pred-item.is-best { border: 2px solid var(--series-2); }
+  .pred-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: start; margin: 0 0 10px; }
+  .pred-grid.is-single { grid-template-columns: 1fr; }
+  .pred-grid .pred-item { margin: 0; min-width: 0; }
+  @media (max-width: 760px) { .pred-grid { grid-template-columns: 1fr; } }
+  .pred-item .pred-pad { padding: 10px 12px; }
+  .best-ribbon { padding: 6px 12px; font-size: 13px; font-weight: 700; background: rgba(179,84,30,.16); color: var(--text-primary); border-bottom: 1px solid var(--border); }
+  .best-ribbon .best-why { display: block; font-size: 11.5px; font-weight: 400; color: var(--text-secondary); margin-top: 1px; }
+  .rank-band { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 6px 12px; font-size: 12px; color: var(--text-secondary); background: var(--surface-2); border-bottom: 1px solid var(--border); }
+  .rank-band .rank-cap { font-weight: 600; white-space: nowrap; }
+  .rank-band .rank-letter { display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box; min-width: 30px; height: 30px; padding: 0 8px; border-radius: 8px; font-size: 18px; font-weight: 800; line-height: 1; border: 2px solid var(--series-2); color: var(--series-2); background: var(--surface-1); white-space: nowrap; }
+  .rank-band .rank-label { font-size: 13.5px; font-weight: 700; color: var(--text-primary); }
+  .rank-band .rank-conf { margin-left: auto; white-space: nowrap; }
+  .rank-band .rank-conf strong { font-size: 14px; color: var(--text-primary); }
+  .rank-band .rank-why { flex: 1 0 100%; font-size: 11.5px; color: var(--text-muted); }
+  .rank-band.rank-s { background: rgba(179,84,30,.16); }
+  .rank-band.rank-s .rank-letter { background: var(--series-2); color: var(--surface-1); }
+  .rank-band.rank-a { background: rgba(179,84,30,.07); }
+  .rank-band.rank-b .rank-letter { border-color: var(--text-muted); color: var(--text-secondary); }
+  .rank-band.rank-skip .rank-letter, .rank-band.rank-none .rank-letter { border: 2px dashed var(--text-muted); color: var(--text-muted); font-size: 13px; font-weight: 700; }
+  .pred-title { font-size: 15px; line-height: 1.4; }
+  .pred-meta { font-size: 12px; color: var(--text-muted); margin-top: 1px; }
+  .pred-pick { margin-top: 6px; font-size: 14px; }
+  .pred-reason { font-size: 12.5px; color: var(--text-secondary); margin-top: 4px; }
+  .pred-alerts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .pred-alert { font-size: 11.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--warning); color: var(--text-primary); background: rgba(250,178,25,.12); }
+  details.pred-more { margin-top: 8px; }
+  details.pred-more > summary { cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--series-2); }
+  details.pred-more[open] > summary { margin-bottom: 4px; }
+  .pred-actions { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+  /* 的中率カード: 1行目は見出しと「詳しく見る」、2行目に件数の注記 */
+  .acc-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+  .acc-headline { min-width: 0; font-size: 15px; }
+  .acc-headline .acc-note { display: block; margin-top: 2px; }
   .chat-followup-btn { border: 1px solid var(--series-home); background: transparent; color: var(--series-home); padding: 5px 11px; border-radius: 999px; font-size: 12px; cursor: pointer; }
   .chat-followup-btn:hover { background: var(--series-home); color: #fff; }
 
@@ -4081,6 +4140,44 @@
     ["フォーム急下降: 平均評価が ⦿ → ⦿(⦿)", "Form dropping: avg rating $1 → $2 ($3)", "状态急降: 平均评分 $1 → $2($3)", "Forma a la baja: nota media $1 → $2 ($3)"],
   ];
   for (var rp10 = 0; rp10 < RAWP10.length; rp10++) P.push([pat(RAWP10[rp10][0]), RAWP10[rp10][1], RAWP10[rp10][2], RAWP10[rp10][3]]);
+  /* ==== v104.2(2026年11月15日): 見やすさの整理(予想カード・たためるカード・「もっと見る」・的中率カード)の文言 ==== */
+  add({
+    // たためるカード
+    "▼ 開く": ["▼ Open", "▼ 展开", "▼ Abrir"],
+    "API-Footballから取得した本日の試合です。各試合のボタンを押すと、試合前はAIの見どころ、終了後は答え合わせを見られます。": ["Today's matches from API-Football. Tap the button on a match to see the AI's key points before kick-off, or the result check after full time.", "来自API-Football的今日比赛。点击每场比赛的按钮,赛前可看AI的看点,赛后可看结果核对。", "Partidos de hoy obtenidos de API-Football. Pulsa el botón de cada partido para ver las claves de la IA antes del inicio o la verificación al terminar."],
+    "今日ピックアップされた注目の選手と豆知識です(登録データから毎日自動で選出)。": ["Today's featured players and a fact of the day (picked automatically each day from the registered data).", "今日精选的焦点球员与小知识(每天从已登记数据中自动选出)。", "Jugadores destacados y un dato curioso de hoy (elegidos automáticamente cada día a partir de los datos registrados)."],
+    "試合中": ["Live", "进行中", "En juego"],
+    "これから": ["Upcoming", "即将开始", "Próximos"],
+    "試合一覧を取得できませんでした": ["Couldn't load the match list", "未能获取比赛列表", "No se pudo cargar la lista de partidos"],
+    // 「もっと見る」(選手検索・AIの反省・賢くなったか・AIの裏側)
+    "📂 もっと見る": ["📂 More", "📂 更多", "📂 Más"],
+    "見たい項目を押すと、この下に開きます(もう一度押すと閉じます)。": ["Tap an item to open it below (tap again to close).", "点击想看的项目,会在下方展开(再点一次即可收起)。", "Pulsa un apartado para abrirlo aquí debajo (pulsa otra vez para cerrarlo)."],
+    // 予想カード(自信ランクの帯・決め手・注意・たたんだ根拠)
+    "対象外": ["Not ranked", "不评级", "Sin nivel"],
+    "自信": ["Confidence", "信心", "Confianza"],
+    "自信が低い試合": ["Low-confidence match", "信心较低的比赛", "Partido de baja confianza"],
+    "親善試合・2軍の試合のため、ランクの対象外です。": ["Not ranked because this is a friendly or a reserve-team match.", "因为是友谊赛或预备队比赛,不在评级范围内。", "Sin nivel por tratarse de un amistoso o de un partido de filial."],
+    "AIがまだ学習していない大会のため、ランクの対象外です。": ["Not ranked because the AI hasn't learned this competition yet.", "因为是AI尚未学习的赛事,不在评级范围内。", "Sin nivel porque la IA aún no ha aprendido esta competición."],
+    "この予想には最終確率が記録されていないため、ランクを付けられません。": ["No rank can be given because the final probabilities weren't recorded for this prediction.", "该预测没有记录最终概率,因此无法评级。", "No se puede asignar nivel porque no se registraron las probabilidades finales de esta predicción."],
+    "この予想にはランクを付けていません。": ["This prediction has no rank.", "该预测未评级。", "Esta predicción no tiene nivel."],
+    "決め手": ["Key factor", "决定因素", "Factor clave"],
+    "確率は割り引いて見てください": ["Treat these probabilities with caution", "概率请打折看待", "Toma estas probabilidades con cautela"],
+    "根拠をくわしく見る": ["See the full reasoning", "查看详细依据", "Ver el razonamiento completo"],
+    "対決のメニュー(シェア・全国ランキング・OFF)": ["Duel menu (share · national ranking · OFF)", "对决菜单(分享・全国排行・关闭)", "Menú del duelo (compartir · ranking nacional · OFF)"],
+    // 的中率カード
+    "🎯 このAIの的中率を読み込み中…": ["🎯 Loading this AI's hit rate…", "🎯 正在加载本AI的命中率…", "🎯 Cargando el porcentaje de acierto de esta IA…"],
+    "このAIの的中率(実測)": ["This AI's hit rate (measured)", "本AI的命中率(实测)", "Acierto de esta IA (medido)"],
+    "学習した大会の公式戦": ["official matches in learned competitions", "已学习赛事的正式比赛", "partidos oficiales de competiciones aprendidas"],
+    "公式戦": ["official matches", "正式比赛", "partidos oficiales"],
+    "答え合わせが済んだ公式戦がまだありません": ["no official matches have been settled yet", "还没有已核对结果的正式比赛", "aún no hay partidos oficiales con resultado verificado"],
+    "🙈 このAI自身の採点記録(外れも含む全試合)を見る": ["🙈 See this AI's own scored record (every match, misses included)", "🙈 查看本AI自己的评分记录(含未命中的全部比赛)", "🙈 Ver el historial puntuado de esta IA (todos los partidos, fallos incluidos)"],
+    "比較用: 外部の予測(API-Football)の記録": ["For comparison: record of an external predictor (API-Football)", "对比用: 外部预测(API-Football)的记录", "Para comparar: historial de un predictor externo (API-Football)"],
+    // 選手検索の「クラブの所属選手」(以前から日本語のまま残っていた見出し)
+    "UEFAクラブランキング": ["UEFA club ranking", "欧足联俱乐部排名", "Ranking UEFA de clubes"],
+    "ポジション未取得": ["Position not available", "位置未获取", "Posición no disponible"],
+    // 「賢くなったか」の見出し(内訳の数が取れなかったときの言い方)
+    "はい。昨日より答えられることが増えました。": ["Yes. It can answer more than it could yesterday.", "是的。能回答的内容比昨天多了。", "Sí. Puede responder más que ayer."],
+  });
   /* ==== v104.1(2026年11月14日): 確信ピック(K・自信ランク)と数字の裏取り(M)の文言 ==== */
   add({
     "自信ランク": ["Confidence rank", "信心等级", "Nivel de confianza"],
@@ -4539,6 +4636,9 @@
     ["守備指標(タックル+インターセプト)⦿回", "defensive actions (tackles + interceptions): $1", "防守数据(抢断+拦截)$1次", "acciones defensivas (entradas + intercepciones): $1"],
     ["デュエル(競り合い)勝率⦿%", "duel win rate $1%", "对抗成功率$1%", "duelos ganados $1 %"],
     ["デュエル勝率⦿%", "duel win rate $1%", "对抗成功率$1%", "duelos ganados $1 %"],
+    // v104.2: 「賢くなったか」の見出し(新しく言えることが0件で、数字の更新だけ/新しく答えられた質問だけの日)
+    ["はい。⦿件 の数字が新しくなりました(新しく言えるようになったことは 0件)。", "Yes. $1 figures were refreshed (0 new things it can say).", "是的。有$1项数字得到更新(新增能说的内容为0条)。", "Sí. Se actualizaron $1 cifras (0 cosas nuevas que pueda decir)."],
+    ["はい。昨日はまったく答えられなかった質問に ⦿問 答えられるようになりました。", "Yes. It can now answer $1 questions it couldn't answer at all yesterday.", "是的。现在能回答$1个昨天完全答不上来的问题。", "Sí. Ahora puede responder $1 preguntas que ayer no podía responder en absoluto."],
   ];
   for (var rp12 = 0; rp12 < RAWP12.length; rp12++) P.push([pat(RAWP12[rp12][0]), RAWP12[rp12][1], RAWP12[rp12][2], RAWP12[rp12][3]]);
   for (var rp11b = 0; rp11b < RAWP11B.length; rp11b++) {
@@ -4625,7 +4725,7 @@
   </div>
 
   <div class="card" id="aiAccuracyCard" style="padding:14px 18px;">
-    <div id="aiAccuracySummary">🤖 AI予測の実績を読み込み中…</div>
+    <div id="aiAccuracySummary">🎯 このAIの的中率を読み込み中…</div>
     <div id="aiAccuracyDetails" style="display:none; margin-top:10px;"></div>
   </div>
 
@@ -4641,73 +4741,62 @@
   <!-- 2026年8月18日・v48「週間AIダイジェスト」: AIの1週間を実測記録だけから
        機械的にまとめた読み物(毎週月曜の学習後に自動生成)。LLMの作文なし。
        中身は /api/digest/latest の読み出しのみ。 -->
-  <div class="card" id="digestCard" style="border:1.5px solid var(--series-2);">
-    <h2 style="margin:0 0 4px;">📰 今週のAIダイジェスト</h2>
-    <div id="digestBody" class="muted" style="font-size:13px;">読み込み中…</div>
+  <!-- v104.2「見やすさの整理」: 見たい人だけが開く、たためるカード(開閉はこの端末に覚える)。
+       見出しはボタンで、閉じているあいだは見出しと一言の要約だけが見える。 -->
+  <div class="card fold-card" id="digestCard" data-fold="digest" data-fold-default="closed" style="border:1.5px solid var(--series-2);">
+    <h2 class="fold-h"><button type="button" class="fold-btn" id="digestFoldBtn" aria-expanded="false" aria-controls="digestFoldBody"><span class="fold-title">📰 今週のAIダイジェスト</span><span class="fold-chev" aria-hidden="true">▼ 開く</span><span class="fold-meta" id="digestFoldMeta"></span></button></h2>
+    <div class="fold-body" id="digestFoldBody" hidden>
+      <div id="digestBody" class="muted" style="font-size:13px;">読み込み中…</div>
+    </div>
   </div>
 
 
 
-  <div class="card" id="realFixturesCard" style="display:none; border:1.5px solid var(--series-3);">
-    <h2>📡 本日の実際の試合</h2>
-    <p class="value-note" style="margin-bottom:10px;">有料API(API-Football)から取得した、本日の実際の試合日程です。「🔴 試合中」「⏰ これから」「✅ 終了」に整理して表示します。試合前は注目ポイントのAIプレビュー(90分ストーリー予想つき)、試合終了後は実際の選手評価・タイムラインをもとにした振り返りを見られます。</p>
-    <div style="margin-bottom:10px;">
-      <input type="text" id="fixtureSearchInput" placeholder="例: レアル / プレミアリーグ / イングランド / 監督名" style="width:100%; box-sizing:border-box; padding:9px 12px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary); font-size:14px;">
-      <p class="value-note" id="fixtureSearchHint" style="margin:6px 0 0; display:none;"></p>
+  <!-- v104.2(ご要望「本日の実際の試合もたためるように。下までスクロールするのが大変」):
+       既定は閉じた状態。見出しに「試合中・これから・終了」の件数を出し、押すと一覧が開く。 -->
+  <div class="card fold-card" id="realFixturesCard" data-fold="fixtures" data-fold-default="closed" style="display:none; border:1.5px solid var(--series-3);">
+    <h2 class="fold-h"><button type="button" class="fold-btn" id="realFixturesFoldBtn" aria-expanded="false" aria-controls="realFixturesFoldBody"><span class="fold-title">📡 本日の実際の試合</span><span class="fold-chev" aria-hidden="true">▼ 開く</span><span class="fold-meta" id="realFixturesFoldMeta"></span></button></h2>
+    <div class="fold-body" id="realFixturesFoldBody" hidden>
+      <p class="value-note" style="margin-bottom:10px;">API-Footballから取得した本日の試合です。各試合のボタンを押すと、試合前はAIの見どころ、終了後は答え合わせを見られます。</p>
+      <div style="margin-bottom:10px;">
+        <input type="text" id="fixtureSearchInput" placeholder="例: レアル / プレミアリーグ / イングランド / 監督名" style="width:100%; box-sizing:border-box; padding:9px 12px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary); font-size:14px;">
+        <p class="value-note" id="fixtureSearchHint" style="margin:6px 0 0; display:none;"></p>
+      </div>
+      <!-- 利用者目線ラウンド: 「終了した試合しかない」ように見える理由(日本時間の
+           日付の仕組み)と、表示枠で省略した件数を正直に説明する欄 -->
+      <p class="value-note" id="fixturesContextNote" style="display:none; margin:0 0 10px; padding:8px 10px; background:rgba(0,0,0,.04); border-radius:6px;"></p>
+      <div id="realFixturesList"></div>
     </div>
-    <!-- 利用者目線ラウンド: 「終了した試合しかない」ように見える理由(日本時間の
-         日付の仕組み)と、表示枠で省略した件数を正直に説明する欄 -->
-    <p class="value-note" id="fixturesContextNote" style="display:none; margin:0 0 10px; padding:8px 10px; background:rgba(0,0,0,.04); border-radius:6px;"></p>
-    <div id="realFixturesList"></div>
   </div>
   <div id="realFixtureAnalysisWrap"></div>
 
-  <div class="card" id="aiMatchAnalysisCard">
-    <h2>🧠 AIマッチ分析(クラブ対戦シミュレーション)</h2>
-    <p class="value-note" style="margin-bottom:12px;">登録クラブ同士を選ぶと、実データ(直近フォーム・得失点・怪我人数・順位・過去対戦・過密日程)をもとに、AIが勝率・重視した要素・試合展開・予想スコアまで読み解きます。単なる勝敗ではなく「AIがどう試合を読んだか」を見られる分析です。</p>
-    <div class="compare-select-row">
-      <select id="maHomeSelect" aria-label="ホームチーム" style="padding:7px 10px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary);"></select>
-      <span style="align-self:center; color:var(--text-muted);">vs</span>
-      <select id="maAwaySelect" aria-label="アウェイチーム" style="padding:7px 10px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary);"></select>
-      <button class="apply-btn" id="maAnalyzeBtn" style="margin-top:0; width:auto; padding:9px 18px;">分析する ▶</button>
-    </div>
-    <div id="maResultWrap" style="margin-top:12px;"></div>
-  </div>
+  <!-- v104.2(ご要望「仮の対戦は全部消す」): ここにあった「🧠 AIマッチ分析(クラブ対戦シミュレーション)」は
+       画面から外した。実際の試合の分析は「📡 本日の実際の試合」の「AI分析を見る」、
+       好きな対戦についての質問は「🤖 AIに質問する」で従来どおり使える。 -->
 
-  <div class="card" id="dashboardCard">
-    <h2>🏠 今日のサッカー</h2>
-    <p class="value-note" style="margin-bottom:12px;">ホーム画面を開くだけで、今日ピックアップされた注目の試合・選手が分かります(登録データから毎日自動で選出)。</p>
-    <div class="grid-2">
-      <div>
-        <h3 class="sim-subhead">⚽ 今日の注目試合</h3>
-        <div id="dashFeaturedMatch"></div>
+  <div class="card fold-card" id="dashboardCard" data-fold="dashboard" data-fold-default="open">
+    <h2 class="fold-h"><button type="button" class="fold-btn" id="dashboardFoldBtn" aria-expanded="true" aria-controls="dashboardFoldBody"><span class="fold-title">🏠 今日のサッカー</span><span class="fold-chev" aria-hidden="true">▲ 閉じる</span><span class="fold-meta" id="dashboardFoldMeta"></span></button></h2>
+    <div class="fold-body" id="dashboardFoldBody">
+      <p class="value-note" style="margin-bottom:12px;">今日ピックアップされた注目の選手と豆知識です(登録データから毎日自動で選出)。</p>
+      <div class="grid-2">
+        <div>
+          <h3 class="sim-subhead">⭐ 今日の注目選手</h3>
+          <div id="dashFeaturedPlayer"></div>
+        </div>
+        <div>
+          <h3 class="sim-subhead">🧠 今日のAI豆知識</h3>
+          <div id="dashTrivia"></div>
+        </div>
       </div>
-      <div>
-        <h3 class="sim-subhead">⭐ 今日の注目選手</h3>
-        <div id="dashFeaturedPlayer"></div>
-      </div>
-    </div>
-    <div class="grid-2" style="margin-top:16px;">
-      <div>
+      <div style="margin-top:16px;">
         <h3 class="sim-subhead">📈 急上昇選手(AI将来性評価より)</h3>
         <div id="dashTrending"></div>
       </div>
-      <div>
-        <h3 class="sim-subhead">🧠 今日のAI豆知識</h3>
-        <div id="dashTrivia"></div>
-      </div>
-    </div>
-    <button class="more-details-btn" id="dashMoreToggleBtn" type="button">▼ もっと見る</button>
-    <div id="dashMoreDetails" style="display:none; margin-top:16px;">
-      <div class="grid-2">
-        <div>
-          <h3 class="sim-subhead">🎯 AIが見るべき試合カード</h3>
-          <div id="dashRecommendedMatches"></div>
-        </div>
-        <div>
-          <h3 class="sim-subhead">🕘 最近見た選手・試合(このセッション)</h3>
-          <div id="dashRecentlyViewed"></div>
-        </div>
+      <!-- v104.2: 「最近見た選手・試合」は、見たものがあるときだけ出す(以前は「▼ もっと見る」を押した中にあり、
+           何も見ていないときも「まだ見ていません」と出ていた)。カードそのものがたためるので、中の開閉は無くした。 -->
+      <div id="dashRecentWrap" style="display:none; margin-top:16px;">
+        <h3 class="sim-subhead">🕘 最近見た選手・試合(このセッション)</h3>
+        <div id="dashRecentlyViewed"></div>
       </div>
     </div>
   </div>
@@ -4715,22 +4804,16 @@
   <!-- 2026年8月18日・ホーム整理: 開発の計器盤(学習ダッシュボード・成長レポート・
        日々の差分)は「AIの裏側」タブへ。消したのではなく、置き場所を変えただけ。
        サッカーを見に来た人が最初に見るのは、予想・質問・正答率・反省・賢くなったか。 -->
+  <!-- v104.2(ご要望): 「⚽ 試合分析AI」(仮の対戦)と「🏆 地力ランキング」は画面から外した。
+       残る4つは、最初はどれも開かない(見たい人が押したときだけ、この下に開く。もう一度押すと閉じる)。
+       その時に欲しい情報だけを見せるための作り。 -->
+  <h2 class="more-menu-title" id="moreMenuTitle">📂 もっと見る</h2>
+  <p class="value-note" id="moreMenuHint" style="margin:0 0 8px;">見たい項目を押すと、この下に開きます(もう一度押すと閉じます)。</p>
   <div class="segmented" id="modeSwitch" style="margin-bottom:16px; flex-wrap:wrap;">
-    <button data-mode="match" class="active">⚽ 試合分析AI</button>
-    <button data-mode="player">🔍 選手検索</button>
-    <button data-mode="rankings">🏆 地力ランキング</button>
-    <button data-mode="reflections">🙈 AIの反省</button>
-    <button data-mode="smarter">🧠 賢くなったか</button>
-    <button data-mode="backstage">🛠 AIの裏側</button>
-  </div>
-
-  <!-- v53「AIが見る地力ランキング」: v50で学習した約200クラブの攻撃力・守備力から
-       算出したTOP50。実測データからの機械的な計算のみ(主観・人手調整なし)。 -->
-  <div id="rankingsSection" style="display:none;">
-    <div class="card" style="border:1.5px solid var(--series-2);">
-      <h2 style="margin:0 0 4px;">🏆 AIが見る世界クラブ地力ランキング</h2>
-      <div id="rankingsBody" class="muted" style="font-size:13px;">読み込み中…</div>
-    </div>
+    <button data-mode="player" aria-pressed="false">🔍 選手検索</button>
+    <button data-mode="reflections" aria-pressed="false">🙈 AIの反省</button>
+    <button data-mode="smarter" aria-pressed="false">🧠 賢くなったか</button>
+    <button data-mode="backstage" aria-pressed="false">🛠 AIの裏側</button>
   </div>
 
   <!-- v58: ご要望「試合分析・選手検索・裏側と同じ位置に」— タブバー直下へ移動。
@@ -4801,15 +4884,6 @@
     <div id="growthLogDetails" style="display:none; margin-top:10px;"></div>
   </div>
 
-  </div>
-
-  <div id="matchSection">
-    <div class="card">
-      <h2>⚽ 注目の試合カード</h2>
-      <p class="value-note" style="margin-bottom:10px;">登録選手のデータを活用できる注目カードをAIが選んでいます(実際に今日開催されるとは限らない、シミュレーション用の組み合わせです)。本日の実際の試合はホーム画面上部の「📡 本日の実際の試合」カードをご覧ください。気になるカードの「分析する」を押すと、AIが選手データをもとにしたプレビューを生成します。</p>
-      <div id="matchList"></div>
-    </div>
-    <div id="matchAnalysisWrap"></div>
   </div>
 
   <div id="playerSection" style="display:none;">
@@ -5193,37 +5267,113 @@ renderGlossary();
 /* =========================================================
    Player scouting mode
    ========================================================= */
-document.getElementById("modeSwitch").addEventListener("click", (e) => {
-  const btn = e.target.closest("button"); if (!btn) return;
-  [...e.currentTarget.children].forEach(b => b.classList.toggle("active", b === btn));
-  const mode = btn.dataset.mode;
-  document.getElementById("matchSection").style.display = mode === "match" ? "block" : "none";
-  document.getElementById("playerSection").style.display = mode === "player" ? "block" : "none";
-  // 2026年8月18日: 開発の計器盤(学習ダッシュボード等)は「AIの裏側」タブへ移動。
-  // 描画は今までどおりページ読み込み時に済ませてあるので、開いた瞬間に表示される。
-  document.getElementById("backstageSection").style.display = mode === "backstage" ? "block" : "none";
-  // v53: 地力ランキング(開いた最初の1回だけ読み込む=方針⑥)
-  document.getElementById("rankingsSection").style.display = mode === "rankings" ? "block" : "none";
-  // v57: 「AIの反省」「賢くなったか」タブ(中身はページ読込時に描画済み=開いた瞬間に出る)
-  document.getElementById("reflectionsSection").style.display = mode === "reflections" ? "block" : "none";
-  document.getElementById("smarterSection").style.display = mode === "smarter" ? "block" : "none";
-  if (mode === "rankings") rankingsEnsureInit();
+// v104.2(ご要望「その時に欲しい情報だけを見せる」): 「📂 もっと見る」の4つは、最初はどれも開かない。
+//   押した項目だけがタブの下に開き、同じ項目をもう一度押すと閉じる。
+//   「⚽ 試合分析AI」(仮の対戦)と「🏆 地力ランキング」は画面から外した(ご要望)。
+//   中身の描画はこれまでどおり(反省・賢くなったか・裏側はページ読み込み時に済ませてあり、
+//   選手検索だけは「開いた最初の1回」に読み込む=ホームを見ているだけの人に通信させない。方針⑥)。
+const HOME_MODE_SECTIONS = { player: "playerSection", reflections: "reflectionsSection", smarter: "smarterSection", backstage: "backstageSection" };
+function setHomeMode(mode) {
+  const active = Object.prototype.hasOwnProperty.call(HOME_MODE_SECTIONS, mode) ? mode : null;
+  document.querySelectorAll("#modeSwitch button[data-mode]").forEach((b) => {
+    const on = b.dataset.mode === active;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+  Object.keys(HOME_MODE_SECTIONS).forEach((m) => {
+    const sec = document.getElementById(HOME_MODE_SECTIONS[m]);
+    if (sec) sec.style.display = m === active ? "block" : "none";
+  });
   // 選手検索の読み込みは「このタブを開いた最初の1回だけ」。
   // ホーム画面を見ているだけの人に通信させない(方針⑥)。
-  if (mode === "player") psEnsureInit();
+  if (active === "player") psEnsureInit();
+}
+/** いま開いている項目(無ければ null) */
+function currentHomeMode() {
+  const b = document.querySelector("#modeSwitch button.active");
+  return b ? b.dataset.mode : null;
+}
+/** 画面の別の場所から項目を開く(すでに開いていても閉じない)。開いたら項目の並びまで画面を動かす */
+function openHomeMode(mode, opts) {
+  if (currentHomeMode() !== mode) setHomeMode(mode);
+  if (opts && opts.scroll) {
+    const bar = document.getElementById("moreMenuTitle") || document.getElementById("modeSwitch");
+    if (bar && typeof bar.scrollIntoView === "function") setTimeout(() => bar.scrollIntoView({ behavior: "smooth", block: "start" }), 30);
+  }
+}
+document.getElementById("modeSwitch").addEventListener("click", (e) => {
+  const btn = e.target.closest("button"); if (!btn || !btn.dataset.mode) return;
+  setHomeMode(btn.classList.contains("active") ? null : btn.dataset.mode);
 });
-// v53: #rankings リンクで直接ランキングタブを開ける(シェア用URL)。
-// 注意: この時点ではまだ後方の let 宣言(rankingsInited等)が未初期化のため、
-// 同期実行するとTDZエラーでタブが空のままになる(実際にテストで再現)。
-// スクリプト全体の解釈が終わった後(タスクキュー末尾)に実行する。
-setTimeout(() => {
+
+/* =========================================================
+   v104.2「たためるカード」(ご要望: 本日の実際の試合もたためるように。下までスクロールするのが大変)
+   ・対象: 📰 今週のAIダイジェスト / 📡 本日の実際の試合 / 🏠 今日のサッカー(class="fold-card")
+   ・見出しがボタン。閉じているあいだは見出しと一言の要約(.fold-meta)だけが見える
+   ・開閉はこの端末(localStorage)に覚える。保存できない環境でも開閉そのものは動く
+   ・最初の状態は data-fold-default(試合一覧とダイジェストは閉じる・今日のサッカーは開く)
+   ========================================================= */
+const FOLD_STATE_KEY = "homeFoldState";
+function foldReadState() {
   try {
-    // ブラウザ以外の実行環境(テストのDOM評価等)では location が無い場合がある
-    if (typeof location === "undefined" || location.hash !== "#rankings") return;
-    const rkBtn = document.querySelector('#modeSwitch button[data-mode="rankings"]');
-    if (rkBtn) rkBtn.click();
-  } catch (e) { /* ハッシュ誘導は付加機能。失敗してもページ本体に影響させない */ }
-}, 0);
+    const o = JSON.parse(localStorage.getItem(FOLD_STATE_KEY) || "{}");
+    return (o && typeof o === "object") ? o : {};
+  } catch (e) { return {}; }
+}
+function foldWriteState(key, open) {
+  if (!key) return;
+  try {
+    const o = foldReadState();
+    o[key] = open ? "open" : "closed";
+    localStorage.setItem(FOLD_STATE_KEY, JSON.stringify(o));
+  } catch (e) { /* プライベートモード等で保存できなくても、開閉は動く */ }
+}
+/** カードを開く/閉じる。opts.persist === false のときは端末に覚えない(最初の状態の反映用) */
+function setFoldOpen(card, open, opts) {
+  if (!card) return;
+  const btn = card.querySelector(".fold-btn");
+  const body = card.querySelector(".fold-body");
+  if (!btn || !body) return;
+  body.hidden = !open;
+  btn.setAttribute("aria-expanded", open ? "true" : "false");
+  card.classList.toggle("is-open", !!open);
+  const chev = btn.querySelector(".fold-chev");
+  if (chev) chev.textContent = open ? "▲ 閉じる" : "▼ 開く";
+  if (!(opts && opts.persist === false)) foldWriteState(card.dataset.fold, !!open);
+}
+function initFoldCards() {
+  const saved = foldReadState();
+  document.querySelectorAll(".fold-card").forEach((card) => {
+    const key = card.dataset.fold;
+    const open = (saved[key] === "open" || saved[key] === "closed") ? saved[key] === "open" : card.dataset.foldDefault === "open";
+    setFoldOpen(card, open, { persist: false });
+    const btn = card.querySelector(".fold-btn");
+    const body = card.querySelector(".fold-body");
+    if (btn && body) btn.addEventListener("click", () => setFoldOpen(card, body.hidden));
+  });
+}
+initFoldCards();
+/** 予想カードの「📡 試合の詳しい分析を見る」は、試合一覧のカードが出ているあいだだけ見せる */
+function syncFixturesJumpUi() {
+  const btn = document.getElementById("jumpToFixturesBtn");
+  if (!btn) return;
+  const c = document.getElementById("realFixturesCard");
+  btn.style.display = (c && c.style.display !== "none") ? "inline-block" : "none";
+}
+/** 試合一覧の見出しに出す一言の要約(試合中・これから・終了の件数)。閉じたままでも「いま何試合あるか」が分かる */
+function setFixturesFoldMeta(fixtures) {
+  const el = document.getElementById("realFixturesFoldMeta");
+  if (!el) return;
+  if (!Array.isArray(fixtures)) { el.innerHTML = ""; return; }
+  const g = { live: 0, upcoming: 0, finished: 0, other: 0 };
+  fixtures.forEach((f) => { g[classifyFixtureStatus(f.status)]++; });
+  const parts = [];
+  if (g.live) parts.push(`🔴 <span>試合中</span> <strong>${g.live}</strong>`);
+  if (g.upcoming) parts.push(`⏰ <span>これから</span> <strong>${g.upcoming}</strong>`);
+  if (g.finished) parts.push(`✅ <span>終了</span> <strong>${g.finished}</strong>`);
+  if (g.other) parts.push(`ℹ️ <span>その他</span> <strong>${g.other}</strong>`);
+  el.innerHTML = parts.join(" ・ ");
+}
 
 const ATTR_LABELS = { attack: "攻撃力", shooting: "シュート", dribbling: "ドリブル", passing: "パス", tactical: "戦術理解", speed: "スピード", physical: "フィジカル", defense: "守備" };
 const ZONE_COORDS = {
@@ -7522,15 +7672,6 @@ function renderContractInfo(player) {
 }
 
 /* ---- Position / nationality grouping (for search filters) ---- */
-function positionGroup(pos) {
-  if (!pos || pos === "-") return "不明";
-  const first = pos.split(/[\/\s]/)[0].toUpperCase();
-  if (first.indexOf("GK") !== -1) return "GK";
-  if (["CB", "RB", "LB", "SB", "WB", "DF"].some(t => first.indexOf(t) !== -1)) return "DF";
-  if (["RW", "LW", "CF", "ST", "FW", "SS"].some(t => first.indexOf(t) !== -1)) return "FW";
-  if (["DM", "CM", "AM", "MF"].some(t => first.indexOf(t) !== -1)) return "MF";
-  return "その他";
-}
 const POSITION_GROUP_LABEL = { GK: "GK(ゴールキーパー)", DF: "DF(ディフェンダー)", MF: "MF(ミッドフィルダー)", FW: "FW(フォワード)", "その他": "その他", "不明": "不明" };
 function countryBase(player) {
   return (player.country || "不明").split("(")[0].trim() || "不明";
@@ -8198,7 +8339,7 @@ async function fetchExternalVerification(player) {
 const API_PROXY_BASE = "https://soccer-analysis-ai-proxy.onrender.com/api";
 
 // fetchOptions (省略可) は fetch() にそのまま渡す追加オプション。POSTでJSONを
-// 送りたい呼び出し元(例: /api/predict-match)は { method: "POST", body: ... ,
+// 送りたい呼び出し元(例: /api/duel/pick)は { method: "POST", body: ... ,
 // headers: {...} } を渡す。既存の呼び出し元(引数2つ)は今まで通りGETとして動作する。
 async function fetchJsonWithTimeout(url, timeoutMs, fetchOptions, _retried) {
   const ms = timeoutMs || 4000;
@@ -8305,147 +8446,9 @@ async function fetchGrowthLog() {
   } catch (e) { return null; }
 }
 
-// 「AIマッチ分析」カード(第一段階のご要望: 単なる勝敗ではなく、AIが試合を
-// 読むように――勝率内訳・重視した要素(★)・試合展開予想・逆シナリオ・予想
-// スコアまで表示する)。裏側は server/server.js の /api/match-analysis で、
-// Prediction Engine v2(実データの特徴量 + 学習済みの重み + ポワソン分布)に
-// よる本物の計算。プロキシ未接続/APIキー未設定の場合はその旨を正直に表示する。
-// v97(全体監査): マッチ分析はサーバー側で最大11回の外部API取得+AIの文章生成を行うため、
-//   温まっていても6秒では終わらないことがある(以前は6秒で中断→「接続できませんでした」と
-//   事実と違う表示)。専用の待ち時間(45秒)にし、中断・混雑(429)・接続失敗を言い分ける。
-const MATCH_ANALYSIS_TIMEOUT_MS = 45000;
-async function fetchMatchAnalysis(homeJa, awayJa) {
-  try {
-    const homeEn = CLUB_JA_TO_EN[homeJa] || homeJa;
-    const awayEn = CLUB_JA_TO_EN[awayJa] || awayJa;
-    const url = `${API_PROXY_BASE}/match-analysis?home=${encodeURIComponent(homeEn)}&away=${encodeURIComponent(awayEn)}${(window.appLang && window.appLang !== "ja") ? `&lang=${window.appLang}` : ""}`;
-    const data = await fetchJsonWithTimeout(url, backendConfirmedWarm ? MATCH_ANALYSIS_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
-    backendConfirmedWarm = true;
-    return data || null;
-  } catch (e) {
-    if (e && e.name === "AbortError") {
-      return { ok: false, reason: "timeout", message: "分析に時間がかかりすぎたため、いったん中断しました(実データの取得とAIの文章生成が混み合っている可能性があります)。もう一度お試しください。" };
-    }
-    if (e && e.httpStatus === 429) {
-      return { ok: false, reason: "rate_limited", message: (e.body && (e.body.messageJa || e.body.error)) || "アクセスが集中しています。少し待ってからもう一度お試しください。" };
-    }
-    return { ok: false, reason: "network_error", message: "分析サーバーに接続できませんでした(実データ連携サーバーが休止中の場合、初回は最大1分ほどかかることがあります。もう一度お試しください)。" };
-  }
-}
-
-function populateMatchAnalysisSelects() {
-  const homeSel = document.getElementById("maHomeSelect");
-  const awaySel = document.getElementById("maAwaySelect");
-  if (!homeSel || !awaySel) return;
-  const names = Object.keys(CLUB_JA_TO_EN);
-  const optionsHtml = names.map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join("");
-  homeSel.innerHTML = optionsHtml;
-  awaySel.innerHTML = optionsHtml;
-  if (names.length > 1) awaySel.selectedIndex = 1;
-}
-
-function renderMatchAnalysisResult(data, homeJa, awayJa) {
-  const wrap = document.getElementById("maResultWrap");
-  if (!wrap) return;
-  if (!data || !data.ok) {
-    wrap.innerHTML = `<p class="value-note">⚠️ ${escapeHtml((data && data.message) || "分析に失敗しました。実データ連携サーバー(API-Football)が未接続の可能性があります。")}</p>`;
-    return;
-  }
-  const wp = data.winProbability;
-  const factorsHtml = (data.keyFactors || []).filter((f) => f.stars > 0).slice(0, 6).map((f) => `
-    <div class="scout-star-row"><span>${escapeHtml(f.labelJa)}</span><span class="stars">${escapeHtml(f.starsDisplay)} <span class="value-note">(寄与度${f.weightPct}%)</span></span></div>
-  `).join("") || `<p class="value-note">まだ強く学習された要素はありません(毎日学習エンジンの検証データが十分に蓄積されると、ここに表示されます)。</p>`;
-  const notesHtml = (data.dataNotes || []).length ? `<p class="value-note" style="margin-top:8px; opacity:.8;">※ ${data.dataNotes.map(escapeHtml).join(" / ")}</p>` : "";
-
-  // 2026年8月・第6次監査で発見した「作ったのに一度も表示していなかった機能」の修正:
-  //   優先順位⑤・⑳の「前回はこう考えていたが、今回はこう考える。理由は…」は
-  //   サーバー側で組み立てて memoryComparison として返していたのに、
-  //   画面のどこからも参照しておらず、**利用者は一度も見たことがなかった**
-  //   (リクエストのたびにUpstashを1回読む費用だけ払っていた)。
-  //   変化があったときだけ出す、という当初の設計どおりに表示する。
-  // 2026年8月・第7次監査で発見した表示の誤りの修正:
-  //   ラベルが**逆**になっていた。LLMが自由に書いた文章には何の印も付かず、
-  //   実データから機械的に組み立てた文章の方に「(簡易版)」と付けていたため、
-  //   利用者から見ると「AIが書いた推測」と「実データから計算した事実」が
-  //   まったく区別できなかった(むしろ推測の方が本格的に見えた)。
-  //   AIが書いたものには必ず【AIの見解】と明示する。
-  const aiTag = (block) => (block && block.source === "ai_generated" ? "(AIの見解)" : "");
-
-  const mc = data.memoryComparison || null;
-  const memoryComparisonHtml = mc ? `
-    <div class="compare-comment" style="margin-top:10px; border-left:3px solid #6a8caf; padding-left:10px;">
-      <strong>🧠 前回この対戦を見たときとの違い:</strong> ${escapeHtml(mc.headlineJa || "")}
-      ${(mc.reasonsJa && mc.reasonsJa.length) ? `<ul style="margin:6px 0 0 1em; padding:0;">${mc.reasonsJa.map((r) => `<li class="value-note">${escapeHtml(r)}</li>`).join("")}</ul>` : ""}
-      ${mc.learnedJa ? `<p class="value-note" style="margin-top:4px; opacity:.85;">${escapeHtml(mc.learnedJa)}</p>` : ""}
-    </div>` : "";
-
-  // 2026年8月・本番監査(⑦情報拡張)対応: 怪我人の実名・直近フォーメーション・
-  // 注目選手(実データのみ・取得できない場合は正直に非表示)を追加表示する。
-  function injuryLineHtml(side, label) {
-    // 2026年8月・第5次監査で発見した表示の誤りの修正:
-    //   `!side.count` は count が null(=/injuries の取得に失敗して**人数が
-    //   分からない**状態)でも真になるため、取得に失敗したときに
-    //   「負傷・出場停止者なし」と断言してしまっていた。
-    //   同じ画面の下部には「負傷者情報の取得に失敗しました」という注記が出るので、
-    //   1つの回答の中で矛盾したことを述べている状態だった。
-    //   「0人だった」と「分からない」を必ず区別する。
-    if (!side || side.count === null || side.count === undefined) {
-      return `<div class="value-note" style="margin:2px 0;">${escapeHtml(label)}: 負傷・出場停止の情報を取得できませんでした</div>`;
-    }
-    if (!side.count) return `<div class="value-note" style="margin:2px 0;">${escapeHtml(label)}: 負傷・出場停止者なし</div>`;
-    const names = [...side.injured, ...side.suspended].slice(0, 4).join("・");
-    return `<div class="value-note" style="margin:2px 0;">${escapeHtml(label)}: ${side.count}名${names ? `(${escapeHtml(names)}等)` : ""}</div>`;
-  }
-  const injuriesHtml = data.injuries ? `
-    <h3 class="sim-subhead">🚑 怪我人・出場停止の影響</h3>
-    ${injuryLineHtml(data.injuries.home, homeJa)}
-    ${injuryLineHtml(data.injuries.away, awayJa)}
-  ` : "";
-  const formationHtml = (data.formation && (data.formation.home || data.formation.away)) ? `
-    <h3 class="sim-subhead">🧩 直近フォーメーション</h3>
-    <div class="value-note" style="margin:2px 0;">${escapeHtml(homeJa)}: ${escapeHtml(data.formation.home || "不明")} ・ ${escapeHtml(awayJa)}: ${escapeHtml(data.formation.away || "不明")}</div>
-    <p class="value-note" style="margin:2px 0; opacity:.75;">${escapeHtml(data.formation.note || "")}</p>
-  ` : "";
-  const keyPlayersHtmlBlock = (data.keyPlayers && (data.keyPlayers.home || data.keyPlayers.away)) ? `
-    <h3 class="sim-subhead">👤 注目選手(今シーズンの得点ランキング上位)</h3>
-    ${data.keyPlayers.home ? `<div class="value-note" style="margin:2px 0;">${escapeHtml(homeJa)}: ${escapeHtml(data.keyPlayers.home.name)}(${data.keyPlayers.home.goals}得点${data.keyPlayers.home.assists ? `・${data.keyPlayers.home.assists}アシスト` : ""})</div>` : ""}
-    ${data.keyPlayers.away ? `<div class="value-note" style="margin:2px 0;">${escapeHtml(awayJa)}: ${escapeHtml(data.keyPlayers.away.name)}(${data.keyPlayers.away.goals}得点${data.keyPlayers.away.assists ? `・${data.keyPlayers.away.assists}アシスト` : ""})</div>` : ""}
-  ` : "";
-
-  wrap.innerHTML = `
-    <div class="verdict-block">
-      <div class="verdict-stars">${escapeHtml(wp.confidenceStarsDisplay)}</div>
-      <div class="verdict-label">${escapeHtml(homeJa)} ${wp.homeWinPct}% ・ 引分 ${wp.drawPct}% ・ ${escapeHtml(awayJa)} ${wp.awayWinPct}%</div>
-      <p class="value-note" style="margin-top:6px;">AI予想スコア: <strong>${escapeHtml(data.predictedScoreline)}</strong> ・ AIが一番気にしていること: <strong>${escapeHtml(data.mostImportantFactor)}</strong></p>
-    </div>
-    <h3 class="sim-subhead">📋 AIが重視した要素(重要度順)</h3>
-    ${factorsHtml}
-    ${data.narrative && data.narrative.text ? `
-    <div class="compare-comment" style="margin-top:10px;">
-      <strong>🗣️ 試合展開予想${aiTag(data.narrative)}:</strong> ${escapeHtml(data.narrative.text)}
-    </div>` : ""}
-    ${data.reverseScenario && data.reverseScenario.text ? `
-    <div class="compare-comment" style="margin-top:8px;">
-      <strong>🔄 もし予想と違ったら${aiTag(data.reverseScenario)}:</strong> ${escapeHtml(data.reverseScenario.text)}
-    </div>` : ""}
-    ${injuriesHtml}
-    ${formationHtml}
-    ${data.tacticalCompatibility && data.tacticalCompatibility.text ? `
-    <div class="compare-comment" style="margin-top:8px;">
-      <strong>⚔️ 戦術相性${aiTag(data.tacticalCompatibility)}:</strong> ${escapeHtml(data.tacticalCompatibility.text)}
-    </div>` : ""}
-    ${keyPlayersHtmlBlock}
-    ${data.biggestHighlight && data.biggestHighlight.text ? `<p class="value-note" style="margin-top:8px;">✨ この試合最大の見どころ${aiTag(data.biggestHighlight)}: <strong>${escapeHtml(data.biggestHighlight.text)}</strong></p>` : ""}
-    ${memoryComparisonHtml}
-    <p style="margin-top:12px; font-weight:700;">🏁 ${escapeHtml(data.conclusion)}</p>
-    ${notesHtml}
-    <p class="value-note" style="margin-top:8px; opacity:.7;">${escapeHtml(data.note || "")}</p>
-  `;
-}
-
-// 初期化(セレクトボックスへのクラブ一覧投入・ボタンのイベント登録)は、
-// CLUB_JA_TO_EN の定義後(このファイル下部)でまとめて行う
-// (initMatchAnalysisWidget を参照)。
+// v104.2(ご要望「仮の対戦は全部消す」): ここにあった「🧠 AIマッチ分析(クラブ対戦シミュレーション)」カードの
+// 画面側の処理(登録クラブを2つ選んで分析する入口)は、カードごと外した。
+// サーバーの /api/match-analysis は残してある(会話の道具「対戦分析」が使うため)。
 
 async function renderRealPerformancePanel(player) {
   const el = document.getElementById("livePerfPanel");
@@ -8991,40 +8994,9 @@ function wirePlayerExtras(player) {
   }
 }
 
-/* =========================================================
-   Match Analysis AI (new) — curated matchup list + AI preview
-   generator built from real registered player data.
-
-   IMPORTANT honesty note: this is a PREVIEW / PREDICTION, not a
-   recap of a real result. No free, keyless API providing today's
-   actual fixtures + full results across arbitrary leagues was
-   found (real fixture+result feeds are paid, e.g. API-Football /
-   SportMonks — see the earlier cost comparison). Presenting a
-   made-up "final score" as if it really happened would be
-   misleading, so every matchup here is generated fresh as an AI
-   prediction each time you click 分析する, clearly labelled as
-   such. Where FC Bayern München is involved, its REAL recent
-   Bundesliga results/table position (via the already-integrated
-   OpenLigaDB) are shown alongside, kept visually separate from
-   the AI-generated part.
-   ========================================================= */
-const MATCHUPS = [
-  { id: "bayern-arsenal", homeClub: "バイエルン・ミュンヘン", awayClub: "アーセナルFC", homeLabel: "バイエルン・ミュンヘン", awayLabel: "アーセナルFC", note: "登録選手数が最も多い2クラブの対戦。予想布陣まで含めて分析します。" },
-  { id: "real-city", homeClub: "レアル・マドリード", awayClub: "マンチェスター・シティ", homeLabel: "レアル・マドリード", awayLabel: "マンチェスター・シティ", note: "エムバペ・ベルナルド シウバ 対 ハーランドの注目対決。" },
-  { id: "barca-sociedad", homeClub: "FCバルセロナ", awayClub: "レアル・ソシエダ", homeLabel: "FCバルセロナ", awayLabel: "レアル・ソシエダ", note: "ヤマル 対 久保建英、若きタレント対決。" },
-  { id: "japan-korea", homeCountry: "日本", awayCountry: "韓国", homeLabel: "日本代表", awayLabel: "韓国代表", note: "久保建英 対 キム・ミンジェ、東アジアのライバル対決。" },
-  { id: "miami-alnassr", homeClub: "インテル・マイアミ", awayClub: "アル・ナスル", homeLabel: "インテル・マイアミ", awayLabel: "アル・ナスル", note: "メッシ 対 ロナウド、夢のエキシビションマッチ。" }
-];
-
-function playersForSide(matchup, side) {
-  const clubKey = side === "home" ? matchup.homeClub : matchup.awayClub;
-  const countryKey = side === "home" ? matchup.homeCountry : matchup.awayCountry;
-  return Object.entries(PLAYERS).filter(([key, p]) => {
-    if (clubKey) return (p.club || "").indexOf(clubKey) !== -1;
-    if (countryKey) return countryBase(p) === countryKey;
-    return false;
-  }).map(([key, p]) => ({ key, ...p }));
-}
+/* v104.2(ご要望「仮の対戦は全部消す」): ここにあった「注目の試合カード」(登録選手のデータから作る
+   仮の対戦の一覧 MATCHUPS と、その AI 試合プレビュー)は画面ごと外した。
+   実際の試合の一覧と分析(下の fixtureRowHtml 以降)は従来どおり。 */
 function teamAvg(players, attr) {
   // 2026年8月・第7次監査で発見した欠陥の修正:
   //   選手が0人のとき固定値62を返していたため、「◯◯は攻撃力で相手を
@@ -9036,42 +9008,6 @@ function teamAvg(players, attr) {
   if (!players.length) return null;
   return players.reduce((s, p) => s + (attr === "overall" ? p.overall : p.attrs[attr]), 0) / players.length;
 }
-function pickLikelyXI(players) {
-  const buckets = { GK: [], DF: [], MF: [], FW: [] };
-  players.forEach(p => { const g = positionGroup(p.position); if (buckets[g]) buckets[g].push(p); });
-  Object.keys(buckets).forEach(g => buckets[g].sort((a, b) => b.overall - a.overall));
-  const counts = { GK: 1, DF: 4, MF: 4, FW: 2 };
-  const xi = [];
-  Object.keys(counts).forEach(g => xi.push(...buckets[g].slice(0, counts[g])));
-  return xi.length ? xi : players.slice().sort((a, b) => b.overall - a.overall).slice(0, Math.min(11, players.length));
-}
-function keyPlayersHtml(players, n) {
-  const top = players.slice().sort((a, b) => b.overall - a.overall).slice(0, n);
-  if (!top.length) return `<p class="value-note">登録選手が見つかりませんでした。</p>`;
-  return top.map(p => {
-    const tag = computePlaystyleTag(p);
-    const photo = photoCache[photoCacheKey(p)];
-    return `<button class="chip match-player-chip" data-name="${p.nameJa}" style="margin:3px 4px 3px 0;">
-      <span class="chip-avatar">${photo ? `<img loading="lazy" decoding="async" src="${escapeHtml(photo)}" alt="">` : p.emoji}</span>${p.nameJa} ${tag.emoji}
-    </button>`;
-  }).join("");
-}
-function renderMatchList() {
-  const el = document.getElementById("matchList");
-  if (!el) return;
-  el.innerHTML = MATCHUPS.map(m => `
-    <div class="match-row">
-      <div>
-        <div class="teams">⚽ ${m.homeLabel} vs ${m.awayLabel}</div>
-        <div class="sub">${m.note}</div>
-      </div>
-      <button class="match-analyze-btn" data-id="${m.id}">分析する ▶</button>
-    </div>`).join("");
-  el.querySelectorAll(".match-analyze-btn").forEach(btn => {
-    btn.addEventListener("click", () => renderMatchAnalysis(btn.dataset.id));
-  });
-}
-
 // If the optional server/ proxy (with an API-Football key) is running, this
 // swaps in a real "today's fixtures" list above the curated illustrative one.
 // If the proxy isn't running / has no key / has no fixtures today, the card
@@ -9357,15 +9293,21 @@ async function renderRealFixturesIfAvailable() {
       cardEl.style.display = "block";
       const noteEl0 = document.getElementById("fixturesContextNote");
       if (noteEl0) noteEl0.style.display = "none";
+      // v104.2: 取得に失敗したことは、たたんだままでも分かるように見出しへ出す(理由の全文はカードの中)
+      const metaEl0 = document.getElementById("realFixturesFoldMeta");
+      if (metaEl0) metaEl0.innerHTML = `⚠️ <span>試合一覧を取得できませんでした</span>`;
     } else {
       cardEl.style.display = "none";
     }
+    syncFixturesJumpUi();
     return;
   }
 
   lastFixturesToday = data.fixtures;
   renderFixturesListInto(listEl, lastFixturesToday);
   cardEl.style.display = "block";
+  setFixturesFoldMeta(lastFixturesToday); // v104.2: 見出しに件数の要約
+  syncFixturesJumpUi();
 
   // UI/UX統一ラウンド: 予想データ(共有・通信1回)が届き次第、一覧の各行へ
   // AI予想ストリップを差し込む(一覧描画が先に終わっていた場合の後追い)。
@@ -10021,311 +9963,6 @@ async function renderRealFixtureAnalysis(fixtureId) {
   if (analysis.fixture && analysis.fixture.home && analysis.fixture.away) trackRecentMatch("real:" + fixtureId, `${analysis.fixture.home.name} vs ${analysis.fixture.away.name}`);
   wrapEl.scrollIntoView({ behavior: "smooth", block: "start" });
 }
-/* ---- Visual upgrade helpers for the curated match preview (redesign ⑨) ----
-   These turn the previously text-only preview into something with actual
-   diagrams: a danger-zone heatmap per side, a formation/tactics board, and a
-   segmented match-flow bar — reusing the same pitch/bar visual language as
-   the individual player cards and the real-fixture analysis. */
-function computeAttrAverages(players) {
-  const out = {};
-  Object.keys(ATTR_LABELS).forEach(k => { out[k] = teamAvg(players, k); });
-  return out;
-}
-function buildWinLossFactors(homeLabel, awayLabel, homeAvg, awayAvg, homeOverall, awayOverall) {
-  const attrKeys = Object.keys(ATTR_LABELS);
-  const homeWins = homeOverall >= awayOverall;
-  const winner = homeWins ? homeLabel : awayLabel;
-  const loser = homeWins ? awayLabel : homeLabel;
-  const winnerAvg = homeWins ? homeAvg : awayAvg;
-  const loserAvg = homeWins ? awayAvg : homeAvg;
-  const winKey = attrKeys.slice().sort((a, b) => (winnerAvg[b] - loserAvg[b]) - (winnerAvg[a] - loserAvg[a]))[0];
-  const loseKey = attrKeys.slice().sort((a, b) => loserAvg[a] - loserAvg[b])[0];
-  const winFactor = `${winner}は${ATTR_LABELS[winKey]}で相手を上回っており(平均${fmt(winnerAvg[winKey], 1)} 対 ${fmt(loserAvg[winKey], 1)})、ここが試合を優位に進める鍵になるとAIは予想しています。`;
-  const loseFactor = `${loser}は${ATTR_LABELS[loseKey]}がチーム内で相対的に弱く(平均${fmt(loserAvg[loseKey], 1)})、ここを突かれると苦しい展開になり得ます。`;
-  return { winFactor, loseFactor, winner, loser };
-}
-function pickStandoutPlayer(players) {
-  if (!players || !players.length) return null;
-  return players.slice().sort((a, b) => b.overall - a.overall)[0];
-}
-function buildTurningPointAndMvp(homeLabel, homeP, awayP, winnerLabel) {
-  const winnerPlayers = winnerLabel === homeLabel ? homeP : awayP;
-  const standout = pickStandoutPlayer(winnerPlayers) || pickStandoutPlayer(homeP.concat(awayP));
-  // 2026年8月・第7次監査で発見した欠陥の修正:
-  //   乱数から作った分数を「後半67分前後に…」と分析結果のように提示していた。
-  //   根拠がゼロの数字なので出さない(サーバー側と同じ修正)。
-  const turningPoint = standout
-    ? `${standout.nameJa}が試合の流れを引き寄せる場面を作れるかどうかが鍵になると予想されます(具体的な時間帯を予測できる根拠はありません)。`
-    : `試合中盤にどちらかのチームがギアを上げるタイミングが訪れると予想されます。`;
-  return { turningPoint, mvp: standout ? { key: standout.key, nameJa: standout.nameJa, emoji: standout.emoji, overall: standout.overall } : null };
-}
-// AIの「判断」部分(どちらの方向から攻めると予想するか)だけを返す。実際の
-// <div>タグの組み立ては、API経由/ローカル計算のどちらでも共通のレンダリング
-// コードを使うため、renderMatchAnalysis側に寄せてある(Stage B: 予測ロジックの
-// API化にあわせて「判断」と「見た目」を分離した)。
-function attackDirectionDecision(homeAvg, awayAvg) {
-  const dirFor = (avg) => (avg.speed + avg.dribbling > avg.passing + avg.tactical) ? "サイドを起点にした攻撃" : "中央からの組み立て";
-  return { homeText: dirFor(homeAvg), awayText: dirFor(awayAvg) };
-}
-// 危険エリアの「判断」(どのエリアが危険か)だけを返す。SVGの描画は
-// dangerZonesSvgFromEntries() 側(API経由/ローカル計算で共通)が担当する。
-function aggregateDangerZones(players) {
-  const attackers = players.slice().sort((a, b) => (b.attrs.shooting + b.attrs.dribbling) - (a.attrs.shooting + a.attrs.dribbling)).slice(0, 3);
-  const agg = {};
-  attackers.forEach(p => (p.zones || []).forEach(([zoneLabel, n]) => { agg[zoneLabel] = Math.max(agg[zoneLabel] || 0, n); }));
-  return Object.entries(agg).map(([zoneLabel, n]) => ({ zoneLabel, n }));
-}
-function dangerZonesSvgFromEntries(entries, label) {
-  if (!entries || !entries.length) return `<p class="value-note">この分析に十分な選手データがありません。</p>`;
-  const hotspots = entries.map(({ zoneLabel, n }) => {
-    const c = ZONE_COORDS[zoneLabel] || [100, 100];
-    return `<circle cx="${c[0]}" cy="${c[1]}" r="${16 + n * 6}" fill="rgba(208,59,59,${0.12 + n * 0.11})" />`;
-  }).join("");
-  return `
-  <svg viewBox="0 0 200 220" style="width:100%; height:auto;">
-    <rect x="0" y="0" width="200" height="220" fill="var(--pitch)" rx="8"/>
-    <rect x="5" y="5" width="190" height="210" fill="none" stroke="var(--pitch-line)" stroke-width="1.5"/>
-    <line x1="5" y1="110" x2="195" y2="110" stroke="var(--pitch-line)" stroke-width="1"/>
-    <rect x="60" y="5" width="80" height="28" fill="none" stroke="var(--pitch-line)" stroke-width="1"/>
-    <rect x="60" y="187" width="80" height="28" fill="none" stroke="var(--pitch-line)" stroke-width="1"/>
-    ${hotspots}
-  </svg>
-  <p class="value-note" style="text-align:center; margin-top:2px;">${label}の主力アタッカーが仕掛けやすいエリア(推定)</p>`;
-}
-// 試合の流れの「判断」(どの時間帯がどちらのペースか)だけを返す。
-function matchFlowSegmentsDecision(diff) {
-  const lean = Math.max(-1, Math.min(1, diff / 30));
-  const segs = [];
-  for (let i = 0; i < 5; i++) segs.push((lean + (Math.random() - 0.5) * 1.1) >= 0 ? "home" : "away");
-  return segs;
-}
-function matchFlowHtmlFromSegments(segs, homeLabel, awayLabel) {
-  const phases = ["0-15分", "15-30分", "30-45分", "45-70分", "70-90分"];
-  const segHtml = segs.map((side, i) => `<div style="flex:1; background:${side === "home" ? "var(--series-home)" : "var(--series-away)"}; opacity:0.78; padding:6px 2px; text-align:center; font-size:10.5px; color:#fff;${i < segs.length - 1 ? " border-right:2px solid var(--surface-1);" : ""}">${phases[i]}</div>`).join("");
-  const homeCount = segs.filter(s => s === "home").length;
-  const summary = homeCount === segs.length ? `${homeLabel}が終始試合を優位に進めると予想されます。`
-    : homeCount === 0 ? `${awayLabel}が終始試合を優位に進めると予想されます。`
-    : homeCount > segs.length / 2 ? `${homeLabel}が主導権を握る時間が長いと予想されますが、${awayLabel}にもチャンスがある展開です。`
-    : homeCount < segs.length / 2 ? `${awayLabel}が主導権を握る時間が長いと予想されますが、${homeLabel}にもチャンスがある展開です。`
-    : `拮抗した、どちらに転ぶか分からない展開が予想されます。`;
-  return `
-    <div style="display:flex; border-radius:8px; overflow:hidden; margin:8px 0;">${segHtml}</div>
-    <p class="value-note">${summary}(<span style="color:var(--series-home); font-weight:700;">■</span>${homeLabel} / <span style="color:var(--series-away); font-weight:700;">■</span>${awayLabel}が優勢と予想される時間帯)</p>`;
-}
-function tacticsBoardSvg(homeXI, awayXI, homeP, awayP) {
-  function dotsForSide(xi, isHome) {
-    const source = xi.length ? xi : (isHome ? homeP : awayP).slice(0, 11);
-    const buckets = { GK: [], DF: [], MF: [], FW: [] };
-    source.forEach(p => { const g = positionGroup(p.position); if (buckets[g]) buckets[g].push(p); });
-    const rows = isHome ? [["FW", 245], ["MF", 200], ["DF", 155], ["GK", 128]] : [["FW", 55], ["MF", 100], ["DF", 145], ["GK", 172]];
-    const dots = [];
-    rows.forEach(([g, y]) => {
-      const arr = buckets[g];
-      if (!arr.length) return;
-      const n = arr.length;
-      arr.forEach((p, i) => dots.push({ x: 20 + (i + 1) * (160 / (n + 1)), y, p }));
-    });
-    return dots;
-  }
-  const homeDots = dotsForSide(homeXI, true), awayDots = dotsForSide(awayXI, false);
-  const circle = (d, color) => `<circle cx="${d.x}" cy="${d.y}" r="7.5" fill="${color}" stroke="var(--surface-1)" stroke-width="1.5"/>`;
-  return `
-  <svg viewBox="0 0 200 300" style="width:100%; height:auto;">
-    <rect x="0" y="0" width="200" height="300" fill="var(--pitch)" rx="8"/>
-    <rect x="5" y="5" width="190" height="290" fill="none" stroke="var(--pitch-line)" stroke-width="1.5"/>
-    <line x1="5" y1="150" x2="195" y2="150" stroke="var(--pitch-line)" stroke-width="1"/>
-    <circle cx="100" cy="150" r="20" fill="none" stroke="var(--pitch-line)" stroke-width="1"/>
-    <rect x="55" y="5" width="90" height="30" fill="none" stroke="var(--pitch-line)" stroke-width="1"/>
-    <rect x="55" y="265" width="90" height="30" fill="none" stroke="var(--pitch-line)" stroke-width="1"/>
-    ${awayDots.map(d => circle(d, "var(--series-away)")).join("")}
-    ${homeDots.map(d => circle(d, "var(--series-home)")).join("")}
-  </svg>`;
-}
-
-/* =========================================================
-   Stage B「予測ロジックAPI化」: 試合分析AIの「判断」部分(予想スコア・
-   AI確信度・ボール支配率・勝因/弱点・試合の流れ・ターニングポイント/MVP・
-   攻撃方向・危険エリア・予想布陣)は、まずサーバーのAPI(/api/predict-match)
-   に計算させる。サーバーが利用できない場合(オフライン・初回デプロイ前の
-   サーバー・タイムアウトなど)は、このファイル内にまだ残してある同じロジック
-   (computeMatchAnalysisLocally)でその場に計算し、利用者からは何も変わらない
-   ように見せる(既存のfetchRealPlayerSeasonStats等と同じgraceful-degradation
-   パターン)。どちらの経路でも返すデータの形は完全に同じなので、HTML組み立て側
-   (renderMatchAnalysis)は結果がどちらから来たか気にする必要がない。
-   ========================================================= */
-function toPredictPlayerPayload(p) {
-  return { key: p.key, name: p.name, nameJa: p.nameJa, emoji: p.emoji, overall: p.overall, position: p.position, attrs: p.attrs, zones: p.zones || [] };
-}
-function computeMatchAnalysisLocally(homeLabel, awayLabel, homeP, awayP) {
-  // 2026年8月・第7次監査での追加: 片方でも登録選手が0人なら比較できない。
-  // 以前は固定値62で「62.0 対 62.0」という嘘の比較文を作っていた。
-  if (!homeP.length || !awayP.length) return null;
-  const homeOverall = teamAvg(homeP, "overall"), awayOverall = teamAvg(awayP, "overall");
-  const diff = homeOverall - awayOverall;
-  const homeLambda = Math.max(0.4, 1.35 + diff / 28);
-  const awayLambda = Math.max(0.4, 1.15 - diff / 28);
-  function poissonish(lambda) {
-    let n = 0, p = Math.exp(-lambda), cum = p, r = Math.random();
-    while (cum < r && n < 8) { n++; p *= lambda / n; cum += p; }
-    return n;
-  }
-  const homeGoals = poissonish(homeLambda), awayGoals = poissonish(awayLambda);
-  const confidence = Math.round(50 + Math.min(38, Math.abs(diff) * 2.6));
-
-  const homeAvg = computeAttrAverages(homeP), awayAvg = computeAttrAverages(awayP);
-  const homePossPct = Math.round(50 + (homeAvg.passing + homeAvg.tactical - awayAvg.passing - awayAvg.tactical) / 6);
-  const possessionHomePct = Math.max(30, Math.min(70, homePossPct));
-
-  const homeStyle = homeAvg.passing + homeAvg.tactical > homeAvg.speed + homeAvg.shooting ? "ボール保持を軸にした組み立て" : "スピードと決定力を活かした縦への速さ";
-  const awayStyle = awayAvg.passing + awayAvg.tactical > awayAvg.speed + awayAvg.shooting ? "ボール保持を軸にした組み立て" : "スピードと決定力を活かした縦への速さ";
-  const styleText = `${homeLabel}は${homeStyle}が持ち味、対する${awayLabel}は${awayStyle}が持ち味とAIは分析しています。${Math.abs(diff) < 2 ? "登録選手の平均能力値はほぼ互角で、拮抗した展開が予想されます。" : (diff > 0 ? homeLabel + "がやや優勢という分析です。" : awayLabel + "がやや優勢という分析です。")}`;
-
-  const { winFactor, loseFactor } = buildWinLossFactors(homeLabel, awayLabel, homeAvg, awayAvg, homeOverall, awayOverall);
-  const matchFlowSegments = matchFlowSegmentsDecision(diff);
-  const winnerLabelForTp = homeOverall >= awayOverall ? homeLabel : awayLabel;
-  const { turningPoint, mvp } = buildTurningPointAndMvp(homeLabel, homeP, awayP, winnerLabelForTp);
-  const attackDirection = attackDirectionDecision(homeAvg, awayAvg);
-  const homeDangerZones = aggregateDangerZones(homeP.length ? homeP : [{ attrs: { shooting: 0, dribbling: 0 }, zones: [] }]);
-  const awayDangerZones = aggregateDangerZones(awayP.length ? awayP : [{ attrs: { shooting: 0, dribbling: 0 }, zones: [] }]);
-
-  const homeXIFull = pickLikelyXI(homeP), awayXIFull = pickLikelyXI(awayP);
-  const toXIEntry = p => ({ key: p.key, nameJa: p.nameJa, emoji: p.emoji, overall: p.overall, position: p.position });
-  const homeXI = homeXIFull.map(toXIEntry), awayXI = awayXIFull.map(toXIEntry);
-  const homeFormation = `${homeXIFull.filter(p=>positionGroup(p.position)==="DF").length}-${homeXIFull.filter(p=>positionGroup(p.position)==="MF").length}-${homeXIFull.filter(p=>positionGroup(p.position)==="FW").length}`;
-  const awayFormation = `${awayXIFull.filter(p=>positionGroup(p.position)==="DF").length}-${awayXIFull.filter(p=>positionGroup(p.position)==="MF").length}-${awayXIFull.filter(p=>positionGroup(p.position)==="FW").length}`;
-
-  return {
-    homeGoals, awayGoals, confidence, possessionHomePct, homeOverall, awayOverall,
-    styleText, winFactor, loseFactor, matchFlowSegments, turningPoint, mvp,
-    attackDirection, homeXI, awayXI, homeFormation, awayFormation,
-    dangerZones: { home: homeDangerZones, away: awayDangerZones },
-  };
-}
-// 試合分析APIのタイムアウト。既存の実データ取得(fetchRealPlayerSeasonStats等)は
-// 初回コールドスタート時に最大60秒待つ設計だが、「分析する」ボタンはこれまで
-// 常に一瞬で結果が出ていた最も使用頻度の高い機能のため、「表示速度が落ちない」
-// ことを優先し、短いタイムアウトで即座にローカル計算へフォールバックする。
-const PREDICT_MATCH_TIMEOUT_MS = 1500;
-async function getMatchAnalysisData(homeLabel, awayLabel, homeP, awayP) {
-  try {
-    const payload = {
-      homeLabel, awayLabel,
-      homePlayers: homeP.map(toPredictPlayerPayload),
-      awayPlayers: awayP.map(toPredictPlayerPayload),
-    };
-    const data = await fetchJsonWithTimeout(`${API_PROXY_BASE}/predict-match`, PREDICT_MATCH_TIMEOUT_MS, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    if (data && data.ok) { backendConfirmedWarm = true; return data; }
-    throw new Error("predict-match API returned ok:false");
-  } catch (e) {
-    return computeMatchAnalysisLocally(homeLabel, awayLabel, homeP, awayP); // API未対応/オフライン/タイムアウト時は、これまでと全く同じロジックでその場に計算
-  }
-}
-
-async function renderMatchAnalysis(matchupId) {
-  const m = MATCHUPS.find(x => x.id === matchupId);
-  const wrapEl = document.getElementById("matchAnalysisWrap");
-  if (!m || !wrapEl) return;
-  trackRecentMatch("curated:" + m.id, `${m.homeLabel} vs ${m.awayLabel}`);
-  const homeP = playersForSide(m, "home"), awayP = playersForSide(m, "away");
-
-  // Stage B: 予想スコア・AI確信度・ボール支配率・勝因/弱点・試合の流れ・
-  // ターニングポイント/MVP・攻撃方向・危険エリア・予想布陣は、すべてこの1回の
-  // API呼び出し(失敗時はローカル計算にフォールバック)で取得する。
-  const data = await getMatchAnalysisData(m.homeLabel, m.awayLabel, homeP, awayP);
-  // 2026年8月・第7次監査での追加: 比較できるだけの登録選手がいない場合、
-  // 架空の平均値で比較文を作らず、正直にその旨だけを表示する。
-  if (!data) {
-    wrapEl.innerHTML = `<p class="value-note">この対戦は、どちらかのチームに登録選手データが無いため、能力値にもとづく分析ができませんでした(架空の数値で比較することはしません)。</p>`;
-    return;
-  }
-  const { homeGoals, awayGoals, confidence, possessionHomePct: possClamp, styleText, winFactor, loseFactor,
-    matchFlowSegments, turningPoint, mvp, attackDirection, homeXI, awayXI, homeFormation, awayFormation, dangerZones } = data;
-
-  const matchFlowHtml = matchFlowHtmlFromSegments(matchFlowSegments, m.homeLabel, m.awayLabel);
-  const attackDirectionHtml = `
-    <div class="value-note" style="margin:2px 0;">↔️ <b>${m.homeLabel}</b>: ${attackDirection.homeText}が中心になると予想されます。</div>
-    <div class="value-note" style="margin:2px 0;">↔️ <b>${m.awayLabel}</b>: ${attackDirection.awayText}が中心になると予想されます。</div>`;
-  const homeDangerSvg = dangerZonesSvgFromEntries(dangerZones.home, m.homeLabel);
-  const awayDangerSvg = dangerZonesSvgFromEntries(dangerZones.away, m.awayLabel);
-  const boardSvg = tacticsBoardSvg(homeXI, awayXI, homeP, awayP);
-
-  const bayernSide = m.homeClub === "バイエルン・ミュンヘン" ? "home" : (m.awayClub === "バイエルン・ミュンヘン" ? "away" : null);
-
-  wrapEl.innerHTML = `
-    <div class="card">
-      <h2>🤖 AI試合プレビュー: ${m.homeLabel} vs ${m.awayLabel}</h2>
-      <div class="sim-banner">⚠️ これは実際の試合結果ではありません。登録選手のデータをもとにAIが生成した予測プレビューで、「分析する」を押すたびに新しく生成されます(今日この試合が実際に開催されるとは限りません)。</div>
-      <p class="value-note" style="margin:0 0 8px;">※ このプレビューの文章は、上部の「超入門/標準/戦術」の切り替えには連動しません(選手カードと、実際の試合の分析は連動します)。</p>
-      <div style="text-align:center; margin:14px 0;">
-        <div style="font-size:13px; color:var(--text-secondary); margin-bottom:4px;">AI予想スコア</div>
-        <div style="font-size:32px; font-weight:800;">${m.homeLabel} <span style="color:var(--series-home);">${homeGoals}</span> - <span style="color:var(--series-away);">${awayGoals}</span> ${m.awayLabel}</div>
-        <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">AIの自信度: ${confidence}%(登録選手の平均能力値差から算出)</div>
-      </div>
-      <div class="stat-row">
-        <div class="label-line"><span class="metric-name">予想ボール支配率</span></div>
-        <div class="bar-track">
-          <div class="bar-half left"><div class="bar-fill home" style="width:${possClamp}%;"><span class="bar-value">${possClamp}%</span></div></div>
-          <div class="center-tick"></div>
-          <div class="bar-half right"><div class="bar-fill away" style="width:${100-possClamp}%;"><span class="bar-value">${100-possClamp}%</span></div></div>
-        </div>
-      </div>
-      <p style="font-size:13.5px; color:var(--text-secondary); margin:10px 0 16px;">${styleText}</p>
-      <h3 class="sim-subhead">✅ 予想勝因 / ⚠️ 予想の弱点</h3>
-      <p class="value-note" style="margin:4px 0;">✅ ${winFactor}</p>
-      <p class="value-note" style="margin:4px 0 14px;">⚠️ ${loseFactor}</p>
-      <h3 class="sim-subhead">📈 試合の流れ(予想)</h3>
-      ${matchFlowHtml}
-      <div class="grid-2" style="margin-top:14px;">
-        <div>
-          <h3 class="sim-subhead">🔑 予想ターニングポイント</h3>
-          <p class="value-note">${turningPoint}</p>
-        </div>
-        <div>
-          <h3 class="sim-subhead">🌟 AI予想MVP</h3>
-          <p class="value-note">${mvp ? `${mvp.emoji} ${mvp.nameJa}(総合評価 ${fmt(mvp.overall, 1)})` : "該当データがありません。"}</p>
-        </div>
-      </div>
-      <h3 class="sim-subhead" style="margin-top:14px;">➡️ 予想される攻撃方向</h3>
-      ${attackDirectionHtml}
-      <div class="grid-2" style="margin-top:14px;">
-        <div>
-          <h3 class="sim-subhead">🔥 ${m.homeLabel}の危険エリア</h3>
-          ${homeDangerSvg}
-        </div>
-        <div>
-          <h3 class="sim-subhead">🔥 ${m.awayLabel}の危険エリア</h3>
-          ${awayDangerSvg}
-        </div>
-      </div>
-      <h3 class="sim-subhead" style="margin-top:14px;">📋 戦術ボード(予想布陣)</h3>
-      <div style="max-width:280px; margin:0 auto;">${boardSvg}</div>
-      <p class="value-note" style="text-align:center; margin-top:4px;"><span style="color:var(--series-home); font-weight:700;">●</span>${m.homeLabel}(下から攻撃) / <span style="color:var(--series-away); font-weight:700;">●</span>${m.awayLabel}(上から攻撃)</p>
-      <div class="grid-2" style="margin-top:14px;">
-        <div>
-          <h3 class="sim-subhead">📋 ${m.homeLabel} 予想フォーメーション ${homeXI.length >= 7 ? "(" + homeFormation + ")" : ""}</h3>
-          ${keyPlayersHtml(homeP, 5)}
-        </div>
-        <div>
-          <h3 class="sim-subhead">📋 ${m.awayLabel} 予想フォーメーション ${awayXI.length >= 7 ? "(" + awayFormation + ")" : ""}</h3>
-          ${keyPlayersHtml(awayP, 5)}
-        </div>
-      </div>
-      <p class="value-note" style="margin-top:10px;">選手名をタップすると、その選手の詳細を直接見られます(「🔍 選手検索」タブに切り替わります)。${homeXI.length < 7 || awayXI.length < 7 ? "このカードは登録選手数が少ないため、布陣の全員ではなく注目選手のみのスポットライト形式です。" : ""}</p>
-    </div>
-    ${bayernSide ? `<div class="card" id="matchLiveBayern"><p class="value-note">実データを取得中…</p></div>` : ""}
-  `;
-  wrapEl.querySelectorAll(".match-player-chip").forEach(btn => {
-    // 選手名をタップしたら「🔍 選手検索」の1画面へ渡す(旧スカウティング画面は廃止)
-    btn.addEventListener("click", () => { psOpenByName(btn.dataset.name); });
-  });
-  if (bayernSide) renderLiveBayernPanel("matchLiveBayern");
-  wrapEl.scrollIntoView({ behavior: "smooth", block: "start" });
-}
-
 /* スカウト速報(新規加入・移籍・若手有望株・フォーム急上昇/急下降)。
    サーバーが実測値の変化から検知したものだけを表示する。 */
 const SCOUT_TYPE_ICONS = { new: "🆕", transfer: "🔄", prospect: "🌱", formUp: "📈", formDown: "📉" };
@@ -10395,12 +10032,8 @@ function renderHeroChatUI() {
   el.scrollTop = el.scrollHeight;
 }
 function switchToPlayerMode() {
-  const btn = document.querySelector('#modeSwitch button[data-mode="player"]');
-  if (btn && !btn.classList.contains("active")) btn.click();
-}
-function switchToMatchMode() {
-  const btn = document.querySelector('#modeSwitch button[data-mode="match"]');
-  if (btn && !btn.classList.contains("active")) btn.click();
+  // v104.2: すでに開いていれば何もしない(もう一度押すと閉じる作りになったため、click ではなく開く専用の関数で)
+  openHomeMode("player");
 }
 function scrollToEl(id) {
   const el = document.getElementById(id);
@@ -10571,14 +10204,6 @@ function guessUnregisteredPlayerName(q) {
   return jp || null;
 }
 
-function getDailyFeaturedMatchup() {
-  // 第7次監査での修正: UTCの日付だと日本時間の午前9時に「今日の注目」が
-  // 切り替わっていた。利用者の端末の日付に合わせる。
-  const now = new Date();
-  const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-  const idx = hashString("matchup|" + dateStr) % MATCHUPS.length;
-  return MATCHUPS[idx];
-}
 
 // ============================================================
 // Stage C: 対話エンジン(議論モード) ― RAG + LLM推論
@@ -10826,33 +10451,6 @@ const CLUB_JA_TO_EN = {
   "パリ・サンジェルマン": "Paris Saint Germain",
   "インテル・ミラン": "Inter",
 };
-
-// 「AIマッチ分析」カードの初期化(セレクト投入・ボタンのイベント登録)。
-// 定義自体はこのファイル上部(fetchMatchAnalysis/populateMatchAnalysisSelects/
-// renderMatchAnalysisResult)にあるが、CLUB_JA_TO_EN(直前で定義)に依存するため、
-// ここで初めて実行する。
-function initMatchAnalysisWidget() {
-  populateMatchAnalysisSelects();
-  const btn = document.getElementById("maAnalyzeBtn");
-  if (!btn) return;
-  btn.addEventListener("click", async () => {
-    const homeJa = document.getElementById("maHomeSelect").value;
-    const awayJa = document.getElementById("maAwaySelect").value;
-    const wrap = document.getElementById("maResultWrap");
-    if (homeJa === awayJa) {
-      wrap.innerHTML = `<p class="value-note">⚠️ 異なる2クラブを選んでください。</p>`;
-      return;
-    }
-    btn.disabled = true;
-    btn.textContent = "分析中…";
-    wrap.innerHTML = `<p class="value-note">🔄 AIが実データを分析しています…(初回はサーバー起動のため最大1分ほどかかることがあります)</p>`;
-    const data = await fetchMatchAnalysis(homeJa, awayJa);
-    renderMatchAnalysisResult(data, homeJa, awayJa);
-    btn.disabled = false;
-    btn.textContent = "分析する ▶";
-  });
-}
-initMatchAnalysisWidget();
 
 // 議論トリガー検出(ご指示のフレーズ一覧に準拠): 「〜だと思う」「〜な気がする」
 // 「〜では？」「もし〜だったら？」「なぜ？」「本当に？」「どう思う？」など、
@@ -11700,10 +11298,7 @@ function buildRecommendedHeroQuestions() {
     const p = PLAYERS[keys[todaySeed("featured-player") % keys.length]];
     qs.push(`${p.nameJa}はどんな選手？`, `${p.nameJa}の今後は？`);
   }
-  if (MATCHUPS.length) {
-    const m = getDailyFeaturedMatchup();
-    qs.push(`${m.homeLabel}と${m.awayLabel}どっちが勝つ？`);
-  }
+  // v104.2: 仮の対戦(日替わりの組み合わせ)の質問は外した(ご要望)。実際の試合についての質問だけを勧める
   qs.push("今日見るべき試合は？");
   return qs;
 }
@@ -11859,15 +11454,14 @@ renderAll = function () {
 // 手作業整備カードの置き場は、選手を選んだときだけ使う。
 (() => { const host = document.getElementById("playerCardWrap"); if (host) host.style.display = "none"; })();
 
-// Match Analysis AI: populate the curated matchup list
-renderMatchList();
 renderRealFixturesIfAvailable();
 
 /* =========================================================
    Homepage dashboard (redesign ②): daily-rotating widgets that make
    the homepage worth browsing on its own, not just a search box.
-   Everything here is computed live from the registered PLAYERS /
-   MATCHUPS data — nothing is a fabricated stat or fake headline.
+   Everything here is computed live from the registered PLAYERS data —
+   nothing is a fabricated stat or fake headline.
+   (v104.2: 仮の対戦の2枠「今日の注目試合」「AIが見るべき試合カード」は外した)
    ========================================================= */
 function todaySeed(salt) {
   // 第8次監査(Low)の修正: UTC日付だと日替わりウィジェットが日本時間の朝9時に
@@ -11899,25 +11493,6 @@ function renderDashFeaturedPlayer() {
       <button class="match-analyze-btn">詳しく見る ▶</button>
     </div>`;
   document.getElementById("dashFeaturedPlayerRow").addEventListener("click", () => openPlayerFromDashboard(p.nameJa));
-}
-function renderDashFeaturedMatch() {
-  const el = document.getElementById("dashFeaturedMatch");
-  if (!el) return;
-  if (!MATCHUPS.length) { el.innerHTML = `<p class="value-note">登録カードがありません。</p>`; return; }
-  const m = getDailyFeaturedMatchup();
-  el.innerHTML = `
-    <div class="match-row">
-      <div>
-        <div class="teams">⚽ ${m.homeLabel} vs ${m.awayLabel}</div>
-        <div class="sub">${m.note}</div>
-      </div>
-      <button class="match-analyze-btn" id="dashFeaturedMatchBtn">分析する ▶</button>
-    </div>`;
-  document.getElementById("dashFeaturedMatchBtn").addEventListener("click", () => {
-    switchToMatchMode();
-    renderMatchAnalysis(m.id);
-    scrollToEl("matchAnalysisWrap");
-  });
 }
 function pickTrendingPlayers(n) {
   n = n || 4;
@@ -11970,25 +11545,6 @@ function renderDashTrivia() {
     <button type="button" class="value-note" id="dashTriviaLink" style="margin-top:6px; cursor:pointer; background:none; border:none; padding:0; text-align:left; font:inherit; color:inherit;">→ ${escapeHtml(p.nameJa)}のカードを見る</button>`;
   document.getElementById("dashTriviaLink").addEventListener("click", () => openPlayerFromDashboard(p.nameJa));
 }
-function renderDashRecommendedMatches() {
-  const el = document.getElementById("dashRecommendedMatches");
-  if (!el) return;
-  if (!MATCHUPS.length) { el.innerHTML = `<p class="value-note">登録カードがありません。</p>`; return; }
-  const first = getDailyFeaturedMatchup();
-  const secondIdx = (MATCHUPS.indexOf(first) + 1) % MATCHUPS.length;
-  const second = MATCHUPS[secondIdx];
-  const picks = first.id === second.id ? [first] : [first, second];
-  el.innerHTML = picks.map(m => `
-    <div class="match-row">
-      <div><div class="teams">⚽ ${m.homeLabel} vs ${m.awayLabel}</div><div class="sub">${m.note}</div></div>
-      <button class="match-analyze-btn" data-id="${m.id}">分析する ▶</button>
-    </div>`).join("");
-  el.querySelectorAll("[data-id]").forEach(btn => btn.addEventListener("click", () => {
-    switchToMatchMode();
-    renderMatchAnalysis(btn.dataset.id);
-    scrollToEl("matchAnalysisWrap");
-  }));
-}
 function renderDashRecentlyViewed() {
   const el = document.getElementById("dashRecentlyViewed");
   if (!el) return;
@@ -11999,31 +11555,19 @@ function renderDashRecentlyViewed() {
   if (recentMatchesViewed.length) {
     parts.push(recentMatchesViewed.map(m => `<div class="value-note" style="margin:2px 0;">⚽ ${m.label}</div>`).join(""));
   }
-  el.innerHTML = parts.length ? parts.join("") : `<p class="value-note">まだ選手・試合を見ていません。上のダッシュボードやチャットから見てみましょう。</p>`;
+  // v104.2: 見たものがあるときだけ、この欄ごと出す(空のときに「まだ見ていません」と場所を取らない)
+  el.innerHTML = parts.join("");
+  const wrap = document.getElementById("dashRecentWrap");
+  if (wrap) wrap.style.display = parts.length ? "block" : "none";
   el.querySelectorAll("[data-name]").forEach(btn => btn.addEventListener("click", () => openPlayerFromDashboard(btn.dataset.name)));
 }
 function renderDashboard() {
   renderDashFeaturedPlayer();
-  renderDashFeaturedMatch();
   renderDashTrending();
   renderDashTrivia();
-  renderDashRecommendedMatches();
   renderDashRecentlyViewed();
 }
 renderDashboard();
-
-// home-screen polish: the lower-priority widgets (AIが見るべき試合カード /
-// 最近見た選手・試合) start collapsed so the home screen shows only the four
-// priority items (試合 → 選手 → 急上昇 → 豆知識) at a glance.
-const dashMoreBtn = document.getElementById("dashMoreToggleBtn");
-const dashMoreWrap = document.getElementById("dashMoreDetails");
-if (dashMoreBtn && dashMoreWrap) {
-  dashMoreBtn.addEventListener("click", () => {
-    const isHidden = dashMoreWrap.style.display === "none";
-    dashMoreWrap.style.display = isHidden ? "block" : "none";
-    dashMoreBtn.textContent = isHidden ? "▲ 閉じる" : "▼ もっと見る";
-  });
-}
 
 // ---- AI予測の「本物の実績」ホーム画面ウィジェット ----
 // このアプリは「学習して成長するAI」を謳うにあたり、架空の正答率を表示しない。
@@ -12045,10 +11589,50 @@ function buildAccuracyRecentRow(rec) {
   return `<div class="value-note" style="margin:3px 0;">${icon} ${escapeHtml(rec.home || "?")} vs ${escapeHtml(rec.away || "?")} — AI予測:${OUTCOME_LABEL_JA[rec.predictedWinner] || "-"} / 結果:${OUTCOME_LABEL_JA[rec.actualWinner] || "-"}</div>`;
 }
 
+// v104.2: 反省タブが読み込んだ「このAI自身の的中率」の控え。ホームの予想カードのリンクと、
+//   的中率カードの見出しの両方が使う。ページ読み込み中にこの下の renderAiAccuracyWidget() が
+//   先に走るので、宣言はここ(最初に使う場所の前)に置く(let は宣言行より前では読めないため)。
+let reflHeadlineForHero = null;
+let reflHeadlineState = "loading"; // 読み込みの状態: loading / ok / none / failed
 async function renderAiAccuracyWidget() {
   const summaryEl = document.getElementById("aiAccuracySummary");
   const detailsEl = document.getElementById("aiAccuracyDetails");
   if (!summaryEl) return;
+
+  // ---- v104.2「見やすさの整理」 ----
+  //   これまでこのカードの見出しは、API-Football が提供する予測の的中率(このAI自身の成績ではない)で、
+  //   その断り書きと運用の内訳(記録開始・答え合わせ待ち・自動照合の実行時刻)が常に4行並んでいた。
+  //   ・見出しは「このAI自身の的中率(実測)」の1行にする(反省タブの見出しと同じ数字。追加の通信なし。
+  //     反省の読み込みが後から届いても applyReflHeadlineToAccuracyCard が書き換える)
+  //   ・API-Football の予測の記録と運用の内訳は、消さずに「詳しく見る」の中へ移す(外部の予測であることを明記)
+  summaryEl.innerHTML = `
+    <div class="acc-row">
+      <div id="aiAccuracyHeadline" class="acc-headline">${accuracyHeadlineHtml()}</div>
+      <button class="more-details-btn" id="aiAccuracyToggleBtn" type="button" style="margin:0; display:inline-block; width:auto; padding:4px 10px; flex:0 0 auto;">詳しく見る ▼</button>
+    </div>
+  `;
+  const toggleBtn = document.getElementById("aiAccuracyToggleBtn");
+  if (toggleBtn && detailsEl) {
+    toggleBtn.addEventListener("click", () => {
+      const isHidden = detailsEl.style.display === "none";
+      detailsEl.style.display = isHidden ? "block" : "none";
+      toggleBtn.textContent = isHidden ? "▲ 閉じる" : "詳しく見る ▼";
+    });
+  }
+  /** 「詳しく見る」の中身: このAI自身の採点記録への導線 + 比較用の外部の予測(API-Football)の記録 */
+  const setDetails = (externalHtml) => {
+    if (!detailsEl) return;
+    detailsEl.innerHTML = `
+      <p class="value-note" style="margin:0 0 4px;"><a href="#" id="accuracyToReflectionsLink" style="color:inherit;">🙈 このAI自身の採点記録(外れも含む全試合)を見る</a></p>
+      <div style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border);">
+        <div class="value-note" style="margin-bottom:4px;">📎 <span>比較用: 外部の予測(API-Football)の記録</span></div>
+        ${externalHtml}
+      </div>
+    `;
+    const toRefl = document.getElementById("accuracyToReflectionsLink");
+    if (toRefl) toRefl.addEventListener("click", (ev) => { ev.preventDefault(); openHomeMode("reflections", { scroll: true }); });
+  };
+  setDetails(`<p class="value-note">読み込み中…</p>`);
 
   const stats = await fetchAccuracyStats();
 
@@ -12056,12 +11640,12 @@ async function renderAiAccuracyWidget() {
   // タイムアウトしただけなのに「これから記録を開始します」と表示すると、
   // 既に記録があるのに無いかのような誤解を与えるため。
   if (!stats) {
-    summaryEl.innerHTML = `🤖 <strong>AI予測の実績</strong>: <span class="value-note">実績データを取得できませんでした(サーバー起動待ちの可能性があります。しばらくして再読み込みしてください)。</span>`;
+    setDetails(`<div>🤖 <strong>AI予測の実績</strong>: <span class="value-note">実績データを取得できませんでした(サーバー起動待ちの可能性があります。しばらくして再読み込みしてください)。</span></div>`);
     return;
   }
   if (!stats.configured) {
     // Upstash未設定 — 架空の数字は出さず、準備中であることだけ伝える。
-    summaryEl.innerHTML = `🤖 <strong>AI予測の実績</strong>: これから記録を開始します。データが十分に集まり次第、ここに実際の予測正答率を表示します。`;
+    setDetails(`<div>🤖 <strong>AI予測の実績</strong>: これから記録を開始します。データが十分に集まり次第、ここに実際の予測正答率を表示します。</div>`);
     return;
   }
 
@@ -12071,13 +11655,13 @@ async function renderAiAccuracyWidget() {
   //   「記録を開始したばかりです」と表示されていた。
   //   実績が無いのか、読み出せなかっただけなのかを必ず区別する。
   if (stats.error) {
-    summaryEl.innerHTML = `🤖 <strong>AI予測の実績</strong>: いまは記録を読み出せませんでした(保存先との通信が一時的に不安定な可能性があります)。しばらくしてから再度お試しください。`;
+    setDetails(`<div>🤖 <strong>AI予測の実績</strong>: いまは記録を読み出せませんでした(保存先との通信が一時的に不安定な可能性があります)。しばらくしてから再度お試しください。</div>`);
     return;
   }
 
   if (!stats.resolved || stats.resolved === 0) {
     const pendingNote = stats.total > 0 ? `(現在${stats.total}件の予測を検証中)` : "";
-    summaryEl.innerHTML = `🤖 <strong>AI予測の実績</strong>: 記録を開始したばかりです${pendingNote}。試合結果が出次第、正答率が表示されます。`;
+    setDetails(`<div>🤖 <strong>AI予測の実績</strong>: 記録を開始したばかりです${pendingNote}。試合結果が出次第、正答率が表示されます。</div>`);
     return;
   }
 
@@ -12097,31 +11681,18 @@ async function renderAiAccuracyWidget() {
       + (Number.isFinite(stats.hoursSinceLastAutoCollect) ? ` ・ <span>自動照合の最終実行 ${stats.hoursSinceLastAutoCollect}時間前</span>` : (stats.lastAutoCollect === null ? " ・ <span>自動照合の実行記録なし</span>" : ""))
       + `</div>`
     : "";
-  summaryEl.innerHTML = `
-    🤖 <strong>AI予測の正答率: ${stats.accuracyPct}%</strong>
-    <span class="value-note">(${stats.correct}/${stats.resolved}件的中${lowSample ? "・サンプル数が少ないため参考値です" : ""})</span>
-    <button class="more-details-btn" id="aiAccuracyToggleBtn" type="button" style="margin-left:8px; display:inline-block; width:auto; padding:4px 10px;">詳しく見る ▼</button>
-    <div class="value-note" style="margin-top:4px;">${sinceText}</div>
-    ${pendingLine}
-    ${stalled}
-    ${stats.noteJa ? `<div class="value-note" style="margin-top:4px; opacity:.85;">${escapeHtml(stats.noteJa)}</div>` : ""}
-  `;
-
-  const toggleBtn = document.getElementById("aiAccuracyToggleBtn");
-  if (toggleBtn && detailsEl) {
-    const recentHtml = (stats.recent && stats.recent.length)
-      ? stats.recent.map(buildAccuracyRecentRow).join("")
-      : `<p class="value-note">まだ結果が確定した予測はありません。</p>`;
-    detailsEl.innerHTML = `
-      <p class="value-note" style="margin-bottom:6px;">直近の予測結果(API-Footballの実際の予測データと、実際の試合結果を照合しています):</p>
-      ${recentHtml}
-    `;
-    toggleBtn.addEventListener("click", () => {
-      const isHidden = detailsEl.style.display === "none";
-      detailsEl.style.display = isHidden ? "block" : "none";
-      toggleBtn.textContent = isHidden ? "▲ 閉じる" : "詳しく見る ▼";
-    });
-  }
+  const recentHtml = (stats.recent && stats.recent.length)
+    ? stats.recent.map(buildAccuracyRecentRow).join("")
+    : `<p class="value-note">まだ結果が確定した予測はありません。</p>`;
+  setDetails(`
+        <div>🤖 <strong>AI予測の正答率: ${stats.accuracyPct}%</strong>
+        <span class="value-note">(${stats.correct}/${stats.resolved}件的中${lowSample ? "・サンプル数が少ないため参考値です" : ""})</span></div>
+        ${stats.noteJa ? `<div class="value-note" style="margin-top:4px; opacity:.85;">${escapeHtml(stats.noteJa)}</div>` : ""}
+        <div class="value-note" style="margin-top:4px;">${sinceText}</div>
+        ${pendingLine}
+        ${stalled}
+        <p class="value-note" style="margin:8px 0 6px;">直近の予測結果(API-Footballの実際の予測データと、実際の試合結果を照合しています):</p>
+        ${recentHtml}`);
 }
 renderAiAccuracyWidget();
 
@@ -12846,21 +12417,20 @@ function predFreshnessLineHtml(p) {
   return `<div class="value-note" style="margin-top:2px; opacity:.85;">🕓 予想生成: ${d.toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}(毎朝の学習時。フォーム・怪我などの材料もその時点の実測)</div>`;
 }
 
-// 予想の要約ブロック(予想勝者→バー→根拠→学習バージョンの順。詳細画面用)
+// 予想の要約ブロック(詳細画面用)。v104.2: ホームの予想カードと同じ並び
+//   (自信ランクの帯 → AIの予想 → 勝率の帯 → 決め手 → 「根拠をくわしく見る」)に揃えた。
 function predictionSummaryBlockHtml(p, titleJa) {
   if (!p) return "";
-  // 精度証明ラウンド: 実績補正後の勝率・似た試合・市場比較も(あるものだけ)表示
-  const similarLine = p.similarPastJa ? `<div class="value-note" style="margin-top:2px;">📚 ${escapeHtml(p.similarPastJa)}</div>` : "";
-  const marketLine = (p.market && Number.isFinite(p.market.edgePt))
-    ? `<div class="value-note" style="margin-top:2px;">🏦 市場(オッズ)比較: AIは市場より${p.market.edgePt > 0 ? "強気" : "弱気"}(${p.market.edgePt > 0 ? "+" : ""}${Number(p.market.edgePt)}pt)</div>`
-    : "";
-  const blendLine = predBlendLineHtml(p);
   return `
-    <div style="margin:8px 0; padding:10px 12px; border-left:4px solid var(--series-2); background:rgba(0,0,0,.03); border-radius:6px;">
-      <div>${escapeHtml(titleJa || "🤖 AIの予想")}: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predTierChipHtml(p)}${predResultBadgeHtml(p)}</div>
-      ${predBarHtml(p)}
-      <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-      ${predUnlearnedLineHtml(p)}${predTierLineHtml(p)}${predConfidenceLineHtml(p)}${predFactorsLineHtml(p)}${predBasisLineHtml(p)}${similarLine}${marketLine}${blendLine}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
+    <div class="pred-item" style="margin:8px 0;">
+      ${predRankBandHtml(p)}
+      <div class="pred-pad">
+        <div class="pred-pick" style="margin-top:0;">${escapeHtml(titleJa || "🤖 AIの予想")}: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predResultBadgeHtml(p)}</div>
+        ${predBarHtml(p)}
+        ${predReasonLineHtml(p)}
+        ${predAlertsHtml(p)}
+        ${predDetailsHtml(p, "", Number.isFinite(Number(p.fixtureId)) ? "detail:" + Number(p.fixtureId) : "")}
+      </div>
     </div>`;
 }
 // ---- 2026年8月18日・v50「市場ブレンド」の開示 ----
@@ -12962,7 +12532,8 @@ function predTierChipHtml(p) {
   const t = p && p.tier;
   if (!t || !t.rank) return "";
   const cls = { S: "tier-s", A: "tier-a", B: "tier-b", skip: "tier-skip" }[t.rank] || "tier-b";
-  return `<span class="tier-chip ${cls}">${t.rank === "skip" ? "<span>見送り</span>" : escapeHtml(String(t.rank))}</span>`;
+  // v104.2: 文字1つ(S / A / B)だけでは何の印か分からないので、「ランク」の語を添える
+  return `<span class="tier-chip ${cls}">${t.rank === "skip" ? "<span>見送り</span>" : `<span>ランク</span> ${escapeHtml(String(t.rank))}`}</span>`;
 }
 function predTierLineHtml(p) {
   const t = p && p.tier;
@@ -12985,6 +12556,106 @@ function predTierLineHtml(p) {
   const stampNote = (t.stamped && Number.isFinite(Number(t.confPct)) && c && Number.isFinite(Number(c.displayPct)) && Number(c.displayPct) !== Number(t.confPct))
     ? ` ・ <span>予想時の自信 ${Number(t.confPct)}%</span>` : "";
   return `<div class="value-note" style="margin-top:2px;">🏅 <span>自信ランク</span> ${rankHtml}${lead}${rec}${stampNote}</div>`;
+}
+// ============================================================================
+// v104.2「予想カードの整理」(ご指摘: 自信ランクがどこに書いてあるか分かりにくい・情報が多すぎて見にくい)
+//   予想1件につき常に見せるのは「自信ランクの帯 → 対戦 → AIの予想 → 勝率の帯 → 決め手ひとこと」だけ。
+//   それ以外の根拠(ランクの実績・確信度の内訳・根拠スコア・使えたデータ・似た試合・市場比較・合成の判定・
+//   直前情報・スコアの可能性・予想の生成時刻)は「🔎 根拠をくわしく見る」を押した人にだけ見せる。
+//   行の文言と順番は変えていない(消したのではなく、たたんだだけ)。
+// ============================================================================
+/** ランクを決めた自信の数字(%)。予想時に刻んだ値があればそれ、無ければ今カードに出している自信 */
+function predRankConfPct(p) {
+  const t = p && p.tier;
+  if (t && Number.isFinite(Number(t.confPct))) return Number(t.confPct);
+  const c = p && p.confidence;
+  if (c && Number.isFinite(Number(c.displayPct))) return Number(c.displayPct);
+  return null;
+}
+/**
+ * 自信ランクの帯(カードのいちばん上・色つき)。
+ *   ランクのある予想: 「🏅 自信ランク [S] 確信 …… 自信 70%」
+ *   ランクの無い予想: 「🏅 自信ランク [–] 対象外」と、サーバーが返した理由(学習していない大会・親善試合など)
+ *   tier そのものが無い応答(旧い形)では何も出さない(理由を推測で書かない)。
+ */
+function predRankBandHtml(p) {
+  const t = p && p.tier;
+  if (!t || typeof t !== "object") return "";
+  const cap = `<span class="rank-cap">🏅 <span>自信ランク</span></span>`;
+  const rank = t.rank ? String(t.rank) : null;
+  if (!rank) {
+    const why = t.reasonJa ? `<span class="rank-why"><span>${escapeHtml(String(t.reasonJa))}</span></span>` : "";
+    return `<div class="rank-band rank-none">${cap}<span class="rank-letter">–</span><span class="rank-label"><span>対象外</span></span>${why}</div>`;
+  }
+  const cls = { S: "rank-s", A: "rank-a", B: "rank-b", skip: "rank-skip" }[rank] || "rank-b";
+  const conf = predRankConfPct(p);
+  const confHtml = conf !== null ? `<span class="rank-conf"><span>自信</span> <strong>${conf}%</strong></span>` : "";
+  if (rank === "skip") {
+    return `<div class="rank-band ${cls}">${cap}<span class="rank-letter"><span>見送り</span></span><span class="rank-label"><span>自信が低い試合</span></span>${confHtml}</div>`;
+  }
+  return `<div class="rank-band ${cls}">${cap}<span class="rank-letter">${escapeHtml(rank)}</span><span class="rank-label"><span>${escapeHtml(String(t.labelJa || ""))}</span></span>${confHtml}</div>`;
+}
+/** 決め手ひとこと(この予想にいちばん効いた要素)。無ければ何も出さない */
+function predReasonLineHtml(p) {
+  if (!p || !p.topFactorJa) return "";
+  return `<div class="pred-reason">💡 <span>決め手</span>: <span>${escapeHtml(String(p.topFactorJa))}</span></div>`;
+}
+/** 常に見せる注意(当てはまるときだけ): 引き分けの確率が高い・モデルの範囲外・直前情報で見立てが変わった。説明の全文は「くわしく見る」の中 */
+function predAlertsHtml(p) {
+  if (!p) return "";
+  const chips = [];
+  const drawPct = p.probs && Number.isFinite(Number(p.probs.drawPct)) ? Number(p.probs.drawPct) : null;
+  if (drawPct !== null && drawPct >= 30 && p.predictedWinner !== "draw") chips.push(`<span class="pred-alert">⚖️ <span>引き分け注意</span> <strong>${drawPct}%</strong></span>`);
+  if (p.confidence && p.confidence.outOfRange) chips.push(`<span class="pred-alert">⚠️ <span>確率は割り引いて見てください</span></span>`);
+  // 直前情報(スタメン確定・直前オッズ)で、朝の予想と違う見立てになったときだけ、その見立てを1つ出す
+  //   (公式の予想は朝のまま。内訳と断り書きは「くわしく見る」の中の直前情報の行にある)
+  const pkb = p.preKick && p.preKick.blended;
+  if (pkb && pkb.changedFromMorning) {
+    let verdict = "";
+    if (pkb.probsPct) {
+      const w = pkb.predictedWinner;
+      const nameH = escapeHtml((p.home && p.home.name) || "ホーム");
+      const nameA = escapeHtml((p.away && p.away.name) || "アウェイ");
+      const label = w === "home" ? `${nameH} 勝利` : w === "away" ? `${nameA} 勝利` : "引き分け";
+      const pct = w === "home" ? pkb.probsPct.homeWinPct : w === "away" ? pkb.probsPct.awayWinPct : pkb.probsPct.drawPct;
+      verdict = ` → <strong>${label} ${Number(pct)}%</strong>`;
+    }
+    chips.push(`<span class="pred-alert">⚡ <span>直前情報</span>${verdict} <span>(朝から変化)</span></span>`);
+  }
+  return chips.length ? `<div class="pred-alerts">${chips.join("")}</div>` : "";
+}
+/** たたんである根拠の中身(これまでカードに常時出していた行。文言・順番は従来のまま) */
+function predDetailsBodyHtml(p, extraHtml) {
+  // 精度証明ラウンド: 実績補正後の勝率(較正)・似た試合・市場(オッズ)比較。
+  // それぞれ実測がある試合にだけ表示する(無いものは出さない=でっち上げない)。
+  const similarLine = p.similarPastJa ? `<div class="value-note" style="margin-top:2px;">📚 ${escapeHtml(p.similarPastJa)}</div>` : "";
+  const marketLine = (p.market && Number.isFinite(p.market.edgePt))
+    ? `<div class="value-note" style="margin-top:2px;">🏦 市場(オッズ)比較: AIは市場より${p.market.edgePt > 0 ? "強気" : "弱気"}(${p.market.edgePt > 0 ? "+" : ""}${Number(p.market.edgePt)}pt)</div>`
+    : "";
+  const basisTop = (p.topFactorJa || Number.isFinite(p.weightsVersion))
+    ? `<div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>`
+    : "";
+  return `${basisTop}${predUnlearnedLineHtml(p)}${predTierLineHtml(p)}${predConfidenceLineHtml(p)}${predFactorsLineHtml(p)}${predBasisLineHtml(p)}${similarLine}${marketLine}${predBlendLineHtml(p)}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}${extraHtml || ""}`;
+}
+// 開いた「くわしく見る」は、カードを描き直しても(対決で予想を選んだあとなど)開いたままにする。
+const predOpenDetails = new Set(); // "hero:<試合ID>" / "detail:<試合ID>"
+let duelMenuOpen = false;          // 「対決のメニュー」の開閉(同じ理由)
+function predDetailsHtml(p, extraHtml, openKey) {
+  const key = openKey ? String(openKey) : "";
+  const isOpen = !!key && predOpenDetails.has(key);
+  return `<details class="pred-more"${key ? ` data-pred-key="${escapeHtml(key)}"` : ""}${isOpen ? " open" : ""}><summary>🔎 <span>根拠をくわしく見る</span></summary><div class="pred-more-body">${predDetailsBodyHtml(p, extraHtml)}</div></details>`;
+}
+// toggle は親へ伝わらない(バブリングしない)ので、document の捕捉段階で1か所だけ受ける。
+if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+  document.addEventListener("toggle", (ev) => {
+    const d = ev && ev.target;
+    if (!d || typeof d.matches !== "function") return;
+    if (d.matches("details.pred-more[data-pred-key]")) {
+      if (d.open) predOpenDetails.add(d.dataset.predKey); else predOpenDetails.delete(d.dataset.predKey);
+    } else if (d.id === "duelMenu") {
+      duelMenuOpen = !!d.open;
+    }
+  }, true);
 }
 /** 「🏅 自信ランク別の成績」(今日のAI予想カードの下に折りたたみで出す) */
 function tiersTableHtml(tiers) {
@@ -13161,17 +12832,22 @@ function duelScoreboardHtml() {
   const lbLine = duelLbJoined()
     ? `<span class="value-note">🏆 「${escapeHtml(duelLbNickname() || "")}」として全国ランキング参加中</span> <button class="ghost-btn" id="duelLbToggleBtn" type="button" style="padding:2px 10px; font-size:12px;">🏆 全国ランキングを見る</button>`
     : `<button class="ghost-btn" id="duelLbJoinBtn" type="button" style="padding:2px 10px; font-size:12px;">🏆 全国ランキングに参加(ニックネームだけ)</button> <button class="ghost-btn" id="duelLbToggleBtn" type="button" style="padding:2px 10px; font-size:12px;">ランキングを見る</button>`;
-  return `<div id="duelScoreboard" style="margin:0 0 8px; padding:8px 10px; border:1.5px solid var(--series-home); border-radius:8px; background:rgba(0,0,0,.03);">
+  // v104.2: 常に見せるのは戦績の1行だけ。シェア・全国ランキング・OFF は「対決のメニュー」にたたむ
+  //   (登録の結果の知らせは、メニューを閉じていても見えるように外に出す)。
+  return `<div id="duelScoreboard" style="margin:0 0 10px; padding:8px 10px; border:1.5px solid var(--series-home); border-radius:8px; background:rgba(0,0,0,.03);">
     <div>${head}</div>
-    <div class="value-note" style="margin-top:3px;">記録はこの端末の中だけに保存されます ・ <button class="ghost-btn" id="duelShareBtn" type="button" style="padding:2px 10px; font-size:12px;"${rec.n ? "" : " disabled"}>📸 対戦成績をシェア</button> <button class="ghost-btn" id="duelModeOffBtn" type="button" style="padding:2px 10px; font-size:12px;">対決をOFF</button></div>
-    <div style="margin-top:4px;">${lbLine}</div>
     ${duelLastRegisterNote ? `<div class="value-note" style="margin-top:3px;">${escapeHtml(duelLastRegisterNote)}</div>` : ""}
+    <details id="duelMenu" style="margin-top:4px;"${duelMenuOpen ? " open" : ""}>
+    <summary style="cursor:pointer; font-size:12px; color:var(--text-secondary);">⚙️ <span>対決のメニュー(シェア・全国ランキング・OFF)</span></summary>
+    <div class="value-note" style="margin-top:6px;">記録はこの端末の中だけに保存されます ・ <button class="ghost-btn" id="duelShareBtn" type="button" style="padding:2px 10px; font-size:12px;"${rec.n ? "" : " disabled"}>📸 対戦成績をシェア</button> <button class="ghost-btn" id="duelModeOffBtn" type="button" style="padding:2px 10px; font-size:12px;">対決をOFF</button></div>
+    <div style="margin-top:4px;">${lbLine}</div>
     <div id="duelJoinForm" style="display:none; margin-top:6px;">
       <input type="text" id="duelNickInput" maxlength="12" placeholder="ニックネーム(12文字まで)" style="padding:7px 10px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary); font-size:13px; width:200px;">
       <button class="apply-btn" id="duelJoinSubmitBtn" type="button" style="margin-top:0; width:auto; padding:7px 12px; font-size:13px;">参加する</button>
       <div class="value-note" style="margin-top:3px;">参加は任意です。ニックネームと匿名の端末IDだけで参加でき、本名やアカウントは不要です(機種変更で記録は引き継げません)。キックオフ1分前までに選んだ予想だけが集計されます(後出し防止)。</div>
     </div>
     <div id="duelLbView" style="display:none; margin-top:6px;"></div>
+    </details>
   </div>`;
 }
 function buildDuelShareImage() {
@@ -13210,10 +12886,10 @@ async function shareDuelImage() {
 const DUEL_PICK_LABELS = { home: "ホーム勝ち", draw: "引き分け", away: "アウェイ勝ち" };
 function duelPickRowHtml(p, homeName, awayName, kickoffStr) {
   return `
-    <div style="padding:10px 0; border-bottom:1px solid var(--border);">
-      <div><strong>${homeName} vs ${awayName}</strong>
-        <span class="value-note" style="margin-left:8px;">${escapeHtml(p.league || "")}${kickoffStr ? " ・ " + kickoffStr : ""}</span></div>
-      <div style="margin-top:4px;">🤜🤛 <strong>AIより先に、あなたの予想は?</strong> <span class="value-note">(選ぶとAIの予想が見えます)</span></div>
+    <div>
+      <div class="pred-title"><strong>${homeName} vs ${awayName}</strong></div>
+      <div class="pred-meta">${escapeHtml(p.league || "")}${kickoffStr ? " ・ " + kickoffStr : ""}</div>
+      <div style="margin-top:6px;">🤜🤛 <strong>AIより先に、あなたの予想は?</strong> <span class="value-note">(選ぶとAIの予想が見えます)</span></div>
       <div style="margin-top:6px; display:flex; gap:6px; flex-wrap:wrap;">
         <button class="apply-btn duel-pick-btn" type="button" data-fixture="${Number(p.fixtureId)}" data-pick="home" style="margin-top:0; width:auto; padding:7px 12px;">${homeName}勝ち</button>
         <button class="apply-btn duel-pick-btn" type="button" data-fixture="${Number(p.fixtureId)}" data-pick="draw" style="margin-top:0; width:auto; padding:7px 12px; opacity:.85;">引き分け</button>
@@ -13301,77 +12977,10 @@ async function renderDuelLeaderboard(container) {
     <p class="value-note" style="margin-top:6px; opacity:.85;">${esc(d.noteJa || "")}</p>`;
 }
 
-// ================================================================
-// 2026年8月18日・v53「AIが見る地力ランキング」タブ
-// ================================================================
-let rankingsInited = false;
-let rankingsRenderedAt = 0; // v57: 開きっぱなしのタブ(特にスマホ)で古い表示が残る問題への対応
-function rankingsEnsureInit() {
-  // v57: 前回描画から10分以上たってタブを開いたら取り直す。
-  // 本番で「サーバー側はクラブ名に自己回復済みなのに、開きっぱなしの画面だけ
-  // 古いチームID表示のまま」という実例があった(再読込しない限り直らなかった)。
-  if (rankingsInited && (Date.now() - rankingsRenderedAt) < 10 * 60 * 1000) return;
-  rankingsInited = true;
-  rankingsRenderedAt = Date.now();
-  renderRankingsTab();
-}
-async function renderRankingsTab() {
-  const el = document.getElementById("rankingsBody");
-  if (!el) return;
-  let d = null;
-  try {
-    d = await fetchJsonWithTimeout(`${API_PROXY_BASE}/ratings/rankings`, backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
-  } catch (e) { d = null; }
-  if (!d) {
-    // v85.1(監査): rankingsEnsureInit は描画成功の前に「初期化済み」と記録するため、
-    // 起動直後の失敗を1回引くと、10分間はタブを開き直しても再取得されずエラーの
-    // まま固定されていた。取得失敗時は初期化フラグを戻し、次にタブを開いたら
-    // 取り直せるようにする(サーバーが温まれば次の1タップで表示される)。
-    rankingsInited = false; rankingsRenderedAt = 0;
-    el.innerHTML = `<p class="value-note">ランキングを取得できませんでした(サーバー起動待ちの可能性があります)。</p>`; return;
-  }
-  if (!d.available) {
-    el.innerHTML = `<p class="value-note">${escapeHtml(d.reasonJa || "レーティングはまだありません。")}</p>`;
-    return;
-  }
-  const esc = escapeHtml;
-  const moveHtml = (m) => m === null || m === undefined ? `<span class="value-note">—</span>`
-    : m > 0 ? `<span style="color:var(--success,#1d7a46); font-weight:700;">▲${m}</span>`
-    : m < 0 ? `<span style="color:var(--critical,#b3261e); font-weight:700;">▼${-m}</span>`
-    : `<span class="value-note">→</span>`;
-  const rows = (d.teams || []).map((t) => `
-    <tr>
-      <td style="padding:5px 8px; text-align:right; font-weight:700;">${Number(t.rank)}</td>
-      <td style="padding:5px 4px; text-align:center;">${moveHtml(t.move)}</td>
-      <td style="padding:5px 8px;">${esc(t.nameJa || t.name)}${t.nameJa ? ` <span class="value-note">${esc(t.name)}</span>` : ""}</td>
-      <td style="padding:5px 8px; text-align:right;"><strong>${Number(t.strength).toFixed(2)}</strong></td>
-      <td style="padding:5px 8px; text-align:right;" class="value-note">${Number(t.att).toFixed(2)} / ${Number(t.def).toFixed(2)}</td>
-    </tr>`).join("");
-  el.innerHTML = `
-    <p class="value-note" style="margin:0 0 8px;">${esc(d.noteJa || "")}</p>
-    <div class="value-note" style="margin:0 0 8px;">最終更新: ${d.updatedAt ? new Date(d.updatedAt).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" }) : "-"}(毎朝の学習後に自動更新)</div>
-    <div style="overflow-x:auto;">
-      <table style="width:100%; border-collapse:collapse; font-size:13px;">
-        <thead><tr class="value-note"><th style="padding:5px 8px; text-align:right;">順位</th><th style="padding:5px 4px;">前週比</th><th style="padding:5px 8px; text-align:left;">クラブ</th><th style="padding:5px 8px; text-align:right;">地力</th><th style="padding:5px 8px; text-align:right;">攻/守</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>
-    <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
-      <button class="more-details-btn" type="button" id="rankingsShareBtn" style="display:inline-block; width:auto; padding:5px 12px;">🔗 このランキングをシェア</button>
-    </div>`;
-  const sb = document.getElementById("rankingsShareBtn");
-  if (sb) sb.addEventListener("click", async () => {
-    const top3 = (d.teams || []).slice(0, 3).map((t) => `${t.rank}位 ${t.nameJa || t.name}`).join(" / ");
-    const text = window.t(`🏆 AIが見る世界クラブ地力ランキング: ${top3} | 実試合${d.matchesUsed || "?"}件からAIが学習した独自レーティング`);
-    const url = `${location.origin + location.pathname}#rankings`;
-    try {
-      if (navigator.share) { await navigator.share({ title: window.t("AI地力ランキング"), text, url }); return; }
-      await navigator.clipboard.writeText(`${text}\n${url}`);
-      sb.textContent = "✅ コピーしました";
-      setTimeout(() => { sb.textContent = "🔗 このランキングをシェア"; }, 2000);
-    } catch (e) { /* キャンセル等 */ }
-  });
-}
+// v104.2(ご要望): ここにあった「🏆 地力ランキング」タブの読み込みと描画は、タブごと外した。
+//   理由(利用者の指摘): AIがまだ学習していないクラブがある状態でランキングを出すと、信頼性が低く見える。
+//   地力の数字そのもの(レーティング)は予想の材料として従来どおり使っており、サーバーの
+//   /api/ratings/rankings も残してある(画面からは呼ばない)。
 
 // ---- 2026年8月・利用者目線ラウンド: 「🔮 今日のAI予想」ヒーローカード ----
 // サーバーの /api/predictions/today(保存済み予測の読み出しのみ)を表示する。
@@ -13395,7 +13004,11 @@ async function renderTodayPredictionsHero(reuseCached) {
     el.innerHTML = `<p class="value-note">${escapeHtml(data.noteJa || "本日のAI予想はありません。")}</p>`;
     return;
   }
-  const rowHtml = (p) => {
+  // v104.2「予想カードの整理」: 1件 = 枠つきの小さなカード。
+  //   [🎯 今日のベスト予想(ベストの1件だけ)] → [🏅 自信ランクの帯] → 対戦・大会・時刻 → AIの予想 → 勝率の帯
+  //   → 決め手ひとこと → (当てはまるときだけ)注意 → 「🔎 根拠をくわしく見る」(根拠の全行とシェアのボタン)
+  const rowHtml = (p, opts) => {
+    const o = opts || {};
     const homeName = escapeHtml((p.home && p.home.name) || "ホーム");
     const awayName = escapeHtml((p.away && p.away.name) || "アウェイ");
     // v97: 「次の試合」(今日ではない日)は日付も添える。時刻だけだと「今夜23:00」と誤読される。
@@ -13405,32 +13018,30 @@ async function renderTodayPredictionsHero(reuseCached) {
       const sameDay = d.toLocaleDateString("ja-JP") === new Date().toLocaleDateString("ja-JP");
       return sameDay ? t : `${d.toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" })} ${t}`;
     })() : "";
+    const bestRibbon = o.best ? `<div class="best-ribbon">🎯 今日のベスト予想${o.bestWhy ? `<span class="best-why">${escapeHtml(o.bestWhy)}</span>` : ""}</div>` : "";
+    const itemCls = `pred-item${o.best ? " is-best" : ""}`;
     // ---- v53「AIと予想対決」: 未開始の試合は、自分の予想を選ぶまでAIの予想を伏せる ----
-    //   (スキップでいつでも見られる。対決OFFなら従来どおり)
+    //   (スキップでいつでも見られる。対決OFFなら従来どおり。伏せているあいだは自信ランクも出さない)
     if (duelModeOn() && String(p.status || "") === "NS" && !p.resolved && p.predictedWinner && !duelGetPicks()[p.fixtureId]) {
-      return duelPickRowHtml(p, homeName, awayName, kickoffStr);
+      return `<div class="${itemCls}">${bestRibbon}<div class="pred-pad">${duelPickRowHtml(p, homeName, awayName, kickoffStr)}</div></div>`;
     }
     const scoreStr = (p.score && p.score.home !== null && p.score.home !== undefined) ? ` <strong>${Number(p.score.home)} - ${Number(p.score.away)}</strong>` : "";
-    // 精度証明ラウンド: 実績補正後の勝率(較正)・似た試合・市場(オッズ)比較。
-    // それぞれ実測がある試合にだけ表示する(無いものは出さない=でっち上げない)。
-    const similarLine = p.similarPastJa
-      ? `<div class="value-note" style="margin-top:2px;">📚 ${escapeHtml(p.similarPastJa)}</div>`
-      : "";
-    const marketLine = (p.market && Number.isFinite(p.market.edgePt))
-      ? `<div class="value-note" style="margin-top:2px;">🏦 市場(オッズ)比較: AIは市場より${p.market.edgePt > 0 ? "強気" : "弱気"}(${p.market.edgePt > 0 ? "+" : ""}${Number(p.market.edgePt)}pt)</div>`
-      : "";
+    const actionsHtml = `<div class="pred-actions"><button class="ghost-btn pred-share-btn" type="button" data-share-idx="${todayPredShareItems.indexOf(p)}" style="padding:5px 12px; font-size:12px;">📸 画像でシェア</button>${
+      /* v77(集客①): 検索エンジンにも載る試合個別ページへの導線(共有用URLにもなる) */
+      Number.isFinite(Number(p.fixtureId)) ? `<a class="ghost-btn" href="/match/${Number(p.fixtureId)}" style="padding:5px 12px; font-size:12px; text-decoration:none; display:inline-block;">🔗 この試合のページ</a>` : ""}</div>`;
     return `
-      <div style="padding:10px 0; border-bottom:1px solid var(--border);">
-        <div><strong>${homeName} vs ${awayName}</strong>${scoreStr}${predResultBadgeHtml(p)}
-          <span class="value-note" style="margin-left:8px;">${escapeHtml(p.league || "")}${kickoffStr ? " ・ " + kickoffStr : ""}</span></div>
-        <div style="margin-top:2px;">🤖 AIの予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}${predTierChipHtml(p)}</div>
-        ${duelMyPickLineHtml(p)}
-        ${predBarHtml(p)}
-        <div class="value-note" style="margin-top:2px;">${p.topFactorJa ? `根拠(最重要要素): ${escapeHtml(p.topFactorJa)} ・ ` : ""}${Number.isFinite(p.weightsVersion) ? `学習v${Number(p.weightsVersion)}の重みで予測` : ""}</div>
-        ${predUnlearnedLineHtml(p)}${predTierLineHtml(p)}${predConfidenceLineHtml(p)}${predFactorsLineHtml(p)}${predBasisLineHtml(p)}${similarLine}${marketLine}${predBlendLineHtml(p)}${predPreKickLineHtml(p)}${predScenarioLineHtml(p)}${predFreshnessLineHtml(p)}
-        <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;"><button class="ghost-btn pred-share-btn" type="button" data-share-idx="${todayPredShareItems.indexOf(p)}" style="padding:5px 12px; font-size:12px;">📸 画像でシェア</button>${
-          /* v77(集客①): 検索エンジンにも載る試合個別ページへの導線(共有用URLにもなる) */
-          Number.isFinite(Number(p.fixtureId)) ? `<a class="ghost-btn" href="/match/${Number(p.fixtureId)}" style="padding:5px 12px; font-size:12px; text-decoration:none; display:inline-block;">🔗 この試合のページ</a>` : ""}</div>
+      <div class="${itemCls}">
+        ${bestRibbon}${predRankBandHtml(p)}
+        <div class="pred-pad">
+          <div class="pred-title"><strong>${homeName} vs ${awayName}</strong>${scoreStr}${predResultBadgeHtml(p)}</div>
+          <div class="pred-meta">${escapeHtml(p.league || "")}${kickoffStr ? " ・ " + kickoffStr : ""}</div>
+          <div class="pred-pick">🤖 AIの予想: <strong>${escapeHtml(predWinnerLabelJa(p))}</strong>${p.predictedScoreline ? `(最有力スコア ${escapeHtml(p.predictedScoreline)})` : ""}</div>
+          ${duelMyPickLineHtml(p)}
+          ${predBarHtml(p)}
+          ${predReasonLineHtml(p)}
+          ${predAlertsHtml(p)}
+          ${predDetailsHtml(p, actionsHtml, Number.isFinite(Number(p.fixtureId)) ? "hero:" + Number(p.fixtureId) : "")}
+        </div>
       </div>`;
   };
   // 共有画像はこの一覧のデータから描くため、描画前に持っておく
@@ -13438,39 +13049,36 @@ async function renderTodayPredictionsHero(reuseCached) {
   // 精度証明ラウンド③: 今日のベスト予想(サーバーが機械的に選定・選定理由つき)を最初に出す
   const best = data.bestPick ? data.predictions.find((x) => x.fixtureId === data.bestPick.fixtureId) : null;
   const rest = data.predictions.filter((p) => !best || p.fixtureId !== best.fixtureId).slice(0, best ? 4 : 5);
-  const bestHtml = best ? `
-    <div style="border:2px solid var(--series-2); border-radius:8px; padding:8px 10px; margin-bottom:6px; background:rgba(179,84,30,.06);">
-      <div style="font-weight:700;">🎯 今日のベスト予想</div>
-      <div class="value-note">${escapeHtml((data.bestPick && data.bestPick.reasonJa) || "")}</div>
-      ${rowHtml(best)}
-    </div>` : "";
-  const rows = [bestHtml, ...rest.map(rowHtml)].filter(Boolean);
+  const bestHtml = best ? rowHtml(best, { best: true, bestWhy: (data.bestPick && data.bestPick.reasonJa) || "" }) : "";
+  // ベストの1件は横いっぱい。残りは、幅の広い画面では2列に並べる(スマホ幅では1列のまま)
+  const restHtml = rest.length ? `<div class="pred-grid${rest.length === 1 ? " is-single" : ""}">${rest.map((p) => rowHtml(p)).join("")}</div>` : "";
   const shownCount = (best ? 1 : 0) + rest.length;
   const moreCount = data.predictions.length - shownCount;
   el.innerHTML = `
     ${duelScoreboardHtml()}
     ${usingUpcoming ? `<p class="value-note" style="margin:0 0 6px; padding:6px 8px; background:rgba(0,0,0,.04); border-radius:6px;">📅 本日はAIが追跡しているクラブの試合がないため、<strong>AIが予想している「次の試合」</strong>を表示しています。</p>` : ""}
-    ${rows.join("")}
+    ${bestHtml}${restHtml}
     ${moreCount > 0 ? `<p class="value-note" style="margin-top:6px;">ほか${moreCount}試合の予想は「📡 本日の実際の試合」から見られます。</p>` : ""}
     ${tiersTableHtml(data.tiers)}
     <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
-      ${(() => { const c = document.getElementById("realFixturesCard"); return c && c.style.display !== "none"; })()
-        ? `<button class="more-details-btn" type="button" id="jumpToFixturesBtn" style="display:inline-block; width:auto; padding:5px 12px;">📡 試合の詳しい分析を見る ▼</button>`
-        : `<span class="value-note">📡 本日の実際の試合一覧は、データ連携サーバーに接続できたときに表示されます。</span>`}
+      <button class="more-details-btn" type="button" id="jumpToFixturesBtn" style="display:none; width:auto; padding:5px 12px;">📡 試合の詳しい分析を見る ▼</button>
       <button class="more-details-btn" type="button" id="sharePredictionsBtn" style="display:inline-block; width:auto; padding:5px 12px;">🔗 この予想をシェア</button>
     </div>
     <p class="value-note" style="margin-top:6px; opacity:.8;">${escapeHtml(data.noteJa || "")}</p>
     <p class="value-note" style="margin-top:4px;"><a href="#" id="predsToReflectionsLink" style="color:inherit;">🙈 これまでの的中実績(外れも含む全試合の採点記録)を見る</a></p>`;
 
-  // 監査の指摘への対応: インラインonclickをやめ、対象カードが表示されている
-  // ときだけボタンを描画するようにしたので、ここで通常どおり配線する。
+  // v104.2: 「📡 試合の詳しい分析を見る」は、試合一覧のカードが出ているあいだだけ見せる。
+  //   以前は予想カードを描いた瞬間の状態で決めていたため、試合一覧が一瞬あとに届いた場合に
+  //   「データ連携サーバーに接続できたときに表示されます」という事実と違う注記が残っていた。
+  //   押すと、たたんである試合一覧を開いてからそこへ動く。
   const jumpBtn = document.getElementById("jumpToFixturesBtn");
   if (jumpBtn) {
     jumpBtn.addEventListener("click", () => {
       const c = document.getElementById("realFixturesCard");
-      if (c && c.style.display !== "none") c.scrollIntoView({ behavior: "smooth" });
+      if (c && c.style.display !== "none") { setFoldOpen(c, true); c.scrollIntoView({ behavior: "smooth" }); }
     });
   }
+  syncFixturesJumpUi();
   // ---- v76(2026年9月1日・利用者意見調査の還元B): 実績への導線 ----
   //   ネット上の調査で、AI予想サービスへの最大の要望は「自称の的中率ではなく、
   //   負けも含む採点済みの全記録」だと分かった(ScoreGPT比較・Trustpilot実レビュー等)。
@@ -13482,8 +13090,9 @@ async function renderTodayPredictionsHero(reuseCached) {
     applyReflHeadlineToHeroLink(); // 反省タブの読み込みが先に済んでいれば、実測値つきの文言に差し替わる
     reflLink.addEventListener("click", (ev) => {
       ev.preventDefault();
-      const b = document.querySelector('#modeSwitch button[data-mode="reflections"]');
-      if (b) { b.click(); window.scrollTo({ top: 0, behavior: "smooth" }); }
+      // v104.2: 以前は反省を開いたあと画面の一番上へ動かしていたため、反省(タブの下)が見えなかった。
+      //   開いた項目の場所まで動かす。すでに開いているときも閉じない。
+      openHomeMode("reflections", { scroll: true });
     });
   }
   // 精度証明ラウンド③: シェアボタン(端末の共有機能があればそれを、無ければURLコピー)
@@ -14088,18 +13697,27 @@ async function renderSmarterCard() {
 
   /* ---- 一行結論(いちばん上・大きく) ---- */
   const grew = diff.grew;
-  const headline = grew === true
-    ? `はい。昨日は言えなかったことを ${diff.newFactTotal}件 言えるようになりました。`
-    : grew === false
-      ? "いいえ。昨日から言えることが増えていません。"
-      : "まだ判定できません(昨日の記録がありません)。";
+  // v104.2: 判定(サーバーの grew = 新しく言えること・新しくなった数字・新しく答えられた質問のどれかが1件以上)は変えず、
+  //   見出しの文だけを「その日に実際に起きたこと」に合わせる。以前は、数字が新しくなっただけの日(新しく言えることは0件)にも
+  //   「はい。昨日は言えなかったことを 0件 言えるようになりました。」と書いていた(「はい」と「0件」が食い違う文)。
+  const newFactN = Number(diff.newFactTotal) || 0;
+  const changedFactN = Number(diff.changedFactTotal) || 0;
+  const newlyAnswerableN = Number(diff.newlyAnswerableCount) || 0;
+  let headline, headlineCovers = "none"; // headlineCovers: 見出しがすでに述べた内容(下の補足で同じことを繰り返さないため)
+  if (grew === true) {
+    if (newFactN > 0) { headline = `はい。昨日は言えなかったことを ${newFactN}件 言えるようになりました。`; headlineCovers = "newFacts"; }
+    else if (changedFactN > 0) { headline = `はい。${changedFactN}件 の数字が新しくなりました(新しく言えるようになったことは 0件)。`; headlineCovers = "changed"; }
+    else if (newlyAnswerableN > 0) { headline = `はい。昨日はまったく答えられなかった質問に ${newlyAnswerableN}問 答えられるようになりました。`; headlineCovers = "newlyAnswerable"; }
+    else headline = "はい。昨日より答えられることが増えました。";
+  } else if (grew === false) headline = "いいえ。昨日から言えることが増えていません。";
+  else headline = "まだ判定できません(昨日の記録がありません)。";
   const headColor = grew === true ? "var(--good)" : grew === false ? "var(--warning)" : "var(--text-secondary)";
   parts.push(`<div class="smarter-headline" style="color:${headColor};">${esc(headline)}</div>`);
-  if (grew === true && diff.newlyAnswerableCount > 0) {
-    parts.push(`<div class="smarter-sub">そのうち ${diff.newlyAnswerableCount}問 は、昨日はまったく答えられなかった質問です。</div>`);
+  if (grew === true && newlyAnswerableN > 0 && headlineCovers === "newFacts") {
+    parts.push(`<div class="smarter-sub">そのうち ${newlyAnswerableN}問 は、昨日はまったく答えられなかった質問です。</div>`);
   }
-  if (diff.changedFactTotal > 0) {
-    parts.push(`<div class="smarter-sub">さらに ${diff.changedFactTotal}件 の数字が新しくなりました。</div>`);
+  if (changedFactN > 0 && headlineCovers !== "changed") {
+    parts.push(`<div class="smarter-sub">さらに ${changedFactN}件 の数字が新しくなりました。</div>`);
   }
   // 監査での指摘: 増えた話だけを出し、減った話を隠していた。
   // 索引が壊れて選手が消えた日でも前向きな見出しが出てしまうため、必ず併記する。
@@ -14310,7 +13928,22 @@ function teamLabel(x, fallback) {
 //   ・反省タブが先 → 予想カード描画後の配線がこの関数を呼んで反映
 //   ・予想カードが先 → 反省タブ読込後にこの関数が直接リンクを書き換える
 //   追加の通信は無し(既存の /api/reflections 読み出しの結果を使い回すだけ)。
-let reflHeadlineForHero = null;
+// (reflHeadlineForHero / reflHeadlineState の宣言は、最初に使う renderAiAccuracyWidget の前へ移した=v104.2)
+function accuracyHeadlineHtml() {
+  const hb = reflHeadlineForHero;
+  const title = `🎯 <strong><span>このAIの的中率(実測)</span></strong>`;
+  if (hb && Number.isFinite(Number(hb.hitRatePct)) && Number(hb.n) > 0) {
+    const scope = hb.scope === "learned" ? "学習した大会の公式戦" : "公式戦";
+    return `${title}: <strong>${Number(hb.hitRatePct)}%</strong><span class="value-note acc-note"><span>${Number(hb.n)}件中${Number(hb.hits)}件的中</span> ・ <span>${scope}</span></span>`;
+  }
+  if (reflHeadlineState === "failed") return `${title}<span class="value-note acc-note"><span>取得できませんでした</span></span>`;
+  if (reflHeadlineState === "loading") return `${title}<span class="value-note acc-note"><span>読み込み中…</span></span>`;
+  return `${title}<span class="value-note acc-note"><span>答え合わせが済んだ公式戦がまだありません</span></span>`;
+}
+function applyReflHeadlineToAccuracyCard() {
+  const el = document.getElementById("aiAccuracyHeadline");
+  if (el) el.innerHTML = accuracyHeadlineHtml();
+}
 function applyReflHeadlineToHeroLink() {
   const link = document.getElementById("predsToReflectionsLink");
   const hb = reflHeadlineForHero;
@@ -14326,8 +13959,9 @@ async function renderReflectionsCard() {
     d = await fetchJsonWithTimeout(`${API_PROXY_BASE}/reflections`,
       backendConfirmedWarm ? FAST_TIMEOUT_MS : COLD_START_TIMEOUT_MS);
   } catch (e) { d = null; }
-  if (!d) { el.textContent = "サーバーに接続できないため、反省の記録を読み込めませんでした。"; return; }
+  if (!d) { reflHeadlineState = "failed"; applyReflHeadlineToAccuracyCard(); el.textContent = "サーバーに接続できないため、反省の記録を読み込めませんでした。"; return; }
   if (d.available === false) {
+    reflHeadlineState = "none"; applyReflHeadlineToAccuracyCard();
     el.innerHTML = `<div class="value-note">${esc(d.reasonJa || "答え合わせが済んだ予測がまだありません。")}</div>`;
     return;
   }
@@ -14359,9 +13993,11 @@ async function renderReflectionsCard() {
     ? d.learnedSummary.learned : null;
   // v76(還元B): 見出しに使うのと同じ数字を、ホームの予想カードのリンクにも反映する
   reflHeadlineForHero = lsHead
-    ? { hitRatePct: lsHead.hitRatePct, hits: lsHead.hits, n: lsHead.n }
-    : ((off && off.n > 0) ? { hitRatePct: off.hitRatePct, hits: off.hits, n: off.n } : null);
+    ? { hitRatePct: lsHead.hitRatePct, hits: lsHead.hits, n: lsHead.n, scope: "learned" }
+    : ((off && off.n > 0) ? { hitRatePct: off.hitRatePct, hits: off.hits, n: off.n, scope: "official" } : null);
+  reflHeadlineState = reflHeadlineForHero ? "ok" : "none";
   applyReflHeadlineToHeroLink();
+  applyReflHeadlineToAccuracyCard(); // v104.2: ホームの的中率カードの見出しにも同じ数字を出す
   if (off && off.n > 0) {
     if (lsHead) {
       parts.push(`<div style="margin-bottom:4px;"><span style="font-size:15px; font-weight:700;">学習した大会の的中率(勝敗): ${Number(lsHead.hitRatePct)}%</span> <span class="value-note">(${Number(lsHead.hits)}/${Number(lsHead.n)}件)</span>${
@@ -14665,6 +14301,9 @@ async function renderDigestCard() {
   parts.push(`<div style="margin-top:8px;"><button class="apply-btn pred-share-btn" id="digestShareBtn" style="margin-top:0; width:auto; padding:7px 14px;">📸 画像でシェア</button></div>`);
   parts.push(`<p class="value-note" style="margin-top:8px; opacity:.8;">${esc(dg.noteJa || "")}</p>`);
   el.innerHTML = parts.join("");
+  // v104.2: たたんだままでも今週の一言が読めるように、見出しの下へ要約を出す
+  const metaEl = document.getElementById("digestFoldMeta");
+  if (metaEl) metaEl.textContent = (dg.summary && dg.summary.lineJa) || "";
   const sb = document.getElementById("digestShareBtn");
   if (sb) sb.addEventListener("click", () => shareDigestImage(dg));
 }
@@ -15431,10 +15070,10 @@ async function psOpenClub(clubEn) {
   const club = data.club || {};
   const labels = data.positionLabelsJa || {};
   const groups = Object.entries(data.byPosition || {}).map(([code, list]) => `<div class="ps-sec">
-      <h3 class="sim-subhead">${psEsc(labels[code] || code)}(${list.length}人)</h3>
+      <h3 class="sim-subhead"><span>${psEsc(labels[code] || code)}</span>(<span>${list.length}人</span>)</h3>
       <ul class="ps-list">${list.map((p) => `<li>
         <button class="ps-link" data-act="psDetail" data-id="${psEsc(p.id)}">${psEsc(p.name)}</button>
-        <span class="muted" style="font-size:12px">${p.number != null ? "#" + psEsc(p.number) + " " : ""}${p.age != null ? psEsc(p.age) + "歳 " : ""}評価 ${psNum(p.rating, "", 2)}${p.injured ? " / 負傷者リスト" : ""}</span>
+        <span class="muted" style="font-size:12px">${p.number != null ? "<span>#" + psEsc(p.number) + "</span> " : ""}${p.age != null ? "<span>" + psEsc(p.age) + "歳</span> " : ""}<span>評価</span> ${psNum(p.rating, "", 2)}${p.injured ? " / <span>負傷者リスト</span>" : ""}</span>
       </li>`).join("")}</ul>
     </div>`).join("");
   const unknown = (data.unknownPosition || []);
@@ -15446,10 +15085,10 @@ async function psOpenClub(clubEn) {
         <button class="ghost-btn" type="button" data-act="psCloseDetail">閉じる</button>
       </div>
     </div>
-    <p class="muted" style="font-size:13px;margin:6px 0 0">索引にあるこのクラブの選手: ${psEsc(data.count)}人${club.rank ? ` / UEFAクラブランキング ${psEsc(club.rank)}位` : ""}${club.country ? ` / ${psEsc(club.country)}` : ""}</p>
+    <p class="muted" style="font-size:13px;margin:6px 0 0"><span>索引にあるこのクラブの選手:</span> <span>${psEsc(data.count)}人</span>${club.rank ? ` / <span>UEFAクラブランキング</span> <span>${psEsc(club.rank)}位</span>` : ""}${club.country ? ` / <span>${psEsc(club.country)}</span>` : ""}</p>
     ${data.emptyReasonJa ? `<p class="muted" style="font-size:13px;margin-top:8px">${psEsc(data.emptyReasonJa)}</p>` : ""}
     <div class="ps-two" style="margin-top:10px">${groups}</div>
-    ${unknown.length ? `<div class="ps-sec" style="margin-top:10px"><h3 class="sim-subhead">ポジション未取得(${unknown.length}人)</h3>
+    ${unknown.length ? `<div class="ps-sec" style="margin-top:10px"><h3 class="sim-subhead"><span>ポジション未取得</span>(<span>${unknown.length}人</span>)</h3>
       <ul class="ps-list">${unknown.map((p) => `<li><button class="ps-link" data-act="psDetail" data-id="${psEsc(p.id)}">${psEsc(p.name)}</button></li>`).join("")}</ul></div>` : ""}
     <p class="muted" style="font-size:12px;margin-top:10px">サーバー側の処理 ${psEsc(data.tookMs)}ミリ秒。</p>
   </div>`;

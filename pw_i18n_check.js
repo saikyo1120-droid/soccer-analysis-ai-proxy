@@ -172,15 +172,6 @@ const STUB = {
     topReasons: [{ labelJa: "直近フォームを重視しすぎた", count: 12 }, { labelJa: "ホーム補正が強すぎた", count: 9 }],
     honestyJa: "理由は、答え合わせの時点で実測データから機械的に分類したものです。AIが後から言い訳の文章を作っているのではありません。",
   },
-  rankings: {
-    ok: true, available: true, updatedAt: "2026-09-08T05:00:00Z", matchesUsed: 5321,
-    noteJa: "15大会×5シーズン(欧州カップ戦・J1・イングランド2部・ブラジルを含む)の実試合(5321試合)から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。対象は、このデータの中に8試合以上の実績があり、かつ他の対象クラブと十分に対戦しているクラブだけです(数試合だけの記録から地力を断定しないため)。", // v87③: サーバーの新文言に追従
-    teams: [
-      { rank: 1, move: 1, nameJa: "アーセナル", name: "Arsenal", strength: 1.92, att: 2.05, def: 0.87 },
-      { rank: 2, move: -1, nameJa: "レアル・マドリード", name: "Real Madrid", strength: 1.88, att: 1.98, def: 0.9 },
-      { rank: 3, move: 0, nameJa: "マンチェスター・シティ", name: "Manchester City", strength: 1.8, att: 1.9, def: 0.95 },
-    ],
-  },
 };
 
 /** APIルート横取り: 本番APIのURL(絶対)・相対 /api/ のどちらでも同じ固定データを返す */
@@ -196,7 +187,6 @@ async function routeApiStub(ctx) {
     if (p.endsWith("/api/predictions/today")) return reply(STUB.predictionsToday);
     if (p.endsWith("/api/club/summary")) return reply(STUB.clubSummary);
     if (p.endsWith("/api/reflections")) return reply(STUB.reflections);
-    if (p.endsWith("/api/ratings/rankings")) return reply(STUB.rankings);
     return reply({}, 404); // その他はデータ無し経路(v82検査で担保済み)のまま
   });
 }
@@ -220,6 +210,9 @@ const ck = (label, ok, detail) => { results.push([label, ok]); console.log(`  [$
       await page.click(`#modeSwitch button[data-mode="${mode}"]`).catch(() => {});
       await page.waitForTimeout(1200);
       await page.$$eval("details:not([open])", (ds) => ds.forEach((d) => { d.open = true; })).catch(() => {});
+      // v104.2: たたんであるカード(今週のAIダイジェスト・本日の実際の試合・今日のサッカー)は、閉じたままだと
+      //   中身が走査から外れる(見えていない文字は調べない作りのため)。開いてから調べる。
+      await page.$$eval('.fold-btn[aria-expanded="false"]', (bs) => bs.forEach((b) => b.click())).catch(() => {});
       await page.waitForTimeout(900);
       if (lang && lang !== "ja") {
         for (const [s, c] of await scanLeaks(page, lang)) merged.set(s, (merged.get(s) || 0) + c);
@@ -308,7 +301,7 @@ const ck = (label, ok, detail) => { results.push([label, ok]); console.log(`  [$
     }
   }
 
-  // ---- v83: 実データあり(マイクラブ・今日の予想・実績・ランキング) ----
+  // ---- v83: 実データあり(マイクラブ・今日の予想・実績)。v104.2: 地力ランキングは画面から外した ----
   const SENTINELS = {
     en: ["My club", "Sabah FA", "🎯"],
     zh: ["我的俱乐部", "Sabah FA", "🎯"],

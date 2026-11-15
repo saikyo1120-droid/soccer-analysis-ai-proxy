@@ -17,7 +17,7 @@ const inlineScripts = [];
 }
 if (!inlineScripts.length) throw new Error('no inline <script> blocks found in index.html');
 let code = inlineScripts.reduce((a, b) => (b.length >= a.length ? b : a), '');
-code += `\nreturn { PLAYERS, MATCHUPS, state, chatHistories, heroChatHistory, sendChatMessage, heroAskAI, renderPlayerCard, renderChatUI, renderHeroChatUI, buildDialogueExtras, effectiveDialogueLevel, findPlayer };`;
+code += `\nreturn { PLAYERS, state, chatHistories, heroChatHistory, sendChatMessage, heroAskAI, renderPlayerCard, renderChatUI, renderHeroChatUI, buildDialogueExtras, effectiveDialogueLevel, findPlayer };`;
 
 function makeEl(id) {
   const listeners = {};

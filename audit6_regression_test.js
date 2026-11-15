@@ -365,9 +365,14 @@ test("★欠陥52: 前回との比較(⑤⑳)が実際に画面へ表示され�
   // サーバー側で組み立てて memoryComparison として返していたのに、
   // 画面のどこからも参照しておらず、利用者は一度も見たことがなかった
   // (リクエストのたびにUpstashを1回読む費用だけ払っていた)。
+  // v104.2(利用者のご要望「仮の対戦は全部消す」): 表示先だった「AIマッチ分析」カードは画面から外した。
+  //   作った比較が再び「誰にも読まれない」状態にならないよう、会話の道具「対戦分析」が
+  //   回答AIへ渡す項目に memoryComparison が入っていること(=回答に使われること)を確かめる。
   const html = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");
-  assert.ok(/data\.memoryComparison/.test(html), "memoryComparisonを画面が読んでいない");
-  assert.ok(/前回この対戦を見たときとの違い/.test(html), "表示用の見出しが無い");
+  const src = fs.readFileSync(path.join(ROOT, "server/server.js"), "utf8");
+  assert.ok(!/id="maResultWrap"/.test(html), "外したはずのAIマッチ分析カードが画面に残っている");
+  const keysBlock = (src.match(/const MATCH_ANALYSIS_TOOL_KEYS = \[[\s\S]*?\];/) || [""])[0];
+  assert.ok(/"memoryComparison"/.test(keysBlock), "前回との比較(memoryComparison)が、会話の道具から回答AIへ渡されていない");
 });
 
 test("★欠陥53: IDを動的に解決するリーグの知識も読み出せる", async () => {

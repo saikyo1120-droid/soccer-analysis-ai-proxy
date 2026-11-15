@@ -595,7 +595,8 @@ function extractFunction(html, name) {
     const pS = today.predictions.find((p) => p.fixtureId === 502), pB = today.predictions.find((p) => p.fixtureId === 501), pNone = today.predictions.find((p) => p.fixtureId === 503);
     const lineS = strip(sandbox.predTierLineHtml(pS));
     assert.strictEqual(lineS, "🏅 自信ランク S(確信) ・ このランクの実績: 75.4%(61件中46件的中 ・ 直近30日 ・ 今の基準を過去の予想に当てはめた実測) ・ 予想時の自信 74%", lineS);
-    assert.ok(/class="tier-chip tier-s">S</.test(sandbox.predTierChipHtml(pS)));
+    // v104.2: 文字1つだけでは何の印か分からないので「ランク」の語を添えた(一覧の行で使う小さな印)
+    assert.ok(/class="tier-chip tier-s"><span>ランク<\/span> S</.test(sandbox.predTierChipHtml(pS)), sandbox.predTierChipHtml(pS));
     const lineB = strip(sandbox.predTierLineHtml(pB));
     assert.ok(lineB.startsWith("🏅 自信ランク B(やや優勢) ・ このランクの実績: 54.2%(131件中71件的中") && !/予想時の自信/.test(lineB), lineB);
     assert.strictEqual(sandbox.predTierLineHtml(pNone), ""); assert.strictEqual(sandbox.predTierChipHtml(pNone), "");
@@ -637,8 +638,13 @@ function extractFunction(html, name) {
     assert.ok(!sandbox.groundingNoteHtml({ grounding: { verdict: "partial", checked: 1, supported: 0, unsupportedCount: 1, unsupported: [{ text: "<b>1</b>" }] } }).includes("<b>1</b>"));
   });
   await t("U4 配線と辞書: 両方の予想カード・一覧の行・両方の会話の描画に入っている。新しい文言はすべて EN/ZH/ES の訳がある。sw.js の版を進めた", async () => {
-    assert.strictEqual((html.match(/\$\{predUnlearnedLineHtml\(p\)\}\$\{predTierLineHtml\(p\)\}\$\{predConfidenceLineHtml\(p\)\}/g) || []).length, 2, "予想カード2種類");
-    assert.strictEqual((html.match(/\$\{predTierChipHtml\(p\)\}/g) || []).length, 3, "ヒーロー・詳細・一覧の行");
+    // v104.2「予想カードの整理」: 根拠の行は1か所(predDetailsBodyHtml)にまとめ、ホームの予想カードと詳細画面の
+    //   両方が「🔎 根拠をくわしく見る」(predDetailsHtml)の中に同じ行を出す。カードの上には自信ランクの帯(predRankBandHtml)。
+    //   小さな印(predTierChipHtml)は一覧の行だけが使う。
+    assert.strictEqual((html.match(/\$\{predUnlearnedLineHtml\(p\)\}\$\{predTierLineHtml\(p\)\}\$\{predConfidenceLineHtml\(p\)\}/g) || []).length, 1, "根拠の行は1か所にまとめてある");
+    assert.strictEqual((html.match(/\$\{predDetailsHtml\(p, /g) || []).length, 2, "予想カード2種類(ホーム・詳細)が同じ根拠の折りたたみを使う");
+    assert.strictEqual((html.match(/\$\{predRankBandHtml\(p\)\}/g) || []).length, 2, "予想カード2種類に自信ランクの帯");
+    assert.strictEqual((html.match(/\$\{predTierChipHtml\(p\)\}/g) || []).length, 1, "小さな印は一覧の行だけ");
     assert.ok(html.includes("${tiersTableHtml(data.tiers)}"));
     assert.ok(html.includes("return `${toolsHtml}${groundingNoteHtml(resp)}${factsHtml}${genInfoHtml}${followupsHtml}`;") && html.includes("${ragHtml}${toolsLineHtml(resp)}${groundingNoteHtml(resp)}${deliberationHtml}"), "会話の描画2種類");
     const dictStart = html.indexOf("/* ==== v104.1(2026年11月14日): 確信ピック(K・自信ランク)と数字の裏取り(M)の文言 ==== */");
@@ -670,7 +676,7 @@ function extractFunction(html, name) {
     // サーバーが返すランクの名前(labelJa)は、すべて辞書の見出しにある(画面で訳せる)
     for (const r of T.RANKS) assert.ok(keys.includes(T.RANK_LABELS_JA[r]), T.RANK_LABELS_JA[r]);
     const sw = fs.readFileSync(path.join(__dirname, "sw.js"), "utf8");
-    assert.ok(/CACHE_NAME = "soccer-ai-shell-v1041"/.test(sw));
+    assert.ok(/CACHE_NAME = "soccer-ai-shell-v104[1-9]"/.test(sw)); // v104.2 で画面を更新したので版を進めた(1041 以上)
     assert.ok(/\.tier-chip\s*\{/.test(html) && /\.tier-chip\.tier-skip\s*\{/.test(html));
   });
 

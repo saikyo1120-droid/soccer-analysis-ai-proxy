@@ -214,8 +214,11 @@ test("★欠陥69: AIが書いた文章と、実データから作った文章�
   //   LLMが自由に書いた文章には何の印も付かず、実データから機械的に組み立てた
   //   文章の方に「(簡易版)」と付けていた。利用者から見ると、AIの推測の方が
   //   本格的な分析に見えるという、真逆の印象になっていた。
-  assert.ok(/const aiTag = \(block\) => \(block && block\.source === "ai_generated" \? "\(AIの見解\)" : ""\);/.test(HTML),
-    "AI生成に印を付ける仕組みが無い");
+  // v104.2(利用者のご要望「仮の対戦は全部消す」): この文章を表示していた「AIマッチ分析」カードは画面から外した。
+  //   同じ応答は会話の道具「対戦分析」が回答AIへ渡すので、サーバーが「AIが書いた文章」に
+  //   source: "ai_generated" の印を付け続けていること(回答AIが実データと区別できること)を確かめる。
+  assert.ok(!/id="maResultWrap"/.test(HTML), "外したはずのAIマッチ分析カードが画面に残っている");
+  assert.ok((SERVER.match(/source: "ai_generated"/g) || []).length >= 1, "AI生成に印を付ける仕組みがサーバーに無い");
   assert.ok(!/data\.narrative\.source === "ai_generated" \? "" : "\(簡易版\)"/.test(HTML),
     "逆のラベル付けが残っている");
 });
@@ -262,9 +265,12 @@ test("★欠陥73: 中身が空のLLM応答を知識として保存しない", (
 test("★欠陥74: 登録選手が0人でも固定値62で比較しない(フロントエンド側)", () => {
   // サーバー側は0人を弾くようにしたが、ローカル計算のフォールバックに
   // 同じ定数62が残っていたため、結局同じ嘘が利用者に見えてしまう状態だった。
+  // v104.2(利用者のご要望「仮の対戦は全部消す」): ローカル計算(computeMatchAnalysisLocally)を使っていた
+  //   「注目の試合カード」のAI試合プレビューは画面ごと外した。残っている平均の計算(teamAvg。実際の試合の
+  //   90分ストーリーなどが使う)が、選手0人のとき固定値ではなく null を返すことを確かめる。
   assert.ok(!/if \(!players\.length\) return 62;/.test(HTML), "固定値62が残っている");
-  assert.ok(/if \(!homeP\.length \|\| !awayP\.length\) return null;/.test(HTML), "空ロースターを弾いていない");
-  assert.ok(/架空の数値で比較することはしません/.test(HTML), "理由を利用者へ伝えていない");
+  assert.ok(!/function computeMatchAnalysisLocally\(/.test(HTML), "外したはずの仮の対戦のローカル計算が残っている");
+  assert.ok(/function teamAvg\(players, attr\) \{[\s\S]{0,900}?if \(!players\.length\) return null;/.test(HTML), "平均の計算が、選手0人のとき null を返していない");
 });
 
 // =====================================================================

@@ -7238,6 +7238,110 @@ const DISCUSS_TOOLS_ENABLED = String(process.env.DISCUSS_TOOLS || "1") !== "0"; 
 const DISCUSS_RESOLVE_SUBJECT = String(process.env.DISCUSS_RESOLVE_SUBJECT || "1") !== "0"; // ⑥ 主題の解決
 const DISCUSS_TOOL_MAX_ROUNDS = Math.max(1, parseInt(process.env.DISCUSS_TOOL_MAX_ROUNDS, 10) || 3);
 const DISCUSS_TOOL_MAX_CALLS = Math.max(1, parseInt(process.env.DISCUSS_TOOL_MAX_CALLS, 10) || 5);
+
+// ---- v104.2: 会話の経路の実績(このプロセスの起動後)。/api/diag/llm で開示する ----
+//   回答AIを 5.5 世代へ上げたあと、「道具つきの会話が本当に通っているか」「従来の1往復へ戻っていないか」を
+//   本番の外から確かめられるようにする(質問文・鍵は含めない。エラー文は Anthropic の応答の先頭だけ)。
+const discussPathStats = { toolPathOk: 0, toolPathFellBackToLegacy: 0, legacyOnlyOk: 0, failed: 0, lastToolPathErrors: [] };
+function noteToolPathError(e) {
+  discussPathStats.lastToolPathErrors.push({
+    at: new Date().toISOString(), code: (e && e.code) || null, httpStatus: (e && e.httpStatus) || null,
+    message: String((e && e.message) || e).slice(0, 240), primaryModelError: (e && e.primaryModelError) || null,
+  });
+  while (discussPathStats.lastToolPathErrors.length > 5) discussPathStats.lastToolPathErrors.shift();
+}
+/** LLM プロバイダーの内部状態(既定モデル・戻り先・切り替えの実績・回答の見送りの記録・考える深さの設定・実測の使用量)。Anthropic 以外は null */
+function llmProviderDiagnostics() {
+  try {
+    if (currentProviderName() !== "anthropic") return null;
+    const prov = require("./llm/providers/anthropic");
+    return typeof prov.diagnostics === "function" ? prov.diagnostics() : null;
+  } catch (e) { return null; }
+}
+
+/* ----------------------------------------------------------------------------
+ * v104.2: 回答AIの「深い自己診断」(/api/diag/llm?deep=1)
+ *   回答AIの版を上げると、要求の決まりが変わる(考えた跡のブロック・道具の往復の返し方など)。
+ *   手元の模擬APIでは決まりどおりに作って確かめてあるが、本物の API での最終確認は本番でしかできない。
+ *   そこで、本番の実呼び出しで次の5つを順に試し、1つずつ結果(成功/失敗・使われたモデル・応答の
+ *   ブロックの種類・使ったトークン・エラー文)を返す:
+ *     1. 軽量モデルの1往復   2. 上位モデルの1往復
+ *     3. 道具つきの会話(まとめて受け取る)  4. 道具つきの会話(流れる表示)
+ *     5. 道具つきの会話+上位モデルの仕上げ
+ *   道具は診断専用の1つ(毎回ちがう確認コードを返す)。最終回答にそのコードが入っていれば、
+ *   「道具の結果が回答AIに届いている」と実測で言える(入っていなければ ok:false)。
+ *   費用: 1回の診断で小さな呼び出しが9回前後。結果は30分キャッシュし、実行中の重複起動もしない。
+ *   鍵なしで開ける入口なので、費用の保護として実行は1日 LLM_DEEP_DIAG_MAX_PER_DAY 回(既定6回)まで
+ *   (超えたら実行せず、直近の結果を「1日の上限」と明記して返す。数え直しは日付(UTC)が変わったとき)。
+ *   時間がかかるので裏で実行し、最初の呼び出しには「実行中」を返す(30〜60秒後にもう一度開くと結果が出る)。
+ * -------------------------------------------------------------------------- */
+const LLM_DEEP_DIAG_TTL_MS = 30 * 60 * 1000;
+const LLM_DEEP_DIAG_MAX_PER_DAY = Math.max(1, parseInt(process.env.LLM_DEEP_DIAG_MAX_PER_DAY, 10) || 6);
+const llmDeepDiagState = { running: false, startedAt: null, result: null, finishedAtMs: 0, day: null, runsToday: 0 };
+async function runLlmDeepDiagnostic() {
+  const steps = [];
+  const short = (v, n) => String(v == null ? "" : v).slice(0, n || 300);
+  const runStep = async (name, fn) => {
+    const t0 = Date.now();
+    const st = { step: name, ok: false };
+    try { Object.assign(st, await fn()); }
+    catch (e) {
+      st.ok = false; st.code = (e && e.code) || null; st.httpStatus = (e && e.httpStatus) || null;
+      st.error = short((e && e.message) || e); if (e && e.primaryModelError) st.primaryModelError = short(e.primaryModelError);
+    }
+    st.ms = Date.now() - t0;
+    steps.push(st);
+  };
+  const single = (tier) => async () => {
+    const r = await generateLLM({ systemPrompt: "接続確認のテストです。「OK」とだけ返してください。", userPrompt: "接続確認", maxTokens: 20, tier, timeoutMs: 45000, truncateRetry: false });
+    return { ok: !!(r && r.text), model: r.model || null, tier: r.tier || null, fallbackFrom: r.modelFallbackFrom || null, textPreview: short(r.text, 40), truncated: !!r.truncated };
+  };
+  const toolRun = (opts) => async () => {
+    const code = 1000 + Math.floor(Math.random() * 9000);
+    const rounds = [];
+    const gen = async (args) => {
+      const r = await generateConversation(args);
+      rounds.push({
+        model: r.model || null, tier: r.tier || null, stopReason: r.stopReason || null,
+        blocks: (Array.isArray(r.rawContent) ? r.rawContent : (r.content || [])).map((b) => b && b.type).filter(Boolean),
+        usage: r.usage ? { input: r.usage.input_tokens ?? null, output: r.usage.output_tokens ?? null } : null,
+        fallbackFrom: r.fallbackFrom || null, fallbackReason: r.fallbackReason || null, toolsSent: Array.isArray(args.tools) ? args.tools.length : 0, messagesSent: Array.isArray(args.messages) ? args.messages.length : 0,
+      });
+      return r;
+    };
+    let deltas = 0;
+    const run = await discussToolLoop.runToolLoop({
+      systemPrompt: "接続確認のためのテストです。必ず最初に道具 get_check_code を1回だけ呼び、返ってきた確認コードを「確認コード: 1234」の形でそのまま答えてください。ほかのことは書かないでください。",
+      userContent: "確認コードを教えてください。",
+      tools: [{ name: "get_check_code", description: "接続確認用。確認コード(4桁の数字)を返す。入力は不要。", input_schema: { type: "object", properties: {}, additionalProperties: false } }],
+      execute: async () => ({ ok: true, resultJson: JSON.stringify({ ok: true, code }), summaryJa: "確認コード", elapsedMs: 0 }),
+      generateConversation: gen, tier: "light", finalTier: opts.finalTier || null, fallbackTier: "light",
+      stream: !!opts.stream, emit: (ev) => { if (ev && ev.t === "delta") deltas++; },
+      maxRounds: 2, maxCalls: 2, maxTokens: 200, timeoutMs: 40000, finalTimeoutMs: 60000, finalMaxTokens: 200, fallbackTimeoutMs: 25000,
+      finalInstruction: "上の下書きと取得済みのデータをもとに、確認コードを「確認コード: 1234」の形でそのまま答えてください。ほかのことは書かないでください。",
+    });
+    const toolCalled = run.calls >= 1;
+    const codeEchoed = String(run.text || "").includes(String(code));
+    return {
+      ok: toolCalled && codeEchoed, toolCalled, codeEchoed, stream: !!opts.stream, finalTier: opts.finalTier || null,
+      model: run.model || null, loopRounds: run.rounds, exhausted: !!run.exhausted, deltas: opts.stream ? deltas : null,
+      modelFallbacks: run.modelFallbacks || [], timeoutFallbackFrom: run.fallbackFrom || null, rounds, textPreview: short(run.text, 60),
+    };
+  };
+  await runStep("1_light_single", single("light"));
+  await runStep("2_heavy_single", single("heavy"));
+  const caps = providerCapabilities();
+  if (caps.tools) {
+    await runStep("3_tools_nonstream", toolRun({ stream: false }));
+    if (caps.streaming) await runStep("4_tools_stream", toolRun({ stream: true }));
+    await runStep("5_tools_heavy_final", toolRun({ stream: false, finalTier: "heavy" }));
+  }
+  return {
+    ok: steps.length > 0 && steps.every((x) => x.ok), deep: true, provider: currentProviderName(), configured: !!process.env.ANTHROPIC_API_KEY,
+    generatedAt: new Date().toISOString(), steps, providerDiagnostics: llmProviderDiagnostics(), conversation: discussPathStats,
+    noteJa: "本番からの実呼び出しで、1往復・道具つきの会話(まとめて/流れる表示)・上位モデルの仕上げを順に試した結果です。steps の各行が1つの試験で、model が実際に答えたモデルです(30分キャッシュ)。",
+  };
+}
 const DISCUSS_HISTORY_TURNS = Math.max(1, parseInt(process.env.DISCUSS_HISTORY_TURNS, 10) || 10);  // ⑤ 記憶(往復数)
 
 /**
@@ -8352,12 +8456,16 @@ async function handleDiscuss(body, clientIp, hooks) {
         canAffordRound: async () => tryConsumeLlmBudget(),
         finalInstruction: "上の下書きと取得済みのデータをもとに、指定の形式で最終回答を書き直してください。数字・固有名詞は取得済みの事実にあるものだけを使い、無いものは「取得できません」と書くこと。",
       });
-      discussRun = { rounds: run.rounds, calls: run.calls, toolCalls: run.toolCalls, exhausted: run.exhausted, streamed: !!(hooks && hooks.stream), finalSkippedForBudget: !!run.finalSkippedForBudget };
+      discussRun = { rounds: run.rounds, calls: run.calls, toolCalls: run.toolCalls, exhausted: run.exhausted, streamed: !!(hooks && hooks.stream), finalSkippedForBudget: !!run.finalSkippedForBudget,
+        // v104.2: 別の版のモデルが答えた往復(新しい版が使えなかった・回答を見送った)があれば、理由つきで開示する(無ければ空配列)
+        modelFallbacks: Array.isArray(run.modelFallbacks) ? run.modelFallbacks : [] };
       groundingToolTexts = discussGrounding.toolResultTextsOf(run.messages);
       llmTierUsed = run.tier || loopTier;
       llmModelUsed = run.model || null;
       llmWasTruncated = !!run.truncated;
+      discussPathStats.toolPathOk++;
       if (run.fallbackFrom) console.error(`[discuss] heavyモデルが時間切れのため、${run.model}で回答しました`);
+      if (run.modelFallbacks && run.modelFallbacks.length) console.error("[discuss] 別の版のモデルが答えた往復があります(新しい版が使えなかった・回答を見送った等。理由つき):", JSON.stringify(run.modelFallbacks).slice(0, 400));
       llmOut = parseDiscussOutputForMode(discussMode, run.text);
     } else {
       // ---- 従来の1往復(道具なし。他プロバイダー・DISCUSS_TOOLS=0・挨拶や雑談) ----
@@ -8376,9 +8484,11 @@ async function handleDiscuss(body, clientIp, hooks) {
       llmModelUsed = usedModel || null;
       llmWasTruncated = !!llmTruncated;
       if (modelFallbackFrom) {
-        console.error(`[discuss] heavyモデル(${modelFallbackFrom})が時間切れのため、${usedModel}で回答しました`);
+        // v104.2: 切り替えの理由は「時間切れ」か「新しい版が使えなかった」のどちらか(プロバイダーが決める)
+        console.error(`[discuss] モデル(${modelFallbackFrom})の代わりに、${usedModel}で回答しました(時間切れ、または新しい版が使えなかったため)`);
       }
       llmOut = parseDiscussOutputForMode(discussMode, text);
+      discussPathStats.legacyOnlyOk++;
     }
   } catch (e) {
     // これまでここでエラーの中身(実際のAnthropic APIのHTTPステータス・応答本文)を
@@ -8388,7 +8498,10 @@ async function handleDiscuss(body, clientIp, hooks) {
     console.error("[discuss] generateLLM failed:", e.code || "(no code)", "-", e.message);
     // ---- v104: 道具つきの往復が「リクエストが不正(400)」や「道具が未対応」で失敗したときは、従来の1往復で1回だけやり直す ----
     //   (道具の定義や会話形式の問題で会話全体が止まらないようにする。何が起きたかは meta.tools に残す)
-    const toolPathFailed = useToolLoop && e && (e.code === "TOOLS_UNSUPPORTED" || (e.code === "HTTP_ERROR" && e.httpStatus === 400));
+    //   v104.2: 本文も道具の呼び出しも無い空の応答(EMPTY_RESPONSE)も、従来の1往復で1回だけやり直す
+    //   (空の応答では本文の断片が1つも流れていないので、流れる表示が二重になることはない)。
+    const toolPathFailed = useToolLoop && e && (e.code === "TOOLS_UNSUPPORTED" || e.code === "EMPTY_RESPONSE" || (e.code === "HTTP_ERROR" && e.httpStatus === 400));
+    if (useToolLoop) noteToolPathError(e);
     if (toolPathFailed) {
       try {
         emit({ t: "reset" });
@@ -8403,13 +8516,16 @@ async function handleDiscuss(body, clientIp, hooks) {
         llmOut = parseDiscussOutputForMode(discussMode, r2.text);
         discussRun = { rounds: 0, calls: 0, toolCalls: [], exhausted: false, streamed: false, fallbackReasonJa: `道具つきの会話が失敗(${e.code || "?"}${e.httpStatus ? ` HTTP ${e.httpStatus}` : ""})したため、従来の1往復で回答` };
         console.error("[discuss] tool path failed, answered with the legacy single call:", e.code || "(no code)", "-", String(e.message).slice(0, 200));
+        discussPathStats.toolPathFellBackToLegacy++;
       } catch (e2) {
         console.error("[discuss] legacy fallback also failed:", e2.code || "(no code)", "-", e2.message);
+        discussPathStats.failed++;
         refundLlmBudgetForIp(clientIp);
         await refundLlmBudget().catch(() => {});
         return { status: 200, body: { ok: false, reason: e2.code || (e2 && e2.httpStatus ? `http_${e2.httpStatus}` : "llm_error"), message: discussLlmErrorMessageJa(e2), mode: discussMode } };
       }
     } else {
+      discussPathStats.failed++;
       // v97: 回答を返せなかったので、この利用者の1回ぶんとサイト全体の1回ぶんを返す
       //   (利用者の責任ではない失敗で残り回数が減るのは不公平。多段思考ぶんの計画呼び出しは
       //    実際に実行されているので返さない)。
@@ -8633,7 +8749,7 @@ async function handleDiscuss(body, clientIp, hooks) {
       // v51: 2回試しても切れた場合だけ、正直に注記する(黙って尻切れを見せない)
       truncatedNoteJa: llmWasTruncated ? "※ 回答が長くなり、文字数上限のため末尾が一部省略されています。" : null,
       lang: appLang, // v56: どの言語設定で回答したか(既定はja)
-      meta: { ...knowledgeMeta, llmProvider: currentProviderName(), llmTier: llmTierUsed, llmModel: llmModelUsed, llmTruncated: llmWasTruncated, parsedOk: llmOut.parsedOk, intelligence: intelligenceForMeta, tools: discussRun ? { rounds: discussRun.rounds, calls: discussRun.calls, calls_list: discussRun.toolCalls, exhausted: discussRun.exhausted, finalSkippedForBudget: !!discussRun.finalSkippedForBudget, fallbackReasonJa: discussRun.fallbackReasonJa || null } : { rounds: 0, calls: 0, calls_list: [], exhausted: false, reasonJa: useToolLoop ? null : (lightweightMode ? "挨拶・雑談のため道具は使わない" : (DISCUSS_TOOLS_ENABLED ? "このLLMプロバイダーは道具つきの会話に未対応(従来の1往復)" : "DISCUSS_TOOLS=0 のため従来の1往復")) } },
+      meta: { ...knowledgeMeta, llmProvider: currentProviderName(), llmTier: llmTierUsed, llmModel: llmModelUsed, llmTruncated: llmWasTruncated, parsedOk: llmOut.parsedOk, intelligence: intelligenceForMeta, tools: discussRun ? { rounds: discussRun.rounds, calls: discussRun.calls, calls_list: discussRun.toolCalls, exhausted: discussRun.exhausted, finalSkippedForBudget: !!discussRun.finalSkippedForBudget, fallbackReasonJa: discussRun.fallbackReasonJa || null, modelFallbacks: discussRun.modelFallbacks || [] } : { rounds: 0, calls: 0, calls_list: [], exhausted: false, reasonJa: useToolLoop ? null : (lightweightMode ? "挨拶・雑談のため道具は使わない" : (DISCUSS_TOOLS_ENABLED ? "このLLMプロバイダーは道具つきの会話に未対応(従来の1往復)" : "DISCUSS_TOOLS=0 のため従来の1往復")) } },
     },
   };
 }
@@ -9038,10 +9154,37 @@ async function handleHttpRequest(req, res) {
         //   ごく小さい実呼び出しを1回だけ行い、成功/失敗と実際のエラー文(鍵は含まれない)
         //   ・所要msを返す。10分キャッシュ(連打されても実呼び出しは10分に1回。
         //   1回あたりのコストは入力十数トークン+出力数トークンでごくわずか)。
+        // ---- v104.2: ?deep=1 で、道具つきの会話まで含めた深い自己診断(裏で実行・30分キャッシュ) ----
+        if (parsed.searchParams.get("deep") === "1") {
+          const st = llmDeepDiagState;
+          const fresh = st.result && (Date.now() - st.finishedAtMs) < LLM_DEEP_DIAG_TTL_MS;
+          let payload;
+          if (fresh) {
+            payload = { ...st.result, cached: true };
+          } else if (st.running) {
+            payload = { ok: null, deep: true, status: "running", startedAt: st.startedAt, noteJa: "深い自己診断を実行中です。30〜60秒後にもう一度開いてください。" };
+          } else if ((() => { const today = new Date().toISOString().slice(0, 10); if (st.day !== today) { st.day = today; st.runsToday = 0; } return st.runsToday >= LLM_DEEP_DIAG_MAX_PER_DAY; })()) {
+            // 1日の上限(費用の保護): 実行せず、直近の結果(あれば)をそのまま返す
+            payload = { ...(st.result || { ok: null, deep: true }), cached: !!st.result, status: "daily_limit", runsToday: st.runsToday, maxPerDay: LLM_DEEP_DIAG_MAX_PER_DAY,
+              noteJa: `深い自己診断の実行は1日${LLM_DEEP_DIAG_MAX_PER_DAY}回までです(費用の保護)。${st.result ? "直近の結果を返しています(generatedAt が実行した時刻)。" : "今日はもう実行できません。"}` };
+          } else {
+            st.runsToday++;
+            st.running = true; st.startedAt = new Date().toISOString();
+            runLlmDeepDiagnostic()
+              .then((r) => { st.result = r; })
+              .catch((e) => { st.result = { ok: false, deep: true, generatedAt: new Date().toISOString(), errorJa: "深い自己診断そのものが失敗しました。", errorDetail: String((e && e.message) || e).slice(0, 300) }; })
+              .then(() => { st.finishedAtMs = Date.now(); st.running = false; });
+            payload = { ok: null, deep: true, status: "started", startedAt: st.startedAt, noteJa: "深い自己診断を開始しました。30〜60秒後にもう一度開いてください。" };
+          }
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify(payload));
+          return;
+        }
         const llmDiagCached = cacheGet("diag:llm");
         if (llmDiagCached) {
           res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-          res.end(JSON.stringify({ ...llmDiagCached, cached: true }));
+          // v104.2: 切り替えの実績は「いま」の値を添える(キャッシュした時点の値ではなく)
+          res.end(JSON.stringify({ ...llmDiagCached, cached: true, providerDiagnostics: llmProviderDiagnostics(), conversation: discussPathStats }));
           return;
         }
         const t0 = Date.now();
@@ -9057,6 +9200,7 @@ async function handleHttpRequest(req, res) {
           });
           out.ok = true;
           out.model = r && r.model ? r.model : null;
+          out.modelFallbackFrom = (r && r.modelFallbackFrom) || null; // v104.2: 別の版で答えたときだけ、元の版の名前
           out.ms = Date.now() - t0;
           out.noteJa = "LLMへの実呼び出しに成功しました(この結果は10分キャッシュされます)。";
         } catch (e) {
@@ -9066,7 +9210,7 @@ async function handleHttpRequest(req, res) {
         }
         cacheSet("diag:llm", out, 10 * 60 * 1000);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-        res.end(JSON.stringify(out));
+        res.end(JSON.stringify({ ...out, providerDiagnostics: llmProviderDiagnostics(), conversation: discussPathStats }));
         return;
       }
       if (pathname === "/api/player-season-stats") {
@@ -11482,6 +11626,16 @@ module.exports = {
   // v101: バックアップ export の partial 判定・較正済み記録の表示・日次レポート開示の検証用(本番では誰も呼ばない)
   __v101ForTest: {
     handleBackupExport, BACKUP_CORE_KEYS, buildTodayPredictionEntry, probCalibrationLib,
+  },
+  // v104.2: 回答AIの版上げ(深い自己診断・会話の経路の実績)の検証用(本番では誰も呼ばない)
+  __v1042ForTest: {
+    runLlmDeepDiagnostic, llmProviderDiagnostics, discussPathStats,
+    resetLlmDeepDiag: (opts) => {
+      llmDeepDiagState.running = false; llmDeepDiagState.startedAt = null; llmDeepDiagState.finishedAtMs = 0;
+      if (!(opts && opts.keepResult)) llmDeepDiagState.result = null;      // keepResult: 結果は残して「30分のキャッシュが切れた」状態にする
+      if (!(opts && opts.keepCount)) { llmDeepDiagState.day = null; llmDeepDiagState.runsToday = 0; }
+    },
+    llmDeepDiagInfo: () => ({ runsToday: llmDeepDiagState.runsToday, maxPerDay: LLM_DEEP_DIAG_MAX_PER_DAY, day: llmDeepDiagState.day }),
   },
   // v104: 会話の改良と試合内容の予測の検証用(本番では誰も呼ばない)
   __v104ForTest: {

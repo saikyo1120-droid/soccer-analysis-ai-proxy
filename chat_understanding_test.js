@@ -25,7 +25,7 @@ const inlineScripts = [];
 }
 if (!inlineScripts.length) throw new Error('no inline <script> blocks found in index.html');
 let code = inlineScripts.reduce((a, b) => (b.length >= a.length ? b : a), '');
-code += `\nreturn { PLAYERS, MATCHUPS, state, chatHistories, heroChatHistory, sendChatMessage, heroAskAI, answerClubQuestion, buildClubAnswer, answerPlayerQuestion, guessUnregisteredPlayerName, NO_RULE_MATCH, detectClubMention, findAllMentionedPlayers };`;
+code += `\nreturn { PLAYERS, state, chatHistories, heroChatHistory, sendChatMessage, heroAskAI, answerClubQuestion, buildClubAnswer, answerPlayerQuestion, guessUnregisteredPlayerName, NO_RULE_MATCH, detectClubMention, findAllMentionedPlayers };`;
 
 function makeEl(id) {
   return {
