@@ -269,7 +269,8 @@ function seedClubs(m, n) {
     assert.ok(/\$1.*\$2/.test(rows[1]) && /\$1.*\$2/.test(rows[2]) && /\$1.*\$2/.test(rows[3]), "翻訳に数値スロット($1/$2)が両方無い");
     assert.ok(/not an all-time total/.test(rows[1]), "英語訳に「累計ではない」が無い");
     // 表示位置: 見出し(学習した大会/公式戦の的中率)の直後・スコア一致の前
-    const iHead = html.indexOf("学習した大会の的中率(勝敗): ${Number(lsHead.hitRatePct)}%");
+    // v104.3: 見出しは「ラベル」と「大きな数字」を分けて描く形になった(順番 = 見出し → 開示行 → スコア一致 は変えていない)
+    const iHead = html.indexOf('<div class="vz-fig-label"><span>${lsHead ? "学習した大会の的中率(勝敗)" : "公式戦の的中率(勝敗)"}</span></div>');
     const iNote = html.indexOf("if (off.windowNoteJa) {");
     const iSl = html.indexOf("const offSl = off.scoreline || null;");
     assert.ok(iHead > 0 && iHead < iNote && iNote < iSl, "開示行の位置が見出しの直下ではない");

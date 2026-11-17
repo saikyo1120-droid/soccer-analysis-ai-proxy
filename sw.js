@@ -6,7 +6,7 @@
  *   ・/api/ へのリクエストは一切触らない(鮮度・予算計測・レート制限をそのまま保つ)。
  *   ・POST等のGET以外・別オリジンも触らない。
  */
-const CACHE_NAME = "soccer-ai-shell-v1042"; // v104.2: 画面の整理(予想カード・たためるカード・「もっと見る」)に合わせて更新
+const CACHE_NAME = "soccer-ai-shell-v1043"; // v104.3: 見た目の全面リニューアル(色・濃い帯・下のメニュー・図の部品)に合わせて更新
 const SHELL = ["/", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"];
 
 self.addEventListener("install", (event) => {

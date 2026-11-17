@@ -222,9 +222,12 @@ const tier = (rank, extra) => ({ rank, labelJa: { S: "確信", A: "有力", B: "
     assert.ok(/^<details class="pred-more" data-pred-key="hero:501"><summary>/.test(h), h.slice(0, 120));
     assert.ok(!/<details class="pred-more"[^>]* open/.test(h), "既定で開いている");
     const txt = strip(h);
-    for (const part of ["🔎 根拠をくわしく見る", "根拠(最重要要素): 直近フォーム ・ 学習v12の重みで予測", "🏅 自信ランク A(有力)", "このランクの実績: 66.7%", "🎚️ 確信度(実績で補正): 63%", "🧮 根拠スコア: 直近フォーム★★★★", "📦 使えたデータ: 直近フォーム", "📚 似た試合の実績: ホーム勝ち3", "🏦 市場(オッズ)比較: AIは市場より強気(+4.5pt)", "⚖️ この予想の判定: 市場60%+AI40%の合成", "⚡ 直前情報(スタメン確定)", "スコアの可能性(上位5件): 2-1 11%", "両チーム得点 55%", "🕓 予想生成:", "ボタン"]) {
+    for (const part of ["🔎 根拠をくわしく見る", "根拠(最重要要素): 直近フォーム ・ 学習v12の重みで予測", "🏅 自信ランク A(有力)", "このランクの実績: 66.7%", "🎚️ 確信度(実績で補正): 63%", "AIが重く見たこと", "影響の大きさ(5段階)", "直近フォーム4", "市場オッズは予測には未使用・比較専用", "📦 使えたデータ: 直近フォーム", "📚 似た試合の実績: ホーム勝ち3", "🏦 市場(オッズ)比較: AIは市場より強気(+4.5pt)", "⚖️ この予想の判定: 市場60%+AI40%の合成", "⚡ 直前情報(スタメン確定)", "スコアの可能性(上位5件)", "2-111%", "両チーム得点55%", "3点以上58%", "完封 Arsenal30%", "完封 Chelsea15%", "🕓 予想生成:", "ボタン"]) {
       assert.ok(txt.includes(part), "たたんだ根拠に無い: " + part + " ← " + txt.slice(0, 400));
     }
+    // v104.3: 根拠スコア(★の並び)は5段階の目盛りに、スコアの可能性は札(スコア・確率・細い棒)に形を変えた。数字は同じ
+    assert.ok(/<div class="vz-fac-row"><span>直近フォーム<\/span><span class="vz-pips" aria-hidden="true">(?:<i class="vz-on"><\/i>){4}<i><\/i><\/span><b>4<\/b><\/div>/.test(h), "5段階の目盛り(4/5)が無い");
+    assert.ok(h.includes('<div class="vz-sc3">') && h.includes('<span class="vz-board vz-sm">2<i>-</i>1</span>') && h.includes('<div class="vz-mm">'), "スコアの札・細い棒が無い");
     // 学習していない大会の断りも中に残る
     assert.ok(strip(api.predDetailsHtml({ ...P_BASE, learnedCompetition: false, tier: { rank: null, reasonJa: "x" } }, "", "hero:9")).includes("この大会はAIがまだ学習していません(参考予想)"));
   });
@@ -411,14 +414,17 @@ const tier = (rank, extra) => ({ rank, labelJa: { S: "確信", A: "有力", B: "
     // 「#1 19歳 評価 7.23」を1つの文字列で書いていたため、日本語以外の画面でまるごと日本語のまま残っていた。
     assert.ok(html.includes('<span>索引にあるこのクラブの選手:</span> <span>${psEsc(data.count)}人</span>${club.rank ? ` / <span>UEFAクラブランキング</span> <span>${psEsc(club.rank)}位</span>` : ""}${club.country ? ` / <span>${psEsc(club.country)}</span>` : ""}'));
     assert.ok(html.includes('<h3 class="sim-subhead"><span>${psEsc(labels[code] || code)}</span>(<span>${list.length}人</span>)</h3>'));
-    assert.ok(html.includes('<span>評価</span> ${psNum(p.rating, "", 2)}${p.injured ? " / <span>負傷者リスト</span>" : ""}'));
+    // v104.3: 選手の行は「背番号 / 名前・年齢・負傷者リスト / 評価の札」の1人1行に作り直した。部品ごとに訳せる形(別々の span)は保っている
+    const squadTpl = html.slice(html.indexOf('<div class="vz-list vz-squad">'), html.indexOf("const unknown = (data.unknownPosition || []);"));
+    assert.ok(squadTpl.length > 200, "クラブの選手一覧の描き方が見つからない");
+    for (const part of ['"<span>#" + psEsc(p.number) + "</span>"', '"<span>" + psEsc(p.age) + "歳</span>"', '"<span>負傷者リスト</span>"', '<span>評価</span> <span class="muted">未取得</span>', "VZ.rate("]) assert.ok(squadTpl.includes(part), "部品が分かれていない: " + part);
     assert.ok(html.includes('<span>ポジション未取得</span>(<span>${unknown.length}人</span>)'));
     // 部品の訳(完全一致・型)が辞書にある
     for (const k of ['    "索引にあるこのクラブの選手:": ["', '    "評価": ["', '    "負傷者リスト": ["', '    "GK(ゴールキーパー)": ["', '    "DF(ディフェンダー)": ["', '    "MF(ミッドフィールダー)": ["', '    "FW(フォワード)": ["', '    "UEFAクラブランキング": ["', '    "ポジション未取得": ["', '    ["⦿人", "', '    ["⦿歳", "', '    ["⦿位", "']) assert.ok(html.includes(k), "辞書に無い: " + k);
   });
   await t("sw.js の版を進めた(古い画面が端末に残らないように)", () => {
     const sw = fs.readFileSync(path.join(SERVER_DIR, "sw.js"), "utf8");
-    assert.ok(/CACHE_NAME = "soccer-ai-shell-v1042"/.test(sw), sw.slice(0, 600));
+    assert.ok(/CACHE_NAME = "soccer-ai-shell-v104[2-9]"/.test(sw), sw.slice(0, 600)); // v104.3 で画面を更新したので版を進めた(1042 以上)
   });
 
   console.log("■ 9. 写真を見直して直した細かな点(「もっと見る」の並び・狭い画面のはみ出し・「賢くなったか」の見出し)");

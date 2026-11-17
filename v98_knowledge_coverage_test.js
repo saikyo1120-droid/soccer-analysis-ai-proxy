@@ -505,6 +505,7 @@ function mockStore() {
   await t("U2b 試合前プレビューを実際に描く: 追跡クラブは主力実測(注目選手・怪我・監督・直近5試合)、対象外は正直な一文、AI予想が無ければ API-Football 参考表示。undefined/NaN を出さない", () => {
     const cut = (from, to) => { const i = html.indexOf(from); assert.ok(i >= 0, "見つからない: " + from); const j = html.indexOf(to, i + 1); assert.ok(j > i, "終端が見つからない: " + to); return html.slice(i, j); };
     const src = [
+      cut("const VZ = (function () {", "/* ---- 画面の外枠の動き"), // v104.3: 図の部品(評価の札・勝ち負けの丸・左右の棒・濃い帯)を使うため読み込む
       cut("const KNOWLEDGE_POS_SHORT", "function ratingBadgeColor("),
       cut("function ratingBadgeColor(", "function playerRatingRowHtml("),
       cut("function strengthBarHtml(", "\n}\n") + "\n}\n",
@@ -525,7 +526,8 @@ function mockStore() {
       knowledge: { home: { tracked: true, nameEn: "Arsenal", nameJa: "アーセナル", squad, dossier }, away: { tracked: false, reason: "untracked" } },
       aiPrediction: { homePct: 50, drawPct: 25, awayPct: 25 }, ownBasis: null };
     const out = api.buildUpcomingPreviewHtml(analysis, "standard");
-    for (const sstr of ["Saka", "Rice", "7.60", "⚽×5", "🩹", "M. Arteta", "4-3-3", "○△●", "追跡対象外のクラブのため", "AI自身の予想対象外", "API-Football: Arsenal 50%", "評価点のある主力が少ないため", "Dibrados &lt;FC&gt;"]) {
+    // v104.3: 得点は言葉(5得点)・怪我は「負傷者リスト」の札・直近の勝ち負けは色つきの丸(勝・分・負)と「1勝1分1敗」に変えた(中身は同じ)
+    for (const sstr of ["Saka", "Rice", "7.60", "<span>5得点</span>", "<span>3アシスト</span>", "負傷者リスト", "M. Arteta", "4-3-3", 'class="vz-w"', 'class="vz-d"', 'class="vz-l"', "1勝1分1敗", "(左が新しい)", "追跡対象外のクラブのため", "AI自身の予想対象外", "API-Football: Arsenal 50%", "評価点のある主力が少ないため", "Dibrados &lt;FC&gt;"]) {
       assert.ok(out.includes(sstr), "表示に無い: " + sstr);
     }
     assert.ok(!/undefined|NaN/.test(out), "undefined/NaN が混じる");
@@ -533,7 +535,7 @@ function mockStore() {
     const analysis2 = { ...analysis, knowledge: { home: analysis.knowledge.home, away: { tracked: true, nameEn: "Chelsea", squad: { ...squad, avgRating: 6.7 }, dossier } } };
     const out2 = api.buildUpcomingPreviewHtml(analysis2, "standard");
     assert.ok(out2.includes("主力の平均評価点ではArsenalがやや上(差0.32)"), out2.slice(0, 600));
-    assert.ok(out2.includes("bar-track"), "強さのバーが出る");
+    assert.ok(out2.includes("vz-cmp") && out2.includes("くらべる") && out2.includes("7.02") && out2.includes("6.70"), "左右でくらべる棒(主力の平均評価点)が出る");
     // 拮抗
     const out3 = api.buildUpcomingPreviewHtml({ ...analysis2, knowledge: { home: analysis.knowledge.home, away: { tracked: true, nameEn: "Chelsea", squad: { ...squad, avgRating: 6.95 }, dossier } } }, "standard");
     assert.ok(out3.includes("拮抗しています"));
@@ -548,7 +550,7 @@ function mockStore() {
     assert.strictEqual(api.predBasisLineHtml({}), "");
   });
   await t("U2c index.html: 試合前プレビューの見出し行「キックオフ」は辞書で訳せる形(span)になっている", () => {
-    assert.ok(html.includes("` ・ <span>キックオフ</span> ${timeStr}`"), "キックオフが span で囲まれていない");
+    assert.ok(html.includes("<b>${clockStr}</b><span>キックオフ</span>"), "キックオフが span で囲まれていない"); // v104.3: 見出しは濃い帯の中(日付・時刻・キックオフ)
     const dictPart = html.slice(0, html.indexOf("/* ==== 辞書ここまで ==== */"));
     assert.ok(/"キックオフ":\s*\[/.test(dictPart), "辞書に「キックオフ」が無い");
   });
