@@ -339,12 +339,16 @@ async function main() {
   }
   const resolveTeamIdSim = async (name) => teamIdOf.get(name) || 100;
 
-  // ---- 事前seed: 30件の検証済み予測(弱いフォーム差が結果を決めるデータ)。
+  // ---- 事前seed: 120件の検証済み予測(弱いフォーム差が結果を決めるデータ)。
+  //      v102: 重みの関門が交差検証になり、統計的に判断できる件数(既定100件)に満たない記録では重みを動かさなくなった。
+  //      (30件のうち検証用は9件しかなく、その9件の当たり外れで重みが変わっていた。件数不足で据え置くことは
+  //       v102_cv_gate_test.js で確かめている。)ここで確かめたいのは「学習→採用→翌日の予想に反映」の流れなので、
+  //       関門が判断できる件数の教材を用意する。
   //      初期重み(壊れた状態: sensitivity 0.02)では全問「引き分け」予想=0%。
   //      学習すれば100%になれる=学習の効果が測定できる教材。 ----
   const sim = createMockRedis();
   const seeds = [];
-  for (let i = 0; i < 30; i++) {
+  for (let i = 0; i < 120; i++) {
     const homeStrong = i % 2 === 0;
     seeds.push({
       fixtureId: 9000 + i,
@@ -354,7 +358,7 @@ async function main() {
       weightsSnapshot: { homeBase: 1.0, awayBase: 1.0, sensitivity: 0.02 },
     });
   }
-  await sim.upstashCmd(["SET", "learn:ownpred:resolved", "30"]);
+  await sim.upstashCmd(["SET", "learn:ownpred:resolved", "120"]);
   await sim.upstashCmd(["SET", "learn:ownpred:correct", "0"]);
   for (const r of seeds) await sim.upstashCmd(["RPUSH", "learn:ownpred:recent", JSON.stringify(r)]);
   await sim.upstashSetJSON("learn:weights", { homeBase: 1.0, awayBase: 1.0, sensitivity: 0.02, version: 0, updatedAt: null });

@@ -537,8 +537,12 @@ function deliberationStrings() {
     // ほぼ訳せた文(残る日本語が1か所・少量)は、従来どおり訳して出す
     const r = EN2.en.window.t("理由: 直近25試合の検証結果で、的中率が20%→20%に上がったため(拡張特徴量モデル(v2))。");
     assert.ok(/^Reason: Because validation on the last 25 matches/.test(r), r);
+    // v102: 学習の種類の名前(基本モデル・拡張特徴量モデルなど)にも訳を付けたので、この文は全部訳される
     const r2 = EN2.en.window.t("理由: 直近21試合の検証結果で、的中率が28.6%→28.6%に上がったため(基本モデル(v1・フォーム差のみ))。");
-    assert.ok(/^Reason: Because validation on the last 21 matches/.test(r2) && /\(基本モデル\(v1・フォーム差のみ\)\)/.test(r2), r2); // 残りは原文どおり1か所
+    assert.ok(/^Reason: Because validation on the last 21 matches/.test(r2) && /\(Basic model \(v1, form difference only\)\)/.test(r2) && !/[ぁ-んァ-ヶ一-龥]/.test(r2), r2);
+    // 「ほぼ訳せた文(残りが原文どおり1か所)」の確認は、辞書に無い名前で行う
+    const r2b = EN2.en.window.t("理由: 直近21試合の検証結果で、的中率が28.6%→28.6%に上がったため(ズワルキコモデル)。");
+    assert.ok(/^Reason: Because validation on the last 21 matches/.test(r2b) && /\(ズワルキコモデル\)/.test(r2b), r2b); // 残りは原文どおり1か所
     const r3 = EN2.en.window.t("ℹ️ 128クラブ(パリ・サンジェルマン・PSVアイントホーフェン・アヤックスほか)は、データ提供元での表記が異なるため今回は収集できませんでした。");
     assert.ok(/128 clubs/.test(r3) && /couldn't be collected/.test(r3), r3);
   });

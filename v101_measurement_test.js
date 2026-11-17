@@ -284,11 +284,22 @@ const req = (method, p) => new Promise((resolve, reject) => {
   });
 
   /* ================= G: OddsAPI の対象(不具合D) ================= */
-  await t("G1 oddsApi.SPORT_KEYS: 学習済み15大会がすべてコンセンサスの対象", async () => {
-    const { SPORT_KEYS } = require("./learning/oddsApi");
-    const { DEFAULT_BACKFILL_LEAGUES } = require("./learning/historicalBackfill");
-    const missing = DEFAULT_BACKFILL_LEAGUES.map((l) => l.id).filter((id) => !SPORT_KEYS[id]);
+  await t("G1 oddsApi.SPORT_KEYS: 学習済み15大会がすべてコンセンサスの対象(v102 で足した16リーグは「対象外」と明記)", async () => {
+    const { SPORT_KEYS, NO_CONSENSUS_LEAGUE_IDS } = require("./learning/oddsApi");
+    const { DEFAULT_BACKFILL_LEAGUES, CORE_LEAGUE_IDS } = require("./learning/historicalBackfill");
+    // v101 で確かめた内容(そのまま): 従来の15大会は、1つ残らずコンセンサスの対象
+    assert.strictEqual(CORE_LEAGUE_IDS.size, 15);
+    const missing = [...CORE_LEAGUE_IDS].filter((id) => !SPORT_KEYS[id]);
     assert.deepStrictEqual(missing, [], "学習済みなのに OddsAPI の対象外の大会: " + missing.join(","));
+    // v102 ★2: 足した16リーグは、月の予算を従来の大会と取り合わないよう、まだコンセンサスの対象にしていない。
+    //   「黙って対象外」にならないよう、学習リーグは SPORT_KEYS か NO_CONSENSUS_LEAGUE_IDS のどちらか一方に必ず入っていること
+    const allIds = DEFAULT_BACKFILL_LEAGUES.map((l) => l.id);
+    const unclassified = allIds.filter((id) => !SPORT_KEYS[id] && !NO_CONSENSUS_LEAGUE_IDS.includes(id));
+    assert.deepStrictEqual(unclassified, [], "コンセンサスの対象か対象外かが決まっていない学習リーグ: " + unclassified.join(","));
+    const both = allIds.filter((id) => SPORT_KEYS[id] && NO_CONSENSUS_LEAGUE_IDS.includes(id));
+    assert.deepStrictEqual(both, [], "対象と対象外の両方に入っている: " + both.join(","));
+    const stray = NO_CONSENSUS_LEAGUE_IDS.filter((id) => !allIds.includes(id) || CORE_LEAGUE_IDS.has(id));
+    assert.deepStrictEqual(stray, [], "対象外の一覧に、従来の大会か学習していない大会が混ざっている: " + stray.join(","));
     assert.strictEqual(SPORT_KEYS[98], "soccer_japan_j_league"); assert.strictEqual(SPORT_KEYS[40], "soccer_efl_champ"); assert.strictEqual(SPORT_KEYS[71], "soccer_brazil_campeonato");
   });
 

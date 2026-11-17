@@ -6,9 +6,9 @@
  *   ①-3 expGoalsFromRatingsの第4引数: リーグ別値を使う/不明リーグ・リーグ無しは全体値/JSON往復後も動く
  *   ①-4 リーグIDの無い行だけでも壊れない(全体値で動く)
  *   ①-5 modelTuningの門番の構造(マージン・採用条件・本番保存への伝搬)がソースに存在する
- *   ③-1 15大会になっている(J1=98・チャンピオンシップ=40・ブラジル=71)
+ *   ③-1 従来の15大会はそのまま(J1=98・チャンピオンシップ=40・ブラジル=71)+v102 で照合つきの16リーグ
  *   ③-2 学習済み判定が新リーグに自動追従する(ID・名前の補助判定・15大会の文言)
- *   ③-3 保存容量が15大会×5シーズンに足りる(切り詰めで黙ってシーズンが欠けない)
+ *   ③-3 保存容量が全大会×5シーズンに足りる(切り詰めで黙ってシーズンが欠けない。v102 で上限 54,000)
  *   ④-1 中継の受け口: 鍵必須(未設定503)・不一致403・GET405・短いCSV400・日付検証400・正常200で正しい形の保存
  *   ④-2 学習側(getDailyElo)は同日の中継データがあればネットワークを一切呼ばずに使う
  *   ④-3 GitHub Actionsワークフローが存在し、学習前の時刻に取得→POSTする内容になっている */
@@ -113,8 +113,15 @@ function httpReq(method, url, body, headers) {
     assert.ok(src.includes("homeAdvFullFitFallback = true"), "本番学習失敗時の全体値フォールバックが無い");
   });
 
-  await t("③-1 15大会になっている(J1=98・チャンピオンシップ=40・ブラジル=71・既存12はそのまま)", async () => {
-    assert.strictEqual(DEFAULT_BACKFILL_LEAGUES.length, 15, "大会数=" + DEFAULT_BACKFILL_LEAGUES.length);
+  await t("③-1 従来の15大会はそのまま(J1=98・チャンピオンシップ=40・ブラジル=71・既存12)+v102 で照合つきの16リーグが足されている", async () => {
+    // v102 ★2: 一覧は 15(従来。常に学習に使う)+16(照合に通ったものだけ使う)= 31。
+    //   「従来の15大会が変わっていない」ことは、これまでどおりここで固定する(弱めない)。
+    const core = DEFAULT_BACKFILL_LEAGUES.filter((l) => !l.verify);
+    assert.strictEqual(core.length, 15, "従来の大会数=" + core.length);
+    assert.deepStrictEqual(core.map((l) => l.id).sort((a, b) => a - b), [2, 3, 39, 40, 61, 71, 78, 88, 94, 98, 135, 140, 144, 203, 848]);
+    assert.strictEqual(DEFAULT_BACKFILL_LEAGUES.filter((l) => l.verify).length, 16, "照合つきの新リーグの数");
+    assert.strictEqual(DEFAULT_BACKFILL_LEAGUES.length, 31, "大会数=" + DEFAULT_BACKFILL_LEAGUES.length);
+    assert.strictEqual(new Set(DEFAULT_BACKFILL_LEAGUES.map((l) => l.id)).size, 31, "大会IDが重複している");
     const byId = new Map(DEFAULT_BACKFILL_LEAGUES.map((l) => [l.id, l]));
     assert.ok(byId.get(98) && byId.get(98).nameJa === "J1リーグ", "J1(98)が無い/名前違い");
     assert.ok(byId.get(40) && /チャンピオンシップ/.test(byId.get(40).nameJa), "チャンピオンシップ(40)が無い");
@@ -150,13 +157,24 @@ function httpReq(method, url, body, headers) {
     assert.ok(Number.isFinite(p.homeAdv) && Number.isFinite(p.mu), "下限未満リーグの混入で数値が壊れた");
   });
 
-  await t("③-3 保存容量が15大会×5シーズンに足りる(上限28,000・ブロック容量がそれ以上)", async () => {
-    assert.strictEqual(MAX_STORED_MATCHES, 28000, "MAX_STORED_MATCHES=" + MAX_STORED_MATCHES);
+  await t("③-3 保存容量が全大会×5シーズンに足りる(v102: 上限54,000・ブロック容量がそれ以上)", async () => {
+    assert.strictEqual(MAX_STORED_MATCHES, 54000, "MAX_STORED_MATCHES=" + MAX_STORED_MATCHES);
     assert.ok(BACKFILL_SHARD_SIZE * BACKFILL_MAX_SHARDS >= MAX_STORED_MATCHES,
       `ブロック容量${BACKFILL_SHARD_SIZE * BACKFILL_MAX_SHARDS} < 上限${MAX_STORED_MATCHES}(保存で黙って切れる)`);
-    // 15大会×5シーズンの概算(J1≒306・英2部≒552・ブラジル≒380/シーズン込み)が上限内
+    // 15大会×5シーズンの概算(J1≒306・英2部≒552・ブラジル≒380/シーズン込み。v87 のときの式のまま)が上限内
     const rough = (380 + 380 + 306 + 380 + 342 + 306 + 306 + 342 + 240 + 140 + 140 + 140 + 306 + 552 + 380) * 5;
     assert.ok(rough <= MAX_STORED_MATCHES, `概算${rough}件が上限を超える`);
+    // v102 ★2: 31大会の見積り(リーグごとの概数=SEASON_MATCH_ESTIMATE)。
+    //   「5シーズンぶん+暦年のリーグの1シーズンぶん(1〜6月は1つ多く持つ)」が上限に収まること
+    const { SEASON_MATCH_ESTIMATE, CALENDAR_YEAR_LEAGUE_IDS } = require("./learning/historicalBackfill");
+    for (const l of DEFAULT_BACKFILL_LEAGUES) {
+      assert.ok(Number.isFinite(SEASON_MATCH_ESTIMATE[l.id]) && SEASON_MATCH_ESTIMATE[l.id] >= 100, `大会${l.id}の試合数の見積りが無い`);
+    }
+    const perSeason = DEFAULT_BACKFILL_LEAGUES.reduce((a, l) => a + SEASON_MATCH_ESTIMATE[l.id], 0);
+    const calendarExtra = DEFAULT_BACKFILL_LEAGUES.filter((l) => CALENDAR_YEAR_LEAGUE_IDS.has(l.id)).reduce((a, l) => a + SEASON_MATCH_ESTIMATE[l.id], 0);
+    const worst = perSeason * 5 + calendarExtra;
+    assert.ok(worst <= MAX_STORED_MATCHES, `31大会の見積り${worst}件が上限${MAX_STORED_MATCHES}を超える(古いシーズンが切れる)`);
+    assert.ok(worst >= 40000, `見積り${worst}件が小さすぎる(見積りの表が壊れていないか)`);
   });
 
   await t("③-4 学習のリーグ名表(LEAGUE_NAMES_JA)に3リーグがある(表でIDのまま出さない)", async () => {

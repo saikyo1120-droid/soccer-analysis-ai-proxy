@@ -2172,7 +2172,7 @@
   });
   // ---- ⑩b 追加(実バイト抽出キー: ホーム説明・接続不可メッセージ・質問チップ) ----
   add({
-    "🧠 予測モデルは15大会×5シーズン(欧州カップ戦・J1・イングランド2部・ブラジルを含む)の実試合とAI自身の的中記録から毎日学習しています。2026年8月18日からは、①市場オッズ(ブックメーカーの評価) ②チーム別の地力レーティング(約200クラブの攻撃力・守備力を過去試合から学習) ③市場ブレンド(最終確率にオッズを混ぜる比率。使った予想には内訳を明記)も加わりました。影響の強さはすべてAI自身が実データから学習し、データが無い試合では使いません。": ["🧠 The prediction model learns daily from real matches across 15 competitions × 5 seasons (including European cups, the J1 League, the English Championship and Brazil) plus its own hit/miss record. Since Aug 18, 2026 it also uses ① market odds (bookmakers' view), ② per-club power ratings (attack/defence of ~200 clubs learned from past matches) and ③ a market blend (how much odds mix into the final probability — every blended pick discloses its ratio). All influence strengths are learned by the AI itself from real data, and none are used for matches without data.","🧠 预测模型每天从15项赛事×5个赛季(含欧洲杯赛、J1联赛、英冠、巴西联赛)的实际比赛及AI自身的命中记录中学习。自2026年8月18日起还加入了:①市场赔率(博彩公司评估)②各俱乐部实力评级(从过往比赛学习约200家俱乐部的攻防)③市场混合(最终概率中掺入赔率的比例,使用时必在预测中注明构成)。所有影响强度均由AI自己从实测数据学习,无数据的比赛不使用。","🧠 El modelo de predicción aprende a diario de partidos reales de 15 competiciones × 5 temporadas (incluidas las copas europeas, la J1 japonesa, el Championship inglés y Brasil) y de su propio historial de aciertos. Desde el 18/8/2026 usa además ① cuotas del mercado (visión de las casas), ② ratings de fuerza por club (ataque/defensa de ~200 clubes aprendidos de partidos pasados) y ③ una mezcla de mercado (cuánto pesan las cuotas en la probabilidad final; cada predicción mezclada declara su proporción). Todas las influencias las aprende la propia IA de datos reales y no se usan en partidos sin datos."],
+    "🧠 予測モデルは、学習している大会(欧州の主要リーグ・欧州カップ戦・J1・イングランド2部・ブラジルなど)の過去5シーズンの実試合と、AI自身の的中記録から毎日学習しています。2026年8月18日からは、①市場オッズ(ブックメーカーの評価) ②チーム別の地力レーティング(学習している大会のクラブの攻撃力・守備力を過去試合から学習) ③市場ブレンド(最終確率にオッズを混ぜる比率。使った予想には内訳を明記)も加わりました。影響の強さはすべてAI自身が実データから学習し、データが無い試合では使いません。": ["🧠 The prediction model learns daily from real matches over the past 5 seasons in the competitions it has learned (major European leagues, European cups, the J1 League, the English Championship, Brazil and more), plus its own hit/miss record. Since Aug 18, 2026 it also uses ① market odds (bookmakers' view), ② per-club power ratings (attack/defence of the clubs in the learned competitions, learned from past matches) and ③ a market blend (how much odds mix into the final probability — every blended pick discloses its ratio). All influence strengths are learned by the AI itself from real data, and none are used for matches without data.","🧠 预测模型每天从已学习赛事(欧洲主要联赛、欧洲杯赛、J1联赛、英冠、巴西联赛等)过去5个赛季的实际比赛及AI自身的命中记录中学习。自2026年8月18日起还加入了:①市场赔率(博彩公司评估)②各俱乐部实力评级(从过往比赛学习已学习赛事中各俱乐部的攻防)③市场混合(最终概率中掺入赔率的比例,使用时必在预测中注明构成)。所有影响强度均由AI自己从实测数据学习,无数据的比赛不使用。","🧠 El modelo de predicción aprende a diario de partidos reales de las últimas 5 temporadas en las competiciones que ha aprendido (grandes ligas europeas, copas europeas, la J1 japonesa, el Championship inglés, Brasil y más) y de su propio historial de aciertos. Desde el 18/8/2026 usa además ① cuotas del mercado (visión de las casas), ② ratings de fuerza por club (ataque/defensa de los clubes de las competiciones aprendidas, aprendidos de partidos pasados) y ③ una mezcla de mercado (cuánto pesan las cuotas en la probabilidad final; cada predicción mezclada declara su proporción). Todas las influencias las aprende la propia IA de datos reales y no se usan en partidos sin datos."],
     "サーバーに接続できないため、昨日との比較を読み込めませんでした。": ["Couldn't reach the server, so yesterday's comparison couldn't be loaded.","无法连接服务器,无法加载与昨日的对比。","No se pudo conectar con el servidor; no se cargó la comparación con ayer."],
     "サーバーに接続できないため、昨日との違いを読み込めませんでした。": ["Couldn't reach the server, so the changes since yesterday couldn't be loaded.","无法连接服务器,无法加载与昨日的变化。","No se pudo conectar con el servidor; no se cargaron los cambios desde ayer."],
     "サーバーに接続できないため、反省の記録を読み込めませんでした。": ["Couldn't reach the server, so the reflections couldn't be loaded.","无法连接服务器,无法加载反思记录。","No se pudo conectar con el servidor; no se cargaron las reflexiones."],
@@ -5416,6 +5416,126 @@
     ["⦿ 選手評価(MOTM候補: ⦿)", "$1 player ratings (MOTM candidate: $2)", "$1 球员评分(全场最佳候选: $2)", "$1: notas de los jugadores (candidato a MVP: $2)"],
   ];
   for (var rp13 = 0; rp13 < RAWP13.length; rp13++) P.push([pat(RAWP13[rp13][0]), RAWP13[rp13][1], RAWP13[rp13][2], RAWP13[rp13][3]]);
+  // ---- v102(学習リーグの拡張・交差検証の関門)で足した文言 ----
+  add({
+    "条件をすべて満たしました。": ["All conditions were met.", "所有条件均已满足。", "Se cumplieron todas las condiciones."],
+    "全件で学習し直した重みを採用します。": ["The weights re-learned on all matches are adopted.", "采用以全部比赛重新学习得到的权重。", "Se adoptan los pesos reaprendidos con todos los partidos."],
+    "そのため採用しません。": ["So they are not adopted.", "因此不予采用。", "Por eso no se adoptan."],
+    "モデルは変更しません。": ["The model is left unchanged.", "模型不作更改。", "El modelo no cambia."],
+    "どの区間でも候補を作れなかったため、比べるものがありません。": ["No candidate could be built in any period, so there is nothing to compare.", "所有时期都未能生成候选,因此没有可比较的对象。", "No se pudo construir un candidato en ningún periodo, así que no hay nada que comparar."],
+    "交差検証は通りましたが、全件での学習が収束しなかった(または結果が保存基準を満たさなかった)ため、モデルは変更しません。": ["Cross-validation passed, but learning on all matches did not converge (or the result failed the save criteria), so the model is left unchanged.", "交叉验证已通过,但以全部比赛进行的学习未收敛(或结果未达到保存标准),因此模型不作更改。", "La validación cruzada se superó, pero el aprendizaje con todos los partidos no convergió (o el resultado no cumplió los criterios de guardado), así que el modelo no cambia."],
+    // 「AIが実際に学習して変更した内容」に出る、学習の種類の名前(これまで訳が無く、日本語のまま出ていた)
+    "拡張特徴量モデル(v2)": ["Extended-feature model (v2)", "扩展特征模型(v2)", "Modelo de características ampliadas (v2)"],
+    "基本モデル(v1・フォーム差のみ)": ["Basic model (v1, form difference only)", "基础模型(v1,仅状态差)", "Modelo básico (v1, solo diferencia de forma)"],
+    "市場ブレンド(最終確率のオッズ配合)": ["Market blend (odds mixed into the final probability)", "市场混合(最终概率中的赔率配比)", "Mezcla de mercado (cuotas en la probabilidad final)"],
+    "過去試合の学習(前向きの交差検証)": ["Learning from past matches (walk-forward cross-validation)", "基于过往比赛的学习(前向交叉验证)", "Aprendizaje con partidos pasados (validación cruzada hacia delante)"],
+    "過去試合の勾配学習(v47)": ["Gradient learning on past matches (v47)", "基于过往比赛的梯度学习(v47)", "Aprendizaje por gradiente con partidos pasados (v47)"],
+    "過去試合のグリッド探索": ["Grid search on past matches", "基于过往比赛的网格搜索", "Búsqueda en rejilla con partidos pasados"],
+    "2つ目の意見のブレンド(API-Football予想の配合)": ["Second-opinion blend (API-Football forecast mixed in)", "第二意见混合(API-Football预测的配比)", "Mezcla de segunda opinión (pronóstico de API-Football)"],
+    "有害と出た特徴量の見直し": ["Review of features found harmful", "对被判定为有害的特征的重新审视", "Revisión de características que resultaron perjudiciales"],
+    // 学習の失敗の分類(回答AIの失敗。v102 で分類を足した)
+    "回答AIの利用料の残高が不足しています": ["The answer AI's account balance is too low", "回答AI的账户余额不足", "El saldo de la cuenta de la IA de respuestas es insuficiente"],
+    "回答AI(Anthropic)が「残高が足りない」と答え、呼び出しを受け付けませんでした(データ提供元の失敗ではありません)。": ["The answer AI (Anthropic) replied that the balance is too low and refused the call (this is not a data-provider failure).", "回答AI(Anthropic)答复“余额不足”,拒绝了调用(并非数据提供方的故障)。", "La IA de respuestas (Anthropic) respondió que el saldo es insuficiente y rechazó la llamada (no es un fallo del proveedor de datos)."],
+    "「質問」への回答と、AIの見解などの文章の生成が止まります。予想・答え合わせ・学習の計算には影響しません。Anthropic の管理画面(console.anthropic.com)の Billing で残高を追加すると、追加の操作なしで戻ります。": ["Answers to questions and generated text such as the AI's views stop. Predictions, result checking and the learning calculations are not affected. Adding balance under Billing in the Anthropic console (console.anthropic.com) restores it with no further action.", "对“提问”的回答以及AI见解等文字的生成会停止。预测、结果核对和学习计算不受影响。在Anthropic控制台(console.anthropic.com)的Billing中充值后,无需其他操作即可恢复。", "Se detienen las respuestas a las preguntas y la generación de textos como las opiniones de la IA. Los pronósticos, la comprobación de resultados y los cálculos de aprendizaje no se ven afectados. Al añadir saldo en Billing de la consola de Anthropic (console.anthropic.com) se recupera sin más pasos."],
+    "AIの見解を作れなかったクラブがあります": ["The AI's view could not be written for some clubs", "有些俱乐部未能生成AI见解", "No se pudo redactar la opinión de la IA para algunos clubes"],
+    "回答AIの呼び出しが失敗した、または返ってきた文が使えませんでした(データ提供元の取得の失敗ではありません)。": ["The call to the answer AI failed, or the returned text was unusable (this is not a data-provider fetch failure).", "对回答AI的调用失败,或返回的文字无法使用(并非数据提供方的获取失败)。", "La llamada a la IA de respuestas falló o el texto devuelto no era utilizable (no es un fallo de obtención del proveedor de datos)."],
+    "そのクラブの「AIの見解」が、その日は新しくなりません(前の日の見解のまま)。予想・答え合わせには影響しません。": ["That club's AI view is not refreshed that day (the previous day's view stays). Predictions and result checking are not affected.", "该俱乐部的“AI见解”当天不会更新(保持前一天的见解)。预测和结果核对不受影响。", "La opinión de la IA sobre ese club no se actualiza ese día (se mantiene la del día anterior). Los pronósticos y la comprobación de resultados no se ven afectados."],
+    "採用条件は満たしましたが、保存に失敗したためモデルは変更されていません。": ["The adoption criteria were met, but saving failed, so the model has not been changed.", "虽已满足采用条件,但保存失败,因此模型未作更改。", "Se cumplían los criterios de adopción, pero el guardado falló, así que el modelo no ha cambiado."],
+    "学習データ上も自前モデル単独が最良だったため、ブレンドは使いません。": ["The AI's own model alone was best even on the learning data, so no blend is used.", "即使在学习数据上也是仅用自有模型最佳,因此不使用混合。", "Incluso en los datos de aprendizaje lo mejor fue el modelo propio solo, así que no se usa mezcla."],
+    // 過去試合の交差検証の「リーグ別の内訳」の表(見出し・判定・注記)と、リーグの名前(これまで訳が無かったもの)
+    "試合数": ["Matches", "场次", "Partidos"],
+    "LogLoss(現行→候補)": ["LogLoss (current → candidate)", "LogLoss(现行→候选)", "LogLoss (actual → candidato)"],
+    "的中率(現行→候補)": ["Hit rate (current → candidate)", "命中率(现行→候选)", "Acierto (actual → candidato)"],
+    "判定不可(試合が少ない)": ["Not assessable (too few matches)", "无法判定(场次太少)", "No evaluable (pocos partidos)"],
+    "差は誤差の範囲": ["Within noise", "差异在误差范围内", "Dentro del margen de error"],
+    "各リーグの数字は、時系列の前向き検証(その試合より前の試合だけで学習したレーティングと重み)で測ったものです。": ["Each league's figures were measured with walk-forward validation in time order (ratings and weights learned only from matches before each match).", "各联赛的数字均以按时间顺序的前向验证测得(评级和权重仅从该场比赛之前的比赛中学习)。", "Las cifras de cada liga se midieron con validación hacia delante en orden temporal (ratings y pesos aprendidos solo con partidos anteriores a cada partido)."],
+    "リーグ別の比較はできませんでした。": ["A per-league comparison was not possible.", "未能进行按联赛的比较。", "No fue posible la comparación por liga."],
+    "チャンピオンズリーグ": ["Champions League", "欧洲冠军联赛", "Liga de Campeones"],
+    "ヨーロッパリーグ": ["Europa League", "欧洲联赛", "Europa League"],
+    "カンファレンスリーグ": ["Conference League", "欧洲协会联赛", "Conference League"],
+    "ブンデスリーガ2部": ["2. Bundesliga", "德国乙级联赛", "2. Bundesliga"],
+    "スペイン2部(ラ・リーガ2)": ["Spain 2nd tier (LaLiga 2)", "西班牙乙级联赛(LaLiga 2)", "Segunda División (LaLiga 2)"],
+    "ベルギー・プロ・リーグ": ["Belgian Pro League", "比利时甲级联赛", "Pro League de Bélgica"],
+    "シュペル・リグ": ["Süper Lig", "土耳其超级联赛", "Süper Lig"],
+    "MLS(メジャーリーグサッカー)": ["MLS (Major League Soccer)", "美国职业足球大联盟(MLS)", "MLS (Major League Soccer)"],
+    "ノルウェー・エリテセリエン": ["Norway, Eliteserien", "挪威超级联赛", "Noruega, Eliteserien"],
+    "スウェーデン・アルスヴェンスカン": ["Sweden, Allsvenskan", "瑞典超级联赛", "Suecia, Allsvenskan"],
+    "ポーランド・エクストラクラサ": ["Poland, Ekstraklasa", "波兰甲级联赛", "Polonia, Ekstraklasa"],
+    "ギリシャ・スーパーリーグ": ["Greece, Super League", "希腊超级联赛", "Grecia, Super League"],
+    "スイス・スーパーリーグ": ["Switzerland, Super League", "瑞士超级联赛", "Suiza, Super League"],
+    "ハンガリー・NB I": ["Hungary, NB I", "匈牙利甲级联赛(NB I)", "Hungría, NB I"],
+    "セルビア・スーペルリーガ": ["Serbia, SuperLiga", "塞尔维亚超级联赛", "Serbia, SuperLiga"],
+    "チェコ・1部リーグ": ["Czech First League", "捷克甲级联赛", "Primera División checa"],
+    "イスラエル・プレミアリーグ": ["Israeli Premier League", "以色列超级联赛", "Premier League de Israel"],
+    "アゼルバイジャン・プレミアリーグ": ["Azerbaijan Premier League", "阿塞拜疆超级联赛", "Premier League de Azerbaiyán"],
+    // 過去試合によるモデル調整の安全弁(前回が途中で止まったあとの「軽い設定」)と、学習データの保存に失敗した日の文
+    "軽い設定で動かしていますが、保存済みの過去試合を読み出せなかったため、今回の過去試合によるモデル調整は見送りました。": ["It is running in a light setting, but the stored past matches could not be read, so this run's model tuning on past matches was skipped.", "目前以轻量设置运行,但未能读取已保存的过往比赛,因此本次暂不进行基于过往比赛的模型调整。", "Funciona en un modo ligero, pero no se pudieron leer los partidos pasados guardados, así que esta vez se omitió el ajuste del modelo con partidos pasados."],
+    "前回の過去試合によるモデル調整が途中で止まったため、軽い設定で動かしています。": ["The previous model tuning on past matches stopped partway, so it is running in a light setting.", "上一次基于过往比赛的模型调整中途停止,因此目前以轻量设置运行。", "El ajuste anterior del modelo con partidos pasados se detuvo a medias, así que ahora funciona en un modo ligero."],
+    "学習データの目次の保存に失敗しました。": ["Saving the index of the training data failed.", "学习数据目录保存失败。", "No se pudo guardar el índice de los datos de entrenamiento."],
+    "次回の実行で作り直します。": ["It will be rebuilt on the next run.", "将在下次运行时重新生成。", "Se reconstruirá en la próxima ejecución."],
+    "今日の学習には使いますが、次回は取り直しになります。": ["It is used for today's learning, but will be fetched again next time.", "今天的学习会使用这些数据,但下次需要重新获取。", "Se usa para el aprendizaje de hoy, pero la próxima vez habrá que volver a obtenerlos."],
+    "保存先(Upstash)が未設定のため、過去試合を蓄積できません。": ["The data store (Upstash) is not configured, so past matches can't be accumulated.", "由于尚未配置存储(Upstash),无法积累过往比赛。", "El almacén de datos (Upstash) no está configurado, así que no se pueden acumular partidos pasados."],
+    "保存先(Upstash)が未設定のため、学習データを保存できません。": ["The data store (Upstash) is not configured, so the training data can't be saved.", "由于尚未配置存储(Upstash),无法保存学习数据。", "El almacén de datos (Upstash) no está configurado, así que no se pueden guardar los datos de entrenamiento."],
+    "過去試合の学習データがまだありません。": ["There is no training data from past matches yet.", "尚无来自过往比赛的学习数据。", "Aún no hay datos de entrenamiento de partidos pasados."],
+    "理由は記録できませんでした。": ["The reason could not be recorded.", "未能记录原因。", "No se pudo registrar el motivo."],
+  });
+  var RAWP14 = [
+    // 学習している大会の数(決め打ちをやめた文)
+    ["学習した大会(⦿大会)", "Learned competitions ($1)", "已学习的赛事($1项)", "Competiciones aprendidas ($1)"],
+    ["AIが過去試合を学習しているのは⦿大会(欧州9リーグ+CL・EL・ECL+J1・イングランド2部・ブラジル全国選手権の15大会と、あとから加えた各国リーグ⦿大会)です。それ以外の大会は学習データが無いため、予想は出しますが実力を測る集計とは分けています。", "The AI has learned from past matches in $1 competitions (the original 15 — 9 European leagues + UCL/UEL/UECL + J1 League, the English Championship and Brazil's Série A — plus $2 national leagues added later). It still makes picks elsewhere, but those are counted separately from the figure that measures its skill.", "AI从$1项赛事(原有的15项——欧洲9个联赛+欧冠/欧联/欧协联+J1联赛、英冠、巴西全国锦标赛——以及后来新增的$2个各国联赛)的过往比赛中学习。其他赛事仍会给出预测,但与衡量实力的命中率分开统计。", "La IA ha aprendido de partidos de $1 competiciones (las 15 originales —9 ligas europeas + UCL/UEL/UECL + la J1 japonesa, el Championship inglés y el Brasileirão— más $2 ligas nacionales añadidas después). Sigue dando pronósticos en otras, pero se contabilizan aparte de la cifra que mide su nivel."],
+    ["⦿大会×5シーズン(欧州カップ戦・J1・イングランド2部・ブラジル・各国リーグ⦿大会を含む)の実試合⦿から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。⦿", "Learned by the AI from real matches across $1 competitions × 5 seasons (incl. European cups, the J1 League, the English Championship, Brazil and $2 more national leagues)$3: each club's attack and defence strength (Dixon-Coles method, time-decayed, updated daily). Power = attack + defence. ↑↓ compares with last week. Not a subjective ranking — a purely mechanical calculation from measured data, with no manual adjustment.$4", "由AI从$1项赛事×5个赛季(含欧洲杯赛、J1联赛、英冠、巴西联赛及$2个各国联赛)的实际比赛$3中学习得出: 各俱乐部的攻击力与防守力(Dixon-Coles法、含时间衰减、每日更新)。实力=攻击+防守。↑↓为与上周对比。这不是主观排名——全部由实测数据机械计算,无人工调整。$4", "Aprendido por la IA de partidos reales de $1 competiciones × 5 temporadas (incl. copas europeas, la J1 japonesa, el Championship inglés, Brasil y $2 ligas nacionales más)$3: fuerza ofensiva y defensiva de cada club (método Dixon-Coles, con decaimiento temporal, actualización diaria). Fuerza = ataque + defensa. ↑↓ compara con la semana pasada. No es un ranking subjetivo: cálculo puramente mecánico de datos medidos, sin ajustes manuales.$4"],
+    ["地力レーティングは、次の朝の学習(⦿大会×5シーズンの実試合からの初回学習)のあとに公開されます。でっち上げの暫定値は出しません。", "True-strength ratings go public after the next morning learning run (first learned from real matches across $1 competitions × 5 seasons). No made-up provisional values.", "实力评级将在下一次晨间学习(以$1项赛事×5个赛季的实际比赛首次学习)之后公开。不给出杜撰的临时值。", "El rating de fuerza se publicará tras el próximo aprendizaje matinal (primero aprendido de partidos reales de $1 competiciones × 5 temporadas). Sin valores provisionales inventados."],
+    ["⦿AIの学習データに含まれていない大会です(学習しているのは⦿大会)。参考予想として扱い、実力を測る的中率とは分けて集計しています。", "$1This competition isn't in the AI's learning data (it learns $2 competitions). It's treated as a reference prediction and tallied separately from the accuracy that measures real ability.", "$1该赛事不在AI的学习数据内(AI学习的是$2项赛事)。作为参考预测处理,与衡量实力的命中率分开统计。", "$1Esta competición no está en los datos de aprendizaje de la IA (aprende $2 competiciones). Se trata como predicción de referencia y se cuenta aparte de la precisión que mide la capacidad real."],
+    // 過去試合によるモデル調整(前向きの交差検証)の理由。1文ずつ訳す
+    ["過去試合⦿件を、古い順に⦿つの時期に分け、前の時期だけで学習した重みを次の時期で確かめました(前向きの交差検証)。", "Split $1 past matches into $2 periods in time order, and tested weights learned only from earlier periods on the next period (walk-forward cross-validation).", "将$1场过往比赛按时间先后分为$2个时期,用仅从较早时期学到的权重在下一个时期进行检验(前向交叉验证)。", "Se dividieron $1 partidos pasados en $2 periodos por orden temporal, y los pesos aprendidos solo con los periodos anteriores se probaron en el siguiente (validación cruzada hacia delante)."],
+    ["検証に使えた記録が⦿件で、統計的に判断できる件数(⦿件)に達していません。", "Only $1 records were usable for validation — below the $2 needed for a statistically sound decision.", "可用于验证的记录为$1条,未达到可作统计判断的数量($2条)。", "Solo $1 registros sirvieron para validar, por debajo de los $2 necesarios para decidir con rigor estadístico."],
+    ["束ねた改善が⦿で、意味のある大きさ(⦿以上)に達していません。", "The pooled improvement was $1 — short of a meaningful size ($2 or more).", "汇总后的改善为$1,未达到有意义的幅度($2以上)。", "La mejora conjunta fue de $1, sin llegar a un tamaño relevante ($2 o más)."],
+    ["改善は⦿ありましたが、z=⦿で、偶然と区別できる水準(⦿以上)に達していません。", "There was an improvement of $1, but at z=$2 it doesn't reach the level that can be told apart from chance ($3 or more).", "虽有$1的改善,但z=$2,未达到可与偶然区分的水平($3以上)。", "Hubo una mejora de $1, pero con z=$2 no alcanza el nivel que la distingue del azar ($3 o más)."],
+    ["改善した区間が⦿で、ほぼ全部の区間(⦿以上)では改善していません(一部の時期だけの当たりの可能性)。", "It improved in $1 periods — not in nearly all of them ($2 or more), so it may be a hit in only part of the timeline.", "有改善的时期为$1,并非几乎所有时期($2以上)都有改善(可能只是部分时期碰巧命中)。", "Mejoró en $1 periodos, no en casi todos ($2 o más); puede ser un acierto de solo una parte del calendario."],
+    ["確率の質は改善しましたが、的中率が⦿pt 変化し、許容幅(−⦿pt)を超えて下がりました。", "Probability quality improved, but the hit rate changed by $1pt — a drop beyond the tolerance (−$2pt).", "概率质量有所改善,但命中率变化了$1pt,降幅超过了容许范围(−$2pt)。", "La calidad de las probabilidades mejoró, pero la tasa de acierto cambió $1pt: una caída mayor que la tolerancia (−$2pt)."],
+    ["検証⦿件を束ねて、改善⦿・z=⦿・改善した区間⦿・的中率の変化⦿pt。", "Pooling $1 validation records: improvement $2, z=$3, improved periods $4, hit-rate change $5pt.", "汇总$1条验证记录: 改善$2、z=$3、有改善的时期$4、命中率变化$5pt。", "Con $1 registros de validación en conjunto: mejora $2, z=$3, periodos con mejora $4, cambio en la tasa de acierto $5pt."],
+    ["自社予想の記録が⦿件で、確認に必要な⦿件に達していないため、この確認は行っていません。", "There are $1 of the AI's own prediction records — fewer than the $2 needed, so this check was not run.", "AI自身的预测记录为$1条,未达到确认所需的$2条,因此未进行此项确认。", "Hay $1 registros de predicciones propias, menos de los $2 necesarios, así que esta comprobación no se hizo."],
+    ["自社予想の記録⦿件でも悪化していません(LogLoss ⦿→⦿・的中率の変化 ⦿pt)。", "It is no worse on the AI's own $1 prediction records either (LogLoss $2→$3, hit-rate change $4pt).", "在AI自身的$1条预测记录上也没有变差(LogLoss $2→$3,命中率变化 $4pt)。", "Tampoco empeora en los $1 registros de predicciones propias (LogLoss $2→$3, cambio en la tasa de acierto $4pt)."],
+    ["自社予想の記録⦿件では悪化しました(LogLoss ⦿→⦿・的中率の変化 ⦿pt/許容は LogLoss +⦿ まで・的中率 −⦿pt まで)。", "It got worse on the AI's own $1 prediction records (LogLoss $2→$3, hit-rate change $4pt; tolerance: LogLoss up to +$5, hit rate down to −$6pt).", "在AI自身的$1条预测记录上变差了(LogLoss $2→$3,命中率变化 $4pt;容许范围: LogLoss 最多+$5,命中率最多−$6pt)。", "Empeoró en los $1 registros de predicciones propias (LogLoss $2→$3, cambio en la tasa de acierto $4pt; tolerancia: LogLoss hasta +$5, acierto hasta −$6pt)."],
+    // 過去試合の取り直し(学習リーグが増えた日などに出る)
+    ["過去⦿シーズン×⦿リーグから⦿試合を取得し、⦿件の学習データを作りました(APIリクエスト⦿件)。", "Fetched $3 matches from $2 leagues × the past $1 seasons and built $4 training rows ($5 API requests).", "从过去$1个赛季×$2个联赛获取了$3场比赛,生成了$4条学习数据(API请求$5次)。", "Se obtuvieron $3 partidos de $2 ligas × las últimas $1 temporadas y se generaron $4 filas de entrenamiento ($5 peticiones a la API)."],
+    // 過去試合によるモデル調整の安全弁(前回が途中で止まったあとの「軽い設定」)。1文ずつ訳す
+    ["前回(日本時間 ⦿ に開始)の過去試合によるモデル調整は、途中で処理ごと止まっていました。", "The previous model tuning on past matches (started $1 Japan time) had stopped partway, with the whole process ending.", "上一次基于过往比赛的模型调整(日本时间 $1 开始)在中途连同整个进程一起停止了。", "El ajuste anterior del modelo con partidos pasados (iniciado el $1, hora de Japón) se había detenido a medias al terminar todo el proceso."],
+    ["過去試合によるモデル調整が、通常の設定に戻して確かめた回でも、途中で処理ごと止まりました(⦿回め)。", "Model tuning on past matches stopped partway again, with the whole process ending, on the run that retried the normal setting (occurrence no. $1).", "基于过往比赛的模型调整在恢复常规设置进行确认的那一次,又在中途连同整个进程一起停止了(第$1次)。", "El ajuste del modelo con partidos pasados volvió a detenerse a medias, al terminar todo el proceso, en la ejecución que probaba de nuevo el modo normal (vez n.º $1)."],
+    ["そのため、日本時間 ⦿ までは軽い設定で動かします(新しいほうの過去試合だけを使い、重みの検証は行いません)。", "So it runs in a light setting until $1 Japan time (using only the more recent past matches and skipping the weight validation).", "因此在日本时间 $1 之前以轻量设置运行(仅使用较新的过往比赛,不进行权重验证)。", "Por eso funciona en un modo ligero hasta el $1, hora de Japón (usando solo los partidos pasados más recientes y sin validar los pesos)."],
+    ["軽い設定で動かしているため、保存済みの過去試合のうち新しい⦿件だけを使い、取り直しは見送りました。", "Because it is running in a light setting, only the newest $1 of the stored past matches were used and the refetch was skipped.", "由于以轻量设置运行,仅使用已保存的过往比赛中最新的$1场,并暂不重新获取。", "Como funciona en un modo ligero, solo se usaron los $1 partidos pasados más recientes de los guardados y se omitió volver a obtenerlos."],
+    // 過去試合の交差検証の「リーグ別の内訳」の表の下に出す、全体の1行
+    ["全体: 検証⦿件・LogLoss ⦿→⦿(改善 ⦿・z=⦿)", "Overall: $1 validation records, LogLoss $2→$3 (improvement $4, z=$5)", "整体: 验证$1条,LogLoss $2→$3(改善 $4,z=$5)", "En conjunto: $1 registros de validación, LogLoss $2→$3 (mejora $4, z=$5)"],
+    // 交差検証の前のメモリの確認で、余裕が足りずに検証を見送った回
+    ["メモリの余裕が足りないため、今回は過去試合での重みの検証を見送りました(Node の空き ⦿MB・必要の目安 ⦿MB)。", "There wasn't enough memory headroom, so this run skipped the weight validation on past matches (Node free: $1MB; estimated need: $2MB).", "由于内存余量不足,本次暂不进行基于过往比赛的权重验证(Node 可用 $1MB,所需估计 $2MB)。", "No había suficiente margen de memoria, así que esta vez se omitió la validación de pesos con partidos pasados (libre en Node: $1MB; necesidad estimada: $2MB)."],
+    ["メモリの余裕が足りないため、今回は過去試合での重みの検証を見送りました(サーバーの空き ⦿MB・必要の目安 ⦿MB)。", "There wasn't enough memory headroom, so this run skipped the weight validation on past matches (server free: $1MB; estimated need: $2MB).", "由于内存余量不足,本次暂不进行基于过往比赛的权重验证(服务器可用 $1MB,所需估计 $2MB)。", "No había suficiente margen de memoria, así que esta vez se omitió la validación de pesos con partidos pasados (libre en el servidor: $1MB; necesidad estimada: $2MB)."],
+    // 学習データの保存に失敗した日・上限を超えた日
+    ["過去試合⦿件から⦿件の学習データを作りましたが、保存に失敗しました。", "Built $2 training rows from $1 past matches, but saving failed.", "已从$1场过往比赛生成$2条学习数据,但保存失败。", "Se generaron $2 filas de entrenamiento a partir de $1 partidos pasados, pero el guardado falló."],
+    ["学習データの保存に失敗しました(⦿/⦿ブロック)。", "Saving the training data failed ($1 of $2 blocks).", "学习数据保存失败($1/$2个数据块)。", "No se pudieron guardar los datos de entrenamiento ($1 de $2 bloques)."],
+    ["上限を超えた⦿件は保存していません(直近⦿件を保存)。", "The $1 rows beyond the limit were not saved (the most recent $2 were saved).", "超出上限的$1条未保存(已保存最近的$2条)。", "Las $1 filas que superaban el límite no se guardaron (se guardaron las $2 más recientes)."],
+    // 市場ブレンドの比率の見直し(前向きの検証)
+    ["検証⦿件でブレンド(w=⦿)の改善は⦿・z=⦿で、偶然と区別できる水準(⦿以上)に達していないため、採用を見送りました(迷ったら現状維持)。", "Across $1 validation samples, the blend (w=$2) improved by $3 at z=$4 — below the level that can be told apart from chance ($5 or more) — so it was not adopted (when in doubt, keep the status quo).", "在$1条验证样本中,混合(w=$2)的改善为$3、z=$4,未达到可与偶然区分的水平($5以上),故暂不采用(拿不准时维持现状)。", "En $1 muestras de validación, la mezcla (w=$2) mejoró $3 con z=$4, por debajo del nivel que la distingue del azar ($5 o más), así que no se adoptó (ante la duda, se mantiene lo actual)."],
+    ["検証⦿件ではブレンドと自前モデル単独の差が誤差の範囲(改善⦿・z=⦿)だったため、ブレンドは続け、比率は記録の中で最良の値(市場⦿%)にしました。", "Across $1 validation samples the gap between the blend and the AI's own model alone was within noise (improvement $2, z=$3), so blending continues with the ratio set to the best value in the records (market $4%).", "在$1条验证样本中,混合与仅用自有模型的差距在误差范围内(改善$2、z=$3),因此继续混合,并将比例设为记录中的最佳值(市场$4%)。", "En $1 muestras de validación la diferencia entre la mezcla y el modelo propio solo quedó dentro del ruido (mejora $2, z=$3), así que la mezcla continúa con la proporción fijada en el mejor valor de los registros (mercado $4%)."],
+    ["検証⦿件ではブレンドと自前モデル単独の差が誤差の範囲(改善⦿・z=⦿)だったため、ブレンドは続けます。", "Across $1 validation samples the gap between the blend and the AI's own model alone was within noise (improvement $2, z=$3), so blending continues.", "在$1条验证样本中,混合与仅用自有模型的差距在误差范围内(改善$2、z=$3),因此继续混合。", "En $1 muestras de validación la diferencia entre la mezcla y el modelo propio solo quedó dentro del ruido (mejora $2, z=$3), así que la mezcla continúa."],
+    ["最良の比率は市場⦿%でしたが、いまの比率(市場⦿%)との差がごく小さい(NLL の差⦿)ため、いまの比率を変えません。", "The best ratio was market $1%, but its gap from the current ratio (market $2%) is tiny (NLL difference $3), so the current ratio is kept.", "最佳比例为市场$1%,但与当前比例(市场$2%)的差距极小(NLL差$3),因此不改变当前比例。", "La mejor proporción era mercado $1%, pero su diferencia con la actual (mercado $2%) es mínima (diferencia de NLL $3), así que se mantiene la actual."],
+    // 「学習していない大会」の説明。従来の型は先頭の「「大会名」は」「この大会は」を日本語のまま残していた(半端な訳)。全文の型を足す
+    ["「⦿」はAIの学習データに含まれていない大会です(学習しているのは⦿大会)。参考予想として扱い、実力を測る的中率とは分けて集計しています。", "“$1” isn't in the AI's learning data (it learns $2 competitions). It's treated as a reference prediction and tallied separately from the accuracy that measures real ability.", "「$1」不在AI的学习数据内(AI学习的是$2项赛事)。作为参考预测处理,与衡量实力的命中率分开统计。", "«$1» no está en los datos de aprendizaje de la IA (aprende $2 competiciones). Se trata como predicción de referencia y se cuenta aparte de la precisión que mide la capacidad real."],
+    ["この大会はAIの学習データに含まれていない大会です(学習しているのは⦿大会)。参考予想として扱い、実力を測る的中率とは分けて集計しています。", "This competition isn't in the AI's learning data (it learns $1 competitions). It's treated as a reference prediction and tallied separately from the accuracy that measures real ability.", "该赛事不在AI的学习数据内(AI学习的是$1项赛事)。作为参考预测处理,与衡量实力的命中率分开统计。", "Esta competición no está en los datos de aprendizaje de la IA (aprende $1 competiciones). Se trata como predicción de referencia y se cuenta aparte de la precisión que mide la capacidad real."],
+    // 「AIが実際に学習して変更した内容」の箇条書き(これまで「強めました/弱めました」が日本語のまま残っていた)
+    ["✓ ⦿を大きく強めました", "✓ Greatly strengthened: $1", "✓ 大幅加强: $1", "✓ Se reforzó mucho: $1"],
+    ["✓ ⦿を少し強めました", "✓ Slightly strengthened: $1", "✓ 略微加强: $1", "✓ Se reforzó un poco: $1"],
+    ["✓ ⦿を強めました", "✓ Strengthened: $1", "✓ 加强: $1", "✓ Se reforzó: $1"],
+    ["✓ ⦿を大きく弱めました", "✓ Greatly weakened: $1", "✓ 大幅减弱: $1", "✓ Se redujo mucho: $1"],
+    ["✓ ⦿を少し弱めました", "✓ Slightly weakened: $1", "✓ 略微减弱: $1", "✓ Se redujo un poco: $1"],
+    ["✓ ⦿を弱めました", "✓ Weakened: $1", "✓ 减弱: $1", "✓ Se redujo: $1"],
+    // 「AIが実際に学習して変更した内容」の理由(関門が LogLoss / 交差検証のとき)
+    ["検証⦿件の交差検証で、確率の質を表す LogLoss(小さいほど良い)が⦿→⦿に改善したため(⦿)。", "Because cross-validation on $1 records improved LogLoss — the measure of probability quality, lower is better — from $2 to $3 ($4).", "因为在$1条记录的交叉验证中,表示概率质量的LogLoss(越小越好)从$2改善到$3($4)。", "Porque la validación cruzada sobre $1 registros mejoró el LogLoss —la medida de calidad de las probabilidades; cuanto más bajo, mejor— de $2 a $3 ($4)."],
+    ["検証⦿件で、確率の質を表す LogLoss(小さいほど良い)が⦿→⦿に改善したため(⦿)。", "Because validation on $1 records improved LogLoss — the measure of probability quality, lower is better — from $2 to $3 ($4).", "因为在$1条记录的验证中,表示概率质量的LogLoss(越小越好)从$2改善到$3($4)。", "Porque la validación sobre $1 registros mejoró el LogLoss —la medida de calidad de las probabilidades; cuanto más bajo, mejor— de $2 a $3 ($4)."],
+    ["的中率は⦿%→⦿%でした。", "The hit rate went from $1% to $2%.", "命中率为$1%→$2%。", "La tasa de acierto pasó de $1% a $2%."],
+    ["検証の結果、こちらの比率の方が確率の質が良かったため(⦿)。", "Because validation showed this ratio gives better probability quality ($1).", "因为验证结果显示该比例的概率质量更好($1)。", "Porque la validación mostró que esta proporción da probabilidades de mejor calidad ($1)."],
+    ["検証データでブレンド(w=⦿)が自前モデル単独を上回らなかったため、採用を見送りました(迷ったら現状維持)。", "On validation data the blend (w=$1) did not beat the AI's own model alone, so it was not adopted (when in doubt, keep the status quo).", "在验证数据上,混合(w=$1)未能胜过仅用自有模型,故暂不采用(拿不准时维持现状)。", "En los datos de validación la mezcla (w=$1) no superó al modelo propio solo, así que no se adoptó (ante la duda, se mantiene lo actual)."],
+  ];
+  for (var rp14 = 0; rp14 < RAWP14.length; rp14++) P.push([pat(RAWP14[rp14][0]), RAWP14[rp14][1], RAWP14[rp14][2], RAWP14[rp14][3]]);
   /* ==== 辞書ここまで ==== */
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
   else boot();
@@ -5625,7 +5745,7 @@
          ・過去試合の学習を5リーグ→9リーグ×3シーズンに拡張(実試合のみ)
          ・市場オッズを特徴量に追加(丸写しではなく、影響の強さはAIが実データから学習。
            オッズを取得できない試合では一切使わない=推測で埋めない) -->
-    <details class="vz-fold-note"><summary><span>このAIの予測モデルについて</span></summary><p class="value-note" style="margin:6px 0 0;">🧠 予測モデルは15大会×5シーズン(欧州カップ戦・J1・イングランド2部・ブラジルを含む)の実試合とAI自身の的中記録から毎日学習しています。2026年8月18日からは、①市場オッズ(ブックメーカーの評価) ②チーム別の地力レーティング(約200クラブの攻撃力・守備力を過去試合から学習) ③市場ブレンド(最終確率にオッズを混ぜる比率。使った予想には内訳を明記)も加わりました。影響の強さはすべてAI自身が実データから学習し、データが無い試合では使いません。</p></details>
+    <details class="vz-fold-note"><summary><span>このAIの予測モデルについて</span></summary><p class="value-note" style="margin:6px 0 0;">🧠 予測モデルは、学習している大会(欧州の主要リーグ・欧州カップ戦・J1・イングランド2部・ブラジルなど)の過去5シーズンの実試合と、AI自身の的中記録から毎日学習しています。2026年8月18日からは、①市場オッズ(ブックメーカーの評価) ②チーム別の地力レーティング(学習している大会のクラブの攻撃力・守備力を過去試合から学習) ③市場ブレンド(最終確率にオッズを混ぜる比率。使った予想には内訳を明記)も加わりました。影響の強さはすべてAI自身が実データから学習し、データが無い試合では使いません。</p></details>
     <div id="reflectionsBody" class="muted" style="font-size:13px;">読み込み中…</div>
   </div>
   </div>
@@ -14720,6 +14840,17 @@ async function renderDailyReportWidget() {
     : "";
 
   const mt = data.modelTuning;
+  // v102: 過去試合の交差検証の、リーグ別の内訳。項目ごとの形(cv.byLeague)があれば表にする(値が無い項目は「—」。0 や null と書かない)
+  const cvLeagueRows = mt && mt.cv && Array.isArray(mt.cv.byLeague) ? mt.cv.byLeague.filter((r) => r && r.leagueJa) : [];
+  const cvCell = (v, suffix) => (v === null || v === undefined || v === "" || !Number.isFinite(Number(v)) ? "—" : `${Number(v)}${suffix || ""}`);
+  const cvLeagueTableHtml = cvLeagueRows.length
+    ? `<div style="overflow-x:auto; margin-top:6px;"><table class="cv-league-table" style="border-collapse:collapse; font-size:12px; white-space:nowrap;">
+          <tr style="border-bottom:1px solid var(--border);"><th style="text-align:left; padding:3px 10px 3px 0;">リーグ</th><th style="text-align:left; padding:3px 10px;">判定</th><th style="text-align:right; padding:3px 10px;">試合数</th><th style="text-align:right; padding:3px 10px;">LogLoss(現行→候補)</th><th style="text-align:right; padding:3px 0 3px 10px;">的中率(現行→候補)</th></tr>
+          ${cvLeagueRows.map((r) => `<tr style="border-bottom:1px solid var(--border);"><td style="padding:3px 10px 3px 0; white-space:normal; min-width:11em; max-width:11em;">${escapeHtml(String(r.leagueJa))}</td><td style="padding:3px 10px;">${escapeHtml(String(r.verdictJa || "—"))}</td><td style="text-align:right; padding:3px 10px;">${cvCell(r.n)}</td><td style="text-align:right; padding:3px 10px;">${cvCell(r.baseLogLoss)}→${cvCell(r.candLogLoss)}</td><td style="text-align:right; padding:3px 0 3px 10px;">${cvCell(r.baseAccuracyPct, "%")}→${cvCell(r.candAccuracyPct, "%")}</td></tr>`).join("")}
+        </table></div>
+        <div class="value-note" style="margin-top:3px; opacity:.85;">各リーグの数字は、時系列の前向き検証(その試合より前の試合だけで学習したレーティングと重み)で測ったものです。</div>
+        ${[mt.cv.n, mt.cv.baseLogLoss, mt.cv.candLogLoss, mt.cv.pooledGain, mt.cv.z].every((v) => v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v))) ? `<div class="value-note" style="opacity:.85;">${escapeHtml(`全体: 検証${mt.cv.n}件・LogLoss ${mt.cv.baseLogLoss}→${mt.cv.candLogLoss}(改善 ${mt.cv.pooledGain}・z=${mt.cv.z})`)}</div>` : ""}`
+    : "";
   const modelTuningHtml = mt
     ? `<div style="margin-top:8px;"><strong>🧬 過去試合によるモデル調整(バックテスト)</strong>
         <div class="value-note">${escapeHtml(mt.reasonJa || "")}</div>
@@ -14727,7 +14858,7 @@ async function renderDailyReportWidget() {
         ${mt.adopted === true ? `<div class="value-note" style="color:var(--good);">✅ 新しいパラメータを採用しました。</div>`
           : mt.adopted === false ? `<div class="value-note">⏸️ 今回は採用を見送りました(現状のモデルを維持)。</div>` : ""}
         ${Array.isArray(mt.secondaryGains) && mt.secondaryGains.length ? `<div class="value-note"><span>副次的な改善</span>: ${mt.secondaryGains.map((g) => `<span>${escapeHtml(String(g))}</span>`).join("、")}</div>` : ""}
-        ${mt.leagueTableJa ? `<pre class="value-note" style="white-space:pre-wrap; overflow-x:auto; margin:4px 0 0;">${escapeHtml(mt.leagueTableJa)}</pre>` : ""}
+        ${cvLeagueTableHtml || (mt.leagueTableJa ? `<pre class="value-note" style="white-space:pre-wrap; overflow-x:auto; margin:4px 0 0;">${escapeHtml(mt.leagueTableJa)}</pre>` : "")}
       </div>`
     : "";
 
@@ -15271,7 +15402,9 @@ async function renderReflectionsCard() {
     const rowOf = (label, b) => (b && b.n > 0) ? { name: label, value: `${Number(b.hitRatePct)}%`, sub: `${Number(b.hits)}/${Number(b.n)}`, pct: Number(b.hitRatePct), kind: "acc" } : null;
     // v71: 見出しを学習済み大会に譲ったときは、従来の混合値をこの内訳に移して出し続ける
     //   (数字を消さない。実力の数字と参考の数字の置き場所を入れ替えるだけ)。
-    const brk = [rowOf("学習した大会(15大会)", ls.learned), rowOf("学習していない大会(参考)", ls.unlearned),
+    // v102: 大会の数は決め打ちにしない(サーバーが、保存済みの学習データに入っている大会を数えて返す)
+    const learnedLabel = Number.isFinite(Number(ls.learnedCount)) && Number(ls.learnedCount) > 0 ? `学習した大会(${Number(ls.learnedCount)}大会)` : "学習した大会(15大会)";
+    const brk = [rowOf(learnedLabel, ls.learned), rowOf("学習していない大会(参考)", ls.unlearned),
       (lsHead && off && off.n > 0) ? rowOf("全大会混合(公式戦全体)", { n: off.n, hits: off.hits, hitRatePct: off.hitRatePct }) : null].filter(Boolean);
     parts.push(`<div class="vz-divide">
       <h3 class="vz-h3"><span>大会別の内訳</span></h3>

@@ -127,6 +127,7 @@ const predictionModel = require("./learning/predictionModel"); // v98: 特徴量
 const matchupLib = require("./learning/matchupAnalysis");
 // v62: 学習した大会 / していない大会 の判定(的中率を同じ条件どうしで比べるため)
 const learnedComp = require("./learning/learnedCompetitions");
+const historicalBackfillLib = require("./learning/historicalBackfill"); // v102 ★2: 保存済みデータセットに入っている学習リーグの反映
 const { TEAM_STATS_KEY, combineVolatility: _combineVolatility } = require("./learning/teamStats");
 const { buildEloByNorm: buildEloByNormMU, DAILY_KEY: CLUBELO_DAILY_KEY } = require("./learning/clubElo");
 const clubEloDiag = require("./learning/clubElo"); // v73: 診断エンドポイント用(probeDaily)
@@ -1452,9 +1453,27 @@ async function flushBudgetOnExit() {
 }
 // v98: 使用量カウンター(upstashUsage)も終了時に積み上げる(再デプロイで消えていた分の根治)
 process.on("beforeExit", () => { flushBudgetOnExit(); flushUpstashUsageOnExit(); });
+// v102: 過去試合によるモデル調整(④-b)の最中に終了の合図を受けたら、「実行中の印」を消してから終わる。
+//   印が残っていると、次の実行は「前回は途中で処理ごと落ちた」とみなして、数日のあいだ軽い設定に切り替わる。
+//   配備(デプロイ)や再起動での終了は、メモリが足りずに落ちたのとは違うので、印を残さない。
+//   保存先が応答しないときに終了を引き延ばさないよう、3秒で打ち切る(打ち切ったときは印が残る = 安全側)。
+const SHUTDOWN_MARKER_RELEASE_TIMEOUT_MS = 3000;
+async function releaseTuningMarkerOnExit() {
+  try {
+    const { releaseInflightMarkerOnShutdown } = require("./learning/modelTuning");
+    let timer = null;
+    const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve("timeout"), SHUTDOWN_MARKER_RELEASE_TIMEOUT_MS); });
+    const result = await Promise.race([releaseInflightMarkerOnShutdown(), timeout]);
+    if (timer) clearTimeout(timer);
+    return result;
+  } catch (e) {
+    console.warn("[shutdown] tuning_marker_release_failed:", (e && e.message) || e);
+    return false;
+  }
+}
 for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, async () => {
-    await Promise.all([flushBudgetOnExit(), flushUpstashUsageOnExit()]);
+    await Promise.all([flushBudgetOnExit(), flushUpstashUsageOnExit(), releaseTuningMarkerOnExit()]);
     process.exit(0); // 既定動作を上書きした以上、自分で確実に終了する
   });
 }
@@ -3144,7 +3163,7 @@ async function handleFixturesToday(query, opts) {
     }
 
     // ---- v98: 「見た試合のクラブは翌日までに取り込む」の候補記録 ----
-    //   表示される試合(最大80)と、AIが予想している大会(学習対象12大会)の全試合のチームを
+    //   表示される試合(最大80)と、AIが予想している大会(学習している大会。v102 から数は保存済みデータセットで決まる)の全試合のチームを
     //   候補として記録する(まとめ書き1回・外部APIは呼ばない)。固定名簿のクラブは除外される。
     //   取り込み(収集)そのものは毎晩の学習が行う(方針⑥)。
     runInBackgroundCtx(async () => {
@@ -4715,6 +4734,20 @@ async function maybeRepairPlayerIndex() {
 }
 
 let selfHealSkippedForStore = { count: 0, lastAt: 0, lastReason: null }; // v94: 見送りの記録(診断で開示)
+// 止まった学習の拾い直しは、1日に決まった回数まで(壊れていて何度やっても完走しない場合の暴走防止)。
+// v102: 「最後の完走から26時間以上」の経路でも同じ回数制限を使うため、関数にした(中身は従来と同じ)。
+async function stalledRetryAllowed() {
+  try {
+    const rk = `learn:stalledretry:${appDateKey()}`;
+    const n = await upstashCmd(["INCR", rk]);
+    await upstashCmd(["EXPIRE", rk, "172800"]).catch(() => {});
+    if (Number(n) > LEARN_STALLED_RETRY_CAP_PER_DAY) {
+      console.log(`[self-heal daily-learning] stalled retry cap reached (${LEARN_STALLED_RETRY_CAP_PER_DAY}/day)`);
+      return false;
+    }
+  } catch (e) { /* 数えられない場合は従来どおり許可する */ }
+  return true;
+}
 async function maybeSelfHealDailyLearning() {
   if (!SELF_HEAL_DAILY_LEARNING) return;
   if (!UPSTASH_ENABLED) return;
@@ -4769,16 +4802,7 @@ async function maybeSelfHealDailyLearning() {
           console.log("[self-heal daily-learning] progress looks stale but growth log is newer or today's run is complete; treating as finished");
         } else if (Number.isFinite(sinceStage) && sinceStage >= LEARN_STALLED_MS) {
           // 1日に何度も拾い直さない(壊れていて何度やっても完走しない場合の暴走防止)
-          let allowed = true;
-          try {
-            const rk = `learn:stalledretry:${appDateKey()}`;
-            const n = await upstashCmd(["INCR", rk]);
-            await upstashCmd(["EXPIRE", rk, "172800"]).catch(() => {});
-            if (Number(n) > LEARN_STALLED_RETRY_CAP_PER_DAY) {
-              allowed = false;
-              console.log(`[self-heal daily-learning] stalled retry cap reached (${LEARN_STALLED_RETRY_CAP_PER_DAY}/day)`);
-            }
-          } catch (e) { /* 数えられない場合は従来どおり許可する */ }
+          const allowed = await stalledRetryAllowed();
           if (allowed) {
             reason = "stalled";
             console.log("[self-heal daily-learning] stalled run detected", JSON.stringify({
@@ -4801,7 +4825,27 @@ async function maybeSelfHealDailyLearning() {
     //   (作れなかった場合に無限に走らないよう、専用の3時間ロックで抑える)
     if (!reason) return; // 定期実行は生きている(索引の修復は上で確認済み)
     // 二重起動の防止は既存のロックをそのまま使う(プロセスをまたいで効く)
-    const lock = await tryAcquireDailyRunLock();
+    let lock = await tryAcquireDailyRunLock();
+    // ---- v102(本番実測 11/17 を受けた修正): 「最後の完走から26時間以上」の経路でも、止まった実行の印を片づける ----
+    //   実測: 自己修復で始まった学習が、デプロイの再起動で途中(③-b)で消えた。印(90分)は残ったままなので、
+    //   次の確認では「印が取れない」で終わり、印が切れるまで学習が始まらなかった。
+    //   上の「止まっている」の分岐は、完走の記録が新しい(26時間未満)ときしか通らないので、この場合を拾えない。
+    //   印が取れず、進捗が「未完了」のまま35分以上更新されていなければ、その実行は生きていない
+    //   (v102 から、長い段階でも1分おきに進捗の時刻を更新している)。回数の上限は「止まっている」の分岐と共通。
+    if (!lock.acquired && !lock.storeUnavailable && reason === "stale") {
+      let prog = null;
+      try { prog = await upstashGetJSONOrThrow("learn:progress"); }
+      catch (e) { prog = null; } // 読めなかったら何もしない(印を外さない)
+      const sinceStage = prog && prog.finished === false && prog.at ? now - new Date(prog.at).getTime() : NaN;
+      if (Number.isFinite(sinceStage) && sinceStage >= LEARN_STALLED_MS && await stalledRetryAllowed()) {
+        console.log("[self-heal daily-learning] stale + dead run lock detected", JSON.stringify({
+          stage: prog.stage, stalledMin: Math.round(sinceStage / 60000),
+        }));
+        await releaseDailyRunLock({ force: true });
+        lock = await tryAcquireDailyRunLock();
+        if (lock.acquired) reason = "stalled";
+      }
+    }
     if (!lock.acquired) return;
     dailyLearningRunning = true;
     console.log("[self-heal daily-learning] starting", JSON.stringify({
@@ -6043,7 +6087,7 @@ async function handleMatchup(query) {
   if (failed) {
     const messageJa = failed.r.reason === "ambiguous"
       ? `「${failed.raw}」はどのクラブか1つに絞れませんでした(候補: ${(failed.r.candidates || []).join(" / ")})。正式名称で教えてください。`
-      : `「${failed.raw}」に一致するクラブが、AIが学習しているクラブの中に見つかりませんでした。学習対象は15大会(欧州12大会+J1・イングランド2部・ブラジル全国選手権)に出場したクラブです。`;
+      : `「${failed.raw}」に一致するクラブが、AIが学習しているクラブの中に見つかりませんでした。学習対象は${learnedComp.clubScopeJa()}に出場したクラブです。`;
     const body = { ok: true, available: false, reason: failed.r.reason, side: failed.side, queryJa: failed.raw, candidates: failed.r.candidates || null, messageJa };
     cacheSet(ckey, body, MATCHUP_CTX_TTL_MS);
     return { status: 200, body };
@@ -6659,10 +6703,14 @@ async function buildLearningHealth(days) {
   // 実際に記録された理由を読み出して渡す。
   if (!storeDownNow) {
     try {
-      const hist = (await upstashCmd(["LRANGE", "learn:weights:history", "-1", "-1"])) || [];
-      if (hist.length) {
-        const last = JSON.parse(hist[0]);
-        if (last && last.date === todayDateKey && last.note) growthLog.weightsHistoryNoteJa = last.note;
+      // v102: 「更新しなかった理由」は、今日の記録のうち「更新しなかった」もの(新しい順)から取る。
+      //   従来は最後の1件をそのまま使っていたため、同じ日に別の種類の採用(市場ブレンドの比率・過去試合での採用)が
+      //   後ろに入ると、その採用の説明が「更新していない理由」として出てしまう。
+      const hist = (await upstashCmd(["LRANGE", "learn:weights:history", "-6", "-1"])) || [];
+      for (let hi = hist.length - 1; hi >= 0; hi--) {
+        let entry = null;
+        try { entry = JSON.parse(hist[hi]); } catch (eParse) { entry = null; }
+        if (entry && entry.date === todayDateKey && entry.adopted === false && entry.note) { growthLog.weightsHistoryNoteJa = entry.note; break; }
       }
     } catch (e) { /* 読めなくても健康診断自体は返す(その場合は理由を推測しない) */ }
   }
@@ -9267,7 +9315,7 @@ async function handleHttpRequest(req, res) {
           if (rkReadFailed) {
             rkBody = { ok: true, available: false, readFailed: true, reasonJa: "保存先(Upstash)から地力レーティングを読み出せませんでした(レーティングが無いという意味ではありません)。1分ほど待って再読み込みしてください。" };
           } else if (!ratings || !ratings.available || !ratings.byTeam) {
-            rkBody = { ok: true, available: false, reasonJa: "地力レーティングは、次の朝の学習(15大会×5シーズンの実試合からの初回学習)のあとに公開されます。でっち上げの暫定値は出しません。" };
+            rkBody = { ok: true, available: false, reasonJa: `地力レーティングは、次の朝の学習(${learnedComp.learnedCompetitionCount()}大会×5シーズンの実試合からの初回学習)のあとに公開されます。でっち上げの暫定値は出しません。` };
           } else {
             const prevRanks = (prev && prev.ranks) || {};
             const jaByEnLc = new Map(CLUB_UNIVERSE.map((c) => [c.nameEn.toLowerCase(), c.nameJa]));
@@ -9347,7 +9395,7 @@ async function handleHttpRequest(req, res) {
               teamsRated: ratings.teamsRated || teams.length,
               prevWeekKey: (prev && prev.weekKey) || null,
               teams: teamsRanked,
-              noteJa: `15大会×5シーズン(欧州カップ戦・J1・イングランド2部・ブラジルを含む)の実試合${ratings.matchesUsed ? `(${ratings.matchesUsed}試合)` : ""}から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。${Number.isFinite(ratings.minMatches) ? `対象は、このデータの中に${ratings.minMatches}試合以上の実績があり、かつ他の対象クラブと十分に対戦しているクラブだけです(数試合だけの記録から地力を断定しないため)。` : ""}${unnamedCount > 0 ? `※一部クラブ(${unnamedCount}件)の名前を提供元から自動取得しています。数分後に再読み込みすると表示されます。` : ""}`,
+              noteJa: `${learnedComp.ratingsScopeJa()}の実試合${ratings.matchesUsed ? `(${ratings.matchesUsed}試合)` : ""}から、各クラブの攻撃力と守備力をAIが学習した結果です(Dixon-Coles法・時間減衰つき・毎日更新)。強さ=攻撃力+守備力。順位の↑↓は前週との比較です。主観のランキングではなく、すべて実測データからの機械的な計算で、人手の調整は入っていません。${Number.isFinite(ratings.minMatches) ? `対象は、このデータの中に${ratings.minMatches}試合以上の実績があり、かつ他の対象クラブと十分に対戦しているクラブだけです(数試合だけの記録から地力を断定しないため)。` : ""}${unnamedCount > 0 ? `※一部クラブ(${unnamedCount}件)の名前を提供元から自動取得しています。数分後に再読み込みすると表示されます。` : ""}`,
             };
           }
         }
@@ -9756,7 +9804,7 @@ async function handleHttpRequest(req, res) {
                 })(),
               },
               // ---- v62: 学習した大会 / 学習していない大会 を分けて数える ----
-              //   学習データは15大会のみ(v87③で12→15)。ハンガリーNB I・MLS等の予想も出し続けるが、
+              //   学習データがあるのは「学習した大会」だけ(v87③で12→15。v102 ★2 で照合に通った各国リーグを順に追加)。それ以外の大会の予想も出し続けるが、
               //   実力は「同じ条件で測った数字」=学習済み大会の的中率で見る。
               //   参考側の数字も必ず一緒に出す(良く見せるための隠蔽をしない)。
               learnedSummary: (() => {
@@ -9765,7 +9813,9 @@ async function handleHttpRequest(req, res) {
                   learned: split.learnedOfficial,
                   unlearned: split.unlearnedOfficial,
                   unofficial: split.unofficial,
-                  noteJa: "AIが過去試合を学習しているのは15大会(欧州9リーグ+CL・EL・ECL+J1・イングランド2部・ブラジル全国選手権)です。それ以外の大会は学習データが無いため、予想は出しますが実力を測る集計とは分けています。",
+                  // v102 ★2: 大会の数は決め打ちにしない(保存済みデータセットに入っている大会の数)。画面の「学習した大会(◯大会)」もこの数を使う
+                  learnedCount: learnedComp.learnedCompetitionCount(),
+                  noteJa: learnedComp.learnedScopeNoteJa(),
                 };
               })(),
               items, topReasons,
@@ -11131,9 +11181,15 @@ async function handleHttpRequest(req, res) {
               oldLogLoss: r4(t.oldEval && t.oldEval.logLoss), newLogLoss: r4(t.newEval && t.newEval.logLoss),
               oldBrier: r4(t.oldEval && t.oldEval.brier), newBrier: r4(t.newEval && t.newEval.brier),
               testSize: t.testSize ?? null, trainSize: t.trainSize ?? null, datasetSize: t.datasetSize ?? null,
-              reasonJa: t.reasonJa ? String(t.reasonJa).slice(0, 200) : null,
+              // v102(B): 関門の種類と、交差検証の要点。holdoutLogLoss は v101 までと同じ測り方(新しい3割)での現行の重みの値
+              gateMode: t.gateMode || "legacy",
+              holdoutLogLoss: r4(t.holdoutBaseEval && t.holdoutBaseEval.logLoss),
+              cvN: (t.cv && t.cv.n) ?? null, cvGain: (t.cv && t.cv.pooledGain) ?? null, cvZ: (t.cv && t.cv.z) ?? null,
+              cvPositiveFolds: (t.cv && Number.isFinite(t.cv.positiveFolds)) ? `${t.cv.positiveFolds}/${t.cv.foldsWithCandidate}` : null,
+              leaguesInDataset: t.leaguesInDataset ?? null,
+              reasonJa: t.reasonJa ? String(t.reasonJa).slice(0, 300) : null,
             })),
-            noteJa: "過去試合(学習コーパス)の検証用30%に対する自前モデル単独の LogLoss(市場オッズを含まない)。当てずっぽうは ln3≒1.0986。小さいほど賢い。",
+            noteJa: "自前モデル単独の LogLoss(市場オッズを含まない。当てずっぽうは ln3≒1.0986。小さいほど賢い)。gateMode=\"legacy\"(v101 まで)の oldLogLoss / newLogLoss は、過去試合の新しい3割で測った値。gateMode=\"cv\"(v102 から)の oldLogLoss / newLogLoss は、時系列5ブロックの前向き交差検証で束ねた値(現行 / 候補)で、v101 までの値とは測り方が違うため直接は比べられない。続けて比べるときは holdoutLogLoss(v101 までと同じ「新しい3割」で測った現行の重みの値)を使う。v102 で学習リーグが増えた日からは、測っている試合の集まりそのものも変わる(leaguesInDataset)。",
           };
         })();
         // v94: 保存先の状態(読めなかった・止まっている)を同梱し、劣化した結果は長くキャッシュしない
@@ -11171,6 +11227,9 @@ async function handleHttpRequest(req, res) {
           firstRanAt: g.firstRanAt || g.ranAt || null,
           lastRanAt: g.ranAt || null,
           storeUsage: g.storeUsage || null,
+          // v102: この処理(サーバー)のメモリの実測(学習の開始時・終わり。maxRssMb は起動してからの最大値)。
+          //   過去試合によるモデル調整の中の段階ごとの実測は modelTuning.memory、余裕の確認は modelTuning.memoryCheck、安全弁の状態は modelTuning.crashGuard。
+          processMemory: g.processMemory || null,
           // ---- v100: 「AIがいま何を信じているか」「学習の関門は何を見たか」「自前モデルの賢さの推移」 ----
           weightsNow,
           weightGate: g.weightGate || null,
@@ -11525,7 +11584,46 @@ async function handleHttpRequest(req, res) {
   serveStatic(req, res, pathname);
 }
 
+// ---- v102 ★2: 起動時に「保存済みのデータセットに入っている学習リーグ」を反映する ----
+//   あとから加えた各国リーグは、照合に通って保存済みのデータセットに入ったものだけを「学習した大会」に数える
+//   (historicalBackfill.activateFromMeta)。毎朝の学習は自分で反映するが、デプロイや再起動の直後は
+//   このプロセスがまだ目次を読んでいないので、ここで1回読む。読めなかったときは従来の15大会のまま動き、
+//   30秒・2分・10分後にもう一度だけ試す(それでも読めなければ、次の朝の学習で反映される)。
+const learnedLeaguesBoot = { loadedAt: null, tries: 0, error: null };
+async function loadLearnedLeaguesFromStore() {
+  if (!UPSTASH_ENABLED || learnedLeaguesBoot.loadedAt) return !!learnedLeaguesBoot.loadedAt;
+  learnedLeaguesBoot.tries++;
+  try {
+    const meta = await upstashGetJSON(historicalBackfillLib.BACKFILL_META_KEY);
+    historicalBackfillLib.activateFromMeta(meta); // 目次が無ければ何もしない(従来の大会だけのまま)
+    learnedLeaguesBoot.loadedAt = new Date().toISOString();
+    learnedLeaguesBoot.error = null;
+    return true;
+  } catch (e) {
+    learnedLeaguesBoot.error = String((e && e.message) || e).slice(0, 120);
+    console.warn(`[learned-leagues] 保存済みの学習リーグを読めませんでした(${learnedLeaguesBoot.tries}回目): ${learnedLeaguesBoot.error}`);
+    return false;
+  }
+}
+function scheduleLearnedLeaguesBootLoad() {
+  if (!UPSTASH_ENABLED) return;
+  const delays = [0, 30 * 1000, 2 * 60 * 1000, 10 * 60 * 1000];
+  const attempt = (i) => {
+    if (i >= delays.length || learnedLeaguesBoot.loadedAt) return;
+    const timer = setTimeout(() => {
+      // テストが保存先を差し替えているあいだは、あとからの再試行はしない(テストの保存先に余計な読み出しを足さない)
+      if (i > 0 && upstashHooksActive) return;
+      loadLearnedLeaguesFromStore().then((ok) => { if (!ok) attempt(i + 1); }).catch((e) => {
+        console.warn("[learned-leagues] 予期しない失敗:", (e && e.message) || e);
+      });
+    }, delays[i]);
+    if (timer && typeof timer.unref === "function") timer.unref();
+  };
+  attempt(0);
+}
+
 server.listen(PORT, () => {
+  scheduleLearnedLeaguesBootLoad();
   console.log(`soccer-analysis-ai-proxy: http://localhost:${PORT}/ で起動しました`);
   console.log(`APIキー設定: ${API_KEY ? "あり" : "なし(.envのAPI_FOOTBALL_KEYを設定してください)"}`);
   console.log(`AI予測の記録(Upstash Redis): ${UPSTASH_ENABLED ? "あり" : "なし(.envのUPSTASH_REDIS_REST_URL/TOKENを設定してください)"}`);
@@ -11643,6 +11741,14 @@ module.exports = {
     buildDiscussToolDeps, discussLlmErrorMessageJa, matchContentLib, buildTodayPredictionEntry,
     MATCH_ANALYSIS_TOOL_KEYS, handleMatchAnalysis,
     constants: { DISCUSS_TOOLS_ENABLED, DISCUSS_RESOLVE_SUBJECT, DISCUSS_TOOL_MAX_ROUNDS, DISCUSS_TOOL_MAX_CALLS, DISCUSS_HISTORY_TURNS },
+  },
+  // v102: 学習リーグの反映(起動時)の検証用(本番では誰も呼ばない)
+  __v102ForTest: {
+    releaseTuningMarkerOnExit,
+    loadLearnedLeaguesFromStore,
+    learnedLeaguesBoot: () => ({ ...learnedLeaguesBoot }),
+    resetLearnedLeaguesBootForTest: () => { learnedLeaguesBoot.loadedAt = null; learnedLeaguesBoot.tries = 0; learnedLeaguesBoot.error = null; },
+    stalledRetryAllowed, LEARN_STALLED_MS, LEARN_SWEEP_STALE_MS,
   },
   // v99: 同日2回目の学習ガード・保存先コマンド数の実測の検証用(本番では誰も呼ばない)
   __v99ForTest: {
