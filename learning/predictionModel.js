@@ -289,6 +289,36 @@ function sumOrZero(x, y, center) {
   return (x + y) - (center || 0);
 }
 
+// ---- v102: 学習の損失の計算だけで使う、期待得点(λ)の速い計算 ----
+//   predictOutcomeV2 と同じ順番で、同じ足し算・掛け算・範囲の丸めを行う(答えは同じ)。違いは、
+//   特徴量の一覧を毎回作り直さないことと、表示用の付帯情報(丸めた生値など)を作らないことだけ。
+//   学習はこれを数百万回呼ぶ。返す入れ物は使い回すので、呼び出し側はすぐに値を取り出すこと。
+const FEATURE_WEIGHT_ENTRIES = Object.entries(FEATURE_WEIGHT_MAP);
+const FEATURE_SUM_WEIGHT_ENTRIES = Object.entries(FEATURE_SUM_WEIGHT_MAP);
+const lambdaPairScratch = { homeLambda: 0, awayLambda: 0 };
+function lambdaPairFast(features, weights) {
+  const w = weights || EXTENDED_DEFAULT_WEIGHTS;
+  const f = features || {};
+  let score = 0;
+  for (let i = 0; i < FEATURE_WEIGHT_ENTRIES.length; i++) {
+    const e = FEATURE_WEIGHT_ENTRIES[i];
+    score += (f[e[0]] || 0) * (w[e[1]] || 0);
+  }
+  let openness = 0;
+  for (let i = 0; i < FEATURE_SUM_WEIGHT_ENTRIES.length; i++) {
+    const e = FEATURE_SUM_WEIGHT_ENTRIES[i];
+    openness += (f[e[0]] || 0) * (w[e[1]] || 0);
+  }
+  const isMult = w.modelForm === "mult";
+  const hb = (w.homeBase ?? EXTENDED_DEFAULT_WEIGHTS.homeBase);
+  const ab = (w.awayBase ?? EXTENDED_DEFAULT_WEIGHTS.awayBase);
+  const rawHome = isMult ? hb * Math.exp(score + openness) : hb + score + openness;
+  const rawAway = isMult ? ab * Math.exp(-score + openness) : ab - score + openness;
+  lambdaPairScratch.homeLambda = Math.max(LAMBDA_MIN, Math.min(LAMBDA_MAX, rawHome));
+  lambdaPairScratch.awayLambda = Math.max(LAMBDA_MIN, Math.min(LAMBDA_MAX, rawAway));
+  return lambdaPairScratch;
+}
+
 function predictOutcomeV2(features, weights) {
   const w = weights || EXTENDED_DEFAULT_WEIGHTS;
   const f = features || {};
@@ -409,15 +439,43 @@ function scoreGrid(homeLambda, awayLambda, maxGoals, rho) {
   return grid;
 }
 
+// ---- v102(2026年11月17日): 同じ答えを、少ない計算で出す ----
+//   以前はここで scoreGrid を呼び、81マス(9×9)のそれぞれで poissonPmf を2回ずつ=162回計算していた。
+//   重みの学習はこの関数を1回の学習で数百万回呼ぶため、過去試合の学習(④-b)の時間のほとんどがここだった
+//   (本番実測 11/16: 21,824試合で391秒)。学習リーグを増やす(v102)と件数が約2倍になり、そのままでは12分を超える。
+//   ポアソンの値はチームごとに 9個(0〜8点)しかないので、先に9個ずつ計算してから掛け合わせる。
+//   **掛ける順番・足す順番・割る順番は scoreGrid と同じ**にしてあるので、結果は1ビットも変わらない
+//   (v102_speed_identity_test.js が、以前の計算と完全に一致することを乱数で確かめる)。
+const PROB_SCRATCH_MAX = 16;
+const probScratchH = new Float64Array(PROB_SCRATCH_MAX + 1);
+const probScratchA = new Float64Array(PROB_SCRATCH_MAX + 1);
+const probScratchCells = new Float64Array((PROB_SCRATCH_MAX + 1) * (PROB_SCRATCH_MAX + 1));
 function computeMatchProbabilitiesRaw(homeLambda, awayLambda, maxGoals, rho) {
   const cap = maxGoals || 8;
-  const grid = scoreGrid(homeLambda, awayLambda, cap, rho);
+  // scoreGrid の繰り返しは「0 から cap 以下の整数まで」。同じ範囲を n 個(0〜n-1)として持つ
+  const n = cap >= 0 ? Math.floor(cap) + 1 : 0;
+  // 上限が大きい呼び出し(通常は無い)は、作業用の配列をその場で用意する
+  const small = n <= PROB_SCRATCH_MAX + 1;
+  const ph = small ? probScratchH : new Float64Array(n);
+  const pa = small ? probScratchA : new Float64Array(n);
+  const cells = small ? probScratchCells : new Float64Array(n * n);
+  for (let k = 0; k < n; k++) { ph[k] = poissonPmf(k, homeLambda); pa[k] = poissonPmf(k, awayLambda); }
+  let gridTotal = 0;
+  for (let h = 0; h < n; h++) {
+    for (let a = 0; a < n; a++) {
+      // ρ=0 のとき τ は 1(掛けても値は変わらない)なので、呼び出しごと省く
+      const p = rho ? ph[h] * pa[a] * dixonColesTau(h, a, homeLambda, awayLambda, rho) : ph[h] * pa[a];
+      const safe = p > 0 ? p : 0; // τが負を作りうる極端なρでも確率を壊さない(scoreGrid と同じ)
+      cells[h * n + a] = safe;
+      gridTotal += safe;
+    }
+  }
   let pHome = 0;
   let pDraw = 0;
   let pAway = 0;
-  for (let h = 0; h <= cap; h++) {
-    for (let a = 0; a <= cap; a++) {
-      const p = grid[h][a];
+  for (let h = 0; h < n; h++) {
+    for (let a = 0; a < n; a++) {
+      const p = gridTotal > 0 ? cells[h * n + a] / gridTotal : cells[h * n + a];
       if (h > a) pHome += p;
       else if (h < a) pAway += p;
       else pDraw += p;
@@ -625,7 +683,9 @@ function computeNegativeLogLikelihood(records, weights, opts) {
   let total = 0;
   let totalWeight = 0;
   for (const r of usable) {
-    const { homeLambda, awayLambda } = predictOutcomeV2(r.features, weights);
+    // v102: 期待得点は速い計算で求める(predictOutcomeV2 と同じ値。v102_speed_identity_test.js で固定)
+    const lam = lambdaPairFast(r.features, weights);
+    const homeLambda = lam.homeLambda, awayLambda = lam.awayLambda;
     // ---- 2026年8月・検証で判明した「ρが絶対に学習されない」欠陥の修正 ----
     //   ρ(Dixon-Colesの低スコア補正)は学習対象のパラメータに入っていたのに、
     //   この尤度計算だけが ρ を渡していなかった。そのため
@@ -909,10 +969,15 @@ function describeOneWeightChange(key, oldVal, newVal) {
  */
 function describeWeightsHistoryEntry(entry) {
   if (!entry) return null;
-  const methodLabelJa = entry.method === "gradient_descent_v2" ? "拡張特徴量モデル(v2)"
-    : entry.method === "market_blend" ? "市場ブレンド(最終確率のオッズ配合)" // v50
-    : entry.method === "history_gradient_descent" ? "過去試合の勾配学習(v47)" // v47採用分の表示名
-    : entry.method === "grid_search" ? "過去試合のグリッド探索"
+  const methodName = String(entry.method || "");
+  const methodLabelJa = methodName === "gradient_descent_v2" ? "拡張特徴量モデル(v2)"
+    : methodName === "market_blend" ? "市場ブレンド(最終確率のオッズ配合)" // v50
+    : methodName === "corpus_cv" ? "過去試合の学習(前向きの交差検証)" // v102(B)
+    : methodName === "history_gradient_descent" ? "過去試合の勾配学習(v47)" // v47採用分の表示名
+    : methodName === "grid_search" ? "過去試合のグリッド探索"
+    // v102: これまで下の「基本モデル」の名前で出ていた2つに、実態に合う名前を付けた
+    : methodName === "apifb_blend" ? "2つ目の意見のブレンド(API-Football予想の配合)"
+    : methodName.indexOf("ablation_") === 0 ? "有害と出た特徴量の見直し"
     : "基本モデル(v1・フォーム差のみ)";
   if (!entry.adopted) {
     return {
@@ -935,9 +1000,26 @@ function describeWeightsHistoryEntry(entry) {
       : "✓ 予測の計算の形を「足し算(加法)モデル」へ戻しました(検証データでこちらが上回ったため)");
   }
   const accUp = typeof entry.oldAccuracy === "number" && typeof entry.newAccuracy === "number";
-  const reason = accUp
-    ? `直近${entry.sampleSize ?? "?"}試合の検証結果で、的中率が${entry.oldAccuracy}%→${entry.newAccuracy}%に上がったため(${methodLabelJa})。`
-    : `直近の検証結果でこちらの重みの方が的中率が高かったため(${methodLabelJa})。`;
+  // ---- v102: 採用の理由は、実際に通った関門に合わせて書く ----
+  //   v100 の関門(検証 LogLoss)と v102 の関門(交差検証)は「確率の質(LogLoss)の改善」で採用を決める。
+  //   的中率は「下がりすぎていないこと」を見るだけなので、横ばい・微減でも採用され得る。
+  //   そのとき従来の文(「的中率が◯%→◯%に上がったため」)を出すと、事実と違うことを書いてしまう。
+  //   LogLoss の前後が記録にある採用は、LogLoss を理由に書き、的中率は事実として添える。
+  const llOk = typeof entry.oldLogLoss === "number" && typeof entry.newLogLoss === "number";
+  const accNoteJa = accUp ? `的中率は${entry.oldAccuracy}%→${entry.newAccuracy}%でした。` : "";
+  let reason;
+  if (entry.gate === "cv" && llOk) {
+    reason = `検証${entry.sampleSize ?? "?"}件の交差検証で、確率の質を表す LogLoss(小さいほど良い)が${entry.oldLogLoss}→${entry.newLogLoss}に改善したため(${methodLabelJa})。${accNoteJa}`;
+  } else if (entry.gate === "logloss" && llOk) {
+    reason = `検証${entry.sampleSize ?? "?"}件で、確率の質を表す LogLoss(小さいほど良い)が${entry.oldLogLoss}→${entry.newLogLoss}に改善したため(${methodLabelJa})。${accNoteJa}`;
+  } else if (methodName === "market_blend" || methodName === "apifb_blend") {
+    // ブレンドの比率の変更は、的中率ではなく検証の NLL で決めている。記録にある理由(note)をそのまま出す
+    reason = entry.note || `検証の結果、こちらの比率の方が確率の質が良かったため(${methodLabelJa})。`;
+  } else {
+    reason = accUp
+      ? `直近${entry.sampleSize ?? "?"}試合の検証結果で、的中率が${entry.oldAccuracy}%→${entry.newAccuracy}%に上がったため(${methodLabelJa})。`
+      : `直近の検証結果でこちらの重みの方が的中率が高かったため(${methodLabelJa})。`;
+  }
   return {
     date: entry.date, method: entry.method, methodLabelJa, adopted: true,
     bullets: bullets.length ? bullets : ["✓ 重みの数値を微調整しました(表示閾値未満の小さな変化)"],
@@ -1325,7 +1407,7 @@ function blendProbs(model, market, w) {
  *   (既存の重み学習と同じ「迷ったら現状維持」の関門)。
  * ・グリッド探索(0〜0.9・0.05刻み)。データが少なければ正直に見送る。
  */
-function fitMarketBlend(records, opts) {
+function fitMarketBlendHoldout(records, opts) {
   const MIN_SAMPLES = (opts && opts.minSamples) || 40;
   const samples = (records || []).map(blendSampleOf).filter(Boolean);
   if (samples.length < MIN_SAMPLES) {
@@ -1381,6 +1463,166 @@ function fitMarketBlend(records, opts) {
     curve, marketAloneValidNll,
     reasonJa: `検証${valid.length}件でブレンド(市場${Math.round(bestW * 100)}%+AI${Math.round((1 - bestW) * 100)}%)がNLL ${Math.round(validBase * 10000) / 10000}→${Math.round(validBest * 10000) / 10000}へ改善したため採用しました。`,
   };
+}
+
+/* ============================================================================
+ * v102(2026年11月17日): 市場ブレンドの比率 w を「時系列の前向き検証」で決める
+ * ----------------------------------------------------------------------------
+ * ■ v101 までの決め方(上の fitMarketBlendHoldout)で起きていたこと(本番実測)
+ *   古い7割で最良の w を選び、新しい3割で「AI単独より良いか」だけを確かめていた。
+ *   実測では、古い7割の最良は w=0.9、新しい3割の最良は w=0.5 と食い違ったまま 0.9 が使われ続けていた。
+ *   「どの w が良いか」を、1回きりの分け方の片側だけで決めていたのが原因。
+ *
+ * ■ ここでの決め方
+ *   記録を時系列の順に5つの区間に分ける。w には学習するものが無い(確率は予想時点のものを使う)ので、
+ *   「過去の区間で最良だった w を、次の区間で試す」を4回くり返して束ねれば、決め方そのものの成績が標本外で測れる。
+ *   ① 決め方A(全部の過去で選ぶ)と、決め方B(直近の2区間だけで選ぶ)を、同じ試合で比べる。
+ *      B が A より z≥2.33 で良いとき(=最近は市場と AI の力関係が変わった、とはっきり言えるとき)だけ B を使う。ふだんは A。
+ *   ② 選んだ決め方の束ねた成績を、AI単独(w=0)と比べる。「迷ったら現状維持」を、いまの状態を基準にして当てはめる:
+ *        いまブレンドしていない(w=0)  … 改善が z≥1.64 で確かめられたときだけ、ブレンドを始める
+ *        いまブレンドしている(w>0)    … 悪化が z≤−1.64 で確かめられるまではやめない。
+ *                                       比率は、改善が見えているかどうかに関わらず、下の③の値に更新する
+ *                                       (「いまの比率」に固定しない。いまの比率そのものが悪い場合に居座らせないため)
+ *      (v101 までは、新しい3割でたまたま負けた日に w が 0 に戻り得た。予想の出方が1日で大きく変わるのを防ぐ)
+ *   ③ 実際に使う w は、選んだ決め方を全部の記録に当てたもの(A=全件で最良の w/B=直近の2区間で最良の w)。上限は 0.9 のまま。
+ *      ただし、いまの比率との差がごく小さい(同じ記録での NLL の差が 0.0005 未満)ときは、いまの比率を変えない
+ *      (隣り合う比率のあいだを日ごとに行ったり来たりさせない。v71 の減衰率・v87 のホーム有利と同じ幅)。
+ *   開示用の曲線(curve)は v101 と同じ形(古い7割・新しい3割)で残し、全件での値(allNll)を足す。
+ * ========================================================================== */
+function fitMarketBlendCv(records, opts) {
+  const o = opts || {};
+  const MIN_SAMPLES = o.minSamples || 40;
+  const FOLDS = 5;
+  const MIN_Z = Number.isFinite(o.minZ) ? o.minZ : 1.64;               // ブレンドを始める/やめるのに必要な確からしさ
+  const MIN_Z_RECENT = Number.isFinite(o.minZRecent) ? o.minZRecent : 2.33; // 「直近だけで選ぶ」に切り替えるのに必要な確からしさ
+  const currentW = Number.isFinite(o.currentW) && o.currentW > 0 ? Math.min(0.9, o.currentW) : 0; // いま使っている比率(分からなければ 0)
+  const samples = (records || []).map(blendSampleOf).filter(Boolean);
+  if (samples.length < MIN_SAMPLES) {
+    return { adopted: false, w: 0, samples: samples.length, mode: "cv", reasonJa: `オッズ付きで答え合わせ済みの記録が${samples.length}件で、ブレンド学習に必要な${MIN_SAMPLES}件に達していません(記録が貯まれば自動で学習します)。` };
+  }
+  const n = samples.length;
+  const EPS = 1e-9;
+  const r4 = (v) => Math.round(v * 10000) / 10000;
+  const GRID = [];
+  for (let g = 0; g <= 18; g++) GRID.push(Math.round(g * 5) / 100); // 0, 0.05, …, 0.9(採用の上限は 0.9)
+  const lossOf = (x, w) => -Math.log(Math.max(EPS, blendProbs(x.model, x.market, w)[x.actual]));
+  // 損失の表: loss[g][i] = 比率 GRID[g] で i 番めの試合を予想したときの損失
+  const loss = GRID.map((w) => samples.map((x) => lossOf(x, w)));
+  const meanOver = (g, from, to) => { let sum = 0; for (let i = from; i < to; i++) sum += loss[g][i]; return to > from ? sum / (to - from) : Infinity; };
+  // 同点なら小さい w(市場を混ぜすぎない側)を選ぶ。従来と同じ
+  const argminOver = (from, to) => { let best = 0, bestV = meanOver(0, from, to); for (let g = 1; g < GRID.length; g++) { const v = meanOver(g, from, to); if (v < bestV) { bestV = v; best = g; } } return best; };
+  const blocks = [];
+  for (let k = 0; k < FOLDS; k++) blocks.push([Math.floor((n * k) / FOLDS), Math.floor((n * (k + 1)) / FOLDS)]);
+  const pooled = (diffs) => {
+    const m = diffs.length;
+    if (!m) return { n: 0, gain: null, z: null };
+    let sum = 0; for (const d of diffs) sum += d;
+    const mean = sum / m;
+    let ss = 0; for (const d of diffs) ss += (d - mean) * (d - mean);
+    const se = m > 1 ? Math.sqrt(ss / (m - 1) / m) : 0;
+    return { n: m, gain: mean, z: se > 0 ? mean / se : (mean > 0 ? Infinity : 0) };
+  };
+  // ---- 前向きの検証(区間2〜5) ----
+  const dAiVsA = [], dAiVsB = [], dAVsB = [];
+  let sumAi = 0, sumA = 0, sumB = 0;
+  const perBlock = [];
+  for (let k = 1; k < FOLDS; k++) {
+    const [vs, ve] = blocks[k];
+    const gA = argminOver(0, vs);
+    const gB = argminOver(blocks[Math.max(0, k - 2)][0], vs);
+    for (let i = vs; i < ve; i++) {
+      const lAi = loss[0][i], lA = loss[gA][i], lB = loss[gB][i];
+      dAiVsA.push(lAi - lA); dAiVsB.push(lAi - lB); dAVsB.push(lA - lB);
+      sumAi += lAi; sumA += lA; sumB += lB;
+    }
+    perBlock.push({ block: k + 1, size: ve - vs, wFromAllPast: GRID[gA], wFromRecent: GRID[gB], bestWInBlock: GRID[argminOver(vs, ve)] });
+  }
+  const nOof = dAiVsA.length;
+  const stRecent = pooled(dAVsB);
+  const useRecent = stRecent.gain !== null && stRecent.gain > 0 && stRecent.z >= MIN_Z_RECENT;
+  const stAi = pooled(useRecent ? dAiVsB : dAiVsA);
+  const oofBase = nOof ? sumAi / nOof : null;
+  const oofBest = nOof ? (useRecent ? sumB : sumA) / nOof : null;
+  // ---- 実際に使う w(選んだ決め方を、全部の記録に当てる) ----
+  const gFinal = useRecent ? argminOver(blocks[FOLDS - 2][0], n) : argminOver(0, n);
+  const bestW = GRID[gFinal];
+  // ---- 開示用の曲線(v101 と同じ形: 古い7割・新しい3割。+ 全件) ----
+  const split = Math.floor(n * 0.7);
+  const train = samples.slice(0, split), valid = samples.slice(split);
+  const nllOf = (set, w) => (set.length ? set.reduce((acc, x) => acc + lossOf(x, w), 0) / set.length : null);
+  const accOf = (set, w) => (set.length ? set.filter((x) => {
+    const p = blendProbs(x.model, x.market, w);
+    const pick = p.home >= p.draw && p.home >= p.away ? "home" : p.away >= p.draw ? "away" : "draw";
+    return pick === x.actual;
+  }).length / set.length : null);
+  const curve = [];
+  for (let w10 = 0; w10 <= 10; w10++) {
+    const w = w10 / 10;
+    curve.push({ w, trainNll: r4(nllOf(train, w)), validNll: r4(nllOf(valid, w)), validAccPct: Math.round(accOf(valid, w) * 1000) / 10, allNll: r4(nllOf(samples, w)) });
+  }
+  const marketAloneValidNll = r4(nllOf(valid, 1));
+  const cv = {
+    folds: FOLDS, n: nOof,
+    procedure: useRecent ? "recent" : "allPast",
+    gainVsAiOnly: stAi.gain === null ? null : r4(stAi.gain), zVsAiOnly: Number.isFinite(stAi.z) ? Math.round(stAi.z * 100) / 100 : (stAi.z === Infinity ? "Infinity" : null),
+    recentVsAllPast: { gain: stRecent.gain === null ? null : r4(stRecent.gain), z: Number.isFinite(stRecent.z) ? Math.round(stRecent.z * 100) / 100 : (stRecent.z === Infinity ? "Infinity" : null), minZ: MIN_Z_RECENT, used: useRecent },
+    perBlock,
+    bestWAll: GRID[argminOver(0, n)], bestWRecent: GRID[argminOver(blocks[FOLDS - 2][0], n)],
+    noteJa: "区間2〜5のそれぞれで「それより前の区間で最良だった比率」を試し、束ねた値。allPast=それより前の全部で選ぶ/recent=直前の2区間だけで選ぶ。",
+  };
+  const common = {
+    samples: n, mode: "cv", cv, curve, marketAloneValidNll,
+    validNllBase: oofBase === null ? null : r4(oofBase), validNllBest: oofBest === null ? null : r4(oofBest),
+  };
+  // ---- いまの比率との差がごく小さいときは変えない(比べるのは、w を選んだのと同じ範囲の記録) ----
+  const KEEP_MARGIN = 0.0005;
+  const selFrom = useRecent ? blocks[FOLDS - 2][0] : 0;
+  const nllSel = (w) => { let sum = 0; for (let i = selFrom; i < n; i++) sum += lossOf(samples[i], w); return sum / (n - selFrom); };
+  const keepCurrent = currentW > 0 && bestW > 0 && Math.abs(bestW - currentW) >= 0.005 && (nllSel(currentW) - nllSel(bestW)) < KEEP_MARGIN;
+  const useW = keepCurrent ? currentW : bestW;
+  const keptNoteJa = keepCurrent
+    ? `最良の比率は市場${Math.round(bestW * 100)}%でしたが、いまの比率(市場${Math.round(currentW * 100)}%)との差がごく小さい(NLL の差${r4(nllSel(currentW) - nllSel(bestW))})ため、いまの比率を変えません。`
+    : "";
+  const gain = stAi.gain, z = stAi.z;
+  const zTxt = Number.isFinite(z) ? String(Math.round(z * 100) / 100) : (z === Infinity ? "∞" : "測定不可");
+  const accBase = Math.round(accOf(valid, 0) * 1000) / 10;
+  const adoptedOut = (w, reasonJa, extra) => ({
+    adopted: true, w, ...common, currentW,
+    validAccBasePct: accBase, validAccBestPct: Math.round(accOf(valid, w) * 1000) / 10,
+    reasonJa, ...(extra || {}),
+  });
+  const notAdoptedOut = (reasonJa, extra) => ({ adopted: false, w: 0, bestTrainW: bestW, ...common, currentW, reasonJa, ...(extra || {}) });
+  // A: 全件で見ても AI 単独が最良
+  if (bestW === 0) return notAdoptedOut("学習データ上も自前モデル単独が最良だったため、ブレンドは使いません。", { decision: "ai_only_best" });
+  if (gain !== null && gain > 0) {
+    // B: 改善している。いまブレンドしていないときは、確かめられたときだけ始める
+    if (currentW > 0 || z >= MIN_Z) {
+      return adoptedOut(useW, `検証${nOof}件でブレンド(市場${Math.round(useW * 100)}%+AI${Math.round((1 - useW) * 100)}%)がNLL ${r4(oofBase)}→${r4(oofBest)}へ改善したため採用しました。${keptNoteJa}`,
+        { decision: currentW > 0 ? (keepCurrent ? "continue_kept_ratio" : (Math.abs(useW - currentW) < 0.005 ? "continue_same" : "continue_updated")) : "start", bestW });
+    }
+    // C: 改善は見えるが、偶然と区別できない(いまはブレンドしていない → 始めない)
+    return notAdoptedOut(`検証${nOof}件でブレンド(w=${bestW})の改善は${r4(gain)}・z=${zTxt}で、偶然と区別できる水準(${MIN_Z}以上)に達していないため、採用を見送りました(迷ったら現状維持)。`, { decision: "not_started" });
+  }
+  // 改善していない
+  if (currentW > 0 && !(z <= -MIN_Z)) {
+    // D: いまブレンドしていて、悪化も確かめられない → ブレンドは続ける。比率は全件で最良の値にする
+    return adoptedOut(useW, keepCurrent
+      ? `検証${nOof}件ではブレンドと自前モデル単独の差が誤差の範囲(改善${gain === null ? "測定不可" : r4(gain)}・z=${zTxt})だったため、ブレンドは続けます。${keptNoteJa}`
+      : `検証${nOof}件ではブレンドと自前モデル単独の差が誤差の範囲(改善${gain === null ? "測定不可" : r4(gain)}・z=${zTxt})だったため、ブレンドは続け、比率は記録の中で最良の値(市場${Math.round(bestW * 100)}%)にしました。`,
+      { decision: keepCurrent ? "continue_kept_ratio" : "continue_no_clear_gain", bestW });
+  }
+  // E: ブレンドしていない、または悪化が確かめられた → 使わない
+  return notAdoptedOut(`検証データでブレンド(w=${bestW})が自前モデル単独を上回らなかったため、採用を見送りました(迷ったら現状維持)。`, { decision: currentW > 0 ? "stopped" : "not_started" });
+}
+
+/**
+ * 市場ブレンド比 w を学習する(入口)。
+ * 既定は v102 の「時系列の前向き検証」。MARKET_BLEND_FIT_MODE=holdout(または opts.mode="holdout")で v101 までの決め方に戻せる。
+ */
+function fitMarketBlend(records, opts) {
+  const modeRaw = String((opts && opts.mode) || process.env.MARKET_BLEND_FIT_MODE || "cv").toLowerCase();
+  if (modeRaw === "holdout") return { ...fitMarketBlendHoldout(records, opts), mode: "holdout" };
+  return fitMarketBlendCv(records, opts);
 }
 
 // ============================================================================
@@ -1544,7 +1786,7 @@ module.exports = {
   computeFeatureEffectiveness,
   buildAblationCandidates,
   fitWeightsGradientDescent,
-  fitMarketBlend, applyMarketBlend, blendProbs,
+  fitMarketBlend, fitMarketBlendCv, fitMarketBlendHoldout, applyMarketBlend, blendProbs,
   fitSecondOpinionBlend, applySecondOpinionBlend, secondOpinionSampleOf, baselineProbsOf, // v79(案6)
   describeWeightsHistoryEntry,
   buildLearningSummary,

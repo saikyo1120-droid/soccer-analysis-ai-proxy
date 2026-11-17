@@ -491,10 +491,33 @@ function buildEngineStatuses(ctx) {
       (apiPlan && apiPlan.noteJa) || "まだ契約プランを自動判定できていません。");
   }
 
-  push("llm", "LLM(AIの考察生成)",
-    llmConfigured ? "ok" : "warn",
-    llmConfigured ? "APIキーが設定されています。" : "未設定です。実データの蓄積は続きますが、AIによる考察・プロフィール生成は行われません。",
-    llmConfigured ? null : "Renderの環境変数 ANTHROPIC_API_KEY を設定してください。");
+  // ---- v102(本番実測 11/17): 鍵が設定されているだけで「正常」と言わない ----
+  //   実測: 回答AIは残高不足で全部の呼び出しが失敗していたのに、ここは「APIキーが設定されています」で正常だった。
+  //   最新の学習の記録に、回答AIの失敗が残っていれば、それを出す(記録が無い失敗は推測しない)。
+  const llmErrs = (Array.isArray(log.errors) ? log.errors : []).map(String);
+  const llmCreditErrs = llmErrs.filter((x) => /credit_balance_too_low/.test(x));
+  const llmKeyErrs = llmErrs.filter((x) => /invalid_api_key/.test(x));
+  const dailyViewErrs = llmErrs.filter((x) => /^daily_view_failed:/.test(x));
+  const viewsMade = (log.aiViewsChanged || 0) + (log.aiViewsUnchanged || 0);
+  if (!llmConfigured) {
+    push("llm", "LLM(AIの考察生成)", "warn",
+      "未設定です。実データの蓄積は続きますが、AIによる考察・プロフィール生成は行われません。",
+      "Renderの環境変数 ANTHROPIC_API_KEY を設定してください。");
+  } else if (llmCreditErrs.length) {
+    push("llm", "LLM(AIの考察生成)", "error",
+      `回答AI(Anthropic)の利用料の残高が不足しています。最新の学習で、回答AIの呼び出しが${llmCreditErrs.length}件、残高不足で失敗しました。「質問」への回答と、AIの見解などの文章の生成が止まっています(予想・答え合わせ・学習の計算は動いています)。`,
+      "Anthropic の管理画面(console.anthropic.com)の Billing で残高を追加してください。追加後は、アップロードや再デプロイをしなくても戻ります。");
+  } else if (llmKeyErrs.length) {
+    push("llm", "LLM(AIの考察生成)", "error",
+      `回答AI(Anthropic)がAPIキーを受け付けませんでした(最新の学習で${llmKeyErrs.length}件)。「質問」への回答と、文章の生成が止まっています。`,
+      "Renderの環境変数 ANTHROPIC_API_KEY が正しいか確認してください。");
+  } else if (dailyViewErrs.length >= 3 && viewsMade === 0) {
+    push("llm", "LLM(AIの考察生成)", "warn",
+      `最新の学習で、AIの見解の生成が${dailyViewErrs.length}件すべて失敗しました(例: ${dailyViewErrs[0].slice(0, 120)})。回答AIの呼び出しに問題がある可能性があります。`,
+      "/api/diag/llm を開くと、回答AIを実際に1回呼んだ結果(失敗の理由)を確認できます。");
+  } else {
+    push("llm", "LLM(AIの考察生成)", "ok", "APIキーが設定されています。", null);
+  }
 
   // 5. Learning Engine
   if (log.ranYet === false) {
@@ -523,6 +546,9 @@ function buildEngineStatuses(ctx) {
   const minNeeded = log.minResolvedForRecalibration || 10;
   if (log.weightsUpdated || log.weightsUpdatedV2) {
     push("prediction", "Prediction Engine(予測モデル)", "ok", "本日、実データに基づいて重みを更新しました。");
+  } else if (log.modelTuning && log.modelTuning.adopted === true) {
+    // v102(B): 過去試合の交差検証で採用した日(自社予想の記録の関門 ④ は通らなくても、重みは更新されている)
+    push("prediction", "Prediction Engine(予測モデル)", "ok", "本日、過去試合の検証に基づいて重みを更新しました。");
   } else if (resolvedSoFar >= minNeeded) {
     // 第6次監査で発見した誤りの修正:
     //   「更新すると精度が悪化すると判定した」と断言していたが、実際に
@@ -539,6 +565,23 @@ function buildEngineStatuses(ctx) {
   } else {
     push("prediction", "Prediction Engine(予測モデル)", "ok",
       `検証済み${resolvedSoFar}件 / 更新に必要な${minNeeded}件(あと${Math.max(0, minNeeded - resolvedSoFar)}件)。少ないデータで重みを動かすと過学習になるため、意図的に固定しています。`);
+  }
+
+  // 7-b. v102: 過去試合によるモデル調整を「軽い設定」で動かしている日は、注意として出す(黙って切り替えない)
+  //   前回の調整が途中で処理ごと止まったあとの数日間だけ出る。操作は要らないが、続くようなら機械のメモリが足りていない合図。
+  const tuneGuard = log.modelTuning && log.modelTuning.crashGuard;
+  if (tuneGuard && tuneGuard.safeMode === true) {
+    push("tuningSafeMode", "過去試合によるモデル調整(軽い設定で動作中)", "warn",
+      tuneGuard.reasonJa || "前回の過去試合によるモデル調整が途中で止まったため、軽い設定で動かしています。",
+      "操作は不要です。期間が終わると、自動で通常の設定に戻して確かめます。そこでも止まった場合は、軽い設定の期間を14日に延ばします。予想・答え合わせ・地力レーティングの更新は続いています。");
+  }
+
+  // 7-c. v102: メモリの余裕が足りず、過去試合での重みの検証を見送った日(落ちる前にやめた日)も、注意として出す
+  const tuneMemCheck = log.modelTuning && log.modelTuning.memoryCheck;
+  if (tuneMemCheck && tuneMemCheck.ok === false) {
+    push("tuningMemory", "過去試合によるモデル調整(メモリの余裕が不足)", "warn",
+      tuneMemCheck.reasonJa || "メモリの余裕が足りないため、過去試合での重みの検証を見送りました。",
+      "操作は不要です(予想・答え合わせ・地力レーティングの更新は続いています)。何日も続く場合は、サーバーのメモリが、学習リーグを増やしたあとの計算に足りていません。");
   }
 
   // 8. Memory Engine
@@ -639,6 +682,25 @@ const LEARN_ERROR_RULES = [
     titleJa: "提供元で見つからなかった選手がいます",
     meaningJa: "表記ゆれ等で、API-Football側の選手と結びつけられなかったものです。",
     effectJa: "その選手の成績だけが更新されません。他の選手には影響しません。",
+  },
+  // ---- v102(本番実測 11/17)で追加: 回答AIの失敗 ----
+  //   これまでは下の受け皿(「提供元からの取得が失敗」)に落ちていて、データ提供元(API-Football)の話に見えていた。
+  //   残高不足は、利用者が残高を追加するまで直らないので、いちばん上の重さ(影響あり)で、直し方まで書く。
+  {
+    id: "llmCredit",
+    test: /credit_balance_too_low/,
+    level: "impact",
+    titleJa: "回答AIの利用料の残高が不足しています",
+    meaningJa: "回答AI(Anthropic)が「残高が足りない」と答え、呼び出しを受け付けませんでした(データ提供元の失敗ではありません)。",
+    effectJa: "「質問」への回答と、AIの見解などの文章の生成が止まります。予想・答え合わせ・学習の計算には影響しません。Anthropic の管理画面(console.anthropic.com)の Billing で残高を追加すると、追加の操作なしで戻ります。",
+  },
+  {
+    id: "dailyViewLlm",
+    test: /^daily_view_failed:/,
+    level: "minor",
+    titleJa: "AIの見解を作れなかったクラブがあります",
+    meaningJa: "回答AIの呼び出しが失敗した、または返ってきた文が使えませんでした(データ提供元の取得の失敗ではありません)。",
+    effectJa: "そのクラブの「AIの見解」が、その日は新しくなりません(前の日の見解のまま)。予想・答え合わせには影響しません。",
   },
   // ---- v55(第11次監査)で追加: 選手収集の個別失敗 ----
   //   本番で「Guillem Badiaの統計取得失敗」1件が受け皿(影響あり)に落ち、

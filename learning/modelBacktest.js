@@ -28,7 +28,8 @@ const OUTCOMES = ["home", "draw", "away"];
 
 /** 1試合ぶんの予測を、評価に必要な形でまとめて返す */
 function predictRow(row, weights) {
-  const f = computeMatchFeatures(row.homeCtx, row.awayCtx, null);
+  // v102(B): 過去試合の行が対戦成績(それ以前の直接対戦)を持っていれば使う。持っていない行(v3 以前の形式)は従来どおり無し
+  const f = computeMatchFeatures(row.homeCtx, row.awayCtx, row.h2h || null);
   const { homeLambda, awayLambda, predictedWinner } = predictOutcomeV2(f, weights);
   const rho = weights && weights.rho ? weights.rho : 0;
   const p = computeMatchProbabilitiesRaw(homeLambda, awayLambda, 8, rho);

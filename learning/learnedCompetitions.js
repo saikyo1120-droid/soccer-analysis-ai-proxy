@@ -33,10 +33,55 @@
  *   学習されていなかったため、名前で学習済み扱いにすると集計が遡って化ける)。
  */
 
-const { DEFAULT_BACKFILL_LEAGUES } = require("./historicalBackfill");
+const { activeLeagueIds, onLeagueActivationChange, CORE_LEAGUE_IDS } = require("./historicalBackfill");
 
-/** 学習対象の大会ID(過去試合を実際に取得している大会) */
-const LEARNED_LEAGUE_IDS = new Set(DEFAULT_BACKFILL_LEAGUES.map((l) => l.id));
+/**
+ * 学習対象の大会ID(過去試合を実際に取得している大会)。
+ * v102 ★2: 「生きた集合」にした。中身は「従来の15大会+照合に通って保存済みのデータセットに入った新リーグ」。
+ *   新リーグは、historicalBackfill.setActivatedLeagues が呼ばれた時点(起動時・学習の開始時・データセットを作り直したあと)で
+ *   足される。まだ学習データに入っていないリーグを「学習した大会」と数えない。
+ *   この Set そのものを持っている呼び出し側(server.js・dailyJob.js)にも、足した結果がそのまま見える。
+ */
+const LEARNED_LEAGUE_IDS = new Set(activeLeagueIds());
+function syncLearnedLeagueIds() {
+  const want = new Set(activeLeagueIds());
+  for (const id of [...LEARNED_LEAGUE_IDS]) if (!want.has(id)) LEARNED_LEAGUE_IDS.delete(id);
+  for (const id of want) LEARNED_LEAGUE_IDS.add(id);
+  return LEARNED_LEAGUE_IDS.size;
+}
+onLeagueActivationChange(syncLearnedLeagueIds);
+/** いま「学習した大会」に数えている大会の数(画面・回答の文に使う。決め打ちの数字を書かない) */
+function learnedCompetitionCount() { return LEARNED_LEAGUE_IDS.size; }
+/** 内訳: 従来の15大会(core)と、あとから加えた各国リーグ(extra) */
+function learnedScope() {
+  let extra = 0;
+  for (const id of LEARNED_LEAGUE_IDS) if (!CORE_LEAGUE_IDS.has(id)) extra++;
+  const total = LEARNED_LEAGUE_IDS.size;
+  return { total, core: total - extra, extra };
+}
+// ---- 画面・回答に出す文の部品(v102 ★2)。あとから加えたリーグが0のあいだは、v101 までと1文字も変わらない ----
+/** 的中率の内訳に添える説明 */
+function learnedScopeNoteJa() {
+  const s = learnedScope();
+  const scope = s.extra > 0
+    ? `${s.total}大会(欧州9リーグ+CL・EL・ECL+J1・イングランド2部・ブラジル全国選手権の15大会と、あとから加えた各国リーグ${s.extra}大会)`
+    : "15大会(欧州9リーグ+CL・EL・ECL+J1・イングランド2部・ブラジル全国選手権)";
+  return `AIが過去試合を学習しているのは${scope}です。それ以外の大会は学習データが無いため、予想は出しますが実力を測る集計とは分けています。`;
+}
+/** 地力レーティングの説明に入れる「何大会×5シーズン(…を含む)」 */
+function ratingsScopeJa() {
+  const s = learnedScope();
+  return s.extra > 0
+    ? `${s.total}大会×5シーズン(欧州カップ戦・J1・イングランド2部・ブラジル・各国リーグ${s.extra}大会を含む)`
+    : "15大会×5シーズン(欧州カップ戦・J1・イングランド2部・ブラジルを含む)";
+}
+/** 「学習しているクラブ」の説明に入れる範囲 */
+function clubScopeJa() {
+  const s = learnedScope();
+  return s.extra > 0
+    ? `${s.total}大会(欧州12大会+J1・イングランド2部・ブラジル全国選手権+各国リーグ${s.extra}大会)`
+    : "15大会(欧州12大会+J1・イングランド2部・ブラジル全国選手権)";
+}
 
 /**
  * 大会IDが記録されていない古い予測のための、名前による補助判定。
@@ -72,7 +117,7 @@ function classifyLearnedCompetition(leagueId, leagueName, learnedIds) {
   const ids = learnedIds || LEARNED_LEAGUE_IDS;
   const unlearned = () => ({
     learned: false,
-    reasonJa: `${leagueName ? `「${leagueName}」は` : "この大会は"}AIの学習データに含まれていない大会です(学習しているのは15大会)。参考予想として扱い、実力を測る的中率とは分けて集計しています。`,
+    reasonJa: `${leagueName ? `「${leagueName}」は` : "この大会は"}AIの学習データに含まれていない大会です(学習しているのは${ids.size}大会)。参考予想として扱い、実力を測る的中率とは分けて集計しています。`,
   });
   // Number(null) も Number("") も 0 になってしまうため、空の値は先に弾く
   // (これを怠ると、IDが無い古い記録が「ID=0の未知の大会」として扱われ、
@@ -123,6 +168,7 @@ function accuracySplit(records, isOfficial) {
 }
 
 module.exports = {
-  LEARNED_LEAGUE_IDS, LEARNED_LEAGUE_NAMES,
+  LEARNED_LEAGUE_IDS, LEARNED_LEAGUE_NAMES, learnedCompetitionCount, syncLearnedLeagueIds,
+  learnedScope, learnedScopeNoteJa, ratingsScopeJa, clubScopeJa,
   classifyLearnedCompetition, isLearnedRecord, accuracySplit,
 };

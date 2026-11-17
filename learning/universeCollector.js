@@ -102,6 +102,9 @@ async function collectUniverse(deps, runAt, dateKey) {
     thoughtTimeline, computeFormScore, recordLearned,
   } = deps;
   const season = seasonOf(runAt);
+  // v102: 長い繰り返しの途中でも、進捗の時刻を更新する(毎日の学習から渡されたときだけ。間引きは渡す側が行う=1分に1回まで)。
+  //   進捗の更新に失敗しても収集は止めない(渡す側が失敗を記録に残す)。
+  const beat = async (detail) => { if (typeof deps.heartbeat === "function") await deps.heartbeat(detail); };
   // 2026年8月・ご指示⑩: AIが前日に決めた学習計画の「優先クラブ」。
   // 該当クラブは輪番を待たずに、今日のコア更新・xG更新の対象に加わる
   // (計画を立てるだけでなく、実際の収集行動を変える)。
@@ -569,6 +572,7 @@ async function collectUniverse(deps, runAt, dateKey) {
   const leagueTeams = new Map(); // leagueId -> [{club, teamId}]
 
   for (const club of coreClubs) {
+    await beat("クラブの基本情報の更新");
     if (!canSpend(4)) { skip("core", `予算残量が安全ラインを下回ったため、${club.nameJa}以降のコア更新を見送りました。`); break; }
     try {
       let { teamId } = await resolveTeam(club);
@@ -818,6 +822,7 @@ async function collectUniverse(deps, runAt, dateKey) {
   for (const c of identityHealedClubs) if (!squadClubs.includes(c)) squadClubs.push(c);
   stats.squadsPlanned = squadClubs.length;
   for (const club of squadClubs) {
+    await beat("名簿の更新");
     if (!canSpend(1)) { skip("squad", `予算残量が安全ラインを下回ったため、${club.nameJa}以降の名簿更新を見送りました。`); break; }
     try {
       const { teamId } = await resolveTeam(club);
@@ -877,6 +882,7 @@ async function collectUniverse(deps, runAt, dateKey) {
   ];
   stats.bulkClubsPlanned = bulkClubs.length;
   for (const club of bulkClubs) {
+    await beat("選手の一括取得");
     if (!canSpend(2)) {
       skip("bulkPlayers", `予算残量が安全ラインを下回ったため、${club.nameJa}以降の「クラブ単位の選手一括取得」を見送りました(見送ったぶんは翌日に回ります)。`);
       break;

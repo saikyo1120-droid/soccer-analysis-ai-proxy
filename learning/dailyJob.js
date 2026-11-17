@@ -62,7 +62,25 @@ function llmErrorTag(e) {
   const parts = [];
   if (hint) parts.push(hint[0]);
   if (e && e.retriedAfterEmpty) parts.push("再試行も空");
+  // ---- v102(本番実測 11/17): HTTP の失敗は、状態コードと原因の種類も残す ----
+  //   実測: 回答AIが HTTP 400 "Your credit balance is too low to access the Anthropic API." を返していたが、
+  //   記録は「HTTP_ERROR」だけで、残高切れだと読み取れなかった(/api/diag/llm を叩いて初めて分かった)。
+  //   鍵や本文は残さず、状態コードと、決まった種類の印だけを添える。
+  if (code === "HTTP_ERROR") {
+    if (Number.isFinite(e && e.httpStatus)) parts.push(`http=${e.httpStatus}`);
+    const kind = llmHttpErrorKind(e);
+    if (kind) parts.push(kind);
+  }
   return parts.length ? `${code}(${parts.join("・")})` : code;
+}
+/** 回答AIの HTTP の失敗の種類(決まった印だけを返す。分からなければ null) */
+function llmHttpErrorKind(e) {
+  const text = `${(e && e.message) || ""} ${(e && e.bodyText) || ""}`;
+  if (/credit balance is too low/i.test(text)) return "credit_balance_too_low"; // 利用料の残高不足
+  if (e && e.httpStatus === 401) return "invalid_api_key";
+  if (e && e.httpStatus === 429) return "rate_limited";
+  if (e && e.httpStatus === 529) return "overloaded";
+  return null;
 }
 
 // ---- 学習の全段階(自動QAが「完走したか」を判定するための唯一の正解表) ----
@@ -127,6 +145,7 @@ const { scorePrediction, buildDailyAccuracy, saveDailyAccuracy, getAccuracyTrend
 // v92: 「黙って飲み込む失敗」に痕跡を残す(挙動は変えない。learning/warnings.js 参照)
 const { noteWarning, summarizeWarnings, mergeWarningSummaries } = require("./warnings");
 const { readManyJSON } = require("./storeRead"); // v97: 複数キーのまとめ読み(MGET)と「読めなかった」の区別
+const { crossValidate, decideCvGate, summarizeCv } = require("./cvGate"); // v102(A): 重みの採否を交差検証+検定で決める
 // ---- 2026年8月・AI知能計測ラウンド(ご指示①〜⑨) ----
 // 考察の質・RAG使用率の日次保存、エンジン別成長率、Knowledgeの寄与ランキング、
 // 精度低下の自己分析、そして毎日の自己評価「今日のAIは昨日より賢くなったか?」
@@ -158,7 +177,7 @@ const {
 const { computeMarketProbs } = require("./accuracyTracker");
 const { CLUB_UNIVERSE, clubsForPrediction } = require("./clubUniverse");
 // 2026年8月: 過去試合を使ったモデル調整(λの独立化・Dixon-Coles・採用ゲート)
-const { tuneModelOnHistory, getTuningHistory } = require("./modelTuning");
+const { tuneModelOnHistory, getTuningHistory, memorySnapshot, memoryLimits } = require("./modelTuning");
 // v48「週間AIダイジェスト」(2026年8月18日・利用者の選択)
 const { generateAndStoreWeeklyDigest } = require("./weeklyDigest");
 // v50「チームの地力レーティング」(2026年8月18日・利用者の選択①)
@@ -175,7 +194,7 @@ const clubEloMod = require("./clubElo");
 const xgCollectMod = require("./xgCollect");
 // v57: スタメン確定ウォッチ(答え合わせ時に朝版vs直前版のBrierを両方採点)
 const lineupWatchMod = require("./lineupWatch");
-const { DEFAULT_BACKFILL_LEAGUES } = require("./historicalBackfill");
+const { BACKFILL_META_KEY, activateFromMeta, activeLeagueIds } = require("./historicalBackfill"); // v102 ★2: 学習に実際に使っているリーグ
 // ① 学習によって「予測がどう変わったか」の記録
 const { computePredictionShift } = require("./predictionShift");
 // ⑩ AIが自分で「次に何を学ぶか」を決める
@@ -201,12 +220,20 @@ const { sampleWeightOf, buildFeatureTrust } = require("./trustEngine");
 //   控えめな値に戻る(利用者向けの余力を最優先する通常モード)。
 //   フルスロットル中も、予算の安全弁(apiBudget)と40分アラームは従来どおり働く。
 const PRELAUNCH_LEARNING = String(process.env.PRELAUNCH_LEARNING ?? "1") !== "0";
+// ---- v102 C(2026年11月17日・利用者の決定 11/12): 自社予想の記録を増やす ----
+//   学習リーグが最大31大会になると、週末は「今日・明日の全試合」だけで1日100件を超える。
+//   上限が90のままだと、学習した大会の試合なのに予想が立たない(=答え合わせの材料が増えない)日が出る。
+//   公開前モードの上限を 90 → 120(記録)・70 → 100(学習した大会の全試合の枠)に上げる。
+//   答え合わせの上限は下の式で 135 → 180 になる(記録より多く消化できる関係は従来どおり)。
+//   増える消費の見積り: 外部API は予想1件あたり10〜20リクエスト(最大で1日+約600。1日の枠 7,500 に対して余裕がある)、
+//   保存先は予想1件あたり十数コマンド(最大で1日+約2,000。README のラウンド87に月の見通しを書いた)。
+//   通常モード(PRELAUNCH_LEARNING=0)の値は変えていない。
 const OWN_PREDICT_LOG_CAP = Number(process.env.OWN_PREDICT_LOG_CAP)
-  || (PRELAUNCH_LEARNING ? 90 : 20); // 1回の実行で新しく記録する自社予測の件数上限(公開前は90)
+  || (PRELAUNCH_LEARNING ? 120 : 20); // 1回の実行で新しく記録する自社予測の件数上限(公開前は120。v101 までは90)
 // v80(案8): 学習済み12大会の「全試合」を予測対象に加える際の1回あたり上限。
 // 通常モードでは0(=従来どおり登録クラブの試合だけ)。
 const EXTRA_FIXTURES_CAP = Number(process.env.EXTRA_FIXTURES_CAP)
-  || (PRELAUNCH_LEARNING ? 70 : 0);
+  || (PRELAUNCH_LEARNING ? 100 : 0); // v102 C: 70 → 100
 // 予測を1件立てるのに必要な最低リクエスト数の目安。これを下回ったら打ち切る。
 const OWN_PREDICT_MIN_BUDGET = 25;
 // ---- 2026年8月・上の引き上げと必ずセットで直す必要がある値 ----
@@ -850,6 +877,8 @@ async function runDailyLearning(deps) {
 
   const nowFn = typeof now === "function" ? now : () => new Date();
   const runAt = nowFn();
+  // v102: 学習を始めた時点の、この処理のメモリの実測(成長ログの processMemory に、終わりの値と並べて残す)
+  const processMemoryAtStart = memorySnapshot();
   const dateKey = typeof appDateKeyFn === "function"
     ? appDateKeyFn(runAt)
     : runAt.toISOString().slice(0, 10); // YYYY-MM-DD(利用者のいる地域の「今日」)
@@ -1068,7 +1097,45 @@ async function runDailyLearning(deps) {
       });
     } catch (e) { warn(`progress_save_failed:${name}`, e); } // 進捗の記録に失敗しても学習は止めない(v92: 痕跡は残す)
   };
+  // ---- v102: 段階の途中の「心拍」 ----
+  //   自己修復は「進捗が35分更新されなければ、その学習は落ちた」とみなして拾い直す(server.js)。
+  //   学習リーグを増やして過去試合の取得と検証が長くなったので、長い段階(④-b)の途中でも進捗の時刻だけを更新して、
+  //   動いている学習を「落ちた」と見誤らせない(段階の番号・一覧は変えない。保存先への書き込みは1回1コマンド)。
+  let lastHeartbeatMs = 0;
+  const heartbeat = async (detail) => {
+    if (!upstashEnabled || !stageLog.length) return;
+    const nowMs = Date.now();
+    if (nowMs - lastHeartbeatMs < 60 * 1000) return; // 1分に1回まで
+    lastHeartbeatMs = nowMs;
+    const cur = stageLog[stageLog.length - 1];
+    const beat = {
+      date: dateKey, startedAt: runStartedAt, stage: cur.name, stageIndex,
+      at: new Date(nowMs).toISOString(), elapsedSec: Math.max(0, Math.round((nowMs - runAt.getTime()) / 1000)),
+      finished: false, stages: stageLog.slice(-30),
+      ...(detail ? { detail: String(detail).slice(0, 80) } : {}),
+    };
+    // 心拍は長い計算の直後に打つことが多い。待機中に切れていた接続に当たって最初の1回だけ失敗することがあるので、
+    // 少し待ってもう1回だけ試す(同じ内容を書くだけなので、2回書いても結果は同じ)。それでも駄目なら記録に残して先へ進む。
+    try {
+      let ok = false, firstError = null;
+      try { ok = (await upstashSetJSON("learn:progress", beat)) !== false; } catch (e) { firstError = e; }
+      if (!ok) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        const ok2 = (await upstashSetJSON("learn:progress", beat)) !== false;
+        if (!ok2) throw (firstError || new Error("store_write_failed"));
+      }
+    } catch (e) { warn(`progress_heartbeat_failed:${cur.name}`, e); }
+  };
   await stage("開始");
+
+  // ---- v102 ★2: 「学習した大会」を、保存済みの過去試合データセットの中身に合わせる ----
+  //   新しく足したリーグは、照合に通ってデータセットに入ったものだけを学習済みに数える。
+  //   今日の予想(段階③)で「学習した大会か」を正しく判定するため、最初に目次を1回読む。
+  //   読めなかったときは何もしない(いまの状態を保つ)。
+  if (upstashEnabled) {
+    try { activateFromMeta(await upstashGetJSON(BACKFILL_META_KEY)); }
+    catch (e) { warn("backfill_meta_read_failed", e); }
+  }
 
   // ---- ① 登録クラブの実結果から「事実」を抽出(Layer1)+ v2特徴量の下地を計算 ----
   await stage("① 登録クラブの実結果から事実を抽出");
@@ -1856,6 +1923,7 @@ async function runDailyLearning(deps) {
   const oddsApiStats = {
     enabled: oddsApiMod.isEnabled(process.env), leaguesFetched: 0, eventsTotal: 0, used: 0, failures: [],
     fixturesConsidered: 0, fixturesOutOfScope: 0,
+    providerQuota: null, // v102: 提供元が応答ヘッダーで返した利用枠(最後に受け取ったもの)
   };
   async function consensusForFixture(fx) {
     if (!oddsApiStats.enabled) return null;
@@ -1866,6 +1934,7 @@ async function runDailyLearning(deps) {
       const r = await oddsApiMod.fetchLeagueConsensus(
         { fetchFn: (u, o) => fetch(u, o), upstashCmd: upstashEnabled ? upstashCmd : null, env: process.env },
         lgId, runAt.getTime());
+      if (r && r.quota) oddsApiStats.providerQuota = r.quota;
       if (r && r.ok) {
         oddsApiStats.leaguesFetched++;
         oddsApiStats.eventsTotal += r.events.length;
@@ -2587,6 +2656,7 @@ async function runDailyLearning(deps) {
       tune: { xgRotationDays: selfTuneConfig.xgRotationDays, playerDetailCap: selfTuneConfig.playerDetailCap },
       // 第8次監査: 同日再実行ガード(kb:universe:ran:<date>)の読み書きに使う
       upstashCmd, upstashGetJSON, upstashSetJSON,
+      heartbeat, // v102: 長い収集の途中でも進捗の時刻を更新する(動いている学習を「落ちた」と見誤らせない)
     }, runAt, dateKey);
     if (universeStats.errors && universeStats.errors.length) errors.push(...universeStats.errors);
     // v92: 収集側で黙って続行した失敗も、成長ログの warnings に合流させる(内訳は universe: を前置)
@@ -2723,8 +2793,22 @@ async function runDailyLearning(deps) {
       //     B) 検証用LogLossが WEIGHT_GATE_MIN_LOGLOSS_GAIN(既定0.002)以上下がり、学習用LogLossも下がり、
       //        かつ的中率が学習用・検証用とも WEIGHT_GATE_ACCURACY_TOLERANCE_PT(既定0.5pt)以上は落ちない
       //   「劣化禁止」は B の的中率の下限で守る。WEIGHT_GATE_MODE=accuracy で従来の関門だけに戻せる。
-      const GATE_MODE = String(process.env.WEIGHT_GATE_MODE || "logloss").toLowerCase() === "accuracy" ? "accuracy" : "logloss";
-      const GATE_MIN_LOGLOSS_GAIN = Number.isFinite(Number(process.env.WEIGHT_GATE_MIN_LOGLOSS_GAIN)) ? Number(process.env.WEIGHT_GATE_MIN_LOGLOSS_GAIN) : 0.002;
+      // ---- v102(2026年11月17日・A「関門の統計化」): 既定の関門を「5分割の交差検証+対応のある差の検定」へ ----
+      //   本番実測(11/16): 重みは version 33 のまま32日間据え置き(候補5・通過0)。1回の 7:3 分割では、
+      //   新しい3割(約480件)にたまたま合った/合わなかった差と本物の差を区別できず、検証に使える件数も少なかった。
+      //   WEIGHT_GATE_MODE=cv(既定)では、記録を時系列の順のまま5つに分け、各かたまりを順に検証用に取り置いて、
+      //   残りで候補を作る。検証用の試合1件ごとの「現行の損失 − 候補の損失」を全件ぶん束ねて、
+      //   平均の改善・標準誤差・z を出す(learning/cvGate.js)。採用するのは、改善が WEIGHT_GATE_MIN_LOGLOSS_GAIN 以上・
+      //   z が WEIGHT_GATE_MIN_Z 以上・ほぼ全部の折で改善・的中率が許容幅より落ちない、をすべて満たした手続きだけ。
+      //   採用する重みは、通った手続きを全件で実行したもの。logloss / accuracy(v100 までの関門)もそのまま選べる。
+      const gateModeRaw = String(process.env.WEIGHT_GATE_MODE || "cv").toLowerCase();
+      const GATE_MODE = gateModeRaw === "accuracy" ? "accuracy" : gateModeRaw === "logloss" ? "logloss" : "cv";
+      const GATE_MIN_LOGLOSS_GAIN = Number.isFinite(Number(process.env.WEIGHT_GATE_MIN_LOGLOSS_GAIN)) && process.env.WEIGHT_GATE_MIN_LOGLOSS_GAIN !== ""
+        ? Number(process.env.WEIGHT_GATE_MIN_LOGLOSS_GAIN) : (GATE_MODE === "cv" ? 0.001 : 0.002);
+      const envNum = (name, def) => (process.env[name] !== undefined && process.env[name] !== "" && Number.isFinite(Number(process.env[name])) ? Number(process.env[name]) : def);
+      const CV_FOLDS = Math.max(3, Math.min(10, Math.floor(envNum("WEIGHT_GATE_CV_FOLDS", 5))));
+      const CV_MIN_Z = envNum("WEIGHT_GATE_MIN_Z", 1.64);
+      const CV_MIN_RECORDS = Math.max(CV_FOLDS * 20, Math.floor(envNum("WEIGHT_GATE_CV_MIN_RECORDS", 100)));
       const GATE_ACC_TOL = Number.isFinite(Number(process.env.WEIGHT_GATE_ACCURACY_TOLERANCE_PT)) ? Number(process.env.WEIGHT_GATE_ACCURACY_TOLERANCE_PT) : 0.5;
       // 参考値として旧v1モデルの的中率も残す(表示には使わない)
       const v1Reference = backtestAccuracy(recentRecords, currentWeights);
@@ -2770,7 +2854,162 @@ async function runDailyLearning(deps) {
         return true;
       };
 
-      if (baseTrain && baseValid) {
+      if (GATE_MODE === "cv") {
+        // ---- v102(A): 交差検証の関門 ----
+        const r4 = (x) => (Number.isFinite(x) ? Math.round(x * 10000) / 10000 : null);
+        const cvRecords = usable; // 古い順(learn:ownpred:recent の並び)= 時系列のかたまりに分けられる
+        weightGateToday = {
+          mode: "cv", folds: CV_FOLDS, minLogLossGain: GATE_MIN_LOGLOSS_GAIN, minZ: CV_MIN_Z, accuracyTolerancePt: GATE_ACC_TOL,
+          minRecords: CV_MIN_RECORDS, records: cvRecords.length,
+          // 従来からある欄(日次レポート・学習計画が読む)。cv では「束ねた検証」の値を入れる
+          fitSize: cvRecords.length, validSize: null,
+          baseTrainLogLoss: null, baseValidLogLoss: null, baseTrainAccuracyPct: null, baseValidAccuracyPct: null,
+          candidates: 0, passed: 0, adoptedGate: null, bestValidLogLoss: null, bestValidAccuracyPct: null,
+          procedures: [], pooledGain: null, pooledSe: null, z: null, accDeltaPt: null,
+        };
+        if (cvRecords.length < CV_MIN_RECORDS) {
+          const skipReason = !cvRecords.length
+            ? { method: "skipped_no_v2_records", note: "予測の記録に拡張特徴量(features)がまだ含まれていないため、現在の予測モデルでの検証ができませんでした。新しい形式で記録された予測が溜まり次第、自動的に再開します。" }
+            : { method: "skipped_insufficient_cv", note: `検証できる記録が${cvRecords.length}件で、交差検証で統計的に判断できる件数(${CV_MIN_RECORDS}件)に達していないため、重みは変更していません(少ない記録での「たまたまの改善」を採用しないため)。` };
+          weightGateToday.reasonJa = skipReason.note;
+          await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
+            date: dateKey, adopted: false, method: skipReason.method,
+            oldWeights: currentWeights, newWeights: null,
+            oldAccuracy: v1Reference ? v1Reference.accuracy : null, newAccuracy: null,
+            sampleSize: cvRecords.length, holdout: false, gate: "cv",
+            note: skipReason.note,
+          })]).catch(() => {});
+        } else {
+          // 1件の損失(学習の損失と同じ下限 0.005)と、的中(本番と同じ「引き分け帯」の判定)
+          const lossOf = (rec, w) => {
+            const po = predictOutcomeV2(rec.features, w);
+            const rho = w && Number.isFinite(w.rho) ? w.rho : 0;
+            const pr = computeMatchProbabilitiesRaw(po.homeLambda, po.awayLambda, undefined, rho);
+            const pFrac = rec.actualWinner === "home" ? pr.homeWin : rec.actualWinner === "away" ? pr.awayWin : pr.draw;
+            return { nll: -Math.log(Math.max(0.005, pFrac)), hit: po.predictedWinner === rec.actualWinner ? 1 : 0 };
+          };
+          const baseLossCache = new Map();
+          const baseLossOf = (rec) => { let v = baseLossCache.get(rec); if (!v) { v = lossOf(rec, currentWeights); baseLossCache.set(rec, v); } return v; };
+          const trainLossOf = (records, w) => computeNegativeLogLikelihood(records, w, trustOpts);
+          // 学習用の折で、損失がいちばん小さい候補(現行より良いものだけ)。無ければ null(=その折は現行のまま)
+          const pickBest = (train, cands) => {
+            const baseL = trainLossOf(train, currentWeights);
+            let bestC = null;
+            for (const c of cands || []) {
+              if (!c || !isSaneWeights(c.w)) continue;
+              const l = trainLossOf(train, c.w);
+              if (Number.isFinite(l) && Number.isFinite(baseL) && l < baseL - 1e-9 && (!bestC || l < bestC.l)) bestC = { ...c, l };
+            }
+            return bestC;
+          };
+          const gridOf = (w) => [
+            { w: { ...w, sensitivity: w.sensitivity * 1.2 }, method: "grid_search_v1" },
+            { w: { ...w, sensitivity: w.sensitivity * 0.8 }, method: "grid_search_v1" },
+            { w: { ...w, homeBase: Math.min(3, w.homeBase + 0.1) }, method: "grid_search_v1" },
+            { w: { ...w, homeBase: Math.max(0.8, w.homeBase - 0.1) }, method: "grid_search_v1" },
+          ];
+          // 候補の作り方(手続き)。どれも「渡された学習用の記録だけ」から候補を作る(検証用の記録は見ない)
+          const procedures = [
+            { name: "grid_search_v1", labelJa: "ホーム補正・フォーム感度の近傍",
+              run: (train) => { const b = pickBest(train, gridOf(currentWeights)); return b ? { w: b.w, method: b.method } : null; } },
+            { name: "gradient_descent_v2", labelJa: "勾配降下法(全特徴量の重み)",
+              run: (train) => { const w = fitWeightsGradientDescent(train, currentWeights, trustOpts); return w ? { w, method: "gradient_descent_v2" } : null; } },
+            { name: "ablation", labelJa: "有害と出た特徴量を外す",
+              run: (train) => { const eff = computeFeatureEffectiveness(train, currentWeights, trustOpts); const b = pickBest(train, buildAblationCandidates(eff, currentWeights)); return b ? { w: b.w, method: b.method } : null; } },
+          ];
+          let best = null, closest = null;
+          for (const p of procedures) {
+            const cv = crossValidate(cvRecords, {
+              folds: CV_FOLDS, scheme: "blocked", minValid: 20, minTrain: 20,
+              procedure: (train) => { const c = p.run(train); return c ? c.w : null; },
+              lossOf, baseLossOf,
+            });
+            const decision = decideCvGate(cv, { minN: CV_MIN_RECORDS, minGain: GATE_MIN_LOGLOSS_GAIN, minZ: CV_MIN_Z, accTolPt: GATE_ACC_TOL });
+            weightGateToday.procedures.push({ name: p.name, labelJa: p.labelJa, ...summarizeCv(cv, decision) });
+            if (cv.foldsWithCandidate > 0) weightGateToday.candidates++;
+            if (weightGateToday.baseValidLogLoss === null && cv.n) {
+              weightGateToday.validSize = cv.n;
+              weightGateToday.baseValidLogLoss = r4(cv.baseNll);
+              weightGateToday.baseValidAccuracyPct = cv.accBasePct;
+              v2AccuracyBefore = cv.accBasePct;
+              v2AccuracyAfter = cv.accBasePct;
+            }
+            if (decision.pass) {
+              weightGateToday.passed++;
+              if (!best || cv.gain > best.cv.gain) best = { p, cv, decision };
+            }
+            if (cv.foldsWithCandidate > 0 && Number.isFinite(cv.z) && (!closest || cv.z > closest.cv.z)) closest = { p, cv, decision };
+          }
+          const shown = best || closest;
+          if (shown) {
+            weightGateToday.pooledGain = Number.isFinite(shown.cv.gain) ? Math.round(shown.cv.gain * 100000) / 100000 : null;
+            weightGateToday.pooledSe = Number.isFinite(shown.cv.se) ? Math.round(shown.cv.se * 100000) / 100000 : null;
+            weightGateToday.z = Number.isFinite(shown.cv.z) ? Math.round(shown.cv.z * 100) / 100 : null;
+            weightGateToday.accDeltaPt = shown.cv.accDeltaPt;
+            weightGateToday.shownProcedure = shown.p.name;
+          }
+          let adoptedNow = false;
+          if (best) {
+            // 採用する重み = 通った手続きを「全件」で実行したもの
+            const finalC = best.p.run(cvRecords);
+            if (finalC && finalC.w) {
+              weightGateToday.adoptedGate = "cv";
+              weightGateToday.bestValidLogLoss = r4(best.cv.candNll);
+              weightGateToday.bestValidAccuracyPct = best.cv.accCandPct;
+              const ok = await adopt(finalC.w, finalC.method || best.p.name,
+                `記録${best.cv.n}件を${CV_FOLDS}つに分けた交差検証で、「${best.p.labelJa}」の候補がLogLossを平均${r4(best.cv.gain)}下げました(${r4(best.cv.baseNll)}→${r4(best.cv.candNll)}・z=${Number.isFinite(best.cv.z) ? Math.round(best.cv.z * 100) / 100 : "∞"}・改善した区間${best.cv.positiveFolds}/${best.cv.foldsWithCandidate})。` +
+                `的中率は${best.cv.accBasePct}%→${best.cv.accCandPct}%で許容幅(−${GATE_ACC_TOL}pt)の中に収まったため、同じ手続きを全件で実行した重みを採用しました。`,
+                { oldLogLoss: r4(best.cv.baseNll), newLogLoss: r4(best.cv.candNll), gate: "cv",
+                  oldAccuracy: best.cv.accBasePct, newAccuracy: best.cv.accCandPct, sampleSize: best.cv.n, holdout: true,
+                  cv: { folds: CV_FOLDS, pooledGain: weightGateToday.pooledGain, pooledSe: weightGateToday.pooledSe, z: weightGateToday.z, accDeltaPt: best.cv.accDeltaPt, positiveFolds: best.cv.positiveFolds, foldsWithCandidate: best.cv.foldsWithCandidate } });
+              if (ok) {
+                adoptedNow = true;
+                weightsUpdated = true;
+                weightsUpdatedV2 = (finalC.method || best.p.name) === "gradient_descent_v2";
+                v2AccuracyAfter = best.cv.accCandPct;
+                try {
+                  predictionShiftToday = computePredictionShift(usable.slice(-30), currentWeights, finalC.w);
+                  if (predictionShiftToday) {
+                    await upstashCmd(["RPUSH", "learn:weights:impact", JSON.stringify({
+                      date: dateKey, at: runAt.toISOString(), method: finalC.method || best.p.name,
+                      weightsVersionFrom: currentWeights.version || 0,
+                      weightsVersionTo: (currentWeights.version || 0) + 1,
+                      shift: predictionShiftToday,
+                    })]).catch(() => {});
+                    await upstashCmd(["LTRIM", "learn:weights:impact", "-30", "-1"]).catch(() => {});
+                    if (thoughtTimeline) {
+                      await thoughtTimeline.append("model:weights:beliefs", {
+                        kind: "belief",
+                        statementJa: predictionShiftToday.summaryJa,
+                        evidence: [`重みversion ${(currentWeights.version || 0)}→${(currentWeights.version || 0) + 1}(${finalC.method || best.p.name}・交差検証)`],
+                        at: runAt.toISOString(),
+                      }).catch(() => {});
+                    }
+                  }
+                } catch (e) { errors.push(`prediction_shift_failed:${e.message}`); }
+              } else {
+                weightGateToday.adoptedGate = null; // 保存できなかった(adopt が理由を errors に残している)
+              }
+            } else {
+              weightGateToday.reasonJa = `交差検証は通りましたが、全件で同じ手続き(${best.p.labelJa})を実行したときに候補を作れなかったため、重みは変更していません。`;
+            }
+          }
+          if (!adoptedNow) {
+            // 理由は「1文ずつ独立した形」で並べる(画面は「。」で区切って1文ずつ訳す。区切りの記号でつながない)
+            const parts = weightGateToday.procedures.map((x) => `「${x.labelJa}」の候補: ${x.reasonJa || "判定できませんでした。"}`);
+            const noteJa = weightGateToday.reasonJa
+              || `交差検証(${CV_FOLDS}分割・記録${cvRecords.length}件)で、どの手続きの候補も関門を通らなかったため、重みは変更しませんでした。` + parts.join("");
+            weightGateToday.reasonJa = noteJa;
+            await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
+              date: dateKey, adopted: false, method: "cv_validated", oldWeights: currentWeights, newWeights: null,
+              oldAccuracy: weightGateToday.baseValidAccuracyPct, newAccuracy: null, sampleSize: weightGateToday.validSize, holdout: true,
+              oldLogLoss: weightGateToday.baseValidLogLoss, gate: "cv",
+              cv: { folds: CV_FOLDS, pooledGain: weightGateToday.pooledGain, pooledSe: weightGateToday.pooledSe, z: weightGateToday.z, accDeltaPt: weightGateToday.accDeltaPt, procedure: weightGateToday.shownProcedure || null },
+              note: noteJa.slice(0, 900),
+            })]).catch(() => {});
+          }
+        }
+      } else if (baseTrain && baseValid) {
         v2AccuracyBefore = baseValid.accuracy;
         v2AccuracyAfter = baseValid.accuracy;
         // v100: 関門の物差し(LogLoss)。計算できない場合は従来の的中率関門だけで判定する
@@ -2959,7 +3198,7 @@ async function runDailyLearning(deps) {
         const seasonGuess = (runAt.getUTCMonth() + 1) >= 7 ? runAt.getUTCFullYear() : runAt.getUTCFullYear() - 1;
         xgCollectResult = await xgCollectMod.collectRecentXg(
           { callApiFootball, upstashGetJSON, upstashSetJSON, apiBudget, upstashCmd }, // v97: 読み出し失敗の区別用
-          { leagueIds: DEFAULT_BACKFILL_LEAGUES.map((l) => l.id), season: seasonGuess, dateStr: yesterday, nowIso: runAt.toISOString() });
+          { leagueIds: activeLeagueIds(), season: seasonGuess, dateStr: yesterday, nowIso: runAt.toISOString() }); // v102 ★2: 照合に通って学習に使っているリーグだけ
       } catch (e) {
         errors.push(`xg_collect_failed:${String((e && e.message) || e).slice(0, 40)}`);
       }
@@ -3004,10 +3243,34 @@ async function runDailyLearning(deps) {
       } catch (e) {
         errors.push(`clubelo_hist_failed:${String((e && e.message) || e).slice(0, 40)}`);
       }
+      // v102(B): 過去試合で通った重みを、自社予想の記録(本番と同じ特徴量)でも悪化しないか確かめるために渡す
+      let guardRecords = [];
+      try { guardRecords = (await loadRecentRecordsOnce()).filter((r) => r && r.actualWinner && r.features); }
+      catch (e) { warn("corpus_guard_records_read_failed", e); }
       modelTuning = await tuneModelOnHistory(
-        { upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON, callApiFootball, apiBudget, clubEloLookup, xgLookup, noteWarning: warn },
-        baseForTune, runAt, { dateKey }
+        { upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON, callApiFootball, apiBudget, heartbeat, clubEloLookup, xgLookup, noteWarning: warn },
+        baseForTune, runAt, { dateKey, guardRecords }
       );
+      // ---- v102(B): 過去試合での採用を、重みの変更履歴にも残す ----
+      //   これまで ④-b の採用は調整の履歴(learn:tuning:log)にしか残らず、画面の「AIが実際に学習して変更した内容」
+      //   (learn:weights:history から作る)に出なかった。過去試合が主な教材になるので、同じ場所で見えるようにする。
+      if (upstashEnabled && modelTuning && modelTuning.ran === true && modelTuning.adopted === true && modelTuning.newParams) {
+        try {
+          const cvS = modelTuning.cv || null;
+          await upstashCmd(["RPUSH", "learn:weights:history", JSON.stringify({
+            date: dateKey, adopted: true, method: modelTuning.method || "corpus_cv",
+            oldWeights: baseForTune, newWeights: { ...baseForTune, ...modelTuning.newParams },
+            oldAccuracy: cvS ? (cvS.accBasePct ?? null) : ((modelTuning.oldEval && modelTuning.oldEval.accuracyPct) ?? null),
+            newAccuracy: cvS ? (cvS.accCandPct ?? null) : ((modelTuning.newEval && modelTuning.newEval.accuracyPct) ?? null),
+            oldLogLoss: cvS ? (cvS.baseLogLoss ?? null) : ((modelTuning.oldEval && modelTuning.oldEval.logLoss) ?? null),
+            newLogLoss: cvS ? (cvS.candLogLoss ?? null) : ((modelTuning.newEval && modelTuning.newEval.logLoss) ?? null),
+            sampleSize: cvS ? (cvS.n ?? null) : (modelTuning.testSize ?? null),
+            holdout: true, ...(cvS ? { gate: "cv", cv: { folds: cvS.folds, pooledGain: cvS.pooledGain, pooledSe: cvS.pooledSe, z: cvS.z, accDeltaPt: cvS.accDeltaPt, positiveFolds: cvS.positiveFolds, foldsWithCandidate: cvS.foldsWithCandidate } } : {}),
+            source: "corpus", note: modelTuning.reasonJa || null,
+          })]);
+          await upstashCmd(["LTRIM", "learn:weights:history", "-30", "-1"]);
+        } catch (e) { warn("corpus_weights_history_failed", e); }
+      }
       if (upstashEnabled) {
         await upstashCmd(["SET", tunedKey, JSON.stringify({
           ranAt: runAt.toISOString(),
@@ -3026,14 +3289,25 @@ async function runDailyLearning(deps) {
   let marketBlendFitToday = null;
   try {
     const recentForBlend = await loadRecentRecordsOnce();
-    const fitB = fitMarketBlend(recentForBlend);
-    marketBlendFitToday = fitB;
+    // v102: 「いま使っている比率」を先に読んで、学習に渡す(迷ったら現状維持の基準にするため)。
+    //   v97: 読めなかった日は {} と見なさない(他の重みが初期値で上書きされるため)。読めなかったら反映はしない
+    let blendRead = null, blendReadError = null;
+    if (upstashEnabled) {
+      blendRead = await readWeightsStrict();
+      if (!blendRead.ok) blendReadError = blendRead.error || "unknown";
+    }
+    const storedBeforeFit = (blendRead && blendRead.ok && blendRead.weights) || {};
+    const fitB = fitMarketBlend(recentForBlend, { currentW: Number.isFinite(storedBeforeFit.marketBlend) ? storedBeforeFit.marketBlend : 0 });
+    marketBlendFitToday = blendReadError
+      ? { ...fitB, saved: false, reasonJa: `${fitB.reasonJa || ""}(保存済みの重みを読み出せなかったため、今回は反映していません)` }
+      : fitB;
     const MIN_SAMPLES_FOR_BLEND_CHANGE = 40;
-    if (upstashEnabled && fitB && fitB.samples >= MIN_SAMPLES_FOR_BLEND_CHANGE) {
-      // v97: 読めなかった日は {} と見なさない(他の重みが初期値で上書きされるため)
-      const blendRead = await readWeightsStrict();
-      if (!blendRead.ok) throw new Error(`weights_read_failed:${blendRead.error}(保存済みの重みを読み出せなかったため見送り)`);
-      const storedNow = blendRead.weights || {};
+    // 従来どおり: 反映できる件数があるのに重みを読めなかった日は、失敗として記録に残す
+    if (blendReadError && fitB && fitB.samples >= MIN_SAMPLES_FOR_BLEND_CHANGE) {
+      throw new Error(`weights_read_failed:${blendReadError}(保存済みの重みを読み出せなかったため見送り)`);
+    }
+    if (upstashEnabled && !blendReadError && fitB && fitB.samples >= MIN_SAMPLES_FOR_BLEND_CHANGE) {
+      const storedNow = storedBeforeFit;
       const currentW = Number.isFinite(storedNow.marketBlend) ? storedNow.marketBlend : 0;
       const newW = fitB.adopted ? fitB.w : 0;
       if (Math.abs(newW - currentW) >= 0.005) {
@@ -3277,6 +3551,11 @@ async function runDailyLearning(deps) {
     errors.push(`weekly_digest_failed:${e && (e.code || e.message)}`);
   }
 
+  // v102: コンセンサスの月間クレジットの実測(自前のカウンター)。対象リーグを増やせるかを実測で判断する材料。
+  let oddsCreditsUsedThisMonth = null;
+  if (oddsApiStats.enabled) {
+    oddsCreditsUsedThisMonth = await oddsApiMod.readCreditsUsed({ upstashCmd: upstashEnabled ? upstashCmd : null }, runAt.getTime());
+  }
   const growthLog = {
     // v54: 今日採点した対決ピック数(全国ランキングへの反映数)
     duelPicksScoredToday: duelScoredToday,
@@ -3347,6 +3626,10 @@ async function runDailyLearning(deps) {
       // v60: 「対象試合が無かった」のか「取得に失敗した」のかを見分けるための実測
       fixturesConsidered: oddsApiStats.fixturesConsidered,
       fixturesOutOfScope: oddsApiStats.fixturesOutOfScope,
+      // v102: 今月ここまでの消費(朝の学習+直前ウォッチの合計。読めなければ null)と月の予算、提供元が返した残り
+      creditsUsedThisMonth: oddsCreditsUsedThisMonth,
+      monthlyBudget: oddsApiStats.enabled ? oddsApiMod.monthlyBudget(process.env) : null,
+      providerQuota: oddsApiStats.providerQuota,
     },
     // v50: 市場ブレンドの学習結果(採否・w・検証NLL)を実測のまま残す
     marketBlendFit: marketBlendFitToday ? {
@@ -3355,6 +3638,11 @@ async function runDailyLearning(deps) {
       saved: marketBlendFitToday.saved === true,
       validNllBase: marketBlendFitToday.validNllBase ?? null,
       validNllBest: marketBlendFitToday.validNllBest ?? null,
+      // v102: 決め方(cv=時系列の前向き検証・既定 / holdout=v101 までの7:3)と、前向き検証の中身。
+      //   cv のとき validNllBase / validNllBest は「区間2〜5を束ねた標本外の値」(AI単独 / 選んだ決め方)
+      mode: marketBlendFitToday.mode || "holdout",
+      cv: marketBlendFitToday.cv ?? null,
+      decision: marketBlendFitToday.decision ?? null, currentW: marketBlendFitToday.currentW ?? null,
       reasonJa: marketBlendFitToday.reasonJa || null,
       // v101: 市場比率ごとの検証 LogLoss の曲線(w=1.0「市場単独」は診断用で採用対象外)。
       //   「AIを◯割にすると確率の質がどれだけ変わるか」を、推測ではなく実測で開示するため。
@@ -3450,6 +3738,22 @@ async function runDailyLearning(deps) {
       newParams: modelTuning.newParams ?? null,
       // v59: 派生指標(BTTS率・クリーンシート率・荒れやすさ)の集計結果(実測)
       teamStats: modelTuning.teamStats ?? null,
+      // v102(B): 関門の種類・前向き交差検証の結果・自社予想の記録での確認・従来と同じ3割での現行の成績
+      gateMode: modelTuning.gateMode ?? null,
+      method: modelTuning.method ?? null,
+      cv: modelTuning.cv ?? null,
+      // v102: ④-b の安全弁の状態と、メモリの実測(本番の機械で足りているかを、数字で確かめるため)
+      crashGuard: modelTuning.crashGuard ?? null,
+      memoryCheck: modelTuning.memoryCheck ?? null,
+      memory: modelTuning.memory ?? null,
+      ownRecordsGuard: modelTuning.ownRecordsGuard ?? null,
+      holdoutBaseEval: modelTuning.holdoutBaseEval ?? null,
+      // v102 ★2: 新しく足したリーグの照合の結果と、実際に学習に使ったリーグの数
+      leagueChecks: modelTuning.leagueChecks ?? null,
+      leagueCheckErrors: modelTuning.leagueCheckErrors ?? null,
+      leaguesInDataset: modelTuning.leaguesInDataset ?? null,
+      droppedOldest: modelTuning.droppedOldest ?? null,
+      learnedLeagueIds: activeLeagueIds(),
     } : null,
     // 実行中の重複APIをどれだけ削れたか(実測)。データ量は減らしていない。
     apiRunMemo: {
@@ -3554,6 +3858,10 @@ async function runDailyLearning(deps) {
     warnings: summarizeWarnings(jobLog),
     // v99: 学習1回あたりの保存先(Upstash)コマンド数(段階別の実測)。計れない環境では measured:false
     storeUsage: buildStoreUsage(),
+    // v102: この処理(サーバー)のメモリの実測。学習の開始時と、成長ログを作る時点(ほぼ終わり)の値。
+    //   maxRssMb は起動してからの最大値、heapLimitMb は Node が自分に許している上限、constrainedMb は入れ物の上限(読めなければ null)。
+    //   学習リーグを増やしたあとも、機械のメモリに余裕があるかを、推測ではなく数字で確かめるために残す。
+    processMemory: { ...memoryLimits(), start: processMemoryAtStart, end: memorySnapshot() },
   };
 
   // 同じ日付の既存ログがあれば合算する(上のmergeGrowthLogsのコメント参照)。
@@ -3965,6 +4273,7 @@ module.exports = {
   buildReflectionText, mergeGrowthLogs,
   MIN_RESOLVED_FOR_RECALIBRATION, OWN_PRED_RECENT_KEEP, OWN_PREDICT_LOG_CAP, lrangeAllChunked,
   // v80(案8): 全試合拡張(テスト対象)+公開前フルスロットルの状態
-  buildExtraFixtureTeams, EXTRA_FIXTURES_CAP, PRELAUNCH_LEARNING,
+  buildExtraFixtureTeams, EXTRA_FIXTURES_CAP, PRELAUNCH_LEARNING, OWN_PREDICT_RESOLVE_CAP,
+  llmHttpErrorKind, // v102: 回答AIの失敗の種類(テスト用に公開。llmErrorTag は上で公開済み)
   getTuningHistory,
 };

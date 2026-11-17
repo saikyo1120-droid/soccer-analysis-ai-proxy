@@ -51,6 +51,16 @@ const SPORT_KEYS = {
   71: "soccer_brazil_campeonato",
 };
 
+// ---- v102 ★2(2026年11月17日): 学習リーグを16増やしたが、コンセンサスの対象は増やしていない ----
+//   なぜ増やさないか: この提供元は「1リーグの取得=1クレジット」で、月の予算(既定480)は全リーグで共有している。
+//     対象リーグを増やすと、従来の15大会が月の途中で予算切れになるおそれがある(従来の大会を悪くする方向)。
+//     月にどれだけ使っているかは v101 まで成長ログに残していなかったので、増やしてよいかを実測で判断できない。
+//   v102 でやったこと: 消費量(自前のカウンターと、提供元が応答ヘッダーで返す残数)を成長ログに残す(下の readCreditsUsed)。
+//   下の16リーグは、従来どおり API-Football の1社のオッズを使う(v101 より前の J1・英2部・ブラジルと同じ状態)。
+//   実測で余裕が確かめられたら、提供元の公式一覧で sport key を確認したうえで SPORT_KEYS に移す。
+//   (テストは「学習リーグは SPORT_KEYS か、この一覧のどちらかに必ず入っている」ことを固定している=黙って対象外にならない)
+const NO_CONSENSUS_LEAGUE_IDS = Object.freeze([286, 119, 383, 207, 179, 106, 253, 197, 345, 141, 419, 113, 103, 79, 210, 271]);
+
 const DEFAULT_MONTHLY_BUDGET = 480; // 無料枠500に対する安全マージン
 const CREDITS_KEY_PREFIX = "oddsapi:credits:"; // oddsapi:credits:<YYYY-MM(UTC)>
 
@@ -84,6 +94,42 @@ async function tryConsumeCredits(deps, n, nowMs) {
     return true;
   } catch (e) {
     return false;
+  }
+}
+
+/**
+ * v102: 今月ここまでに使ったクレジット(自前のカウンター)を読む。読めなければ null(0 と区別する)。
+ */
+async function readCreditsUsed(deps, nowMs) {
+  const { upstashCmd } = deps || {};
+  if (!upstashCmd) return null;
+  try {
+    const raw = await upstashCmd(["GET", `${CREDITS_KEY_PREFIX}${monthKeyUtc(nowMs)}`]);
+    if (raw === null || raw === undefined || raw === "") return 0; // まだ1回も使っていない月
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * v102: 提供元が応答ヘッダーで返す利用枠(x-requests-remaining / x-requests-used)。無ければ null。
+ */
+function readQuotaHeaders(res) {
+  try {
+    const h = res && res.headers;
+    if (!h || typeof h.get !== "function") return null;
+    const num = (v) => {
+      if (v === null || v === undefined || String(v).trim() === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const remaining = num(h.get("x-requests-remaining"));
+    const used = num(h.get("x-requests-used"));
+    return (remaining === null && used === null) ? null : { remaining, used };
+  } catch (e) {
+    return null;
   }
 }
 
@@ -196,9 +242,10 @@ async function fetchLeagueConsensus(deps, leagueId, nowMs) {
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
     const res = await fetchFn(url, controller ? { signal: controller.signal } : undefined);
-    if (!res || !res.ok) return { ok: false, reason: `http_${res ? res.status : "no_response"}`, events: [] };
+    const quota = readQuotaHeaders(res); // v102: 提供元が返す利用枠の残り(実測。無ければ null)
+    if (!res || !res.ok) return { ok: false, reason: `http_${res ? res.status : "no_response"}`, events: [], quota };
     const json = await res.json();
-    return { ok: true, reason: null, events: buildConsensusEvents(json) };
+    return { ok: true, reason: null, events: buildConsensusEvents(json), quota };
   } catch (e) {
     const msg = String((e && e.message) || e);
     // 鍵をエラー文に残さない(URLに apiKey を含むため、fetch の失敗文に混ざり得る)
@@ -224,8 +271,8 @@ function matchFixture(events, homeName, awayName, kickoffIso) {
 }
 
 module.exports = {
-  SPORT_KEYS, DEFAULT_MONTHLY_BUDGET, CREDITS_KEY_PREFIX,
-  isEnabled, monthlyBudget, monthKeyUtc, tryConsumeCredits,
+  SPORT_KEYS, NO_CONSENSUS_LEAGUE_IDS, DEFAULT_MONTHLY_BUDGET, CREDITS_KEY_PREFIX,
+  isEnabled, monthlyBudget, monthKeyUtc, tryConsumeCredits, readCreditsUsed, readQuotaHeaders,
   normName, namesMatch, devigOneBook, buildConsensusEvents,
   fetchLeagueConsensus, matchFixture,
 };
