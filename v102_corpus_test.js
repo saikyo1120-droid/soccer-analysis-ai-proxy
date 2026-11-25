@@ -456,7 +456,7 @@ const BIG = synthMatches({ leagues: 2, teams: 12, seasons: 11, seed: 33, strengt
   });
   await t("毎日の学習は、自社予想の記録を「悪化していないことの確認」に渡し、成長ログに関門の中身を残す", () => {
     const src = fs.readFileSync(path.join(S, "learning", "dailyJob.js"), "utf8");
-    for (const s of ["baseForTune, runAt, { dateKey, guardRecords }", "gateMode: modelTuning.gateMode ?? null,", "cv: modelTuning.cv ?? null,", "ownRecordsGuard: modelTuning.ownRecordsGuard ?? null,", "holdoutBaseEval: modelTuning.holdoutBaseEval ?? null,", "leagueChecks: modelTuning.leagueChecks ?? null,", "learnedLeagueIds: activeLeagueIds(),", "callApiFootball, apiBudget, heartbeat, clubEloLookup, xgLookup, noteWarning: warn }"]) {
+    for (const s of ["baseForTune, runAt, { dateKey, guardRecords }", "gateMode: modelTuning.gateMode ?? null,", "cv: modelTuning.cv ?? null,", "ownRecordsGuard: modelTuning.ownRecordsGuard ?? null,", "holdoutBaseEval: modelTuning.holdoutBaseEval ?? null,", "leagueChecks: modelTuning.leagueChecks ?? null,", "learnedLeagueIds: activeLeagueIds(),", "callApiFootball: rawCallApiFootball, apiBudget, heartbeat, clubEloLookup, xgLookup, noteWarning: warn }"]) {
       assert.ok(src.includes(s), "無い: " + s);
     }
   });
