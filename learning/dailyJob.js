@@ -550,6 +550,7 @@ function mergeGrowthLogs(previous, current) {
       const hits = (a.hits || 0) + (b.hits || 0);
       return {
         hits, misses: (a.misses || 0) + (b.misses || 0), savedRequests: hits,
+        entries: Math.max(Number(a.entries) || 0, Number(b.entries) || 0), // v102.1: 同じ日に複数回まわしたときは、多いほう(記憶は実行ごとに作り直すので足さない)
         noteJa: hits > 0
           ? `本日の実行で同じ問い合わせが${hits}回発生したため、APIリクエストを${hits}件節約しました(取得データの量・鮮度は変わりません)。`
           : "重複した問い合わせはありませんでした。",
@@ -3247,10 +3248,13 @@ async function runDailyLearning(deps) {
       let guardRecords = [];
       try { guardRecords = (await loadRecentRecordsOnce()).filter((r) => r && r.actualWinner && r.features); }
       catch (e) { warn("corpus_guard_records_read_failed", e); }
-      modelTuning = await tuneModelOnHistory(
-        { upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON, callApiFootball, apiBudget, heartbeat, clubEloLookup, xgLookup, noteWarning: warn },
-        baseForTune, runAt, { dateKey, guardRecords }
-      );
+      // ---- v102.1(本番の実測 11/18 を受けた修正): ④-b には「実行中の記憶(runMemo)」を通さない呼び出しを渡す ----
+      //   過去試合の取り直し(31大会×5シーズン = 155回の問い合わせ)とリーグの照合は、1回の実行の中で同じ問い合わせを繰り返さない。
+      //   それなのに実行中の記憶が、取り直した全シーズンぶんの生の応答(本番 11/18 は 42,654試合。同じ形の合成データで測ると 約55MB)を学習の終わりまで抱えていた。
+      //   取り直しの日(3日に1回)だけ、重みの検証の直前の使用量がそのぶん多かった(11/18 の本番: 検証の前に 152MB / 上限 268MB)。
+      //   取得するデータ・回数・予算の数え方は変わらない(記憶を通さないだけ)。
+      const tuneDeps = { upstashEnabled, upstashCmd, upstashGetJSON, upstashSetJSON, callApiFootball: rawCallApiFootball, apiBudget, heartbeat, clubEloLookup, xgLookup, noteWarning: warn };
+      modelTuning = await tuneModelOnHistory(tuneDeps, baseForTune, runAt, { dateKey, guardRecords });
       // ---- v102(B): 過去試合での採用を、重みの変更履歴にも残す ----
       //   これまで ④-b の採用は調整の履歴(learn:tuning:log)にしか残らず、画面の「AIが実際に学習して変更した内容」
       //   (learn:weights:history から作る)に出なかった。過去試合が主な教材になるので、同じ場所で見えるようにする。
@@ -3759,6 +3763,7 @@ async function runDailyLearning(deps) {
     apiRunMemo: {
       hits: runMemoHits, misses: runMemoMisses,
       savedRequests: runMemoHits,
+      entries: runMemo.size, // v102.1: 実行の終わりに記憶が抱えていた応答の数(メモリの実測と見比べるため)
       noteJa: runMemoHits > 0
         ? `1回の実行の中で同じ問い合わせが${runMemoHits}回発生したため、実際のAPIリクエストを${runMemoHits}件節約しました(取得したデータの量・鮮度は変わりません)。`
         : "実行中の重複した問い合わせはありませんでした。",
